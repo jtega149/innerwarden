@@ -9458,12 +9458,6 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
   const sevCls = (s) => ({'critical':'sc-critical','high':'sc-high','medium':'sc-medium','low':'sc-low','info':'sc-info'}[s] || '');
 
-  /** HTML-escape to prevent XSS injection. */
-  function esc(s) {
-    if (s == null) return '';
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-  }
-
   /** Show a toast notification. */
   function toast(msg, type) {
     const t = document.createElement('div');
