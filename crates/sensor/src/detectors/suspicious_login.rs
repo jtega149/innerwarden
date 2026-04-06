@@ -287,7 +287,8 @@ mod tests {
     #[test]
     fn no_alert_for_clean_login_nonpriv() {
         let mut det = SuspiciousLoginDetector::new("test", 300);
-        let now = Utc::now();
+        // Use a fixed daytime hour (12:00 UTC) to avoid off-hours detection
+        let now = Utc::now().date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc();
 
         // Success without prior failures from non-privileged user → no alert
         assert!(det
