@@ -228,7 +228,11 @@ impl TelegramClient {
         // Guard: compact — just "Not a threat" + "Investigate".
         // Watch/DryRun: operator decides — Block + Ignore + Investigate + "Not a threat".
         {
-            let fp_label = if is_simple { "Not a threat" } else { "Report FP" };
+            let fp_label = if is_simple {
+                "Not a threat"
+            } else {
+                "Report FP"
+            };
             let fp_btn = serde_json::json!({
                 "text": format!("\u{1f4dd} {fp_label}"),
                 "callback_data": callback_data("fp:", &incident.incident_id)
@@ -1054,11 +1058,8 @@ impl TelegramClient {
                                 .and_then(|m| m.chat.as_ref())
                                 .map(|c| c.id)
                                 .unwrap_or(0);
-                            let cb_msg_id = callback
-                                .message
-                                .as_ref()
-                                .map(|m| m.message_id)
-                                .unwrap_or(0);
+                            let cb_msg_id =
+                                callback.message.as_ref().map(|m| m.message_id).unwrap_or(0);
 
                             if let Some(data) = &callback.data {
                                 if let Some(incident_id) = data.strip_prefix("fp:check:") {
@@ -1137,7 +1138,8 @@ impl TelegramClient {
                                             )
                                             .await;
                                         if cb_chat_id != 0 {
-                                            self.react(cb_chat_id, cb_msg_id, "\u{1f6e1}\u{fe0f}").await;
+                                            self.react(cb_chat_id, cb_msg_id, "\u{1f6e1}\u{fe0f}")
+                                                .await;
                                         }
                                         let result = ApprovalResult {
                                             incident_id: format!("__quick_block__:{ip}"),
@@ -2561,10 +2563,7 @@ mod tests {
             suppressed_count: 10,
             auto_resolved_groups: 3,
             needs_review_groups: 1,
-            deferred: vec![
-                ("ssh_bruteforce".into(), 12),
-                ("port_scan".into(), 5),
-            ],
+            deferred: vec![("ssh_bruteforce".into(), 12), ("port_scan".into(), 5)],
         };
         let msg = format_daily_digest_enriched(42, 30, 0, 5, "ssh_bruteforce", 12, false, &stats);
         assert!(msg.contains("Deferred:"));
@@ -3022,15 +3021,11 @@ fn format_simple_message(
 
     // Action line depends on mode.
     let action_line = match mode {
-        GuardianMode::Guard => {
-            "\u{26a1} <b>Handled automatically</b> — no action needed."
-        }
+        GuardianMode::Guard => "\u{26a1} <b>Handled automatically</b> — no action needed.",
         GuardianMode::DryRun => {
             "\u{1f9ea} <b>Dry-run</b> — would act on this. Enable live mode to let me."
         }
-        GuardianMode::Watch => {
-            "\u{26a0}\u{fe0f} <b>Needs your attention.</b>"
-        }
+        GuardianMode::Watch => "\u{26a0}\u{fe0f} <b>Needs your attention.</b>",
     };
 
     let link_line = dashboard_url

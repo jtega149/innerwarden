@@ -1080,7 +1080,12 @@ pub(crate) fn cmd_configure_digest(cli: &Cli, hour_str: &str) -> Result<()> {
     if cli.dry_run {
         println!("  [dry-run] would set [telegram] daily_summary_hour = {hour}");
     } else {
-        config_editor::write_int(&cli.agent_config, "telegram", "daily_summary_hour", i64::from(hour))?;
+        config_editor::write_int(
+            &cli.agent_config,
+            "telegram",
+            "daily_summary_hour",
+            i64::from(hour),
+        )?;
         println!("  Daily Telegram digest set to {hour:02}:00 local time.");
         restart_agent(cli);
     }
@@ -1092,7 +1097,11 @@ pub(crate) fn cmd_configure_digest(cli: &Cli, hour_str: &str) -> Result<()> {
         action: "configure".to_string(),
         target: "telegram.daily_summary_hour".to_string(),
         parameters: serde_json::json!({ "hour": hour }),
-        result: if cli.dry_run { "dry_run".to_string() } else { "success".to_string() },
+        result: if cli.dry_run {
+            "dry_run".to_string()
+        } else {
+            "success".to_string()
+        },
         prev_hash: None,
     };
     if let Err(e) = append_admin_action(&cli.data_dir, &mut audit) {
@@ -1110,7 +1119,12 @@ pub(crate) fn cmd_configure_budget(cli: &Cli, max: u32) -> Result<()> {
     if cli.dry_run {
         println!("  [dry-run] would set [telegram] daily_budget = {max}");
     } else {
-        config_editor::write_int(&cli.agent_config, "telegram", "daily_budget", i64::from(max))?;
+        config_editor::write_int(
+            &cli.agent_config,
+            "telegram",
+            "daily_budget",
+            i64::from(max),
+        )?;
         println!("  Telegram daily budget set to {max} notifications/day.");
         println!("  Critical alerts always break the budget.");
         restart_agent(cli);
@@ -1123,7 +1137,11 @@ pub(crate) fn cmd_configure_budget(cli: &Cli, max: u32) -> Result<()> {
         action: "configure".to_string(),
         target: "telegram.daily_budget".to_string(),
         parameters: serde_json::json!({ "max": max }),
-        result: if cli.dry_run { "dry_run".to_string() } else { "success".to_string() },
+        result: if cli.dry_run {
+            "dry_run".to_string()
+        } else {
+            "success".to_string()
+        },
         prev_hash: None,
     };
     if let Err(e) = append_admin_action(&cli.data_dir, &mut audit) {

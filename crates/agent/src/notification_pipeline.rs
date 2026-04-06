@@ -36,7 +36,12 @@ pub(crate) struct IncidentGroup {
 }
 
 impl IncidentGroup {
-    fn new(incident: &Incident, detector: String, entity_type: EntityType, entity_value: String) -> Self {
+    fn new(
+        incident: &Incident,
+        detector: String,
+        entity_type: EntityType,
+        entity_value: String,
+    ) -> Self {
         Self {
             detector,
             entity_type,
@@ -295,18 +300,12 @@ impl GroupingEngine {
 
 /// Decide whether an incident group should be forwarded to a channel.
 #[allow(dead_code)]
-pub(crate) fn should_notify_channel(
-    group: &IncidentGroup,
-    level: ChannelFilterLevel,
-) -> bool {
+pub(crate) fn should_notify_channel(group: &IncidentGroup, level: ChannelFilterLevel) -> bool {
     filter_by_level(level, &group.severity_max, group.auto_resolved)
 }
 
 /// Decide whether a group summary should be forwarded to a channel.
-pub(crate) fn should_notify_summary(
-    summary: &GroupSummary,
-    level: ChannelFilterLevel,
-) -> bool {
+pub(crate) fn should_notify_summary(summary: &GroupSummary, level: ChannelFilterLevel) -> bool {
     filter_by_level(level, &summary.severity_max, summary.auto_resolved)
 }
 
@@ -315,8 +314,7 @@ fn filter_by_level(level: ChannelFilterLevel, severity: &Severity, auto_resolved
         ChannelFilterLevel::All => true,
         ChannelFilterLevel::None => false,
         ChannelFilterLevel::Critical => {
-            !auto_resolved
-                && matches!(severity, Severity::High | Severity::Critical)
+            !auto_resolved && matches!(severity, Severity::High | Severity::Critical)
         }
         ChannelFilterLevel::Actionable => {
             if auto_resolved {
@@ -369,11 +367,7 @@ pub(crate) fn is_immediate_threat(incident: &Incident) -> bool {
         return true;
     }
 
-    let detector = incident
-        .incident_id
-        .split(':')
-        .next()
-        .unwrap_or("unknown");
+    let detector = incident.incident_id.split(':').next().unwrap_or("unknown");
 
     is_immediate_threat_detector(detector)
 }
@@ -416,17 +410,15 @@ pub(crate) fn should_suppress_for_environment(
     incident: &Incident,
     profile: &crate::environment_profile::EnvironmentProfile,
 ) -> bool {
-    let detector = incident
-        .incident_id
-        .split(':')
-        .next()
-        .unwrap_or("unknown");
+    let detector = incident.incident_id.split(':').next().unwrap_or("unknown");
 
     // Cloud VPS: suppress timing-based detectors up to High severity.
     // On cloud/VM, hypervisor jitter makes timing analysis unreliable.
     // Only Critical timing anomalies go through (indicating persistent pattern).
     if profile.is_cloud()
-        && CLOUD_SUPPRESSED_DETECTORS.iter().any(|d| detector.contains(d))
+        && CLOUD_SUPPRESSED_DETECTORS
+            .iter()
+            .any(|d| detector.contains(d))
         && !matches!(incident.severity, Severity::Critical)
     {
         return true;
@@ -442,11 +434,7 @@ pub(crate) fn is_admin_routine(
     incident: &Incident,
     profile: &crate::environment_profile::EnvironmentProfile,
 ) -> bool {
-    let detector = incident
-        .incident_id
-        .split(':')
-        .next()
-        .unwrap_or("unknown");
+    let detector = incident.incident_id.split(':').next().unwrap_or("unknown");
 
     // Only check admin-demotable detectors
     if !ADMIN_DEMOTED_DETECTORS.iter().any(|d| detector.contains(d)) {
@@ -509,7 +497,12 @@ fn extract_group_key(incident: &Incident) -> (String, EntityType, String) {
         .entities
         .iter()
         .find(|e| e.r#type == EntityType::Ip)
-        .or_else(|| incident.entities.iter().find(|e| e.r#type == EntityType::User))
+        .or_else(|| {
+            incident
+                .entities
+                .iter()
+                .find(|e| e.r#type == EntityType::User)
+        })
         .or_else(|| incident.entities.first());
 
     match entity {
@@ -570,7 +563,12 @@ mod tests {
         }
     }
 
-    fn make_incident_at(detector: &str, ip: &str, severity: Severity, ts: DateTime<Utc>) -> Incident {
+    fn make_incident_at(
+        detector: &str,
+        ip: &str,
+        severity: Severity,
+        ts: DateTime<Utc>,
+    ) -> Incident {
         let mut inc = make_incident(detector, ip, severity);
         inc.ts = ts;
         inc
@@ -745,31 +743,61 @@ mod tests {
 
     #[test]
     fn filter_all_passes_everything() {
-        assert!(should_notify_channel(&make_group(Severity::Low, true), ChannelFilterLevel::All));
-        assert!(should_notify_channel(&make_group(Severity::Low, false), ChannelFilterLevel::All));
+        assert!(should_notify_channel(
+            &make_group(Severity::Low, true),
+            ChannelFilterLevel::All
+        ));
+        assert!(should_notify_channel(
+            &make_group(Severity::Low, false),
+            ChannelFilterLevel::All
+        ));
     }
 
     #[test]
     fn filter_none_blocks_everything() {
-        assert!(!should_notify_channel(&make_group(Severity::Critical, false), ChannelFilterLevel::None));
+        assert!(!should_notify_channel(
+            &make_group(Severity::Critical, false),
+            ChannelFilterLevel::None
+        ));
     }
 
     #[test]
     fn filter_critical_passes_high_unresolved() {
-        assert!(should_notify_channel(&make_group(Severity::High, false), ChannelFilterLevel::Critical));
-        assert!(should_notify_channel(&make_group(Severity::Critical, false), ChannelFilterLevel::Critical));
-        assert!(!should_notify_channel(&make_group(Severity::Medium, false), ChannelFilterLevel::Critical));
-        assert!(!should_notify_channel(&make_group(Severity::High, true), ChannelFilterLevel::Critical));
+        assert!(should_notify_channel(
+            &make_group(Severity::High, false),
+            ChannelFilterLevel::Critical
+        ));
+        assert!(should_notify_channel(
+            &make_group(Severity::Critical, false),
+            ChannelFilterLevel::Critical
+        ));
+        assert!(!should_notify_channel(
+            &make_group(Severity::Medium, false),
+            ChannelFilterLevel::Critical
+        ));
+        assert!(!should_notify_channel(
+            &make_group(Severity::High, true),
+            ChannelFilterLevel::Critical
+        ));
     }
 
     #[test]
     fn filter_actionable_blocks_auto_resolved_except_critical() {
         // Auto-resolved non-critical → not actionable
-        assert!(!should_notify_channel(&make_group(Severity::High, true), ChannelFilterLevel::Actionable));
+        assert!(!should_notify_channel(
+            &make_group(Severity::High, true),
+            ChannelFilterLevel::Actionable
+        ));
         // Auto-resolved critical → still actionable
-        assert!(should_notify_channel(&make_group(Severity::Critical, true), ChannelFilterLevel::Actionable));
+        assert!(should_notify_channel(
+            &make_group(Severity::Critical, true),
+            ChannelFilterLevel::Actionable
+        ));
         // Not auto-resolved → actionable
-        assert!(should_notify_channel(&make_group(Severity::Low, false), ChannelFilterLevel::Actionable));
+        assert!(should_notify_channel(
+            &make_group(Severity::Low, false),
+            ChannelFilterLevel::Actionable
+        ));
     }
 
     // -- Summary filter tests --
@@ -789,24 +817,42 @@ mod tests {
 
     #[test]
     fn summary_filter_actionable_blocks_auto_resolved() {
-        assert!(!should_notify_summary(&make_summary(Severity::High, true), ChannelFilterLevel::Actionable));
-        assert!(should_notify_summary(&make_summary(Severity::High, false), ChannelFilterLevel::Actionable));
+        assert!(!should_notify_summary(
+            &make_summary(Severity::High, true),
+            ChannelFilterLevel::Actionable
+        ));
+        assert!(should_notify_summary(
+            &make_summary(Severity::High, false),
+            ChannelFilterLevel::Actionable
+        ));
     }
 
     #[test]
     fn summary_filter_critical_only_high_and_critical() {
-        assert!(should_notify_summary(&make_summary(Severity::Critical, false), ChannelFilterLevel::Critical));
-        assert!(!should_notify_summary(&make_summary(Severity::Medium, false), ChannelFilterLevel::Critical));
+        assert!(should_notify_summary(
+            &make_summary(Severity::Critical, false),
+            ChannelFilterLevel::Critical
+        ));
+        assert!(!should_notify_summary(
+            &make_summary(Severity::Medium, false),
+            ChannelFilterLevel::Critical
+        ));
     }
 
     #[test]
     fn summary_filter_none_blocks_all() {
-        assert!(!should_notify_summary(&make_summary(Severity::Critical, false), ChannelFilterLevel::None));
+        assert!(!should_notify_summary(
+            &make_summary(Severity::Critical, false),
+            ChannelFilterLevel::None
+        ));
     }
 
     #[test]
     fn summary_filter_all_passes_all() {
-        assert!(should_notify_summary(&make_summary(Severity::Low, true), ChannelFilterLevel::All));
+        assert!(should_notify_summary(
+            &make_summary(Severity::Low, true),
+            ChannelFilterLevel::All
+        ));
     }
 
     // -- Backward compat: default config produces same behavior --
@@ -935,9 +981,21 @@ mod tests {
         let cfg = crate::config::ChannelNotificationConfig::default();
         assert_eq!(cfg.notification_level, ChannelFilterLevel::Actionable);
         // Actionable with auto_resolved=false passes everything (same as current behavior)
-        assert!(filter_by_level(cfg.notification_level, &Severity::Low, false));
-        assert!(filter_by_level(cfg.notification_level, &Severity::High, false));
-        assert!(filter_by_level(cfg.notification_level, &Severity::Critical, false));
+        assert!(filter_by_level(
+            cfg.notification_level,
+            &Severity::Low,
+            false
+        ));
+        assert!(filter_by_level(
+            cfg.notification_level,
+            &Severity::High,
+            false
+        ));
+        assert!(filter_by_level(
+            cfg.notification_level,
+            &Severity::Critical,
+            false
+        ));
     }
 
     // -- Immediate threat classification tests --

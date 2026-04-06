@@ -1212,10 +1212,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
                 },
                 RuleStage {
                     layer: Some(Layer::Network),
-                    kind_patterns: vec![
-                        "dns_tunneling".into(),
-                        "dns.query".into(),
-                    ],
+                    kind_patterns: vec!["dns_tunneling".into(), "dns.query".into()],
                     entity_must_match: false,
                 },
             ],
@@ -1241,10 +1238,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
                 },
                 RuleStage {
                     layer: Some(Layer::Network),
-                    kind_patterns: vec![
-                        "web_scan".into(),
-                        "web_shell".into(),
-                    ],
+                    kind_patterns: vec!["web_scan".into(), "web_shell".into()],
                     entity_must_match: true,
                 },
                 RuleStage {
@@ -1333,10 +1327,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             stages: vec![
                 RuleStage {
                     layer: Some(Layer::Userspace),
-                    kind_patterns: vec![
-                        "sudo_abuse".into(),
-                        "sensitive_write".into(),
-                    ],
+                    kind_patterns: vec!["sudo_abuse".into(), "sensitive_write".into()],
                     entity_must_match: false,
                 },
                 RuleStage {
@@ -1389,10 +1380,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             stages: vec![
                 RuleStage {
                     layer: None,
-                    kind_patterns: vec![
-                        "suspicious_login".into(),
-                        "ssh.login_success".into(),
-                    ],
+                    kind_patterns: vec!["suspicious_login".into(), "ssh.login_success".into()],
                     entity_must_match: false,
                 },
                 RuleStage {
@@ -1418,10 +1406,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             stages: vec![
                 RuleStage {
                     layer: Some(Layer::Network),
-                    kind_patterns: vec![
-                        "distributed_ssh".into(),
-                        "ssh_bruteforce".into(),
-                    ],
+                    kind_patterns: vec!["distributed_ssh".into(), "ssh_bruteforce".into()],
                     entity_must_match: false,
                 },
                 RuleStage {
@@ -1447,26 +1432,17 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             stages: vec![
                 RuleStage {
                     layer: Some(Layer::Kernel),
-                    kind_patterns: vec![
-                        "process_injection".into(),
-                        "fileless".into(),
-                    ],
+                    kind_patterns: vec!["process_injection".into(), "fileless".into()],
                     entity_must_match: false,
                 },
                 RuleStage {
                     layer: None,
-                    kind_patterns: vec![
-                        "reverse_shell".into(),
-                        "shell.command_exec".into(),
-                    ],
+                    kind_patterns: vec!["reverse_shell".into(), "shell.command_exec".into()],
                     entity_must_match: true,
                 },
                 RuleStage {
                     layer: Some(Layer::Network),
-                    kind_patterns: vec![
-                        "dns_tunneling".into(),
-                        "data_exfiltration".into(),
-                    ],
+                    kind_patterns: vec!["dns_tunneling".into(), "data_exfiltration".into()],
                     entity_must_match: true,
                 },
             ],

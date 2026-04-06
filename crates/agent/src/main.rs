@@ -28,6 +28,7 @@ mod decision_cooldown;
 mod decision_honeypot;
 mod decision_skill_actions;
 mod decisions;
+mod environment_profile;
 mod fail2ban;
 mod firmware_tick;
 mod forensics;
@@ -59,10 +60,8 @@ mod ioc;
 mod ip_reputation;
 mod mesh;
 mod mitre;
-mod environment_profile;
 mod narrative;
 mod narrative_anomaly;
-mod notification_pipeline;
 mod narrative_autofp;
 mod narrative_daily_summary;
 mod narrative_incident_ingest;
@@ -73,6 +72,7 @@ mod narrative_incident_ingest;
     clippy::needless_range_loop
 )]
 mod neural_lifecycle;
+mod notification_pipeline;
 mod pcap_capture;
 mod playbook;
 mod reader;
@@ -902,7 +902,10 @@ async fn main() -> Result<()> {
         pending_confirmations: HashMap::new(),
         approval_rx: None, // set below in continuous mode
         grouping_engine: notification_pipeline::GroupingEngine::new(&cfg.notifications),
-        environment_profile: environment_profile::load_or_bootstrap(&cli.data_dir, &cfg.environment),
+        environment_profile: environment_profile::load_or_bootstrap(
+            &cli.data_dir,
+            &cfg.environment,
+        ),
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(neural_lifecycle::AnomalyConfig {
             data_dir: cli.data_dir.clone(),
             ..Default::default()
@@ -2808,7 +2811,9 @@ mod tests {
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            grouping_engine: notification_pipeline::GroupingEngine::new(&crate::config::NotificationPipelineConfig::default()),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
             trust_rules: std::collections::HashSet::new(),
@@ -3063,7 +3068,9 @@ mod tests {
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            grouping_engine: notification_pipeline::GroupingEngine::new(&crate::config::NotificationPipelineConfig::default()),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
             trust_rules: std::collections::HashSet::new(),
@@ -3213,7 +3220,9 @@ mod tests {
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            grouping_engine: notification_pipeline::GroupingEngine::new(&crate::config::NotificationPipelineConfig::default()),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
             trust_rules: std::collections::HashSet::new(),
@@ -3338,7 +3347,9 @@ mod tests {
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            grouping_engine: notification_pipeline::GroupingEngine::new(&crate::config::NotificationPipelineConfig::default()),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
             trust_rules: std::collections::HashSet::new(),
@@ -3475,7 +3486,9 @@ mod tests {
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            grouping_engine: notification_pipeline::GroupingEngine::new(&crate::config::NotificationPipelineConfig::default()),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
             trust_rules: std::collections::HashSet::new(),
@@ -3589,7 +3602,9 @@ mod tests {
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            grouping_engine: notification_pipeline::GroupingEngine::new(&crate::config::NotificationPipelineConfig::default()),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
             trust_rules: std::collections::HashSet::new(),
@@ -3715,7 +3730,9 @@ mod tests {
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            grouping_engine: notification_pipeline::GroupingEngine::new(&crate::config::NotificationPipelineConfig::default()),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
             trust_rules: std::collections::HashSet::new(),

@@ -167,7 +167,10 @@ fn detect_platform() -> (String, String) {
         ("cloud_vps", "aws")
     } else if combined.contains("google") || combined.contains("gce") {
         ("cloud_vps", "gcp")
-    } else if combined.contains("microsoft") || combined.contains("azure") || combined.contains("hyper-v") {
+    } else if combined.contains("microsoft")
+        || combined.contains("azure")
+        || combined.contains("hyper-v")
+    {
         ("cloud_vps", "azure")
     } else if combined.contains("digitalocean") {
         ("cloud_vps", "digitalocean")
@@ -179,7 +182,13 @@ fn detect_platform() -> (String, String) {
         ("cloud_vps", "vultr")
     } else if combined.contains("ovh") {
         ("cloud_vps", "ovh")
-    } else if combined.contains("vmware") || combined.contains("virtualbox") || combined.contains("qemu") || combined.contains("kvm") || combined.contains("xen") || combined.contains("bhyve") {
+    } else if combined.contains("vmware")
+        || combined.contains("virtualbox")
+        || combined.contains("qemu")
+        || combined.contains("kvm")
+        || combined.contains("xen")
+        || combined.contains("bhyve")
+    {
         ("vm", "unknown")
     } else {
         ("bare_metal", "none")
@@ -234,7 +243,13 @@ fn detect_human_uids() -> Vec<u32> {
 
 fn detect_services() -> Vec<String> {
     let output = match std::process::Command::new("systemctl")
-        .args(["list-units", "--type=service", "--state=running", "--no-legend", "--no-pager"])
+        .args([
+            "list-units",
+            "--type=service",
+            "--state=running",
+            "--no-legend",
+            "--no-pager",
+        ])
         .output()
     {
         Ok(o) => o,
@@ -249,11 +264,9 @@ fn detect_services() -> Vec<String> {
         .lines()
         .filter_map(|line| {
             // Format: "unit.service loaded active running description..."
-            line.split_whitespace().next().map(|unit| {
-                unit.strip_suffix(".service")
-                    .unwrap_or(unit)
-                    .to_string()
-            })
+            line.split_whitespace()
+                .next()
+                .map(|unit| unit.strip_suffix(".service").unwrap_or(unit).to_string())
         })
         .collect()
 }
@@ -276,9 +289,7 @@ fn detect_crons() -> Vec<String> {
     }
 
     // User crontabs for root
-    let output = std::process::Command::new("crontab")
-        .args(["-l"])
-        .output();
+    let output = std::process::Command::new("crontab").args(["-l"]).output();
     if let Ok(o) = output {
         if o.status.success() {
             for line in String::from_utf8_lossy(&o.stdout).lines() {

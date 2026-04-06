@@ -115,10 +115,7 @@ pub(crate) async fn try_handle_obvious_incident(
     // Routine blocks (ssh_bruteforce, port_scan) go to daily digest silently.
     let send_action_report = crate::notification_pipeline::is_immediate_threat(incident)
         && cfg.telegram.channel_notifications.notification_level == ChannelFilterLevel::All;
-    if send_action_report
-        && !execution_result.starts_with("skipped")
-        && cfg.telegram.bot.enabled
-    {
+    if send_action_report && !execution_result.starts_with("skipped") && cfg.telegram.bot.enabled {
         if let Some(ref tg) = state.telegram_client {
             let tg = tg.clone();
             let title = incident.title.clone();

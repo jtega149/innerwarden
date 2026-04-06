@@ -44,12 +44,19 @@ pub(crate) fn compute_notification_thresholds(
 
 /// Check if a first-alert should pass the channel filter.
 /// For the first alert, auto_resolved is always false (obvious gate runs after dispatch).
-fn passes_channel_filter(level: ChannelFilterLevel, severity: &innerwarden_core::event::Severity) -> bool {
+fn passes_channel_filter(
+    level: ChannelFilterLevel,
+    severity: &innerwarden_core::event::Severity,
+) -> bool {
     match level {
         ChannelFilterLevel::All | ChannelFilterLevel::Actionable => true,
         ChannelFilterLevel::None => false,
         ChannelFilterLevel::Critical => {
-            matches!(severity, innerwarden_core::event::Severity::High | innerwarden_core::event::Severity::Critical)
+            matches!(
+                severity,
+                innerwarden_core::event::Severity::High
+                    | innerwarden_core::event::Severity::Critical
+            )
         }
     }
 }
@@ -82,7 +89,8 @@ pub(crate) async fn dispatch_incident_notifications(
     }
 
     // Environment-aware suppression: cloud timing anomalies, admin routine.
-    if notification_pipeline::should_suppress_for_environment(incident, &state.environment_profile) {
+    if notification_pipeline::should_suppress_for_environment(incident, &state.environment_profile)
+    {
         info!(
             incident_id = %incident.incident_id,
             "notification suppressed: environment profile (cloud/timing)"
@@ -123,7 +131,10 @@ pub(crate) async fn dispatch_incident_notifications(
             if let Some(min_rank) = thresholds.telegram_min_rank {
                 let level = cfg.telegram.channel_notifications.notification_level;
                 if incident_rank >= min_rank && passes_channel_filter(level, &incident.severity) {
-                    let is_critical = matches!(incident.severity, innerwarden_core::event::Severity::Critical);
+                    let is_critical = matches!(
+                        incident.severity,
+                        innerwarden_core::event::Severity::Critical
+                    );
                     let is_threat = notification_pipeline::is_immediate_threat(incident);
 
                     // Reset daily budget counter on date change.
@@ -141,7 +152,8 @@ pub(crate) async fn dispatch_incident_notifications(
                         if let Some(ref tg) = state.telegram_client {
                             let mode = guardian_mode(cfg);
                             let is_simple = cfg.telegram.is_simple_profile();
-                            if let Err(e) = tg.send_incident_alert(incident, mode, is_simple).await {
+                            if let Err(e) = tg.send_incident_alert(incident, mode, is_simple).await
+                            {
                                 warn!(incident_id = %incident.incident_id, "Telegram alert failed: {e:#}");
                             } else if !is_critical {
                                 state.telegram_daily_sent += 1;
