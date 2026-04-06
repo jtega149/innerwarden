@@ -58,7 +58,7 @@ Everything the InnerWarden sensor produces, compressed into a fixed-size vector:
 
 | Feature | Dimensions | Source |
 |---------|-----------|--------|
-| Event rate per collector (20 collectors) | 20 | telemetry |
+| Event rate per collector (22 collectors) | 22 | telemetry |
 | Active incidents by severity (4 levels) | 4 | incident pipeline |
 | Detector fire counts (top 20 detectors) | 20 | telemetry |
 | Network connection count (inbound/outbound) | 2 | eBPF connect/accept |
