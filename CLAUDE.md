@@ -6,7 +6,7 @@ Sensor (eBPF) + Agent (AI triage) + CTL (CLI). Open source (Apache-2.0).
 
 ```
 crates/
-  sensor/       49 detectors, 40 eBPF hooks, 20 collectors
+  sensor/       49 detectors, 40 eBPF hooks, 22 collectors
   agent/        AI pipeline, dashboard, skills, correlation, notifications
   ctl/          CLI: setup, configure, scan, harden, upgrade
   agent-guard/  AI agent protection (ATR rules, MCP inspection)

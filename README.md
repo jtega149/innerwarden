@@ -1,5 +1,17 @@
 # Inner Warden
 
+**The open-source security agent that detects, scores, and fights back.**
+
+> It's 2 AM. Someone brute-forces your SSH. You're asleep.
+> Inner Warden blocks the IP, captures the session, deploys a honeypot, and alerts you on Telegram.
+> You wake up to a report, not a compromised server.
+
+```bash
+curl -fsSL https://innerwarden.com/install | sudo bash
+```
+
+Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You decide when to go live.
+
 [![CI](https://github.com/InnerWarden/innerwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/InnerWarden/innerwarden/actions/workflows/ci.yml)
 [![Security](https://github.com/InnerWarden/innerwarden/actions/workflows/security.yml/badge.svg)](https://github.com/InnerWarden/innerwarden/actions/workflows/security.yml)
 [![Release](https://img.shields.io/github/v/release/InnerWarden/innerwarden?label=release&color=blue)](https://github.com/InnerWarden/innerwarden/releases/latest)
@@ -10,41 +22,44 @@
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 ![eBPF Hooks](https://img.shields.io/badge/eBPF%20hooks-40-blueviolet)
 ![Detectors](https://img.shields.io/badge/detectors-49-blue)
-![Correlation Rules](https://img.shields.io/badge/correlation%20rules-30-purple)
-![Tests](https://img.shields.io/badge/tests-1943-brightgreen)
+![Correlation Rules](https://img.shields.io/badge/correlation%20rules-40-purple)
+![Tests](https://img.shields.io/badge/tests-1482-brightgreen)
 ![MITRE Coverage](https://img.shields.io/badge/MITRE%20ATT%26CK-65%20mappings-red)
 ![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-208-blueviolet)
 ![Memory](https://img.shields.io/badge/memory-~150MB%20(full%20stack)-green)
 ![AI Optional](https://img.shields.io/badge/AI-optional-lightgrey)
 
-Inner Warden is an autonomous security agent for Linux and macOS. Full-stack visibility from Ring -2 (firmware) to Ring 3 (userspace). 40 eBPF kernel hooks. 49 detectors. 22 collectors. 30 cross-layer correlation rules. 65 MITRE ATT&CK technique mappings (40% validated via Caldera adversary emulation). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. Baseline anomaly detection. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. Automated playbook response. Monthly threat reports. AI agent protection (Agent Guard + 71 ATR rules). Mesh collaborative defense. No cloud. No dependencies. Just two Rust daemons and a CLI.
-
-```bash
-curl -fsSL https://innerwarden.com/install | sudo bash
-```
-
-Installs in 10 seconds. Starts in observe-only mode. You decide when to go live.
-
 ---
 
-## Who this is for
+### Who is this for?
 
-Inner Warden is built for **system administrators, DevOps engineers, and security professionals** who manage Linux or macOS servers and want host-level threat detection and response.
+- **SREs and sysadmins** who manage Linux servers and want automated threat response, not just alerts
+- **Self-hosters** who run exposed services and need production-grade security without enterprise pricing
+- **AI agent operators** who run OpenClaw, LangChain, or n8n and need to stop agents from executing dangerous commands
+- **Security teams** who want kernel-level visibility (eBPF) with MITRE ATT&CK coverage and compliance (ISO 27001)
 
-You should be comfortable with:
-- Managing firewall rules (ufw, iptables, nftables, or pf)
-- Reading system logs and understanding security events
-- Configuring services via TOML files and systemd/launchd
-- Evaluating whether automated responses are appropriate for your environment
+### How is this different?
 
-This is **not** a plug-and-play consumer security product. Misconfigured response skills can lock out legitimate users or disrupt services. If you are unfamiliar with Linux system administration, start with the observe-only mode and study the logs before enabling any response capabilities.
+| | Inner Warden | Falco | Wazuh | CrowdSec |
+|---|:---:|:---:|:---:|:---:|
+| Kernel-level detection (eBPF) | 40 hooks | Rules-based | No | No |
+| Autonomous response (block, kill, isolate) | 20 playbooks | Alert only | Limited | IP only |
+| AI-powered triage | 12 providers | No | No | No |
+| Behavioral DNA fingerprinting | Per-attacker | No | No | No |
+| Mesh collaborative defense | Ed25519 signed | No | No | Community lists |
+| AI agent protection | Agent Guard + 71 rules | No | No | No |
+| Dry-run by default | Yes | N/A | Yes | Yes |
+| Memory footprint | ~150 MB | ~60 MB | ~500 MB+ | ~50 MB |
+| License | Apache-2.0 | Apache-2.0 | GPL | AGPL |
+
+40 eBPF kernel hooks. 49 detectors. 22 collectors. 40 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. 20 automated playbooks. Monthly threat reports. Mesh collaborative defense. No cloud. No dependencies. Just two Rust daemons and a CLI.
 
 <p align="center">
   <a href="https://innerwarden.com/live">
     <img src="docs/images/live-attack.png" alt="Live threat feed" width="820">
   </a>
   <br>
-  <sub><a href="https://innerwarden.com/live"><strong>Test the tool in real time</strong></a> &nbsp;·&nbsp; <a href="https://vimeo.com/1175992244">Watch the explainer video</a></sub>
+  <sub><a href="https://innerwarden.com/live"><strong>See it responding to real attacks right now</strong></a> &nbsp;·&nbsp; <a href="https://vimeo.com/1175992244">3-minute explainer video</a></sub>
 </p>
 
 
@@ -62,6 +77,14 @@ https://github.com/user-attachments/assets/6ea1e124-52c2-48fe-8600-4b2f3d670116
 <p align="center">
   <img src="docs/images/dashboard-investigate.png" alt="Dashboard: IP investigation view" width="820">
 </p>
+
+---
+
+### Why this exists
+
+I built Inner Warden because every security tool I tried either just alerted (Falco), required a massive stack (Wazuh + ELK), or couldn't act autonomously. I wanted something that could detect a reverse shell at the kernel level, block the attacker, deploy a honeypot, and alert me on Telegram, all in under 5 seconds, with zero external dependencies. So I built it.
+
+Solo developer. Apache-2.0. If this project helps protect your servers, [give it a star](https://github.com/InnerWarden/innerwarden/stargazers) so others can find it.
 
 ---
 
@@ -129,7 +152,7 @@ https://github.com/user-attachments/assets/6ea1e124-52c2-48fe-8600-4b2f3d670116
 │                   AGENT  │                                        │
 │                          ▼                                        │
 │     ┌──────────────────────────────────────────────┐              │
-│     │  30 Cross-Layer Correlation Rules            │              │
+│     │  40 Cross-Layer Correlation Rules            │              │
 │     │  + Kill Chain Tracker (7 stages per entity)  │              │
 │     └────────────────────┬─────────────────────────┘              │
 │                          ▼                                        │
@@ -176,7 +199,7 @@ https://github.com/user-attachments/assets/6ea1e124-52c2-48fe-8600-4b2f3d670116
 
 1. **Watches**: 20+ collectors across all layers — eBPF syscall tracing (40 kernel hooks including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting — no Suricata needed), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, osquery, CloudTrail
 2. **Detects**: 48 stateful detectors + 8 YARA malware rules + 8 Sigma log rules identify brute-force, credential stuffing, port scans, C2 callbacks, privilege escalation, container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID), timestomping, log tampering, discovery bursts, and more. **65 MITRE ATT&CK techniques covered** across 14 tactics.
-3. **Correlates**: 30 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP. Kill chain tracker follows 7 attack stages per entity (IP, user, container).
+3. **Correlates**: 40 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP. Kill chain tracker follows 7 attack stages per entity (IP, user, container).
 4. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
 5. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
 6. **Responds automatically**: 20 built-in playbooks covering every detector — ransomware, reverse shell, data exfil, malware, privilege escalation, kernel module load, process injection, persistence (SSH key, crontab, systemd), container escape, crypto miner, DNS tunneling, lateral movement, web shell, discovery burst, and more. Response sequences: kill process, block IP, suspend sudo, quarantine file, isolate network, capture forensics, pcap, notify, escalate
@@ -274,9 +297,9 @@ Plus: `docker_anomaly`, `osquery_anomaly`, `suricata_alert`, `search_abuse`, `cr
 
 ## How it works
 
-**Sensor**: deterministic signal collection. No AI, no HTTP. 20 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 38 kernel hooks, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection). Optional: Suricata, osquery, Wazuh, AWS CloudTrail. Events flow through JSONL files or Redis Streams to the agent. Syslog CEF output for SIEM integration.
+**Sensor**: deterministic signal collection. No AI, no HTTP. 22 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 40 kernel hooks, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection). Optional: Suricata, osquery, Wazuh, AWS CloudTrail. Events flow through JSONL files or Redis Streams to the agent. Syslog CEF output for SIEM integration.
 
-**eBPF**: 38 kernel hooks running inside Linux (5.8+, CO-RE/BTF portable):
+**eBPF**: 40 kernel hooks running inside Linux (5.8+, CO-RE/BTF portable):
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
 - **3 kprobes**: `commit_creds` (privilege escalation), `native_write_msr` (firmware MSR tampering), `acpi_evaluate_object` (ACPI rootkit detection)
 - **3 LSM hooks**: `bprm_check_security` (exec blocking + kill chain with 8 attack patterns), `file_open` (sensitive path write protection), `bpf` (eBPF weaponization / VoidLink defense)
@@ -284,7 +307,7 @@ Plus: `docker_anomaly`, `osquery_anomaly`, `suricata_alert`, `search_abuse`, `cr
 - **XDP program**: wire-speed IP blocking at the network driver (10M+ pps drop rate)
 - **Phase 2 firmware hooks**: MSR write guard (LSTAR/SMRR), I/O port access (SPI controller probing), ACPI method execution monitoring
 
-> **Looking for the eBPF source code?** All 38 kernel programs live in a single file: [`crates/sensor-ebpf/src/main.rs`](crates/sensor-ebpf/src/main.rs).
+> **Looking for the eBPF source code?** All 40 kernel programs live in a single file: [`crates/sensor-ebpf/src/main.rs`](crates/sensor-ebpf/src/main.rs).
 
 **Kernel-level noise filters** keep overhead near zero: COMM_ALLOWLIST (137 trusted processes like sshd, systemd, docker), CGROUP_ALLOWLIST, PID_RATE_LIMIT, and PID_CHAIN. Tail call dispatcher routes events through a single attach point to N handlers via ProgramArray. Ring buffer with epoll wakeup delivers events in microseconds.
 
@@ -299,7 +322,7 @@ innerwarden mesh add-peer https://peer-server:8790
 
 Container-aware via cgroup ID. Zero performance overhead.
 
-**Agent**: reads incidents from JSONL or Redis Streams. Fast loop (2s): algorithm gate → enrichment (AbuseIPDB, GeoIP, CrowdSec, threat feeds) → VirusTotal hash check on YARA matches → AI triage → playbook evaluation → skill execution → pcap capture on High/Critical → audit trail. Slow loop (30s): cross-layer correlation (30 rules) → baseline learning → attacker intelligence consolidation (DNA + campaigns) → monthly report generation → narrative summary.
+**Agent**: reads incidents from JSONL or Redis Streams. Fast loop (2s): algorithm gate → enrichment (AbuseIPDB, GeoIP, CrowdSec, threat feeds) → VirusTotal hash check on YARA matches → AI triage → playbook evaluation → skill execution → pcap capture on High/Critical → audit trail. Slow loop (30s): cross-layer correlation (40 rules) → baseline learning → attacker intelligence consolidation (DNA + campaigns) → monthly report generation → narrative summary.
 
 Two Rust daemons. No external dependencies. ~150 MB RAM with all features active (sensor 32MB + agent 89MB + DNA 11MB + shield 9MB + killchain 7MB). Dashboard with 10 views: Sensors HUD, Threats investigation, Report, Health, Honeypot, Compliance (ISO 27001), Intelligence (Profiles, Campaigns, Chains, Baseline, Playbooks), Monthly Report. Live SSE feed, MITRE ATT&CK mapping, 20 integration cards. Sleeps after 15 min of inactivity.
 
@@ -743,6 +766,17 @@ Inner Warden is provided as-is, without warranty. It is experimental software th
 - Understanding the response skills you enable and their effects
 
 The authors are not responsible for downtime, data loss, or service disruption caused by misconfiguration or false positives. Use good judgment and test in a staging environment first.
+
+---
+
+## Contributing
+
+Contributions are welcome. Check the [contributing guide](CONTRIBUTING.md) and pick an issue:
+
+- [**Good first issues**](https://github.com/InnerWarden/innerwarden/labels/good%20first%20issue) — documentation, config flags, small features
+- [**Help wanted**](https://github.com/InnerWarden/innerwarden/labels/help%20wanted) — new detectors, sinks, integrations, CLI commands
+
+New detectors, integration recipes, and module documentation are especially appreciated.
 
 ---
 
