@@ -192,12 +192,12 @@ fn build_brain_features(
     f[24] = if state.baseline.is_mature() { 1.0 } else { 0.0 };
 
     // [25] baseline anomaly recently?
-    f[25] = if state.last_baseline_anomaly_ts.map_or(false, |ts| {
+    f[25] = if state.last_baseline_anomaly_ts.is_some_and(|ts| {
         (chrono::Utc::now() - ts).num_seconds() < 300
     }) { 1.0 } else { 0.0 };
 
     // [26] autoencoder anomaly recently?
-    f[26] = if state.last_autoencoder_anomaly_ts.map_or(false, |ts| {
+    f[26] = if state.last_autoencoder_anomaly_ts.is_some_and(|ts| {
         (chrono::Utc::now() - ts).num_seconds() < 300
     }) { 1.0 } else { 0.0 };
 

@@ -168,7 +168,8 @@ impl DefenderBrain {
         Self::new()
     }
 
-    /// Load from the gym's JSON format (best-def.json).
+    /// Load from the gym's JSON format (best-def.json). Used in dev/testing.
+    #[allow(dead_code)]
     fn load_json(path: &str) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         let v: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -180,6 +181,7 @@ impl DefenderBrain {
         Some(Self { trunk, policy_head, value_head, loaded: true })
     }
 
+    #[allow(dead_code)]
     fn parse_layers(v: &serde_json::Value) -> Option<Vec<Layer>> {
         let arr = v.as_array()?;
         let mut layers = Vec::new();
