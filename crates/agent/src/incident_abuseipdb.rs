@@ -128,8 +128,9 @@ pub(crate) async fn try_handle_abuseipdb_autoblock(
         }
     }
 
-    // Telegram notification for auto-block.
-    if cfg.telegram.bot.enabled {
+    // Telegram notification for auto-block — only for immediate threats.
+    // Routine auto-blocks (ssh_bruteforce, port_scan) go to daily digest.
+    if cfg.telegram.bot.enabled && crate::notification_pipeline::is_immediate_threat(incident) {
         if let Some(ref tg) = state.telegram_client {
             let tg = tg.clone();
             let ip_clone = ip.clone();

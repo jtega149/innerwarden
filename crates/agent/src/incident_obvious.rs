@@ -111,11 +111,10 @@ pub(crate) async fn try_handle_obvious_incident(
         );
     }
 
-    // Telegram action report — only send when notification level is All.
-    // At the default Actionable level, the incident alert was already sent (or
-    // suppressed by grouping), so the "Threat neutralized" follow-up is noise.
-    let send_action_report = cfg.telegram.channel_notifications.notification_level
-        == ChannelFilterLevel::All;
+    // Telegram action report — only send for immediate threats.
+    // Routine blocks (ssh_bruteforce, port_scan) go to daily digest silently.
+    let send_action_report = crate::notification_pipeline::is_immediate_threat(incident)
+        && cfg.telegram.channel_notifications.notification_level == ChannelFilterLevel::All;
     if send_action_report
         && !execution_result.starts_with("skipped")
         && cfg.telegram.bot.enabled

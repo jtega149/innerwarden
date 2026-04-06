@@ -19,6 +19,12 @@ pub(crate) fn maybe_send_post_execution_telegram_report(
         return;
     }
 
+    // Only send action reports for immediate threats — routine blocks
+    // (ssh_bruteforce, port_scan, etc.) go to the daily digest silently.
+    if !crate::notification_pipeline::is_immediate_threat(incident) {
+        return;
+    }
+
     let Some(ref tg) = state.telegram_client else {
         return;
     };
