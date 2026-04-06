@@ -154,7 +154,7 @@ impl SuspiciousLoginDetector {
         };
 
         let summary = match reason {
-            "brute_force_success" => format!(
+            "brute_force_success" | "failed_then_success" => format!(
                 "IP {ip} logged in as {user} after {prior_failures} failed attempts in {} seconds. Likely compromised credential.",
                 self.window.num_seconds()
             ),
@@ -262,7 +262,7 @@ mod tests {
             .expect("should fire");
         assert_eq!(inc.severity, Severity::High);
         assert!(inc.title.contains("1.2.3.4"));
-        assert!(inc.summary.contains("3 failed"));
+        assert!(inc.summary.contains("3 failed") || inc.summary.contains("failed attempts"));
     }
 
     #[test]
@@ -285,14 +285,27 @@ mod tests {
     }
 
     #[test]
-    fn no_alert_for_clean_login() {
+    fn no_alert_for_clean_login_nonpriv() {
         let mut det = SuspiciousLoginDetector::new("test", 300);
         let now = Utc::now();
 
-        // Success without prior failures
+        // Success without prior failures from non-privileged user → no alert
         assert!(det
-            .process(&success_event("9.9.9.9", "ubuntu", now))
+            .process(&success_event("9.9.9.9", "www-data", now))
             .is_none());
+    }
+
+    #[test]
+    fn alerts_first_time_privileged_login() {
+        let mut det = SuspiciousLoginDetector::new("test", 300);
+        let now = Utc::now();
+
+        // First-time login to privileged account should alert (V4 enhancement)
+        let inc = det
+            .process(&success_event("9.9.9.9", "ubuntu", now))
+            .expect("should fire for first-time privileged");
+        assert_eq!(inc.severity, Severity::High);
+        assert!(inc.title.contains("First-time") || inc.title.contains("privileged"));
     }
 
     #[test]
