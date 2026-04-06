@@ -1,4 +1,6 @@
-use tracing::info;
+use std::path::Path;
+
+use tracing::{info, warn};
 
 use crate::{ai, config, correlation, defender_brain, AgentState};
 
@@ -8,6 +10,7 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
     cfg: &config::AgentConfig,
     state: &mut AgentState,
     decision: &mut ai::AiDecision,
+    data_dir: &Path,
 ) {
     // If the same IP triggered multiple distinct detectors within the
     // correlation window, boost the confidence.
@@ -48,18 +51,64 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
     );
 
     // Query defender brain for a second opinion (AlphaZero-trained model).
-    // Logs the suggestion but does NOT override the AI decision — advisory only.
+    // Logs the suggestion and records to history for dashboard + FP audit.
     if state.defender_brain.is_loaded() {
         let features = build_brain_features(incident, state);
         if let Some(suggestion) = state.defender_brain.suggest(&features) {
+            let ai_action_str = format!("{:?}", decision.action);
+            let brain_agrees = {
+                let ba = suggestion.action_name;
+                let aa = &ai_action_str;
+                (ba == "block_ip" && aa.contains("BlockIp"))
+                || (ba == "kill_process" && aa.contains("KillProcess"))
+                || (ba == "observe" && (aa.contains("Ignore") || aa.contains("Monitor")))
+                || (ba == "alert" && aa.contains("Monitor"))
+                || (ba == "escalate" && aa.contains("Escalate"))
+            };
+
             info!(
                 incident_id = %incident.incident_id,
                 brain_action = suggestion.action_name,
                 brain_confidence = format!("{:.1}%", suggestion.confidence * 100.0),
                 brain_value = format!("{:.2}", suggestion.value),
-                brain_top3 = ?suggestion.top_actions.iter().map(|(_, name, p)| format!("{}: {:.0}%", name, p * 100.0)).collect::<Vec<_>>(),
+                agreed = brain_agrees,
                 "defender brain suggestion"
             );
+
+            let det = incident.incident_id.split(':').next().unwrap_or("unknown");
+            let log_entry = defender_brain::BrainLogEntry {
+                ts: chrono::Utc::now(),
+                incident_id: incident.incident_id.clone(),
+                detector: det.to_string(),
+                severity: format!("{:?}", incident.severity),
+                brain_action: suggestion.action_name,
+                brain_confidence: suggestion.confidence,
+                brain_value: suggestion.value,
+                brain_top3: suggestion.top_actions.clone(),
+                ai_action: ai_action_str,
+                ai_confidence: decision.confidence,
+                agreed: brain_agrees,
+                feedback: None,
+            };
+
+            // Persist to file for dashboard access
+            let log_path = data_dir.join("brain-log.json");
+            let mut entries: Vec<serde_json::Value> = std::fs::read_to_string(&log_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            if let Ok(v) = serde_json::to_value(&log_entry) {
+                entries.push(v);
+                // Keep last 500 entries
+                if entries.len() > 500 {
+                    entries.drain(0..entries.len() - 500);
+                }
+                if let Err(e) = std::fs::write(&log_path, serde_json::to_string(&entries).unwrap_or_default()) {
+                    warn!("failed to write brain-log.json: {e}");
+                }
+            }
+
+            state.brain_history.record(log_entry);
         }
     }
 }

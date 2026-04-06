@@ -39,7 +39,7 @@ pub struct DefenderBrain {
 }
 
 /// Suggested action from the defender brain.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BrainSuggestion {
     /// Recommended action index (0-29).
     pub action: usize,
@@ -51,6 +51,86 @@ pub struct BrainSuggestion {
     pub value: f32,
     /// Top 3 actions with probabilities.
     pub top_actions: Vec<(usize, &'static str, f32)>,
+}
+
+/// A logged brain suggestion with context (for dashboard display + FP audit).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrainLogEntry {
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub incident_id: String,
+    pub detector: String,
+    pub severity: String,
+    pub brain_action: &'static str,
+    pub brain_confidence: f32,
+    pub brain_value: f32,
+    pub brain_top3: Vec<(usize, &'static str, f32)>,
+    pub ai_action: String,
+    pub ai_confidence: f32,
+    /// Whether brain and AI agreed on action type.
+    pub agreed: bool,
+    /// Operator feedback: None = unreviewed, true = correct, false = FP.
+    pub feedback: Option<bool>,
+}
+
+/// History of brain suggestions (ring buffer, last N).
+#[derive(Debug)]
+pub struct BrainHistory {
+    entries: std::collections::VecDeque<BrainLogEntry>,
+    max_entries: usize,
+    pub total_suggestions: u64,
+    pub total_agreed: u64,
+}
+
+impl BrainHistory {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: std::collections::VecDeque::with_capacity(max_entries),
+            max_entries,
+            total_suggestions: 0,
+            total_agreed: 0,
+        }
+    }
+
+    pub fn record(&mut self, entry: BrainLogEntry) {
+        self.total_suggestions += 1;
+        if entry.agreed {
+            self.total_agreed += 1;
+        }
+        if self.entries.len() >= self.max_entries {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+
+    pub fn recent(&self, limit: usize) -> Vec<&BrainLogEntry> {
+        self.entries.iter().rev().take(limit).collect()
+    }
+
+    pub fn mark_feedback(&mut self, incident_id: &str, correct: bool) -> bool {
+        if let Some(entry) = self.entries.iter_mut().rev().find(|e| e.incident_id == incident_id) {
+            entry.feedback = Some(correct);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn agreement_rate(&self) -> f32 {
+        if self.total_suggestions == 0 { return 0.0; }
+        self.total_agreed as f32 / self.total_suggestions as f32
+    }
+
+    pub fn fp_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.feedback == Some(false)).count()
+    }
+
+    pub fn tp_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.feedback == Some(true)).count()
+    }
+
+    pub fn unreviewed_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.feedback.is_none()).count()
+    }
 }
 
 /// Action names matching the gym's defender action space.
