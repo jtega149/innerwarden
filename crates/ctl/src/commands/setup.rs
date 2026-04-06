@@ -926,6 +926,10 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
         }
         if preconfig_plan.set_telegram_min_severity {
             let _ = config_editor::write_str(&cli.agent_config, "telegram", "min_severity", "high");
+            // Sane defaults: daily digest at 9 AM, budget of 10 immediate notifications/day.
+            // Only real threats ping Telegram; everything else goes to the digest.
+            let _ = config_editor::write_int(&cli.agent_config, "telegram", "daily_summary_hour", 9);
+            let _ = config_editor::write_int(&cli.agent_config, "telegram", "daily_budget", 10);
         }
         if preconfig_plan.set_webhook_min_severity {
             let _ = config_editor::write_str(&cli.agent_config, "webhook", "min_severity", "high");
@@ -966,6 +970,9 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
             println!("  [warn] Telegram setup did not finish: {err:#}");
         } else {
             telegram_restarted_agent = true;
+            // Pre-configure sane notification defaults so users don't get spammed.
+            let _ = config_editor::write_int(&cli.agent_config, "telegram", "daily_summary_hour", 9);
+            let _ = config_editor::write_int(&cli.agent_config, "telegram", "daily_budget", 10);
         }
     }
 

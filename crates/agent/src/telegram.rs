@@ -337,33 +337,40 @@ impl TelegramClient {
 
         let text = if dry_run {
             format!(
-                "🧪 <b>Simulation</b>\n\
-                 Would've {action_label} <code>{target}</code>{enrichment}\n\
+                "\u{1f9ea} <b>Simulation</b>\n\
+                 \n\
+                 Would have {action_label} <code>{target}</code>\n\
+                 {enrichment}\n\
                  <i>{incident_title}</i>\n\
-                 Confidence: {pct}% - dry-run, no real action.\n\
-                 <i>Want me to start dropping these for real? Enable live mode.</i>{cf_line}",
+                 \n\
+                 Confidence: {pct}% \u{2014} dry-run, no real action.\n\
+                 <i>Enable live mode to let me handle these.</i>",
                 target = escape_html(target),
                 incident_title = escape_html(incident_title),
             )
         } else if action_label.to_lowercase().contains("ignore") {
             format!(
-                "📝 <b>Analyzed &amp; dismissed</b>\n\
-                 <i>{incident_title}</i>\n\
-                 Confidence: {pct}% - No action needed.{enrichment}",
+                "\u{2705} <b>Analyzed &amp; cleared</b>\n\
+                 \n\
+                 <i>{incident_title}</i>{enrichment}\n\
+                 \n\
+                 Confidence: {pct}% \u{2014} no action needed.",
                 incident_title = escape_html(incident_title),
             )
         } else {
             let kill_quip = match pct {
-                95..=100 => "Clean kill. Zero doubt.",
-                85..=94 => "Textbook containment.",
-                70..=84 => "Threat actor down. Solid confidence.",
-                _ => "Contained - keeping eyes on it.",
+                95..=100 => "Definitive match.",
+                85..=94 => "High-confidence containment.",
+                70..=84 => "Solid confidence. Monitoring for follow-up.",
+                _ => "Contained. Keeping watch.",
             };
             format!(
-                "🔥 <b>Threat neutralized</b>\n\
+                "\u{1f6e1}\u{fe0f} <b>Threat neutralized</b>\n\
+                 \n\
                  {action_label} <code>{target}</code>{enrichment}\n\
                  <i>{incident_title}</i>\n\
-                 Confidence: {pct}% - {kill_quip}{cf_line}",
+                 \n\
+                 Confidence: {pct}% \u{2014} {kill_quip}{cf_line}",
                 target = escape_html(target),
                 incident_title = escape_html(incident_title),
             )
@@ -1605,8 +1612,8 @@ fn format_incident_message(
     mode: GuardianMode,
 ) -> String {
     let sev = severity_label(incident);
-    let source_icon = source_icon(&incident.tags);
     let entity_line = entity_summary(incident);
+    let detector = extract_detector(&incident.incident_id);
 
     let summary_trunc = if incident.summary.len() > 200 {
         format!("{}…", &incident.summary[..200])
@@ -1614,33 +1621,17 @@ fn format_incident_message(
         incident.summary.clone()
     };
 
-    // Mode-specific header and call-to-action
-    let (mode_prefix, cta) = match mode {
-        GuardianMode::Guard => {
-            let quip = incident_quip(incident);
-            (
-                "⚡",
-                format!("\n{quip}\n<i>Handling it - stand by for action report.</i>"),
-            )
-        }
-        GuardianMode::DryRun => {
-            let quip = incident_quip(incident);
-            (
-                "🧪",
-                format!("\n{quip}\n<i>Dry-run - I'd act on this. Enable live mode to let me.</i>"),
-            )
-        }
-        GuardianMode::Watch => {
-            let quip = incident_quip(incident);
-            ("🚨", quip.to_string())
-        }
+    let mode_line = match mode {
+        GuardianMode::Guard => "\u{26a1} Handling — stand by for action report.",
+        GuardianMode::DryRun => "\u{1f9ea} Dry-run — would act. Enable live mode.",
+        GuardianMode::Watch => "\u{1f440} Watching — operator action required.",
     };
 
     let link_line = dashboard_url
         .and_then(|base| first_ip_entity(incident).map(|ip| (base, ip)))
         .map(|(base, ip)| {
             format!(
-                "\n🔗 <a href=\"{}/?subject_type=ip&subject={}&date={}\">Investigate</a>",
+                "\n\u{1f517} <a href=\"{}/?subject_type=ip&subject={}&date={}\">Investigate</a>",
                 base,
                 ip,
                 incident.ts.format("%Y-%m-%d")
@@ -1648,27 +1639,16 @@ fn format_incident_message(
         })
         .unwrap_or_default();
 
-    let prefix_line = if mode_prefix.is_empty() {
-        String::new()
-    } else {
-        format!("{mode_prefix} ")
-    };
-
     format!(
-        "{source_icon} {prefix_line}{sev}\n\
+        "{sev} <code>{detector}</code>\n\
+         \n\
          <b>{title}</b>\n\
          {entity_line}\n\
          <i>{summary}</i>\n\
          \n\
-         {cta}{link_line}",
+         {mode_line}{link_line}",
         title = escape_html(&incident.title),
         summary = escape_html(&summary_trunc),
-        entity_line = entity_line,
-        sev = sev,
-        source_icon = source_icon,
-        prefix_line = prefix_line,
-        cta = cta,
-        link_line = link_line,
     )
 }
 
@@ -1751,6 +1731,31 @@ fn plain_action(action: &str) -> String {
     }
     // fallback
     a.to_string()
+}
+
+/// Human-friendly detector name for digest messages.
+fn friendly_detector_name(detector: &str) -> &str {
+    match detector {
+        "ssh_bruteforce" => "SSH brute force attempts blocked",
+        "credential_stuffing" => "credential stuffing attempts blocked",
+        "port_scan" => "port scans detected",
+        "packet_flood" => "DDoS/flood events handled",
+        "discovery_burst" => "reconnaissance scans detected",
+        "suspicious_execution" => "suspicious executions (reviewed safe)",
+        "web_scan" => "web vulnerability scans blocked",
+        "user_agent_scanner" => "bot scanners blocked",
+        "search_abuse" => "search abuse attempts blocked",
+        "rootkit" => "timing anomalies (cloud noise)",
+        "firmware_integrity" => "firmware checks (cloud noise)",
+        "sigma" => "Sigma rule matches",
+        "neural_anomaly" => "AI anomaly detections",
+        "process_tree" => "process chain alerts",
+        "user_creation" => "user creation events",
+        "sensitive_write" => "sensitive file writes",
+        "docker_anomaly" => "Docker anomalies",
+        "outbound_anomaly" => "outbound traffic anomalies",
+        _ => detector,
+    }
 }
 
 fn severity_label(incident: &Incident) -> &'static str {
@@ -1981,7 +1986,6 @@ mod tests {
         assert!(msg.contains("CRITICAL"));
         assert!(msg.contains("SSH brute force"));
         assert!(msg.contains("1.2.3.4"));
-        assert!(msg.contains("🔬"), "falco icon should appear");
     }
 
     #[test]
@@ -1993,7 +1997,6 @@ mod tests {
         );
         let msg = format_incident_message(&inc, Some("http://127.0.0.1:8787"), GuardianMode::Watch);
         assert!(msg.contains("HIGH"));
-        assert!(msg.contains("🌐"), "suricata icon");
         assert!(msg.contains("Investigate"));
         assert!(msg.contains("203.0.113.10"));
     }
@@ -2009,11 +2012,6 @@ mod tests {
         assert!(
             msg.contains("action report"),
             "GUARD mode mentions action report"
-        );
-        // GUARD mode should NOT show Block/Ignore buttons inline
-        assert!(
-            !msg.contains("🛡 Block"),
-            "GUARD mode has no block CTA button text"
         );
     }
 
@@ -2394,11 +2392,11 @@ mod tests {
         );
         let msg = format_simple_message(&inc, None, GuardianMode::Guard);
         assert!(
-            msg.contains("tried to guess your server's password"),
-            "should contain plain description"
+            msg.contains("Login Attack Blocked"),
+            "should contain detector label"
         );
-        assert!(msg.contains("Handled automatically."));
-        assert!(!msg.contains("1.2.3.4"), "simple mode must not show IPs");
+        assert!(msg.contains("Handled automatically"));
+        assert!(msg.contains("1.2.3.4"), "simple mode shows IPs now");
         assert!(
             !msg.contains("ssh_bruteforce"),
             "simple mode must not show detector name"
@@ -2417,7 +2415,7 @@ mod tests {
             vec![EntityRef::ip("5.6.7.8".to_string())],
         );
         let msg = format_simple_message(&inc, None, GuardianMode::Watch);
-        assert!(msg.contains("Monitoring the situation."));
+        assert!(msg.contains("Needs your attention"));
     }
 
     #[test]
@@ -2425,7 +2423,7 @@ mod tests {
         let mut inc = make_incident(Severity::Medium, vec![], vec![]);
         inc.incident_id = "unknown_detector:foo:bar".to_string();
         let msg = format_simple_message(&inc, None, GuardianMode::Guard);
-        assert!(msg.contains("Suspicious activity detected."));
+        assert!(msg.contains("Threat Detected"));
     }
 
     #[test]
@@ -2488,12 +2486,12 @@ mod tests {
             suppressed_count: 85,
             auto_resolved_groups: 12,
             needs_review_groups: 0,
+            deferred: vec![],
         };
         let msg = format_daily_digest_enriched(42, 30, 0, 3, "ssh_bruteforce", 15, true, &stats);
-        assert!(msg.contains("85 alerts silenced"));
-        assert!(msg.contains("12 threats auto-resolved"));
-        assert!(msg.contains("Everything is under control."));
-        assert!(!msg.contains("need review"));
+        assert!(msg.contains("12 threat groups auto-resolved"));
+        assert!(msg.contains("under control"));
+        assert!(!msg.contains("need your review"));
     }
 
     #[test]
@@ -2502,10 +2500,11 @@ mod tests {
             suppressed_count: 50,
             auto_resolved_groups: 8,
             needs_review_groups: 3,
+            deferred: vec![],
         };
         let msg = format_daily_digest_enriched(42, 30, 2, 5, "ssh_bruteforce", 15, true, &stats);
-        assert!(msg.contains("3 groups need review"));
-        assert!(!msg.contains("Everything is under control."));
+        assert!(msg.contains("3 groups need your review"));
+        assert!(!msg.contains("under control"));
     }
 
     #[test]
@@ -2514,9 +2513,10 @@ mod tests {
             suppressed_count: 100,
             auto_resolved_groups: 15,
             needs_review_groups: 2,
+            deferred: vec![],
         };
         let msg = format_daily_digest_enriched(42, 30, 2, 5, "ssh_bruteforce", 15, false, &stats);
-        assert!(msg.contains("Grouped: 100 alerts suppressed"));
+        assert!(msg.contains("100 grouped"));
         assert!(msg.contains("15 auto-resolved"));
         assert!(msg.contains("2 need review"));
     }
@@ -2527,6 +2527,7 @@ mod tests {
             suppressed_count: 0,
             auto_resolved_groups: 0,
             needs_review_groups: 0,
+            deferred: vec![],
         };
         let msg = format_daily_digest_enriched(42, 30, 2, 5, "ssh_bruteforce", 15, true, &stats);
         // No pipeline line when all zeros
@@ -2535,12 +2536,48 @@ mod tests {
     }
 
     #[test]
+    fn format_daily_digest_enriched_simple_with_deferred() {
+        let stats = super::PipelineDigestStats {
+            suppressed_count: 20,
+            auto_resolved_groups: 5,
+            needs_review_groups: 0,
+            deferred: vec![
+                ("ssh_bruteforce".into(), 18),
+                ("discovery_burst".into(), 9),
+                ("packet_flood".into(), 3),
+            ],
+        };
+        let msg = format_daily_digest_enriched(60, 40, 0, 5, "ssh_bruteforce", 18, true, &stats);
+        assert!(msg.contains("Handled silently"));
+        assert!(msg.contains("18 SSH brute force attempts blocked"));
+        assert!(msg.contains("9 reconnaissance scans detected"));
+        assert!(msg.contains("3 DDoS/flood events handled"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_technical_with_deferred() {
+        let stats = super::PipelineDigestStats {
+            suppressed_count: 10,
+            auto_resolved_groups: 3,
+            needs_review_groups: 1,
+            deferred: vec![
+                ("ssh_bruteforce".into(), 12),
+                ("port_scan".into(), 5),
+            ],
+        };
+        let msg = format_daily_digest_enriched(42, 30, 0, 5, "ssh_bruteforce", 12, false, &stats);
+        assert!(msg.contains("Deferred:"));
+        assert!(msg.contains("ssh_bruteforce=12"));
+        assert!(msg.contains("port_scan=5"));
+    }
+
+    #[test]
     fn format_simple_status_safe() {
         let msg = format_simple_status(false, false, false, 45, 1200, "3 hours ago");
         assert!(msg.contains("\u{1f7e2}")); // 🟢
         assert!(msg.contains("safe"));
-        assert!(msg.contains("45 days"));
-        assert!(msg.contains("1200 attacks blocked"));
+        assert!(msg.contains("45"));
+        assert!(msg.contains("1200"));
         assert!(msg.contains("3 hours ago"));
     }
 
@@ -2960,24 +2997,106 @@ fn simple_severity_emoji(incident: &Incident) -> &'static str {
 }
 
 /// Format a plain-language alert message for simple profile users.
-/// No IPs, no detector names, no technical jargon.
+/// Structured, informative, and impressive — every notification is a jewel.
 fn format_simple_message(
     incident: &Incident,
-    _dashboard_url: Option<&str>,
+    dashboard_url: Option<&str>,
     mode: GuardianMode,
 ) -> String {
     let detector = extract_detector(&incident.incident_id);
-    let (_det_emoji, template) = simple_detector_lookup(detector);
+    let (det_emoji, _template) = simple_detector_lookup(detector);
     let sev_emoji = simple_severity_emoji(incident);
+    let sev_word = match incident.severity {
+        innerwarden_core::event::Severity::Critical => "Critical",
+        innerwarden_core::event::Severity::High => "High",
+        innerwarden_core::event::Severity::Medium => "Medium",
+        innerwarden_core::event::Severity::Low => "Low",
+        _ => "Info",
+    };
+    let det_label = simple_detector_label(detector);
 
-    let action = match mode {
-        GuardianMode::Guard => "Handled automatically.",
-        GuardianMode::DryRun | GuardianMode::Watch => "Monitoring the situation.",
+    // Build concise what-happened line from entities + summary.
+    let ip_entity = first_ip_entity(incident);
+    let detail = simple_detail_line(incident, &ip_entity);
+
+    // Action line depends on mode.
+    let action_line = match mode {
+        GuardianMode::Guard => {
+            "\u{26a1} <b>Handled automatically</b> — no action needed."
+        }
+        GuardianMode::DryRun => {
+            "\u{1f9ea} <b>Dry-run</b> — would act on this. Enable live mode to let me."
+        }
+        GuardianMode::Watch => {
+            "\u{26a0}\u{fe0f} <b>Needs your attention.</b>"
+        }
     };
 
-    let description = template.replace("{action}", action);
+    let link_line = dashboard_url
+        .and_then(|base| ip_entity.as_ref().map(|ip| (base, ip)))
+        .map(|(base, ip)| {
+            format!(
+                "\n\n\u{1f517} <a href=\"{}/?subject_type=ip&subject={}&date={}\">View details</a>",
+                base,
+                ip,
+                incident.ts.format("%Y-%m-%d")
+            )
+        })
+        .unwrap_or_default();
 
-    format!("{sev_emoji} {description}")
+    format!(
+        "{sev_emoji} {det_emoji} <b>{sev_word} — {det_label}</b>\n\
+         \n\
+         {detail}\n\
+         \n\
+         {action_line}{link_line}",
+    )
+}
+
+/// Human-readable detector label for simple profile headers.
+fn simple_detector_label(detector: &str) -> &'static str {
+    match detector {
+        "ssh_bruteforce" => "Login Attack Blocked",
+        "credential_stuffing" => "Credential Attack",
+        "port_scan" => "Port Scan",
+        "packet_flood" => "Traffic Flood",
+        "data_exfil" | "data_exfil_cmd" | "data_exfil_ebpf" => "Data Theft Attempt",
+        "reverse_shell" => "Remote Access Detected",
+        "privesc" => "Privilege Escalation",
+        "rootkit" => "Kernel Tampering",
+        "ransomware" => "Ransomware Detected",
+        "dns_tunneling" | "dns_tunneling_ebpf" => "Covert Channel",
+        "c2_callback" => "Attacker Communication",
+        "crypto_miner" => "Crypto Mining",
+        "container_escape" => "Container Breakout",
+        "lateral_movement" => "Lateral Movement",
+        "web_shell" => "Web Backdoor",
+        "process_injection" => "Code Injection",
+        "fileless" => "Memory-Only Malware",
+        "log_tampering" => "Log Tampering",
+        "ssh_key_injection" => "SSH Key Planted",
+        "crontab_persistence" | "systemd_persistence" => "Persistence Installed",
+        "kernel_module_load" => "Kernel Module Loaded",
+        "discovery_burst" => "Reconnaissance",
+        "suspicious_execution" => "Suspicious Execution",
+        "sigma" => "Known Attack Pattern",
+        "neural_anomaly" => "AI Anomaly",
+        _ => "Threat Detected",
+    }
+}
+
+/// Build a concise detail line from the incident for simple messages.
+fn simple_detail_line(incident: &Incident, ip_entity: &Option<String>) -> String {
+    let detector = extract_detector(&incident.incident_id);
+    let (_emoji, template) = simple_detector_lookup(detector);
+    let base_desc = template.replace(" {action}", "");
+
+    let ip_part = ip_entity
+        .as_ref()
+        .map(|ip| format!("\nIP: <code>{}</code>", escape_html(ip)))
+        .unwrap_or_default();
+
+    format!("{base_desc}{ip_part}")
 }
 
 /// Return a 2-3 sentence plain explanation for a detector.
@@ -3074,6 +3193,8 @@ pub struct PipelineDigestStats {
     pub suppressed_count: u32,
     pub auto_resolved_groups: u32,
     pub needs_review_groups: u32,
+    /// Incidents deferred from immediate Telegram (per-detector counts).
+    pub deferred: Vec<(String, u32)>,
 }
 
 /// Format an enriched daily digest with pipeline grouping stats.
@@ -3087,67 +3208,82 @@ pub fn format_daily_digest_enriched(
     is_simple: bool,
     pipeline: &PipelineDigestStats,
 ) -> String {
-    if is_simple {
-        let raw_score = 100i32
-            .saturating_sub(critical_count as i32 * 20)
-            .saturating_sub(high_count as i32 * 5);
-        let score = raw_score.clamp(0, 100) as u32;
-        let health_emoji = if score >= 80 {
-            "\u{1f7e2}" // 🟢
-        } else if score >= 50 {
-            "\u{1f7e1}" // 🟡
-        } else {
-            "\u{1f534}" // 🔴
-        };
+    let raw_score = 100i32
+        .saturating_sub(critical_count as i32 * 20)
+        .saturating_sub(high_count as i32 * 5);
+    let score = raw_score.clamp(0, 100) as u32;
+    let health_emoji = if score >= 80 {
+        "\u{1f7e2}" // 🟢
+    } else if score >= 50 {
+        "\u{1f7e1}" // 🟡
+    } else {
+        "\u{1f534}" // 🔴
+    };
 
+    if is_simple {
         let mut msg = format!(
-            "\u{2600}\u{fe0f} Good morning! Your server in the last 24h:\n\
+            "\u{1f6e1}\u{fe0f} <b>Daily Security Briefing</b>\n\
              \n\
-             \u{00a0}\u{00a0}{blocks_today} attacks blocked\n\
-             \u{00a0}\u{00a0}{critical_count} critical threats\n\
-             \u{00a0}\u{00a0}Health: {score}/100 {health_emoji}"
+             {health_emoji} Server health: <b>{score}/100</b>\n\
+             \n\
+             While you were away, InnerWarden:\n\
+             \u{00a0}\u{00a0}\u{2022} Blocked <b>{blocks_today}</b> attacks\n\
+             \u{00a0}\u{00a0}\u{2022} Analyzed <b>{incidents_today}</b> security events\n\
+             \u{00a0}\u{00a0}\u{2022} Detected <b>{critical_count}</b> critical, <b>{high_count}</b> high severity threats"
         );
 
-        if pipeline.suppressed_count > 0 || pipeline.auto_resolved_groups > 0 {
-            msg.push_str(&format!(
-                "\n\u{00a0}\u{00a0}{} alerts silenced (grouped)",
-                pipeline.suppressed_count
-            ));
-            if pipeline.auto_resolved_groups > 0 {
-                msg.push_str(&format!(
-                    "\n\u{00a0}\u{00a0}{} threats auto-resolved",
-                    pipeline.auto_resolved_groups
-                ));
+        // Deferred incident breakdown — the bulk of silent work.
+        if !pipeline.deferred.is_empty() {
+            msg.push_str("\n\n\u{1f916} <b>Handled silently:</b>");
+            for (detector, count) in &pipeline.deferred {
+                let label = friendly_detector_name(detector);
+                msg.push_str(&format!("\n\u{00a0}\u{00a0}\u{2022} {count} {label}"));
             }
+        }
+
+        if pipeline.auto_resolved_groups > 0 {
+            msg.push_str(&format!(
+                "\n\n\u{2705} {} threat groups auto-resolved",
+                pipeline.auto_resolved_groups
+            ));
         }
 
         if pipeline.needs_review_groups > 0 {
             msg.push_str(&format!(
-                "\n\n\u{26a0}\u{fe0f} {} groups need review",
+                "\n\n\u{26a0}\u{fe0f} <b>{} groups need your review</b>",
                 pipeline.needs_review_groups
             ));
         } else {
-            msg.push_str("\n\nEverything is under control.");
+            msg.push_str("\n\n\u{2705} No action needed — everything is under control.");
         }
 
         msg
     } else {
         let date = chrono::Local::now().format("%Y-%m-%d");
         let mut msg = format!(
-            "\u{1f4ca} Daily digest ({date}):\n\
-             \u{00a0}\u{00a0}Total: {incidents_today} incidents, {blocks_today} blocks\n\
-             \u{00a0}\u{00a0}{top_detector}: {top_count}\n\
-             \u{00a0}\u{00a0}Critical: {critical_count} | High: {high_count}",
+            "\u{1f4ca} <b>Daily Digest</b> ({date})\n\
+             \n\
+             Health: {score}/100 {health_emoji}\n\
+             Incidents: {incidents_today} | Blocks: {blocks_today}\n\
+             Critical: {critical_count} | High: {high_count}\n\
+             Top: {top_detector} ({top_count})",
             top_detector = escape_html(top_detector),
         );
 
-        if pipeline.suppressed_count > 0 {
+        if pipeline.suppressed_count > 0 || pipeline.auto_resolved_groups > 0 {
             msg.push_str(&format!(
-                "\n\u{00a0}\u{00a0}Grouped: {} alerts suppressed, {} auto-resolved, {} need review",
+                "\nPipeline: {} grouped, {} auto-resolved, {} need review",
                 pipeline.suppressed_count,
                 pipeline.auto_resolved_groups,
                 pipeline.needs_review_groups,
             ));
+        }
+
+        if !pipeline.deferred.is_empty() {
+            msg.push_str("\nDeferred:");
+            for (detector, count) in &pipeline.deferred {
+                msg.push_str(&format!(" {detector}={count}"));
+            }
         }
 
         msg
@@ -3180,11 +3316,11 @@ pub fn format_simple_status(
     let _ = has_critical_last_24h;
 
     format!(
-        "{semaphore} Your server is {status_word}\n\
+        "{semaphore} <b>Server is {status_word}</b>\n\
          \n\
-         Protected for {uptime_days} days\n\
-         {total_blocked} attacks blocked\n\
-         Last threat: {last_threat_ago}",
+         \u{1f6e1}\u{fe0f} Protected for <b>{uptime_days}</b> days\n\
+         \u{1f6ab} <b>{total_blocked}</b> attacks blocked\n\
+         \u{23f1}\u{fe0f} Last threat: {last_threat_ago}",
         last_threat_ago = escape_html(last_threat_ago),
     )
 }

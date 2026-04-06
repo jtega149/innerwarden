@@ -904,6 +904,34 @@ enum NotifyCommand {
         #[arg(long)]
         subject: Option<String>,
     },
+
+    /// Configure the daily Telegram digest hour.
+    ///
+    /// Sets the time (0-23, local time) when InnerWarden sends a daily
+    /// summary of everything that happened. Use "off" to disable.
+    ///
+    /// Examples:
+    ///   innerwarden notify digest 9       # daily digest at 9 AM
+    ///   innerwarden notify digest 20      # daily digest at 8 PM
+    ///   innerwarden notify digest off     # disable daily digest
+    Digest {
+        /// Hour (0-23) for daily digest, or "off" to disable
+        hour: String,
+    },
+
+    /// Configure the daily Telegram notification budget.
+    ///
+    /// Maximum immediate notifications per day. Only real threats count
+    /// against the budget. Critical severity always breaks the budget.
+    /// Everything else goes to the daily digest.
+    ///
+    /// Examples:
+    ///   innerwarden notify budget 5       # max 5 pings/day
+    ///   innerwarden notify budget 20      # more permissive
+    Budget {
+        /// Max immediate notifications per day (default: 10)
+        max: u32,
+    },
 }
 
 /// Allowlist sub-commands.
@@ -1412,6 +1440,12 @@ fn main() -> Result<()> {
             }
             Some(NotifyCommand::WebPush { ref subject }) => {
                 commands::notify::cmd_notify_web_push_setup(&cli, subject.as_deref())
+            }
+            Some(NotifyCommand::Digest { ref hour }) => {
+                commands::notify::cmd_configure_digest(&cli, hour)
+            }
+            Some(NotifyCommand::Budget { max }) => {
+                commands::notify::cmd_configure_budget(&cli, *max)
             }
         },
         Command::Integrate { ref command } => match command {

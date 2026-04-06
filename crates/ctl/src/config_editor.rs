@@ -154,6 +154,15 @@ pub fn write_int(path: &Path, section: &str, key: &str, val: i64) -> Result<()> 
     atomic_write(path, &doc.to_string())
 }
 
+/// Remove a key from `[section]`. No-op if the key does not exist.
+pub fn remove_key(path: &Path, section: &str, key: &str) -> Result<()> {
+    let mut doc = read_doc(path)?;
+    if let Some(tbl) = doc.get_mut(section).and_then(|v| v.as_table_like_mut()) {
+        tbl.remove(key);
+    }
+    atomic_write(path, &doc.to_string())
+}
+
 /// Set a string key in `[section]`.
 pub fn write_str(path: &Path, section: &str, key: &str, val: &str) -> Result<()> {
     let mut doc = read_doc(path)?;
