@@ -32,7 +32,7 @@ make replay-qa    # validacao E2E
 
 ## Estado (2026-04-04)
 
-- 49 detectors, 40 eBPF hooks, 65 MITRE IDs, 30 correlation rules
+- 49 detectors, 40 eBPF hooks, 65 MITRE IDs, 40 correlation rules (CL-001 to CL-040, includes 5 AlphaZero V4 discoveries)
 - Server producao: ver config local (nao expor no repo publico)
 - Branches: main = stable, develop = bleeding edge
 - CI: `make check` + `make test` + `make spec-check`

@@ -1321,6 +1321,159 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             min_confidence: 0.90,
             severity: Severity::Critical,
         },
+        // -----------------------------------------------------------------
+        // AlphaZero V4 discoveries (2026-04-06, round 2)
+        // -----------------------------------------------------------------
+        // CL-036: Security tool disable → Impact chain
+        // V4 attacker discovered: disable innerwarden first, then destroy/exfil.
+        // DisableSecurityTools had 100% success rate in round 2.
+        CorrelationRule {
+            id: "CL-036".into(),
+            name: "V4: Security Tool Disable to Impact".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "sudo_abuse".into(),
+                        "sensitive_write".into(),
+                    ],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "data_exfiltration".into(),
+                        "data_exfil_ebpf".into(),
+                        "ransomware".into(),
+                        "log_tampering".into(),
+                    ],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 300,
+            min_confidence: 0.90,
+            severity: Severity::Critical,
+        },
+        // CL-037: io_uring evasion → exfiltration chain
+        // V4 attacker learned: io_uring bypasses syscall monitoring for network I/O.
+        // IoUringEvasion had 100% success rate — invisible to eBPF tracepoints.
+        CorrelationRule {
+            id: "CL-037".into(),
+            name: "V4: io_uring Evasion to Data Exfiltration".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Kernel),
+                    kind_patterns: vec!["io_uring*".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Network),
+                    kind_patterns: vec![
+                        "data_exfiltration".into(),
+                        "outbound_anomaly".into(),
+                        "dns_tunneling".into(),
+                    ],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 120,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-038: Valid account login (off-hours) → data destruction
+        // V4 attacker: uses valid credentials at unusual hours then immediately impacts.
+        // ValidAccountLogin bypasses SSH brute force detection entirely.
+        CorrelationRule {
+            id: "CL-038".into(),
+            name: "V4: Off-Hours Login to Destructive Action".into(),
+            stages: vec![
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "suspicious_login".into(),
+                        "ssh.login_success".into(),
+                    ],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "sudo_abuse".into(),
+                        "sensitive_write".into(),
+                        "log_tampering".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 600,
+            min_confidence: 0.80,
+            severity: Severity::Critical,
+        },
+        // CL-039: Distributed SSH + web exploit (multi-vector initial access)
+        // V4 attacker: simultaneously brute force SSH from multiple IPs and probe web.
+        // DistributedSshBrute was top 4 technique (214 uses in analysis).
+        CorrelationRule {
+            id: "CL-039".into(),
+            name: "V4: Multi-Vector Initial Access".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Network),
+                    kind_patterns: vec![
+                        "distributed_ssh".into(),
+                        "ssh_bruteforce".into(),
+                    ],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "web_shell".into(),
+                        "web_scan".into(),
+                        "credential_harvest".into(),
+                    ],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 600,
+            min_confidence: 0.85,
+            severity: Severity::High,
+        },
+        // CL-040: Process injection → reverse shell → DNS exfil
+        // V4 attacker: inject into process, spawn reverse shell, exfil via DNS.
+        // ProcessInjection + ReverseShell + ExfilDns all had 100% success.
+        CorrelationRule {
+            id: "CL-040".into(),
+            name: "V4: Process Injection to DNS Exfiltration".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Kernel),
+                    kind_patterns: vec![
+                        "process_injection".into(),
+                        "fileless".into(),
+                    ],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "reverse_shell".into(),
+                        "shell.command_exec".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Network),
+                    kind_patterns: vec![
+                        "dns_tunneling".into(),
+                        "data_exfiltration".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 300,
+            min_confidence: 0.90,
+            severity: Severity::Critical,
+        },
     ]
 }
 
