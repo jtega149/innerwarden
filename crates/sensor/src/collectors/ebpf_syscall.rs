@@ -2603,11 +2603,12 @@ mod tests {
 
     #[test]
     fn execve_event_maps_to_shell_command_exec() {
-        let event = execve_to_event(1234, 0, 1, 0, None, "bash", "/usr/bin/curl", "test-host");
+        // Use PID 0 to avoid reading /proc/<pid>/cmdline of a real process.
+        let event = execve_to_event(0, 0, 1, 0, None, "bash", "/usr/bin/curl", "test-host");
         assert_eq!(event.source, "ebpf");
         assert_eq!(event.kind, "shell.command_exec");
         assert!(event.summary.contains("curl"));
-        assert_eq!(event.details["pid"], 1234);
+        assert_eq!(event.details["pid"], 0);
         assert_eq!(event.details["ppid"], 1);
     }
 

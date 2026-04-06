@@ -56,6 +56,12 @@ pub struct AgentConfig {
     /// Security settings (2FA, etc.)
     #[serde(default)]
     pub security: Option<SecurityConfig>,
+    /// Notification pipeline settings (grouping, filtering).
+    #[serde(default)]
+    pub notifications: NotificationPipelineConfig,
+    /// Environment auto-profiling and census.
+    #[serde(default)]
+    pub environment: EnvironmentConfig,
     /// Redis URL for reading events from Redis Streams instead of JSONL files.
     /// When set, events are consumed via XREADGROUP. Incidents still read from JSONL.
     #[serde(default)]
@@ -240,6 +246,10 @@ pub struct WebhookConfig {
     /// Opsgenie: set url to https://api.opsgenie.com/v2/alerts with GenieKey header in url
     #[serde(default = "default_webhook_format")]
     pub format: String,
+
+    /// Notification pipeline filter and digest settings.
+    #[serde(default)]
+    pub channel_notifications: ChannelNotificationConfig,
 }
 
 fn default_webhook_format() -> String {
@@ -254,6 +264,7 @@ impl Default for WebhookConfig {
             min_severity: default_min_severity(),
             timeout_secs: default_timeout_secs(),
             format: default_webhook_format(),
+            channel_notifications: ChannelNotificationConfig::default(),
         }
     }
 }
@@ -912,6 +923,12 @@ pub struct TelegramConfig {
     #[serde(default)]
     pub daily_summary_hour: Option<u8>,
 
+    /// Maximum Telegram notifications per day (default: 10).
+    /// Only immediate threats count against the budget. Critical severity
+    /// always breaks the budget. Everything else goes to the daily digest.
+    #[serde(default = "default_telegram_daily_budget")]
+    pub daily_budget: u32,
+
     /// Dev mode: adds a "Check FP" button to every notification.
     /// When pressed, logs the incident to a false-positive review file
     /// for later analysis. Useful for tuning detectors.
@@ -927,6 +944,10 @@ pub struct TelegramConfig {
     /// Conversational bot configuration.
     #[serde(default)]
     pub bot: TelegramBotConfig,
+
+    /// Notification pipeline filter and digest settings.
+    #[serde(default)]
+    pub channel_notifications: ChannelNotificationConfig,
 }
 
 impl TelegramConfig {
@@ -999,9 +1020,11 @@ impl Default for TelegramConfig {
             dashboard_url: String::new(),
             approval_ttl_secs: default_telegram_approval_ttl_secs(),
             daily_summary_hour: None,
+            daily_budget: default_telegram_daily_budget(),
             dev_mode: false,
             user_profile: default_user_profile(),
             bot: TelegramBotConfig::default(),
+            channel_notifications: ChannelNotificationConfig::default(),
         }
     }
 }
@@ -1032,6 +1055,10 @@ pub struct SlackConfig {
     /// Example: "http://your-server:8787"
     #[serde(default)]
     pub dashboard_url: String,
+
+    /// Notification pipeline filter and digest settings.
+    #[serde(default)]
+    pub channel_notifications: ChannelNotificationConfig,
 }
 
 impl SlackConfig {
@@ -1070,6 +1097,7 @@ impl Default for SlackConfig {
             webhook_url: String::new(),
             min_severity: default_slack_min_severity(),
             dashboard_url: String::new(),
+            channel_notifications: ChannelNotificationConfig::default(),
         }
     }
 }
@@ -1166,6 +1194,10 @@ pub struct WebPushConfig {
     /// Minimum severity for push notification: "high" or "critical" (default: "high")
     #[serde(default = "default_web_push_min_severity")]
     pub min_severity: String,
+
+    /// Notification pipeline filter and digest settings.
+    #[serde(default)]
+    pub channel_notifications: ChannelNotificationConfig,
 }
 
 fn default_vapid_subject() -> String {
@@ -1184,6 +1216,7 @@ impl Default for WebPushConfig {
             vapid_private_key: String::new(),
             vapid_public_key: String::new(),
             min_severity: default_web_push_min_severity(),
+            channel_notifications: ChannelNotificationConfig::default(),
         }
     }
 }
@@ -1202,7 +1235,6 @@ pub struct SecurityConfig {
     /// TOTP secret (base32 encoded). Stored in agent.env as INNERWARDEN_TOTP_SECRET.
     /// Leave empty in TOML; set via `innerwarden configure 2fa`.
     #[serde(default)]
-    #[allow(dead_code)]
     pub totp_secret: String,
 }
 
@@ -1571,6 +1603,10 @@ fn default_telegram_approval_ttl_secs() -> u64 {
     600
 }
 
+fn default_telegram_daily_budget() -> u32 {
+    10
+}
+
 fn default_user_profile() -> String {
     "simple".to_string()
 }
@@ -1678,6 +1714,158 @@ pub struct GeoIpConfig {
     /// No API key required. Free tier: 45 requests/minute.
     #[serde(default)]
     pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Notification Pipeline (Feature 005)
+// ---------------------------------------------------------------------------
+
+/// Notification filter level for a channel.
+/// Controls which incident groups are forwarded to this channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelFilterLevel {
+    /// Every incident group (first event + summaries).
+    #[default]
+    All,
+    /// Only groups that need human decision (not auto-resolved, ambiguous, or
+    /// above confidence threshold).
+    Actionable,
+    /// Only HIGH/CRITICAL that are not auto-resolved.
+    Critical,
+    /// Silent — only digest (if configured).
+    None,
+}
+
+/// Digest frequency for a notification channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DigestFrequency {
+    Daily,
+    Hourly,
+    #[default]
+    None,
+}
+
+/// Top-level notification pipeline config.
+///
+/// ```toml
+/// [notifications]
+/// group_window_secs = 3600
+/// group_count_threshold = 10
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct NotificationPipelineConfig {
+    /// Grouping window in seconds. Incidents from the same detector+entity
+    /// within this window are grouped into a single notification.
+    #[serde(default = "default_group_window_secs")]
+    pub group_window_secs: u64,
+
+    /// Emit an early group summary when this many incidents accumulate,
+    /// without waiting for the window to close.
+    #[serde(default = "default_group_count_threshold")]
+    pub group_count_threshold: u32,
+}
+
+impl Default for NotificationPipelineConfig {
+    fn default() -> Self {
+        Self {
+            group_window_secs: default_group_window_secs(),
+            group_count_threshold: default_group_count_threshold(),
+        }
+    }
+}
+
+fn default_group_window_secs() -> u64 {
+    3600
+}
+fn default_group_count_threshold() -> u32 {
+    10
+}
+
+/// Per-channel notification filter and digest settings.
+///
+/// Embedded inside each channel config (Telegram, Slack, etc.) as:
+/// ```toml
+/// [telegram]
+/// notification_level = "actionable"
+/// digest = "daily"
+/// digest_hour = 9
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ChannelNotificationConfig {
+    /// Filter level for real-time notifications.
+    #[serde(default = "default_channel_level_actionable")]
+    pub notification_level: ChannelFilterLevel,
+
+    /// Digest frequency.
+    #[serde(default)]
+    pub digest: DigestFrequency,
+
+    /// Hour of day (0–23, local time) to send daily digest.
+    /// Only used when `digest = "daily"`.
+    #[serde(default = "default_digest_hour")]
+    pub digest_hour: u8,
+}
+
+impl Default for ChannelNotificationConfig {
+    fn default() -> Self {
+        Self {
+            notification_level: default_channel_level_actionable(),
+            digest: DigestFrequency::None,
+            digest_hour: default_digest_hour(),
+        }
+    }
+}
+
+fn default_channel_level_actionable() -> ChannelFilterLevel {
+    ChannelFilterLevel::Actionable
+}
+fn default_digest_hour() -> u8 {
+    9
+}
+
+/// Environment auto-profiling and census configuration.
+///
+/// ```toml
+/// [environment]
+/// auto_profile = true
+/// census_interval_hours = 6
+/// cloud_timing_multiplier = 10
+/// ```
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct EnvironmentConfig {
+    /// Run bootstrap profiling on first boot (or when profile missing).
+    #[serde(default = "default_true_val")]
+    pub auto_profile: bool,
+
+    /// How often to run the periodic census (hours).
+    #[serde(default = "default_census_interval_hours")]
+    pub census_interval_hours: u64,
+
+    /// Timing anomaly threshold multiplier for cloud/VM environments.
+    /// Applied automatically when `platform` is detected as cloud VPS.
+    #[serde(default = "default_cloud_timing_multiplier")]
+    pub cloud_timing_multiplier: u32,
+}
+
+impl Default for EnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            auto_profile: true,
+            census_interval_hours: default_census_interval_hours(),
+            cloud_timing_multiplier: default_cloud_timing_multiplier(),
+        }
+    }
+}
+
+fn default_census_interval_hours() -> u64 {
+    6
+}
+fn default_cloud_timing_multiplier() -> u32 {
+    10
 }
 
 // ---------------------------------------------------------------------------

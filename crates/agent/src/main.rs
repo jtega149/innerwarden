@@ -24,9 +24,11 @@ mod dashboard;
 mod data_retention;
 mod decision_block_ip;
 mod decision_confirmation;
+mod decision_cooldown;
 mod decision_honeypot;
 mod decision_skill_actions;
 mod decisions;
+mod environment_profile;
 mod fail2ban;
 mod firmware_tick;
 mod forensics;
@@ -55,6 +57,7 @@ mod incident_post_decision;
 mod incident_prelude;
 mod incident_reputation;
 mod ioc;
+mod ip_reputation;
 mod mesh;
 mod mitre;
 mod narrative;
@@ -69,6 +72,7 @@ mod narrative_incident_ingest;
     clippy::needless_range_loop
 )]
 mod neural_lifecycle;
+mod notification_pipeline;
 mod pcap_capture;
 mod playbook;
 mod reader;
@@ -84,6 +88,7 @@ mod telemetry;
 mod telemetry_tick;
 mod threat_feeds;
 mod threat_report;
+mod trust_rules;
 #[allow(dead_code)]
 mod two_factor;
 mod web_push;
@@ -99,7 +104,6 @@ use chrono::{Datelike as _, Timelike as _};
 use clap::Parser;
 use tracing::{debug, info, warn};
 
-use crate::agent_context::incident_detector;
 use crate::bot_actions::{handle_pending_confirmation, handle_telegram_action_callback};
 use crate::bot_commands::{handle_telegram_bot_command, probe_and_suggest};
 #[cfg(test)]
@@ -315,6 +319,14 @@ struct AgentState {
     last_narrative_at: Option<std::time::Instant>,
     /// Date for which we last sent the daily Telegram digest (avoids re-sending).
     last_daily_summary_telegram: Option<chrono::NaiveDate>,
+    /// Telegram daily budget: how many immediate notifications sent today.
+    /// Resets when the date changes.
+    telegram_daily_sent: u32,
+    /// Date the daily budget counter applies to.
+    telegram_budget_date: Option<chrono::NaiveDate>,
+    /// Incidents deferred from Telegram (not immediate threats) — accumulated
+    /// per-detector for the daily digest breakdown.
+    telegram_deferred: std::collections::HashMap<String, u32>,
     /// Telegram client for T.1 notifications and T.2 approvals (None when disabled).
     telegram_client: Option<Arc<telegram::TelegramClient>>,
     /// Pending T.2 operator confirmations keyed by incident_id.
@@ -330,10 +342,15 @@ struct AgentState {
     /// Receives approval results from the Telegram polling task.
     /// Drained at the start of every incident tick via try_recv.
     approval_rx: Option<tokio::sync::mpsc::Receiver<telegram::ApprovalResult>>,
-    /// Telegram batcher — groups repeated alerts to avoid spam.
-    telegram_batcher: telegram::TelegramBatcher,
+    /// Notification pipeline — groups incidents by detector+entity to reduce noise.
+    grouping_engine: notification_pipeline::GroupingEngine,
+    /// Environment profile — cloud/VM detection, human UIDs, services.
+    environment_profile: environment_profile::EnvironmentProfile,
     /// Neural autoencoder anomaly engine — learns "normal" and flags novel patterns.
     anomaly_engine: neural_lifecycle::AnomalyEngine,
+    /// Neural incidents pending processing — buffered here because the agent
+    /// cannot append to the sensor's incidents file (different user).
+    neural_incidents: Vec<innerwarden_core::incident::Incident>,
     /// In-memory trust rules: set of "detector:action" strings.
     /// Loaded from data_dir/trust-rules.json at startup; updated live when operator clicks "Always".
     trust_rules: std::collections::HashSet<String>,
@@ -409,7 +426,6 @@ struct AgentState {
     /// Timestamp of last autoencoder anomaly detection (for score fusion with baseline).
     last_autoencoder_anomaly_ts: Option<chrono::DateTime<chrono::Utc>>,
     /// Two-factor authentication state (pending actions, brute force protection).
-    #[allow(dead_code)]
     two_factor_state: two_factor::TwoFactorState,
     /// Redis stream reader for events (None when redis_url is not configured).
     #[cfg(feature = "redis-reader")]
@@ -425,466 +441,26 @@ struct PendingHoneypotChoice {
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-// ---------------------------------------------------------------------------
-// Local IP reputation - adaptive blocking
-// ---------------------------------------------------------------------------
+pub(crate) use decision_cooldown::DECISION_COOLDOWN_SECS;
+pub(crate) use decision_cooldown::{
+    decision_cooldown_candidates, decision_cooldown_key_for_decision, load_last_narrative_instant,
+    load_startup_decision_state, notification_cooldown_keys, ABUSEIPDB_REPORT_DELAY_SECS,
+    MAX_BLOCKS_PER_MINUTE, NOTIFICATION_COOLDOWN_SECS,
+};
+pub(crate) use ip_reputation::{
+    adaptive_block_ttl_secs, append_blocked_ip, load_ip_reputations, persist_ip_reputations,
+    scan_honeypot_for_profiles, LocalIpReputation,
+};
+pub(crate) use trust_rules::{
+    append_trust_rule, enable_lsm_enforcement, is_trusted, load_trust_rules, should_auto_enable_lsm,
+};
+// Constants re-exported from decision_cooldown (kept here for backward compat)
 
-/// Per-IP reputation tracking for adaptive block TTL.
-/// Starts neutral (score 0.0); each incident and block increases the score.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LocalIpReputation {
-    /// Total incidents involving this IP.
-    total_incidents: u32,
-    /// Total times this IP has been blocked.
-    total_blocks: u32,
-    /// When this IP was first seen by the agent.
-    first_seen: chrono::DateTime<chrono::Utc>,
-    /// When this IP was last seen by the agent.
-    last_seen: chrono::DateTime<chrono::Utc>,
-    /// Reputation score: 0.0 = neutral, higher = worse.
-    /// Incremented by 1.0 per incident, 2.0 per block.
-    reputation_score: f32,
-}
+// Cooldown functions moved to decision_cooldown.rs
 
-impl LocalIpReputation {
-    pub(crate) fn new() -> Self {
-        let now = chrono::Utc::now();
-        Self {
-            total_incidents: 0,
-            total_blocks: 0,
-            first_seen: now,
-            last_seen: now,
-            reputation_score: 0.0,
-        }
-    }
+// (cooldown functions, startup state loaders, and narrative instant moved to decision_cooldown.rs)
 
-    /// Record an incident for this IP.
-    pub(crate) fn record_incident(&mut self) {
-        self.total_incidents += 1;
-        self.last_seen = chrono::Utc::now();
-        self.reputation_score += 1.0;
-    }
-
-    /// Record a block action for this IP.
-    pub(crate) fn record_block(&mut self) {
-        self.total_blocks += 1;
-        self.last_seen = chrono::Utc::now();
-        self.reputation_score += 2.0;
-    }
-}
-
-/// Adaptive block TTL based on total_blocks count.
-///   1st block  → 1 hour
-///   2nd block  → 4 hours
-///   3rd block  → 24 hours
-///   4+ blocks  → 7 days
-pub(crate) fn adaptive_block_ttl_secs(total_blocks: u32) -> i64 {
-    match total_blocks {
-        0 | 1 => 3600, // 1 hour
-        2 => 14400,    // 4 hours
-        3 => 86400,    // 24 hours
-        _ => 604800,   // 7 days
-    }
-}
-
-/// Write the in-memory reputation map to `ip-reputation.json` so the dashboard
-/// (which runs in a separate task) can read it without shared state.
-/// Append a blocked IP to blocked-ips.txt so the sensor can skip events from it.
-/// Uses append mode. Best-effort: errors are logged but not propagated.
-fn append_blocked_ip(data_dir: &Path, ip: &str) {
-    let path = data_dir.join("blocked-ips.txt");
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            use std::io::Write;
-            if let Err(e) = writeln!(f, "{ip}") {
-                warn!("failed to append to blocked-ips.txt: {e}");
-            }
-        }
-        Err(e) => warn!("failed to open blocked-ips.txt for append: {e}"),
-    }
-}
-
-fn persist_ip_reputations(data_dir: &Path, reputations: &HashMap<String, LocalIpReputation>) {
-    let path = data_dir.join("ip-reputation.json");
-    match serde_json::to_string(reputations) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                warn!("failed to write ip-reputation.json: {e}");
-            }
-        }
-        Err(e) => warn!("failed to serialize ip reputations: {e}"),
-    }
-}
-
-/// Scan honeypot session files for IPs in attacker profiles and feed session
-/// data into their profiles (credentials, commands, IOCs).
-fn scan_honeypot_for_profiles(
-    data_dir: &Path,
-    profiles: &mut HashMap<String, attacker_intel::AttackerProfile>,
-) {
-    let honeypot_dir = data_dir.join("honeypot");
-    let entries = match std::fs::read_dir(&honeypot_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    // Collect IPs we care about (owned to avoid borrow conflict with get_mut)
-    let profile_ips: std::collections::HashSet<String> = profiles.keys().cloned().collect();
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("listener-session-") || !name.ends_with(".jsonl") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        for line in content.lines() {
-            if line.is_empty() || !line.starts_with('{') {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let Some(peer_ip) = v["peer_ip"].as_str() else {
-                continue;
-            };
-            if !profile_ips.contains(peer_ip as &str) {
-                continue;
-            }
-            if let Some(profile) = profiles.get_mut(peer_ip) {
-                // Only observe if session not yet counted (check session_id uniqueness)
-                let session_id = v["session_id"].as_str().unwrap_or("");
-                if !session_id.is_empty() {
-                    // Use commands_executed as a proxy: if we already have commands
-                    // from this session, skip. Simple dedup by command presence.
-                    let already_has = v["shell_commands"]
-                        .as_array()
-                        .and_then(|arr| arr.first())
-                        .and_then(|c| c["command"].as_str())
-                        .is_some_and(|cmd| profile.commands_executed.contains(&cmd.to_string()));
-                    if !already_has {
-                        attacker_intel::observe_honeypot(profile, &v);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Load the reputation map from `ip-reputation.json` at startup.
-fn load_ip_reputations(data_dir: &Path) -> HashMap<String, LocalIpReputation> {
-    let path = data_dir.join("ip-reputation.json");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&content).unwrap_or_default()
-}
-
-pub(crate) const DECISION_COOLDOWN_SECS: i64 = 3600;
-/// Notification cooldown: suppress duplicate Telegram/Slack/webhook alerts for the
-/// same detector+entity within this window. Prevents alert spam when the same attacker
-/// triggers multiple incidents in rapid succession.
-const NOTIFICATION_COOLDOWN_SECS: i64 = 600;
-/// Max block actions per minute - prevents false-positive cascades.
-const MAX_BLOCKS_PER_MINUTE: usize = 20;
-/// Default XDP blocklist TTL (24h) - retained as reference; adaptive TTL now per-IP.
-#[allow(dead_code)]
-const XDP_BLOCK_TTL_SECS: i64 = 86400;
-/// AbuseIPDB reports are delayed by this many seconds to allow false-positive correction.
-const ABUSEIPDB_REPORT_DELAY_SECS: i64 = 300;
-
-/// Returns notification cooldown keys for an incident.
-/// One key per entity (IP or user): `detector:entity_kind:entity_value`.
-fn notification_cooldown_keys(incident: &innerwarden_core::incident::Incident) -> Vec<String> {
-    let detector = incident_detector(&incident.incident_id);
-    incident
-        .entities
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.r#type,
-                innerwarden_core::entities::EntityType::Ip
-                    | innerwarden_core::entities::EntityType::User
-            )
-        })
-        .map(|e| {
-            let kind = match e.r#type {
-                innerwarden_core::entities::EntityType::Ip => "ip",
-                innerwarden_core::entities::EntityType::User => "user",
-                _ => "other",
-            };
-            format!("{detector}:{kind}:{}", e.value)
-        })
-        .collect()
-}
-
-fn decision_cooldown_key(action: &str, detector: &str, entity_kind: &str, entity: &str) -> String {
-    format!("{action}:{detector}:{entity_kind}:{entity}")
-}
-
-pub(crate) fn decision_cooldown_candidates(
-    incident: &innerwarden_core::incident::Incident,
-) -> Vec<String> {
-    let detector = incident_detector(&incident.incident_id);
-    let mut keys = Vec::new();
-
-    for entity in &incident.entities {
-        match entity.r#type {
-            innerwarden_core::entities::EntityType::Ip => {
-                keys.push(decision_cooldown_key(
-                    "block_ip",
-                    detector,
-                    "ip",
-                    &entity.value,
-                ));
-                keys.push(decision_cooldown_key(
-                    "monitor",
-                    detector,
-                    "ip",
-                    &entity.value,
-                ));
-                keys.push(decision_cooldown_key(
-                    "honeypot",
-                    detector,
-                    "ip",
-                    &entity.value,
-                ));
-            }
-            innerwarden_core::entities::EntityType::User => {
-                keys.push(decision_cooldown_key(
-                    "suspend_user_sudo",
-                    detector,
-                    "user",
-                    &entity.value,
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    keys
-}
-
-pub(crate) fn decision_cooldown_key_for_decision(
-    incident: &innerwarden_core::incident::Incident,
-    decision: &ai::AiDecision,
-) -> Option<String> {
-    let detector = incident_detector(&incident.incident_id);
-    match &decision.action {
-        ai::AiAction::BlockIp { ip, .. } => {
-            Some(decision_cooldown_key("block_ip", detector, "ip", ip))
-        }
-        ai::AiAction::Monitor { ip } => Some(decision_cooldown_key("monitor", detector, "ip", ip)),
-        ai::AiAction::Honeypot { ip } => {
-            Some(decision_cooldown_key("honeypot", detector, "ip", ip))
-        }
-        ai::AiAction::SuspendUserSudo { user, .. } => Some(decision_cooldown_key(
-            "suspend_user_sudo",
-            detector,
-            "user",
-            user,
-        )),
-        ai::AiAction::KillProcess { user, .. } => Some(decision_cooldown_key(
-            "kill_process",
-            detector,
-            "user",
-            user,
-        )),
-        ai::AiAction::BlockContainer { container_id, .. } => Some(decision_cooldown_key(
-            "block_container",
-            detector,
-            "container",
-            container_id,
-        )),
-        ai::AiAction::KillChainResponse { .. } => Some(decision_cooldown_key(
-            "kill_chain_response",
-            detector,
-            "pid",
-            "-",
-        )),
-        ai::AiAction::Ignore { .. } | ai::AiAction::RequestConfirmation { .. } => None,
-    }
-}
-
-fn decision_cooldown_key_from_entry(entry: &decisions::DecisionEntry) -> Option<String> {
-    let detector = incident_detector(&entry.incident_id);
-    match entry.action_type.as_str() {
-        "block_ip" | "monitor" | "honeypot" => entry
-            .target_ip
-            .as_ref()
-            .map(|ip| decision_cooldown_key(&entry.action_type, detector, "ip", ip)),
-        "suspend_user_sudo" => entry
-            .target_user
-            .as_ref()
-            .map(|user| decision_cooldown_key("suspend_user_sudo", detector, "user", user)),
-        _ => None,
-    }
-}
-
-#[allow(dead_code)]
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn recent_decision_dates() -> Vec<String> {
-    let today = chrono::Local::now().date_naive();
-    let mut dates = vec![today.format("%Y-%m-%d").to_string()];
-    if let Some(prev) = today.pred_opt() {
-        dates.push(prev.format("%Y-%m-%d").to_string());
-    }
-    dates
-}
-
-fn load_startup_decision_state(
-    data_dir: &Path,
-    preload_blocklist_from_system: bool,
-) -> (
-    skills::Blocklist,
-    HashMap<String, chrono::DateTime<chrono::Utc>>,
-) {
-    let mut blocklist = skills::Blocklist::default();
-    let mut cooldowns: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-
-    if preload_blocklist_from_system {
-        // Caller is responsible for awaiting the async ufw load and inserting later.
-    }
-
-    // Cap: only read the last 500KB of each decisions file to prevent OOM
-    // on hosts that accumulated thousands of CrowdSec entries.
-    const MAX_DECISION_READ: u64 = 512 * 1024;
-
-    for date in recent_decision_dates() {
-        let decisions_path = data_dir.join(format!("decisions-{date}.jsonl"));
-        let file_size = std::fs::metadata(&decisions_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let content = if file_size > MAX_DECISION_READ {
-            // Read only the tail of the file (most recent decisions)
-            let Ok(full) = std::fs::read(&decisions_path) else {
-                continue;
-            };
-            let start = full.len().saturating_sub(MAX_DECISION_READ as usize);
-            String::from_utf8_lossy(&full[start..]).to_string()
-        } else {
-            let Ok(c) = std::fs::read_to_string(&decisions_path) else {
-                continue;
-            };
-            c
-        };
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<decisions::DecisionEntry>(line) else {
-                continue;
-            };
-            if entry.action_type == "block_ip" {
-                if let Some(ip) = &entry.target_ip {
-                    blocklist.insert(ip.clone());
-                }
-            }
-            if let Some(key) = decision_cooldown_key_from_entry(&entry) {
-                cooldowns
-                    .entry(key)
-                    .and_modify(|existing| {
-                        if entry.ts > *existing {
-                            *existing = entry.ts;
-                        }
-                    })
-                    .or_insert(entry.ts);
-            }
-        }
-    }
-
-    (blocklist, cooldowns)
-}
-
-fn load_last_narrative_instant(data_dir: &Path) -> Option<std::time::Instant> {
-    let today = chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
-    let path = data_dir.join(format!("summary-{today}.md"));
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    let elapsed = modified.elapsed().ok()?;
-    std::time::Instant::now().checked_sub(elapsed)
-}
-
-// ---------------------------------------------------------------------------
-// Trust rules - data_dir/trust-rules.json
-// ---------------------------------------------------------------------------
-
-const TRUST_RULES_FILE: &str = "trust-rules.json";
-
-/// Load trust rules from data_dir/trust-rules.json.
-/// Returns a HashSet of "detector:action" keys. Fail-open: returns empty on any error.
-fn load_trust_rules(data_dir: &Path) -> std::collections::HashSet<String> {
-    let path = data_dir.join(TRUST_RULES_FILE);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return std::collections::HashSet::new();
-    };
-    let rules: Vec<serde_json::Value> = serde_json::from_str(&content).unwrap_or_default();
-    rules
-        .into_iter()
-        .filter_map(|r| {
-            let d = r["detector"].as_str()?.to_string();
-            let a = r["action"].as_str()?.to_string();
-            Some(format!("{d}:{a}"))
-        })
-        .collect()
-}
-
-/// Append a trust rule to data_dir/trust-rules.json and update the in-memory set.
-/// Fail-open: logs a warning on I/O errors.
-fn append_trust_rule(
-    data_dir: &Path,
-    trust_rules: &mut std::collections::HashSet<String>,
-    detector: &str,
-    action: &str,
-) {
-    let key = format!("{detector}:{action}");
-    if trust_rules.contains(&key) {
-        return; // already trusted
-    }
-    trust_rules.insert(key);
-
-    let path = data_dir.join(TRUST_RULES_FILE);
-    let mut rules: Vec<serde_json::Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default();
-    rules.push(serde_json::json!({ "detector": detector, "action": action }));
-
-    match serde_json::to_string_pretty(&rules) {
-        Ok(content) => {
-            if let Err(e) = std::fs::write(&path, content) {
-                warn!("failed to write trust-rules.json: {e:#}");
-            }
-        }
-        Err(e) => warn!("failed to serialise trust rules: {e:#}"),
-    }
-}
-
-/// Returns true if a (detector, action) pair has been trusted by the operator.
-pub(crate) fn is_trusted(
-    trust_rules: &std::collections::HashSet<String>,
-    detector: &str,
-    action: &str,
-) -> bool {
-    trust_rules.contains(&format!("{detector}:{action}"))
-        || trust_rules.contains(&format!("*:{action}"))
-        || trust_rules.contains(&format!("{detector}:*"))
-        || trust_rules.contains("*:*")
-}
+// Trust rules and LSM enforcement moved to trust_rules.rs
 
 // ---------------------------------------------------------------------------
 // Main
@@ -1322,14 +898,22 @@ async fn main() -> Result<()> {
         },
         last_narrative_at: load_last_narrative_instant(&cli.data_dir),
         last_daily_summary_telegram: None,
+        telegram_daily_sent: 0,
+        telegram_budget_date: None,
+        telegram_deferred: HashMap::new(),
         telegram_client,
         pending_confirmations: HashMap::new(),
         approval_rx: None, // set below in continuous mode
-        telegram_batcher: telegram::TelegramBatcher::new(60),
+        grouping_engine: notification_pipeline::GroupingEngine::new(&cfg.notifications),
+        environment_profile: environment_profile::load_or_bootstrap(
+            &cli.data_dir,
+            &cfg.environment,
+        ),
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(neural_lifecycle::AnomalyConfig {
             data_dir: cli.data_dir.clone(),
             ..Default::default()
         }),
+        neural_incidents: Vec::new(),
         trust_rules: load_trust_rules(&cli.data_dir),
         crowdsec: if cfg.crowdsec.enabled {
             info!(url = %cfg.crowdsec.url, "CrowdSec integration enabled");
@@ -1658,14 +1242,24 @@ async fn main() -> Result<()> {
                             warn!("narrative tick error: {e:#}");
                         }
                     }
-                    // Flush Telegram batcher — send grouped summaries
-                    if state.telegram_batcher.should_flush() {
-                        let summaries = state.telegram_batcher.flush();
+                    // Tick notification pipeline — emit group summaries for
+                    // groups that hit count threshold or expired windows.
+                    {
+                        let summaries = state.grouping_engine.tick();
                         if !summaries.is_empty() {
-                            if let Some(ref tg) = state.telegram_client {
-                                let digest = summaries.join("\n");
-                                if let Err(e) = tg.send_raw_html(&digest).await {
-                                    warn!("Telegram batch digest failed: {e:#}");
+                            let tg_level = cfg.telegram.channel_notifications.notification_level;
+                            let tg_summaries: Vec<String> = summaries
+                                .iter()
+                                .filter(|s| notification_pipeline::should_notify_summary(s, tg_level))
+                                .filter(|s| notification_pipeline::is_immediate_threat_summary(s))
+                                .map(|s| s.format_html())
+                                .collect();
+                            if !tg_summaries.is_empty() {
+                                if let Some(ref tg) = state.telegram_client {
+                                    let digest = tg_summaries.join("\n");
+                                    if let Err(e) = tg.send_raw_html(&digest).await {
+                                        warn!("Telegram group summary failed: {e:#}");
+                                    }
                                 }
                             }
                         }
@@ -1801,6 +1395,9 @@ async fn main() -> Result<()> {
 
                         // ── Pcap capture cooldown cleanup ──
                         state.pcap_capture.cleanup();
+
+                        // ── 2FA pending action expiry cleanup ──
+                        state.two_factor_state.cleanup_expired();
 
                         // ── Baseline rate anomaly check + save ──
                         {
@@ -1992,14 +1589,23 @@ async fn main() -> Result<()> {
                             warn!("narrative tick error: {e:#}");
                         }
                     }
-                    // Flush Telegram batcher — send grouped summaries
-                    if state.telegram_batcher.should_flush() {
-                        let summaries = state.telegram_batcher.flush();
+                    // Tick notification pipeline — emit group summaries.
+                    {
+                        let summaries = state.grouping_engine.tick();
                         if !summaries.is_empty() {
-                            if let Some(ref tg) = state.telegram_client {
-                                let digest = summaries.join("\n");
-                                if let Err(e) = tg.send_raw_html(&digest).await {
-                                    warn!("Telegram batch digest failed: {e:#}");
+                            let tg_level = cfg.telegram.channel_notifications.notification_level;
+                            let tg_summaries: Vec<String> = summaries
+                                .iter()
+                                .filter(|s| notification_pipeline::should_notify_summary(s, tg_level))
+                                .filter(|s| notification_pipeline::is_immediate_threat_summary(s))
+                                .map(|s| s.format_html())
+                                .collect();
+                            if !tg_summaries.is_empty() {
+                                if let Some(ref tg) = state.telegram_client {
+                                    let digest = tg_summaries.join("\n");
+                                    if let Err(e) = tg.send_raw_html(&digest).await {
+                                        warn!("Telegram group summary failed: {e:#}");
+                                    }
                                 }
                             }
                         }
@@ -2239,7 +1845,14 @@ async fn process_incidents(
         .pending_honeypot_choices
         .retain(|_, choice| choice.expires_at > now);
 
-    if new_incidents.entries.is_empty() {
+    // Drain neural incidents (autoencoder) into the processing pipeline.
+    // These couldn't be written to the sensor's file (different user).
+    let neural = std::mem::take(&mut state.neural_incidents);
+    if !neural.is_empty() {
+        info!(count = neural.len(), "processing buffered neural incidents");
+    }
+
+    if new_incidents.entries.is_empty() && neural.is_empty() {
         return 0;
     }
 
@@ -2309,7 +1922,10 @@ async fn process_incidents(
     let mut handled = 0;
     let mut ai_calls_this_tick: usize = 0;
 
-    for incident in &new_incidents.entries {
+    let all_incidents: Vec<&innerwarden_core::incident::Incident> =
+        new_incidents.entries.iter().chain(neural.iter()).collect();
+
+    for incident in &all_incidents {
         state.telemetry.observe_incident(incident);
 
         // VirusTotal enrichment: when YARA scanner detects a binary, check its
@@ -2386,6 +2002,7 @@ async fn process_incidents(
         }
 
         if incident_obvious::try_handle_obvious_incident(incident, data_dir, cfg, state).await {
+            state.grouping_engine.mark_auto_resolved(incident);
             handled += 1;
             continue;
         }
@@ -2421,6 +2038,7 @@ async fn process_incidents(
         )
         .await
         {
+            state.grouping_engine.mark_auto_resolved(incident);
             handled += 1;
             continue;
         }
@@ -2434,6 +2052,7 @@ async fn process_incidents(
         )
         .await
         {
+            state.grouping_engine.mark_auto_resolved(incident);
             handled += 1;
             continue;
         }
@@ -2930,6 +2549,11 @@ async fn process_telegram_approval(
     cfg: &config::AgentConfig,
     state: &mut AgentState,
 ) {
+    // 2FA: intercept TOTP code responses before any other handler
+    if bot_helpers::handle_totp_response(&result, data_dir, cfg, state) {
+        return;
+    }
+
     if handle_telegram_bot_command(&result, data_dir, cfg, state).await {
         return;
     }
@@ -3055,78 +2679,7 @@ async fn process_narrative_tick(
 // LSM auto-enable helpers
 // ---------------------------------------------------------------------------
 
-/// Returns true if an incident represents a high-severity execution threat
-/// that warrants automatic LSM enforcement (blocking /tmp, /dev/shm execution).
-pub(crate) fn should_auto_enable_lsm(incident: &innerwarden_core::incident::Incident) -> bool {
-    use innerwarden_core::event::Severity;
-
-    // Only trigger on high/critical execution-related incidents
-    if !matches!(incident.severity, Severity::High | Severity::Critical) {
-        return false;
-    }
-
-    let detector = incident.incident_id.split(':').next().unwrap_or("");
-    let title_lower = incident.title.to_lowercase();
-    let summary_lower = incident.summary.to_lowercase();
-
-    // execution_guard detecting download+execute, reverse shells, /tmp execution
-    if detector == "suspicious_execution" || detector == "execution_guard" {
-        return title_lower.contains("reverse shell")
-            || title_lower.contains("download")
-            || summary_lower.contains("/tmp/")
-            || summary_lower.contains("/dev/shm/")
-            || summary_lower.contains("curl")
-            || summary_lower.contains("wget");
-    }
-
-    // LSM blocked event (kind=6) means someone already tried - keep enforcement on
-    if detector == "lsm" {
-        return true;
-    }
-
-    // Container escape attempting to execute from temp paths
-    if detector == "container_escape" {
-        return summary_lower.contains("/tmp") || summary_lower.contains("/dev/shm");
-    }
-
-    false
-}
-
-/// Enable LSM enforcement by setting key 0 = 1 in the pinned policy map.
-/// Note: no Path::exists() pre-check — the agent runs as non-root and can't
-/// stat /sys/fs/bpf/, but sudo bpftool can access it fine.
-pub(crate) async fn enable_lsm_enforcement() -> Result<(), String> {
-    const LSM_POLICY_PIN: &str = "/sys/fs/bpf/innerwarden/lsm_policy";
-
-    let output = tokio::process::Command::new("sudo")
-        .args([
-            "bpftool",
-            "map",
-            "update",
-            "pinned",
-            LSM_POLICY_PIN,
-            "key",
-            "0",
-            "0",
-            "0",
-            "0",
-            "value",
-            "1",
-            "0",
-            "0",
-            "0",
-            "any",
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("failed to run bpftool: {e}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
-}
+// LSM enforcement and trust rules moved to trust_rules.rs
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -3266,11 +2819,18 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(data_dir).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            telegram_batcher: telegram::TelegramBatcher::new(60),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
+            environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3517,11 +3077,18 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            telegram_batcher: telegram::TelegramBatcher::new(60),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
+            environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3663,11 +3230,18 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            telegram_batcher: telegram::TelegramBatcher::new(60),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
+            environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3784,11 +3358,18 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            telegram_batcher: telegram::TelegramBatcher::new(60),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
+            environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3917,11 +3498,18 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            telegram_batcher: telegram::TelegramBatcher::new(60),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
+            environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -4027,11 +3615,18 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            telegram_batcher: telegram::TelegramBatcher::new(60),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
+            environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -4149,11 +3744,18 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
-            telegram_batcher: telegram::TelegramBatcher::new(60),
+            grouping_engine: notification_pipeline::GroupingEngine::new(
+                &crate::config::NotificationPipelineConfig::default(),
+            ),
+            environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,

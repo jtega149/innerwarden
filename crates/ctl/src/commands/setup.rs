@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::commands::agent::{cmd_agent, resolve_dashboard_url};
+use crate::commands::agent::{cmd_agent, parse_selection_indices, resolve_dashboard_url};
 use crate::commands::ai::{fetch_models, prompt_ollama_api_key, WIZARD_PROVIDERS};
-use crate::commands::capability::cmd_enable;
+use crate::commands::capability::cmd_enable_with_deferred_restart;
 use crate::commands::notify::cmd_configure_telegram;
 use crate::{
     am_root, config_editor, load_env_file, prompt, reexec_with_sudo, restart_agent, scan, systemd,
@@ -86,6 +86,33 @@ impl SetupResponderPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupMode {
+    Basic,
+    Advanced,
+}
+
+impl SetupMode {
+    fn from_str(input: &str) -> Self {
+        if input.eq_ignore_ascii_case("advanced") {
+            Self::Advanced
+        } else {
+            Self::Basic
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Advanced => "advanced",
+        }
+    }
+
+    fn is_advanced(&self) -> bool {
+        matches!(self, Self::Advanced)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SetupCheck {
     pub(crate) label: String,
@@ -129,6 +156,57 @@ fn prompt_yes_no(label: &str, default_yes: bool) -> Result<bool> {
     Ok(matches!(trimmed.as_str(), "y" | "yes"))
 }
 
+fn prompt_setup_agent_selection(
+    detected_agents: &[innerwarden_agent_guard::detect::DetectedAgent],
+) -> Result<Vec<u32>> {
+    if detected_agents.is_empty() {
+        return Ok(vec![]);
+    }
+
+    if detected_agents.len() == 1 {
+        let agent = &detected_agents[0];
+        let prompt = format!(
+            "  Found 1 running AI agent ({} / pid {}). Connect now? [Y/n] ",
+            agent.name, agent.pid
+        );
+        return Ok(if prompt_yes_no(&prompt, true)? {
+            vec![agent.pid]
+        } else {
+            vec![]
+        });
+    }
+
+    println!("  Found {} running AI agents.", detected_agents.len());
+    println!("  {:<4} {:<8} {:<16} TYPE", "NO.", "PID", "NAME");
+    println!("  {}", "─".repeat(48));
+    for (idx, agent) in detected_agents.iter().enumerate() {
+        println!(
+            "  {:<4} {:<8} {:<16} {}",
+            idx + 1,
+            agent.pid,
+            agent.name,
+            agent.integration
+        );
+    }
+    println!();
+
+    let selection = prompt("  Select agents [ex: 1,3 or all, Enter to skip]")?;
+    let trimmed = selection.trim();
+    if trimmed.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let Some(indices) = parse_selection_indices(trimmed, detected_agents.len()) else {
+        println!("  Invalid selection '{trimmed}'. Skipping agent connection.");
+        return Ok(vec![]);
+    };
+
+    Ok(indices
+        .into_iter()
+        .map(|idx| detected_agents[idx - 1].pid)
+        .collect())
+}
+
 fn parse_setup_capability_hint(hint: &str) -> Option<SetupCapabilityPlan> {
     let parts: Vec<&str> = hint.split_whitespace().collect();
     if parts.len() < 3 || parts[0] != "innerwarden" || parts[1] != "enable" {
@@ -152,6 +230,18 @@ fn parse_setup_capability_hint(hint: &str) -> Option<SetupCapabilityPlan> {
         id: parts[2].to_string(),
         params,
     })
+}
+
+fn setup_capability_restart_needs(capability_id: &str) -> (bool, bool) {
+    match capability_id {
+        // (sensor, agent)
+        "ai" => (false, true),
+        "block-ip" => (false, true),
+        "sudo-protection" => (true, true),
+        "shell-audit" => (true, false),
+        "search-protection" => (true, true),
+        _ => (false, false),
+    }
 }
 
 fn collect_setup_preconfig_plan(agent_doc: Option<&toml_edit::DocumentMut>) -> SetupPreconfigPlan {
@@ -470,6 +560,36 @@ pub(crate) fn count_failed_setup_checks(checks: &[SetupCheck]) -> usize {
         .count()
 }
 
+pub(crate) fn setup_verdict(critical_failures: usize) -> &'static str {
+    if critical_failures == 0 {
+        "READY"
+    } else {
+        "READY_WITH_GAPS"
+    }
+}
+
+pub(crate) fn setup_remediation_command(checks: &[SetupCheck], is_macos: bool) -> Option<String> {
+    let failed_critical: Vec<&str> = checks
+        .iter()
+        .filter(|check| check.critical && !check.ok)
+        .map(|check| check.label.as_str())
+        .collect();
+
+    if failed_critical.is_empty() {
+        return None;
+    }
+
+    if failed_critical.len() == 1 && failed_critical[0] == "Agent service" {
+        return Some(if is_macos {
+            "sudo launchctl kickstart -k system/com.innerwarden.agent".to_string()
+        } else {
+            "sudo systemctl restart innerwarden-agent".to_string()
+        });
+    }
+
+    Some("innerwarden setup --mode advanced".to_string())
+}
+
 fn collect_setup_checks(
     cli: &Cli,
     env_file: &Path,
@@ -590,10 +710,12 @@ fn collect_setup_checks(
     ]
 }
 
-pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
+pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     if !am_root() {
         return reexec_with_sudo();
     }
+
+    let setup_mode = SetupMode::from_str(mode);
 
     let env_file = cli
         .agent_config
@@ -610,13 +732,13 @@ pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
     let mesh_ok = agent_bool(agent_doc.as_ref(), "mesh", "enabled");
 
     println!();
-    println!("  Setup  (4 quick steps)\n");
+    println!("  Setup  ({} · 4 quick steps)\n", setup_mode.label());
 
     let preconfig_plan = collect_setup_preconfig_plan(agent_doc.as_ref());
     let apply_preconfig = if preconfig_plan.is_empty() {
         false
     } else {
-        println!("  Safe defaults\n");
+        println!("  Pre-configuration detected\n");
         for capability in &preconfig_plan.essential_capabilities {
             println!("  - Enable {}", capability.id);
         }
@@ -627,7 +749,12 @@ pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
             println!("  - Webhook alerts: High + Critical");
         }
         println!();
-        prompt_yes_no("  Apply these during setup? [Y/n] ", true)?
+        if setup_mode.is_advanced() {
+            prompt_yes_no("  Apply these during setup? [Y/n] ", true)?
+        } else {
+            println!("  Included in final review before apply.");
+            true
+        }
     };
 
     println!();
@@ -719,13 +846,16 @@ pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
     let enable_mesh = if mesh_ok {
         println!("  Mesh                OK (enabled)");
         true
-    } else {
+    } else if setup_mode.is_advanced() {
         let enabled = prompt_yes_no(
             "  Share threat blocks with your other InnerWarden nodes? [y/N] ",
             false,
         )?;
         println!();
         enabled
+    } else {
+        println!("  Mesh                default: off (basic mode)");
+        false
     };
 
     let review_profile = profile_plan
@@ -777,20 +907,30 @@ pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
     println!();
 
     let registry = CapabilityRegistry::default_all();
+    let mut restart_sensor_needed = false;
     if apply_preconfig {
         for capability in &preconfig_plan.essential_capabilities {
-            if let Err(err) = cmd_enable(
+            if let Err(err) = cmd_enable_with_deferred_restart(
                 cli,
                 &registry,
                 &capability.id,
                 capability.params.clone(),
                 true,
+                true,
             ) {
                 println!("  [warn] Could not enable {}: {err:#}", capability.id);
+            } else {
+                let (sensor_needed, _agent_needed) = setup_capability_restart_needs(&capability.id);
+                restart_sensor_needed |= sensor_needed;
             }
         }
         if preconfig_plan.set_telegram_min_severity {
             let _ = config_editor::write_str(&cli.agent_config, "telegram", "min_severity", "high");
+            // Sane defaults: daily digest at 9 AM, budget of 10 immediate notifications/day.
+            // Only real threats ping Telegram; everything else goes to the digest.
+            let _ =
+                config_editor::write_int(&cli.agent_config, "telegram", "daily_summary_hour", 9);
+            let _ = config_editor::write_int(&cli.agent_config, "telegram", "daily_budget", 10);
         }
         if preconfig_plan.set_webhook_min_severity {
             let _ = config_editor::write_str(&cli.agent_config, "webhook", "min_severity", "high");
@@ -812,7 +952,7 @@ pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
         "dry_run",
         responder_plan.dry_run,
     )?;
-    let mut restart_needed = true;
+    let restart_agent_needed = true;
 
     if enable_mesh && !mesh_ok {
         config_editor::write_bool(&cli.agent_config, "mesh", "enabled", true)?;
@@ -824,16 +964,33 @@ pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
     }
 
     let needs_telegram_setup = !telegram_ok && notification_plan.needs_telegram();
+    let mut telegram_restarted_agent = false;
     if needs_telegram_setup {
         println!("  Telegram\n");
         if let Err(err) = cmd_configure_telegram(cli, None, None, false) {
             println!("  [warn] Telegram setup did not finish: {err:#}");
         } else {
-            restart_needed = false;
+            telegram_restarted_agent = true;
+            // Pre-configure sane notification defaults so users don't get spammed.
+            let _ =
+                config_editor::write_int(&cli.agent_config, "telegram", "daily_summary_hour", 9);
+            let _ = config_editor::write_int(&cli.agent_config, "telegram", "daily_budget", 10);
         }
     }
 
-    if restart_needed {
+    if restart_sensor_needed {
+        if std::env::consts::OS == "macos" {
+            println!("  [warn] innerwarden-sensor restart skipped on macOS.");
+        } else if cli.dry_run {
+            println!("  [dry-run] would restart innerwarden-sensor");
+        } else if let Err(err) = systemd::restart_service("innerwarden-sensor", false) {
+            println!("  [warn] Could not restart innerwarden-sensor: {err:#}");
+        } else {
+            println!("  [ok] innerwarden-sensor restarted");
+        }
+    }
+
+    if restart_agent_needed && !telegram_restarted_agent {
         restart_agent(cli);
     }
 
@@ -842,27 +999,27 @@ pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
         use innerwarden_agent_guard::signatures::SignatureIndex;
 
         let index = SignatureIndex::new();
-        detect::scan_processes(&index).len()
+        detect::scan_processes(&index)
     };
 
-    if detected_agents > 0 {
-        println!();
-        let prompt = if detected_agents == 1 {
-            "  We found 1 running AI agent. Connect it now? [Y/n] "
-        } else {
-            "  We found running AI agents. Connect them now? [Y/n] "
-        };
-        if prompt_yes_no(prompt, true)? {
-            let connect_command = AgentCommand::Connect {
-                pid: None,
-                name: None,
-                label: None,
-            };
-            let _ = cmd_agent(cli, Some(&connect_command));
-        }
-    } else {
+    if detected_agents.is_empty() {
         println!();
         println!("  No supported AI agents detected right now.");
+    } else {
+        println!();
+        let selected_agent_pids = prompt_setup_agent_selection(&detected_agents)?;
+        if selected_agent_pids.is_empty() {
+            println!("  Agent connection skipped.");
+        } else {
+            for selected_pid in selected_agent_pids {
+                let command = AgentCommand::Connect {
+                    pid: Some(selected_pid),
+                    name: None,
+                    label: Some("setup".to_string()),
+                };
+                let _ = cmd_agent(cli, Some(&command));
+            }
+        }
     }
 
     let checks = collect_setup_checks(
@@ -871,18 +1028,14 @@ pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
         notification_plan,
         responder_plan,
         enable_mesh,
-        detected_agents,
+        detected_agents.len(),
     );
     let critical_failures = count_failed_setup_checks(&checks);
+    let verdict = setup_verdict(critical_failures);
+    let remediation = setup_remediation_command(&checks, std::env::consts::OS == "macos");
 
     println!();
-    if critical_failures == 0 {
-        println!("  Ready to use\n");
-    } else if critical_failures == 1 {
-        println!("  Setup finished with 1 item to fix\n");
-    } else {
-        println!("  Setup finished with {critical_failures} items to fix\n");
-    }
+    println!("  {verdict}\n");
 
     for check in &checks {
         let status = if check.ok { "OK" } else { "FIX" };
@@ -894,7 +1047,15 @@ pub(crate) fn cmd_setup(cli: &Cli) -> Result<()> {
         println!("  Dashboard: {}", resolve_dashboard_url(cli));
         println!("  Re-run anytime: innerwarden setup");
     } else {
-        println!("  Run innerwarden setup again after fixing the items above.");
+        if critical_failures == 1 {
+            println!("  1 critical item needs attention.");
+        } else {
+            println!("  {critical_failures} critical items need attention.");
+        }
+        if let Some(command) = remediation {
+            println!("  Run this command to close critical gaps:");
+            println!("    {command}");
+        }
     }
 
     Ok(())

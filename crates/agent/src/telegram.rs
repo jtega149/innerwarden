@@ -224,165 +224,73 @@ impl TelegramClient {
             "disable_web_page_preview": true,
         });
 
-        match mode {
-            GuardianMode::Guard => {
-                // GUARD: agent will act - show investigate button only, no Block/Ignore
-                if let Some(ip) = first_ip_entity(incident) {
-                    if let Some(ref base_url) = self.dashboard_url {
-                        let link = format!(
-                            "{base_url}/?subject_type=ip&subject={ip}&date={}",
-                            incident.ts.format("%Y-%m-%d")
-                        );
-                        body["reply_markup"] = serde_json::json!({
-                            "inline_keyboard": [[{
+        // Build inline keyboard based on mode.
+        // Guard: compact — just "Not a threat" + "Investigate".
+        // Watch/DryRun: operator decides — Block + Ignore + Investigate + "Not a threat".
+        {
+            let fp_label = if is_simple {
+                "Not a threat"
+            } else {
+                "Report FP"
+            };
+            let fp_btn = serde_json::json!({
+                "text": format!("\u{1f4dd} {fp_label}"),
+                "callback_data": callback_data("fp:", &incident.incident_id)
+            });
+
+            match mode {
+                GuardianMode::Guard => {
+                    let mut row = vec![fp_btn];
+                    if let Some(ip) = first_ip_entity(incident) {
+                        if let Some(ref base_url) = self.dashboard_url {
+                            let link = format!(
+                                "{base_url}/?subject_type=ip&subject={ip}&date={}",
+                                incident.ts.format("%Y-%m-%d")
+                            );
+                            row.push(serde_json::json!({
                                 "text": "🔍 Investigate",
                                 "url": link
-                            }]]
-                        });
+                            }));
+                        }
                     }
+                    body["reply_markup"] = serde_json::json!({ "inline_keyboard": [row] });
                 }
-            }
-            GuardianMode::Watch | GuardianMode::DryRun => {
-                // WATCH/DryRun: operator makes the call - add Block/Ignore buttons
-                if let Some(ip) = first_ip_entity(incident) {
-                    let mut keyboard: Vec<Vec<serde_json::Value>> = vec![vec![
-                        serde_json::json!({
-                            "text": format!("🛡 Block {ip}"),
-                            "callback_data": format!("quick:block:{ip}")
-                        }),
-                        serde_json::json!({
-                            "text": "🙈 Ignore",
-                            "callback_data": "quick:ignore"
-                        }),
-                    ]];
+                GuardianMode::Watch | GuardianMode::DryRun => {
+                    let mut keyboard: Vec<Vec<serde_json::Value>> = Vec::new();
 
-                    if let Some(ref base_url) = self.dashboard_url {
-                        let link = format!(
-                            "{base_url}/?subject_type=ip&subject={ip}&date={}",
-                            incident.ts.format("%Y-%m-%d")
-                        );
+                    if let Some(ip) = first_ip_entity(incident) {
+                        keyboard.push(vec![
+                            serde_json::json!({
+                                "text": format!("🛡 Block {ip}"),
+                                "callback_data": format!("quick:block:{ip}")
+                            }),
+                            serde_json::json!({
+                                "text": "🙈 Ignore",
+                                "callback_data": "quick:ignore"
+                            }),
+                        ]);
+
+                        if let Some(ref base_url) = self.dashboard_url {
+                            let link = format!(
+                                "{base_url}/?subject_type=ip&subject={ip}&date={}",
+                                incident.ts.format("%Y-%m-%d")
+                            );
+                            keyboard.push(vec![serde_json::json!({
+                                "text": "🔍 Investigate in dashboard",
+                                "url": link
+                            })]);
+                        }
+                    } else if let Some(ref base_url) = self.dashboard_url {
+                        let link = format!("{base_url}/?date={}", incident.ts.format("%Y-%m-%d"));
                         keyboard.push(vec![serde_json::json!({
                             "text": "🔍 Investigate in dashboard",
                             "url": link
                         })]);
                     }
 
+                    keyboard.push(vec![fp_btn]);
                     body["reply_markup"] = serde_json::json!({ "inline_keyboard": keyboard });
-                } else if let Some(ref base_url) = self.dashboard_url {
-                    let link = format!("{base_url}/?date={}", incident.ts.format("%Y-%m-%d"));
-                    body["reply_markup"] = serde_json::json!({
-                        "inline_keyboard": [[{
-                            "text": "🔍 Investigate in dashboard",
-                            "url": link
-                        }]]
-                    });
                 }
-            }
-        }
-
-        // Dev mode: append "Check FP" button to every incident notification
-        if self.dev_mode {
-            let incident_id = &incident.incident_id;
-            let fp_btn = serde_json::json!({
-                "text": "\u{1f52c} Check FP",
-                "callback_data": callback_data("fp:check:", incident_id)
-            });
-            if let Some(markup) = body.get_mut("reply_markup") {
-                if let Some(kb) = markup.get_mut("inline_keyboard") {
-                    if let Some(arr) = kb.as_array_mut() {
-                        arr.push(serde_json::json!([fp_btn]));
-                    }
-                }
-            } else {
-                body["reply_markup"] = serde_json::json!({ "inline_keyboard": [[fp_btn]] });
-            }
-        }
-
-        // Triage row: allowlist + report FP buttons (both profiles)
-        {
-            let comm = if let Some(arr) = incident.evidence.as_array() {
-                arr.first()
-                    .and_then(|e| e.get("comm"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                incident
-                    .evidence
-                    .get("comm")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-            let ip = first_ip_entity(incident);
-
-            let mut triage_row = vec![];
-            if !comm.is_empty() {
-                let label = if is_simple {
-                    "Allow this"
-                } else {
-                    "Add to allowlist"
-                };
-                triage_row.push(serde_json::json!({
-                    "text": format!("\u{2705} {label}"),
-                    "callback_data": callback_data("allow:proc:", &comm)
-                }));
-            }
-            if let Some(ref ip_val) = ip {
-                let label = if is_simple {
-                    "Allow this"
-                } else {
-                    "Allowlist IP"
-                };
-                triage_row.push(serde_json::json!({
-                    "text": format!("\u{2705} {label}"),
-                    "callback_data": callback_data("allow:ip:", ip_val)
-                }));
-            }
-
-            let fp_label = if is_simple {
-                "Not a threat"
-            } else {
-                "Report FP"
-            };
-            triage_row.push(serde_json::json!({
-                "text": format!("\u{1f4dd} {fp_label}"),
-                "callback_data": callback_data("fp:", &incident.incident_id)
-            }));
-
-            if !triage_row.is_empty() {
-                if let Some(markup) = body.get_mut("reply_markup") {
-                    if let Some(kb) = markup.get_mut("inline_keyboard") {
-                        if let Some(arr) = kb.as_array_mut() {
-                            arr.push(serde_json::json!(triage_row));
-                        }
-                    }
-                } else {
-                    body["reply_markup"] = serde_json::json!({ "inline_keyboard": [triage_row] });
-                }
-            }
-        }
-
-        // Explain button: both profiles get "What does this mean?"
-        {
-            let detector = extract_detector(&incident.incident_id).to_string();
-            let explain_label = if is_simple {
-                "What does this mean?"
-            } else {
-                "Explain this alert"
-            };
-            let explain_btn = serde_json::json!({
-                "text": format!("\u{2753} {explain_label}"),
-                "callback_data": callback_data("explain:", &detector)
-            });
-            if let Some(markup) = body.get_mut("reply_markup") {
-                if let Some(kb) = markup.get_mut("inline_keyboard") {
-                    if let Some(arr) = kb.as_array_mut() {
-                        arr.push(serde_json::json!([explain_btn]));
-                    }
-                }
-            } else {
-                body["reply_markup"] = serde_json::json!({ "inline_keyboard": [[explain_btn]] });
             }
         }
 
@@ -433,33 +341,40 @@ impl TelegramClient {
 
         let text = if dry_run {
             format!(
-                "🧪 <b>Simulation</b>\n\
-                 Would've {action_label} <code>{target}</code>{enrichment}\n\
+                "\u{1f9ea} <b>Simulation</b>\n\
+                 \n\
+                 Would have {action_label} <code>{target}</code>\n\
+                 {enrichment}\n\
                  <i>{incident_title}</i>\n\
-                 Confidence: {pct}% - dry-run, no real action.\n\
-                 <i>Want me to start dropping these for real? Enable live mode.</i>{cf_line}",
+                 \n\
+                 Confidence: {pct}% \u{2014} dry-run, no real action.\n\
+                 <i>Enable live mode to let me handle these.</i>",
                 target = escape_html(target),
                 incident_title = escape_html(incident_title),
             )
         } else if action_label.to_lowercase().contains("ignore") {
             format!(
-                "📝 <b>Analyzed &amp; dismissed</b>\n\
-                 <i>{incident_title}</i>\n\
-                 Confidence: {pct}% - No action needed.{enrichment}",
+                "\u{2705} <b>Analyzed &amp; cleared</b>\n\
+                 \n\
+                 <i>{incident_title}</i>{enrichment}\n\
+                 \n\
+                 Confidence: {pct}% \u{2014} no action needed.",
                 incident_title = escape_html(incident_title),
             )
         } else {
             let kill_quip = match pct {
-                95..=100 => "Clean kill. Zero doubt.",
-                85..=94 => "Textbook containment.",
-                70..=84 => "Threat actor down. Solid confidence.",
-                _ => "Contained - keeping eyes on it.",
+                95..=100 => "Definitive match.",
+                85..=94 => "High-confidence containment.",
+                70..=84 => "Solid confidence. Monitoring for follow-up.",
+                _ => "Contained. Keeping watch.",
             };
             format!(
-                "🔥 <b>Threat neutralized</b>\n\
+                "\u{1f6e1}\u{fe0f} <b>Threat neutralized</b>\n\
+                 \n\
                  {action_label} <code>{target}</code>{enrichment}\n\
                  <i>{incident_title}</i>\n\
-                 Confidence: {pct}% - {kill_quip}{cf_line}",
+                 \n\
+                 Confidence: {pct}% \u{2014} {kill_quip}{cf_line}",
                 target = escape_html(target),
                 incident_title = escape_html(incident_title),
             )
@@ -847,6 +762,12 @@ impl TelegramClient {
             lines.push(cmd_block.trim_end().to_string());
         }
 
+        if credentials.is_empty() && commands.is_empty() {
+            lines.push(
+                "\nℹ️ Probe-only session: no auth attempts or shell commands captured.".to_string(),
+            );
+        }
+
         if !iocs.is_empty() {
             let ioc_text = iocs.format_telegram();
             if !ioc_text.is_empty() {
@@ -1050,10 +971,15 @@ impl TelegramClient {
 
     /// React to a message with 👀 (processing indicator).
     pub async fn react_eyes(&self, chat_id: i64, message_id: i64) {
+        self.react(chat_id, message_id, "👀").await;
+    }
+
+    /// React to a message with an arbitrary emoji.
+    pub async fn react(&self, chat_id: i64, message_id: i64, emoji: &str) {
         let body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": message_id,
-            "reaction": [{ "type": "emoji", "emoji": "👀" }]
+            "reaction": [{ "type": "emoji", "emoji": emoji }]
         });
         let _ = self.post_json("setMessageReaction", &body).await;
     }
@@ -1125,6 +1051,16 @@ impl TelegramClient {
                                 .clone()
                                 .unwrap_or_else(|| "unknown".to_string());
 
+                            // Extract chat_id + message_id for emoji reactions
+                            let cb_chat_id = callback
+                                .message
+                                .as_ref()
+                                .and_then(|m| m.chat.as_ref())
+                                .map(|c| c.id)
+                                .unwrap_or(0);
+                            let cb_msg_id =
+                                callback.message.as_ref().map(|m| m.message_id).unwrap_or(0);
+
                             if let Some(data) = &callback.data {
                                 if let Some(incident_id) = data.strip_prefix("fp:check:") {
                                     // Dev mode: log incident as potential false positive
@@ -1169,11 +1105,17 @@ impl TelegramClient {
                                             ),
                                         )
                                         .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f4dd}").await;
+                                    }
                                 } else if let Some(detector) = data.strip_prefix("explain:") {
                                     // Simple profile: send a longer explanation of the detector
                                     let explanation = explain_detector(detector);
                                     let _ = self.answer_callback(&callback.id).await;
                                     let _ = self.send_raw_html(&explanation).await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f4a1}").await;
+                                    }
                                 } else if data == "quick:ignore" {
                                     // Just ack with toast - no further action needed
                                     let _ = self
@@ -1182,6 +1124,9 @@ impl TelegramClient {
                                             "👍 Logged as false positive. Keeping eyes on it.",
                                         )
                                         .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f44d}").await;
+                                    }
                                 } else if let Some(ip_str) = data.strip_prefix("quick:block:") {
                                     // Validate IP format before processing
                                     if ip_str.parse::<std::net::IpAddr>().is_ok() {
@@ -1192,6 +1137,10 @@ impl TelegramClient {
                                                 &format!("🛡 Dropping {ip} at the firewall..."),
                                             )
                                             .await;
+                                        if cb_chat_id != 0 {
+                                            self.react(cb_chat_id, cb_msg_id, "\u{1f6e1}\u{fe0f}")
+                                                .await;
+                                        }
                                         let result = ApprovalResult {
                                             incident_id: format!("__quick_block__:{ip}"),
                                             approved: true,
@@ -1226,6 +1175,15 @@ impl TelegramClient {
                                         };
                                         let _ =
                                             self.answer_callback_toast(&callback.id, &toast).await;
+                                        if cb_chat_id != 0 {
+                                            let emoji = match action {
+                                                "honeypot" => "\u{1f36f}",
+                                                "block" => "\u{1f6ab}",
+                                                "monitor" => "\u{1f441}\u{fe0f}",
+                                                _ => "\u{1f44d}",
+                                            };
+                                            self.react(cb_chat_id, cb_msg_id, emoji).await;
+                                        }
                                         let result = ApprovalResult {
                                             incident_id: format!("__hpot__:{ip}"),
                                             approved: action != "ignore",
@@ -1244,6 +1202,9 @@ impl TelegramClient {
                                             &format!("\u{2705} Adding {} to allowlist...", rest),
                                         )
                                         .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{2705}").await;
+                                    }
                                     let result = ApprovalResult {
                                         incident_id: format!("__allow_proc__:{rest}"),
                                         approved: true,
@@ -1261,6 +1222,9 @@ impl TelegramClient {
                                             &format!("\u{2705} Adding {} to allowlist...", rest),
                                         )
                                         .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{2705}").await;
+                                    }
                                     let result = ApprovalResult {
                                         incident_id: format!("__allow_ip__:{rest}"),
                                         approved: true,
@@ -1281,6 +1245,9 @@ impl TelegramClient {
                                             "\u{1f4dd} Reported as false positive. Thanks!",
                                         )
                                         .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f4dd}").await;
+                                    }
                                     let result = ApprovalResult {
                                         incident_id: format!("__fp__:{rest}"),
                                         approved: true,
@@ -1518,6 +1485,23 @@ impl TelegramClient {
         method: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        // Audit log: record every outgoing Telegram message for debugging notification noise.
+        if method == "sendMessage" {
+            let text_preview = body["text"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>()
+                .replace('\n', " ");
+            info!(
+                target: "telegram_audit",
+                method = method,
+                text_preview = %text_preview,
+                "Telegram outgoing message"
+            );
+        }
+
         // Enforce message length limit on outgoing text
         let body = if let Some(text) = body["text"].as_str() {
             let safe_text = enforce_length(text);
@@ -1602,6 +1586,16 @@ struct CallbackQuery {
     from: User,
     #[serde(default)]
     data: Option<String>,
+    #[serde(default)]
+    message: Option<CallbackMessage>,
+}
+
+/// Minimal representation of the message attached to a callback query.
+#[derive(Debug, Deserialize)]
+struct CallbackMessage {
+    message_id: i64,
+    #[serde(default)]
+    chat: Option<Chat>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1620,8 +1614,8 @@ fn format_incident_message(
     mode: GuardianMode,
 ) -> String {
     let sev = severity_label(incident);
-    let source_icon = source_icon(&incident.tags);
     let entity_line = entity_summary(incident);
+    let detector = extract_detector(&incident.incident_id);
 
     let summary_trunc = if incident.summary.len() > 200 {
         format!("{}…", &incident.summary[..200])
@@ -1629,33 +1623,17 @@ fn format_incident_message(
         incident.summary.clone()
     };
 
-    // Mode-specific header and call-to-action
-    let (mode_prefix, cta) = match mode {
-        GuardianMode::Guard => {
-            let quip = incident_quip(incident);
-            (
-                "⚡",
-                format!("\n{quip}\n<i>Handling it - stand by for action report.</i>"),
-            )
-        }
-        GuardianMode::DryRun => {
-            let quip = incident_quip(incident);
-            (
-                "🧪",
-                format!("\n{quip}\n<i>Dry-run - I'd act on this. Enable live mode to let me.</i>"),
-            )
-        }
-        GuardianMode::Watch => {
-            let quip = incident_quip(incident);
-            ("🚨", quip.to_string())
-        }
+    let mode_line = match mode {
+        GuardianMode::Guard => "\u{26a1} Handling — stand by for action report.",
+        GuardianMode::DryRun => "\u{1f9ea} Dry-run — would act. Enable live mode.",
+        GuardianMode::Watch => "\u{1f440} Watching — operator action required.",
     };
 
     let link_line = dashboard_url
         .and_then(|base| first_ip_entity(incident).map(|ip| (base, ip)))
         .map(|(base, ip)| {
             format!(
-                "\n🔗 <a href=\"{}/?subject_type=ip&subject={}&date={}\">Investigate</a>",
+                "\n\u{1f517} <a href=\"{}/?subject_type=ip&subject={}&date={}\">Investigate</a>",
                 base,
                 ip,
                 incident.ts.format("%Y-%m-%d")
@@ -1663,31 +1641,21 @@ fn format_incident_message(
         })
         .unwrap_or_default();
 
-    let prefix_line = if mode_prefix.is_empty() {
-        String::new()
-    } else {
-        format!("{mode_prefix} ")
-    };
-
     format!(
-        "{source_icon} {prefix_line}{sev}\n\
+        "{sev} <code>{detector}</code>\n\
+         \n\
          <b>{title}</b>\n\
          {entity_line}\n\
          <i>{summary}</i>\n\
          \n\
-         {cta}{link_line}",
+         {mode_line}{link_line}",
         title = escape_html(&incident.title),
         summary = escape_html(&summary_trunc),
-        entity_line = entity_line,
-        sev = sev,
-        source_icon = source_icon,
-        prefix_line = prefix_line,
-        cta = cta,
-        link_line = link_line,
     )
 }
 
 /// Returns a hacker-flavored one-liner based on the incident type.
+#[allow(dead_code)]
 fn incident_quip(incident: &Incident) -> &'static str {
     let title = incident.title.to_lowercase();
     let tags: Vec<&str> = incident.tags.iter().map(|s| s.as_str()).collect();
@@ -1766,6 +1734,32 @@ fn plain_action(action: &str) -> String {
     }
     // fallback
     a.to_string()
+}
+
+/// Human-friendly detector name for digest messages.
+fn friendly_detector_name(detector: &str) -> &str {
+    match detector {
+        "ssh_bruteforce" => "SSH brute force attempts blocked",
+        "credential_stuffing" => "credential stuffing attempts blocked",
+        "port_scan" => "port scans detected",
+        "packet_flood" => "DDoS/flood events handled",
+        "discovery_burst" => "reconnaissance scans detected",
+        "suspicious_execution" => "suspicious executions (reviewed safe)",
+        "web_scan" => "web vulnerability scans blocked",
+        "user_agent_scanner" => "bot scanners blocked",
+        "search_abuse" => "search abuse attempts blocked",
+        "rootkit" => "timing anomalies (cloud noise)",
+        "firmware_integrity" => "firmware checks (cloud noise)",
+        "sigma" => "Sigma rule matches",
+        "neural_anomaly" => "AI spider sense detections",
+        "correlated_anomaly" => "AI + statistical convergence alerts",
+        "process_tree" => "process chain alerts",
+        "user_creation" => "user creation events",
+        "sensitive_write" => "sensitive file writes",
+        "docker_anomaly" => "Docker anomalies",
+        "outbound_anomaly" => "outbound traffic anomalies",
+        _ => detector,
+    }
 }
 
 fn severity_label(incident: &Incident) -> &'static str {
@@ -1996,7 +1990,6 @@ mod tests {
         assert!(msg.contains("CRITICAL"));
         assert!(msg.contains("SSH brute force"));
         assert!(msg.contains("1.2.3.4"));
-        assert!(msg.contains("🔬"), "falco icon should appear");
     }
 
     #[test]
@@ -2008,7 +2001,6 @@ mod tests {
         );
         let msg = format_incident_message(&inc, Some("http://127.0.0.1:8787"), GuardianMode::Watch);
         assert!(msg.contains("HIGH"));
-        assert!(msg.contains("🌐"), "suricata icon");
         assert!(msg.contains("Investigate"));
         assert!(msg.contains("203.0.113.10"));
     }
@@ -2024,11 +2016,6 @@ mod tests {
         assert!(
             msg.contains("action report"),
             "GUARD mode mentions action report"
-        );
-        // GUARD mode should NOT show Block/Ignore buttons inline
-        assert!(
-            !msg.contains("🛡 Block"),
-            "GUARD mode has no block CTA button text"
         );
     }
 
@@ -2396,47 +2383,6 @@ mod tests {
         assert!("".parse::<std::net::IpAddr>().is_err());
     }
 
-    #[test]
-    fn telegram_batcher_groups_same_detector() {
-        let mut b = super::TelegramBatcher::new(30);
-        let now = chrono::Utc::now();
-
-        let inc = |det: &str, sev: &str| Incident {
-            ts: now,
-            host: "test".into(),
-            incident_id: format!("{det}:x:{}", now.format("%H:%M")),
-            severity: match sev {
-                "critical" => innerwarden_core::event::Severity::Critical,
-                "high" => innerwarden_core::event::Severity::High,
-                _ => innerwarden_core::event::Severity::Medium,
-            },
-            title: format!("{det} alert"),
-            summary: format!("{det} summary"),
-            evidence: serde_json::json!([]),
-            recommended_checks: vec![],
-            tags: vec![],
-            entities: vec![],
-        };
-
-        // Critical always immediate
-        assert!(b.should_send_immediately(&inc("reverse_shell", "critical")));
-
-        // First ssh_bruteforce goes through
-        assert!(b.should_send_immediately(&inc("ssh_bruteforce", "high")));
-        b.record(&inc("ssh_bruteforce", "high"));
-
-        // Second ssh_bruteforce should batch
-        assert!(!b.should_send_immediately(&inc("ssh_bruteforce", "high")));
-        b.record(&inc("ssh_bruteforce", "high"));
-        b.record(&inc("ssh_bruteforce", "high"));
-
-        // Flush produces summary
-        let summaries = b.flush();
-        assert_eq!(summaries.len(), 1);
-        assert!(summaries[0].contains("ssh_bruteforce"));
-        assert!(summaries[0].contains("2")); // 2 batched
-    }
-
     // -----------------------------------------------------------------------
     // Simple profile tests
     // -----------------------------------------------------------------------
@@ -2450,11 +2396,11 @@ mod tests {
         );
         let msg = format_simple_message(&inc, None, GuardianMode::Guard);
         assert!(
-            msg.contains("tried to guess your server's password"),
-            "should contain plain description"
+            msg.contains("Login Attack Blocked"),
+            "should contain detector label"
         );
-        assert!(msg.contains("Handled automatically."));
-        assert!(!msg.contains("1.2.3.4"), "simple mode must not show IPs");
+        assert!(msg.contains("Handled automatically"));
+        assert!(msg.contains("1.2.3.4"), "simple mode shows IPs now");
         assert!(
             !msg.contains("ssh_bruteforce"),
             "simple mode must not show detector name"
@@ -2473,7 +2419,7 @@ mod tests {
             vec![EntityRef::ip("5.6.7.8".to_string())],
         );
         let msg = format_simple_message(&inc, None, GuardianMode::Watch);
-        assert!(msg.contains("Monitoring the situation."));
+        assert!(msg.contains("Needs your attention"));
     }
 
     #[test]
@@ -2481,7 +2427,7 @@ mod tests {
         let mut inc = make_incident(Severity::Medium, vec![], vec![]);
         inc.incident_id = "unknown_detector:foo:bar".to_string();
         let msg = format_simple_message(&inc, None, GuardianMode::Guard);
-        assert!(msg.contains("Suspicious activity detected."));
+        assert!(msg.contains("Threat Detected"));
     }
 
     #[test]
@@ -2539,12 +2485,100 @@ mod tests {
     }
 
     #[test]
+    fn format_daily_digest_enriched_simple_with_pipeline() {
+        let stats = super::PipelineDigestStats {
+            suppressed_count: 85,
+            auto_resolved_groups: 12,
+            needs_review_groups: 0,
+            deferred: vec![],
+        };
+        let msg = format_daily_digest_enriched(42, 30, 0, 3, "ssh_bruteforce", 15, true, &stats);
+        assert!(msg.contains("12 threat groups auto-resolved"));
+        assert!(msg.contains("under control"));
+        assert!(!msg.contains("need your review"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_simple_needs_review() {
+        let stats = super::PipelineDigestStats {
+            suppressed_count: 50,
+            auto_resolved_groups: 8,
+            needs_review_groups: 3,
+            deferred: vec![],
+        };
+        let msg = format_daily_digest_enriched(42, 30, 2, 5, "ssh_bruteforce", 15, true, &stats);
+        assert!(msg.contains("3 groups need your review"));
+        assert!(!msg.contains("under control"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_technical_with_pipeline() {
+        let stats = super::PipelineDigestStats {
+            suppressed_count: 100,
+            auto_resolved_groups: 15,
+            needs_review_groups: 2,
+            deferred: vec![],
+        };
+        let msg = format_daily_digest_enriched(42, 30, 2, 5, "ssh_bruteforce", 15, false, &stats);
+        assert!(msg.contains("100 grouped"));
+        assert!(msg.contains("15 auto-resolved"));
+        assert!(msg.contains("2 need review"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_no_pipeline_data() {
+        let stats = super::PipelineDigestStats {
+            suppressed_count: 0,
+            auto_resolved_groups: 0,
+            needs_review_groups: 0,
+            deferred: vec![],
+        };
+        let msg = format_daily_digest_enriched(42, 30, 2, 5, "ssh_bruteforce", 15, true, &stats);
+        // No pipeline line when all zeros
+        assert!(!msg.contains("alerts silenced"));
+        assert!(!msg.contains("auto-resolved"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_simple_with_deferred() {
+        let stats = super::PipelineDigestStats {
+            suppressed_count: 20,
+            auto_resolved_groups: 5,
+            needs_review_groups: 0,
+            deferred: vec![
+                ("ssh_bruteforce".into(), 18),
+                ("discovery_burst".into(), 9),
+                ("packet_flood".into(), 3),
+            ],
+        };
+        let msg = format_daily_digest_enriched(60, 40, 0, 5, "ssh_bruteforce", 18, true, &stats);
+        assert!(msg.contains("Handled silently"));
+        assert!(msg.contains("18 SSH brute force attempts blocked"));
+        assert!(msg.contains("9 reconnaissance scans detected"));
+        assert!(msg.contains("3 DDoS/flood events handled"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_technical_with_deferred() {
+        let stats = super::PipelineDigestStats {
+            suppressed_count: 10,
+            auto_resolved_groups: 3,
+            needs_review_groups: 1,
+            deferred: vec![("ssh_bruteforce".into(), 12), ("port_scan".into(), 5)],
+        };
+        let msg = format_daily_digest_enriched(42, 30, 0, 5, "ssh_bruteforce", 12, false, &stats);
+        assert!(msg.contains("Deferred:"));
+        assert!(msg.contains("ssh_bruteforce=12"));
+        assert!(msg.contains("port_scan=5"));
+    }
+
+    #[test]
     fn format_simple_status_safe() {
         let msg = format_simple_status(false, false, false, 45, 1200, "3 hours ago");
         assert!(msg.contains("\u{1f7e2}")); // 🟢
         assert!(msg.contains("safe"));
-        assert!(msg.contains("45 days"));
-        assert!(msg.contains("1200 attacks blocked"));
+        assert!(msg.contains("45"));
+        assert!(msg.contains("1200"));
         assert!(msg.contains("3 hours ago"));
     }
 
@@ -2624,117 +2658,7 @@ mod tests {
 // Telegram Batcher — groups repeated alerts into periodic summaries
 // ---------------------------------------------------------------------------
 
-use std::collections::HashMap;
-
-/// Groups repeated incidents by detector to avoid Telegram spam.
-/// Critical incidents always go immediately. Repeated incidents of the
-/// same detector within `window_secs` are batched into a single summary.
-pub struct TelegramBatcher {
-    /// detector → (count, first_title, unique_ips)
-    pending: HashMap<String, (u32, String, std::collections::HashSet<String>)>,
-    /// When the current batch window started
-    window_start: chrono::DateTime<chrono::Utc>,
-    /// Batch window in seconds
-    window_secs: i64,
-    /// Detectors seen in current window (for "first occurrence" logic)
-    seen_this_window: std::collections::HashSet<String>,
-}
-
-impl TelegramBatcher {
-    pub fn new(window_secs: i64) -> Self {
-        Self {
-            pending: HashMap::new(),
-            window_start: chrono::Utc::now(),
-            window_secs,
-            seen_this_window: std::collections::HashSet::new(),
-        }
-    }
-
-    /// Returns true if this incident should be sent immediately (not batched).
-    /// Critical severity always goes immediately. First occurrence of a detector
-    /// in a window also goes immediately. Subsequent same-detector alerts batch.
-    pub fn should_send_immediately(&self, incident: &Incident) -> bool {
-        // Critical always immediate
-        if matches!(
-            incident.severity,
-            innerwarden_core::event::Severity::Critical
-        ) {
-            return true;
-        }
-
-        let detector = extract_detector(&incident.incident_id);
-
-        // First occurrence in this window — send immediately
-        !self.seen_this_window.contains(detector)
-    }
-
-    /// Record an incident for batching (call after checking should_send_immediately).
-    /// Only counts incidents that were NOT sent immediately (batched ones).
-    pub fn record(&mut self, incident: &Incident) {
-        let detector = extract_detector(&incident.incident_id).to_string();
-        let already_seen = self.seen_this_window.contains(&detector);
-        self.seen_this_window.insert(detector.clone());
-
-        // Only count if this is a repeat (first occurrence was sent immediately)
-        if !already_seen {
-            return;
-        }
-
-        let entry = self
-            .pending
-            .entry(detector)
-            .or_insert_with(|| (0, incident.title.clone(), std::collections::HashSet::new()));
-        entry.0 += 1;
-
-        // Collect unique IPs
-        for entity in &incident.entities {
-            if entity.r#type == innerwarden_core::entities::EntityType::Ip {
-                entry.2.insert(entity.value.clone());
-            }
-        }
-    }
-
-    /// Check if the batch window has elapsed.
-    pub fn should_flush(&self) -> bool {
-        let elapsed = chrono::Utc::now() - self.window_start;
-        elapsed.num_seconds() >= self.window_secs
-    }
-
-    /// Flush all pending batched incidents into summary messages.
-    /// Returns formatted HTML summaries ready to send.
-    pub fn flush(&mut self) -> Vec<String> {
-        let mut summaries = Vec::new();
-
-        // Only emit summaries for detectors with batched (>0) incidents
-        for (detector, (count, _title, ips)) in &self.pending {
-            if *count == 0 {
-                continue;
-            }
-            let ip_list = if ips.is_empty() {
-                String::new()
-            } else {
-                let preview: Vec<&str> = ips.iter().map(|s| s.as_str()).take(5).collect();
-                let more = if ips.len() > 5 {
-                    format!(" +{} more", ips.len() - 5)
-                } else {
-                    String::new()
-                };
-                format!("\nIPs: <code>{}</code>{}", preview.join(", "), more)
-            };
-            summaries.push(format!(
-                "📊 <b>{detector}</b>: {count} alerts batched (last {}s){ip_list}",
-                self.window_secs
-            ));
-        }
-
-        // Reset
-        self.pending.clear();
-        self.seen_this_window.clear();
-        self.window_start = chrono::Utc::now();
-
-        summaries
-    }
-}
+// TelegramBatcher removed — replaced by notification_pipeline::GroupingEngine.
 
 /// Extract detector name from incident_id (format: "detector:rest:...")
 fn extract_detector(incident_id: &str) -> &str {
@@ -3055,7 +2979,11 @@ fn simple_detector_lookup(detector: &str) -> (&'static str, &'static str) {
         "process_tree" => ("\u{1f333}", "Suspicious program chain detected. {action}"),
         "neural_anomaly" => (
             "\u{1f9e0}",
-            "Unusual behavior pattern detected by AI. {action}",
+            "AI spider sense triggered — unusual pattern detected. {action}",
+        ),
+        "correlated_anomaly" => (
+            "\u{1f9e0}\u{26a1}",
+            "Two independent AI systems flagged unusual activity. {action}",
         ),
         _ => ("\u{26a0}\u{fe0f}", "Suspicious activity detected. {action}"),
     }
@@ -3074,24 +3002,103 @@ fn simple_severity_emoji(incident: &Incident) -> &'static str {
 }
 
 /// Format a plain-language alert message for simple profile users.
-/// No IPs, no detector names, no technical jargon.
+/// Structured, informative, and impressive — every notification is a jewel.
 fn format_simple_message(
     incident: &Incident,
-    _dashboard_url: Option<&str>,
+    dashboard_url: Option<&str>,
     mode: GuardianMode,
 ) -> String {
     let detector = extract_detector(&incident.incident_id);
-    let (_det_emoji, template) = simple_detector_lookup(detector);
+    let (det_emoji, _template) = simple_detector_lookup(detector);
     let sev_emoji = simple_severity_emoji(incident);
+    let sev_word = match incident.severity {
+        innerwarden_core::event::Severity::Critical => "Critical",
+        innerwarden_core::event::Severity::High => "High",
+        innerwarden_core::event::Severity::Medium => "Medium",
+        innerwarden_core::event::Severity::Low => "Low",
+        _ => "Info",
+    };
+    let det_label = simple_detector_label(detector);
 
-    let action = match mode {
-        GuardianMode::Guard => "Handled automatically.",
-        GuardianMode::DryRun | GuardianMode::Watch => "Monitoring the situation.",
+    // Build concise what-happened line from entities + summary.
+    let ip_entity = first_ip_entity(incident);
+    let detail = simple_detail_line(incident, &ip_entity);
+
+    // Action line depends on mode.
+    let action_line = match mode {
+        GuardianMode::Guard => "\u{26a1} <b>Handled automatically</b> — no action needed.",
+        GuardianMode::DryRun => {
+            "\u{1f9ea} <b>Dry-run</b> — would act on this. Enable live mode to let me."
+        }
+        GuardianMode::Watch => "\u{26a0}\u{fe0f} <b>Needs your attention.</b>",
     };
 
-    let description = template.replace("{action}", action);
+    let link_line = dashboard_url
+        .and_then(|base| ip_entity.as_ref().map(|ip| (base, ip)))
+        .map(|(base, ip)| {
+            format!(
+                "\n\n\u{1f517} <a href=\"{}/?subject_type=ip&subject={}&date={}\">View details</a>",
+                base,
+                ip,
+                incident.ts.format("%Y-%m-%d")
+            )
+        })
+        .unwrap_or_default();
 
-    format!("{sev_emoji} {description}")
+    format!(
+        "{sev_emoji} {det_emoji} <b>{sev_word} — {det_label}</b>\n\
+         \n\
+         {detail}\n\
+         \n\
+         {action_line}{link_line}",
+    )
+}
+
+/// Human-readable detector label for simple profile headers.
+fn simple_detector_label(detector: &str) -> &'static str {
+    match detector {
+        "ssh_bruteforce" => "Login Attack Blocked",
+        "credential_stuffing" => "Credential Attack",
+        "port_scan" => "Port Scan",
+        "packet_flood" => "Traffic Flood",
+        "data_exfil" | "data_exfil_cmd" | "data_exfil_ebpf" => "Data Theft Attempt",
+        "reverse_shell" => "Remote Access Detected",
+        "privesc" => "Privilege Escalation",
+        "rootkit" => "Kernel Tampering",
+        "ransomware" => "Ransomware Detected",
+        "dns_tunneling" | "dns_tunneling_ebpf" => "Covert Channel",
+        "c2_callback" => "Attacker Communication",
+        "crypto_miner" => "Crypto Mining",
+        "container_escape" => "Container Breakout",
+        "lateral_movement" => "Lateral Movement",
+        "web_shell" => "Web Backdoor",
+        "process_injection" => "Code Injection",
+        "fileless" => "Memory-Only Malware",
+        "log_tampering" => "Log Tampering",
+        "ssh_key_injection" => "SSH Key Planted",
+        "crontab_persistence" | "systemd_persistence" => "Persistence Installed",
+        "kernel_module_load" => "Kernel Module Loaded",
+        "discovery_burst" => "Reconnaissance",
+        "suspicious_execution" => "Suspicious Execution",
+        "sigma" => "Known Attack Pattern",
+        "neural_anomaly" => "AI Spider Sense",
+        "correlated_anomaly" => "AI + Statistical Convergence",
+        _ => "Threat Detected",
+    }
+}
+
+/// Build a concise detail line from the incident for simple messages.
+fn simple_detail_line(incident: &Incident, ip_entity: &Option<String>) -> String {
+    let detector = extract_detector(&incident.incident_id);
+    let (_emoji, template) = simple_detector_lookup(detector);
+    let base_desc = template.replace(" {action}", "");
+
+    let ip_part = ip_entity
+        .as_ref()
+        .map(|ip| format!("\nIP: <code>{}</code>", escape_html(ip)))
+        .unwrap_or_default();
+
+    format!("{base_desc}{ip_part}")
 }
 
 /// Return a 2-3 sentence plain explanation for a detector.
@@ -3140,6 +3147,7 @@ pub fn explain_detector(detector: &str) -> String {
 
 /// Format the daily digest message.
 /// Simple mode: friendly, non-technical. Technical mode: concise stats.
+#[allow(dead_code)]
 pub fn format_daily_digest(
     incidents_today: u32,
     blocks_today: u32,
@@ -3183,6 +3191,109 @@ pub fn format_daily_digest(
     }
 }
 
+/// Pipeline digest stats for enriched daily digest.
+pub struct PipelineDigestStats {
+    pub suppressed_count: u32,
+    pub auto_resolved_groups: u32,
+    pub needs_review_groups: u32,
+    /// Incidents deferred from immediate Telegram (per-detector counts).
+    pub deferred: Vec<(String, u32)>,
+}
+
+/// Format an enriched daily digest with pipeline grouping stats.
+#[allow(clippy::too_many_arguments)]
+pub fn format_daily_digest_enriched(
+    incidents_today: u32,
+    blocks_today: u32,
+    critical_count: u32,
+    high_count: u32,
+    top_detector: &str,
+    top_count: u32,
+    is_simple: bool,
+    pipeline: &PipelineDigestStats,
+) -> String {
+    let raw_score = 100i32
+        .saturating_sub(critical_count as i32 * 20)
+        .saturating_sub(high_count as i32 * 5);
+    let score = raw_score.clamp(0, 100) as u32;
+    let health_emoji = if score >= 80 {
+        "\u{1f7e2}" // 🟢
+    } else if score >= 50 {
+        "\u{1f7e1}" // 🟡
+    } else {
+        "\u{1f534}" // 🔴
+    };
+
+    if is_simple {
+        let mut msg = format!(
+            "\u{1f6e1}\u{fe0f} <b>Daily Security Briefing</b>\n\
+             \n\
+             {health_emoji} Server health: <b>{score}/100</b>\n\
+             \n\
+             While you were away, InnerWarden:\n\
+             \u{00a0}\u{00a0}\u{2022} Blocked <b>{blocks_today}</b> attacks\n\
+             \u{00a0}\u{00a0}\u{2022} Analyzed <b>{incidents_today}</b> security events\n\
+             \u{00a0}\u{00a0}\u{2022} Detected <b>{critical_count}</b> critical, <b>{high_count}</b> high severity threats"
+        );
+
+        // Deferred incident breakdown — the bulk of silent work.
+        if !pipeline.deferred.is_empty() {
+            msg.push_str("\n\n\u{1f916} <b>Handled silently:</b>");
+            for (detector, count) in &pipeline.deferred {
+                let label = friendly_detector_name(detector);
+                msg.push_str(&format!("\n\u{00a0}\u{00a0}\u{2022} {count} {label}"));
+            }
+        }
+
+        if pipeline.auto_resolved_groups > 0 {
+            msg.push_str(&format!(
+                "\n\n\u{2705} {} threat groups auto-resolved",
+                pipeline.auto_resolved_groups
+            ));
+        }
+
+        if pipeline.needs_review_groups > 0 {
+            msg.push_str(&format!(
+                "\n\n\u{26a0}\u{fe0f} <b>{} groups need your review</b>",
+                pipeline.needs_review_groups
+            ));
+        } else {
+            msg.push_str("\n\n\u{2705} No action needed — everything is under control.");
+        }
+
+        msg
+    } else {
+        let date = chrono::Local::now().format("%Y-%m-%d");
+        let mut msg = format!(
+            "\u{1f4ca} <b>Daily Digest</b> ({date})\n\
+             \n\
+             Health: {score}/100 {health_emoji}\n\
+             Incidents: {incidents_today} | Blocks: {blocks_today}\n\
+             Critical: {critical_count} | High: {high_count}\n\
+             Top: {top_detector} ({top_count})",
+            top_detector = escape_html(top_detector),
+        );
+
+        if pipeline.suppressed_count > 0 || pipeline.auto_resolved_groups > 0 {
+            msg.push_str(&format!(
+                "\nPipeline: {} grouped, {} auto-resolved, {} need review",
+                pipeline.suppressed_count,
+                pipeline.auto_resolved_groups,
+                pipeline.needs_review_groups,
+            ));
+        }
+
+        if !pipeline.deferred.is_empty() {
+            msg.push_str("\nDeferred:");
+            for (detector, count) in &pipeline.deferred {
+                msg.push_str(&format!(" {detector}={count}"));
+            }
+        }
+
+        msg
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Simple /status
 // ---------------------------------------------------------------------------
@@ -3209,11 +3320,11 @@ pub fn format_simple_status(
     let _ = has_critical_last_24h;
 
     format!(
-        "{semaphore} Your server is {status_word}\n\
+        "{semaphore} <b>Server is {status_word}</b>\n\
          \n\
-         Protected for {uptime_days} days\n\
-         {total_blocked} attacks blocked\n\
-         Last threat: {last_threat_ago}",
+         \u{1f6e1}\u{fe0f} Protected for <b>{uptime_days}</b> days\n\
+         \u{1f6ab} <b>{total_blocked}</b> attacks blocked\n\
+         \u{23f1}\u{fe0f} Last threat: {last_threat_ago}",
         last_threat_ago = escape_html(last_threat_ago),
     )
 }
