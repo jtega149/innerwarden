@@ -1653,6 +1653,7 @@ fn format_incident_message(
 }
 
 /// Returns a hacker-flavored one-liner based on the incident type.
+#[allow(dead_code)]
 fn incident_quip(incident: &Incident) -> &'static str {
     let title = incident.title.to_lowercase();
     let tags: Vec<&str> = incident.tags.iter().map(|s| s.as_str()).collect();
@@ -3145,6 +3146,7 @@ pub fn explain_detector(detector: &str) -> String {
 
 /// Format the daily digest message.
 /// Simple mode: friendly, non-technical. Technical mode: concise stats.
+#[allow(dead_code)]
 pub fn format_daily_digest(
     incidents_today: u32,
     blocks_today: u32,

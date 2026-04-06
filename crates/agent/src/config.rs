@@ -1722,10 +1722,11 @@ pub struct GeoIpConfig {
 
 /// Notification filter level for a channel.
 /// Controls which incident groups are forwarded to this channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelFilterLevel {
     /// Every incident group (first event + summaries).
+    #[default]
     All,
     /// Only groups that need human decision (not auto-resolved, ambiguous, or
     /// above confidence threshold).
@@ -1736,25 +1737,14 @@ pub enum ChannelFilterLevel {
     None,
 }
 
-impl Default for ChannelFilterLevel {
-    fn default() -> Self {
-        Self::All
-    }
-}
-
 /// Digest frequency for a notification channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DigestFrequency {
     Daily,
     Hourly,
+    #[default]
     None,
-}
-
-impl Default for DigestFrequency {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Top-level notification pipeline config.
@@ -1803,6 +1793,7 @@ fn default_group_count_threshold() -> u32 {
 /// digest_hour = 9
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ChannelNotificationConfig {
     /// Filter level for real-time notifications.
     #[serde(default = "default_channel_level_actionable")]
@@ -1844,6 +1835,7 @@ fn default_digest_hour() -> u8 {
 /// cloud_timing_multiplier = 10
 /// ```
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct EnvironmentConfig {
     /// Run bootstrap profiling on first boot (or when profile missing).
     #[serde(default = "default_true_val")]

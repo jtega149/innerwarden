@@ -89,6 +89,7 @@ mod telemetry_tick;
 mod threat_feeds;
 mod threat_report;
 mod trust_rules;
+#[allow(dead_code)]
 mod two_factor;
 mod web_push;
 mod webhook;
@@ -103,7 +104,6 @@ use chrono::{Datelike as _, Timelike as _};
 use clap::Parser;
 use tracing::{debug, info, warn};
 
-use crate::agent_context::incident_detector;
 use crate::bot_actions::{handle_pending_confirmation, handle_telegram_action_callback};
 use crate::bot_commands::{handle_telegram_bot_command, probe_and_suggest};
 #[cfg(test)]

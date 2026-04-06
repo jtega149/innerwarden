@@ -18,6 +18,7 @@ use crate::config::{ChannelFilterLevel, NotificationPipelineConfig};
 
 /// A group of related incidents (same detector + entity) within a time window.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct IncidentGroup {
     pub detector: String,
     pub entity_type: EntityType,
@@ -58,6 +59,7 @@ impl IncidentGroup {
 
 /// Summary emitted when a group closes or hits the count threshold.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct GroupSummary {
     pub detector: String,
     pub entity_type: EntityType,
@@ -108,6 +110,7 @@ impl GroupSummary {
     }
 }
 
+#[allow(dead_code)]
 fn entity_type_label(et: &EntityType) -> &'static str {
     match et {
         EntityType::Ip => "IP",
@@ -262,11 +265,13 @@ impl GroupingEngine {
     }
 
     /// Number of active groups (for dashboard/metrics).
+    #[allow(dead_code)]
     pub fn active_group_count(&self) -> usize {
         self.groups.len()
     }
 
     /// Get a snapshot of all active groups (for the dashboard API).
+    #[allow(dead_code)]
     pub fn active_groups(&self) -> Vec<IncidentGroup> {
         self.groups.values().cloned().collect()
     }
@@ -289,6 +294,7 @@ impl GroupingEngine {
 // ---------------------------------------------------------------------------
 
 /// Decide whether an incident group should be forwarded to a channel.
+#[allow(dead_code)]
 pub(crate) fn should_notify_channel(
     group: &IncidentGroup,
     level: ChannelFilterLevel,
@@ -398,6 +404,7 @@ const CLOUD_SUPPRESSED_DETECTORS: &[&str] = &[
 ];
 
 /// Detectors whose severity is demoted for known admin UIDs.
+#[allow(dead_code)]
 const ADMIN_DEMOTED_DETECTORS: &[&str] = &[
     "ssh_bruteforce", // admin ssh is expected
     "sudo_abuse",     // admin sudo is expected
@@ -430,6 +437,7 @@ pub(crate) fn should_suppress_for_environment(
 
 /// Check if this incident is from a known admin UID and should be demoted.
 /// Returns true if the incident should be treated as LOW severity for notification purposes.
+#[allow(dead_code)]
 pub(crate) fn is_admin_routine(
     incident: &Incident,
     profile: &crate::environment_profile::EnvironmentProfile,

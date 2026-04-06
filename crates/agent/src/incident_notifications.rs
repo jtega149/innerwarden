@@ -4,7 +4,7 @@ use tracing::{info, warn};
 
 use crate::agent_context::guardian_mode;
 use crate::config::ChannelFilterLevel;
-use crate::notification_pipeline::{self, GroupAction, GroupingEngine};
+use crate::notification_pipeline::{self, GroupAction};
 use crate::{config, state_store, web_push, webhook, AgentState};
 
 pub(crate) struct NotificationThresholds {

@@ -49,6 +49,7 @@ impl EnvironmentProfile {
         self.platform == "cloud_vps" || self.platform == "vm"
     }
 
+    #[allow(dead_code)]
     pub fn is_human_uid(&self, uid: u32) -> bool {
         self.human_uids.contains(&uid)
     }
@@ -218,7 +219,7 @@ fn detect_human_uids() -> Vec<u32> {
             let shell = parts[6];
 
             // Human users: uid >= 1000, with a login shell (not nologin/false)
-            if uid >= 1000 && uid < 65534 && !nologin_shells.iter().any(|s| shell.ends_with(s)) {
+            if (1000..65534).contains(&uid) && !nologin_shells.iter().any(|s| shell.ends_with(s)) {
                 Some(uid)
             } else {
                 None
