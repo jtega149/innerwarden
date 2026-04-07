@@ -457,6 +457,9 @@ struct AgentState {
     last_baseline_anomaly_ts: Option<chrono::DateTime<chrono::Utc>>,
     /// Timestamp of last autoencoder anomaly detection (for score fusion with baseline).
     last_autoencoder_anomaly_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Latest autoencoder anomaly score (0.0-1.0). Used as signal to boost confidence
+    /// in decisions made by other detectors. Reset each tick.
+    latest_anomaly_score: Option<f32>,
     /// Two-factor authentication state (pending actions, brute force protection).
     two_factor_state: two_factor::TwoFactorState,
     /// Redis stream reader for events (None when redis_url is not configured).
@@ -1075,6 +1078,7 @@ async fn main() -> Result<()> {
         threat_feed: None, // initialized below if configured
         last_baseline_anomaly_ts: None,
         last_autoencoder_anomaly_ts: None,
+        latest_anomaly_score: None,
         two_factor_state: two_factor::TwoFactorState::new(),
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
@@ -3126,6 +3130,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -3401,6 +3406,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -3571,6 +3577,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -3716,6 +3723,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -3873,6 +3881,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -4007,6 +4016,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -4153,6 +4163,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
