@@ -53,7 +53,7 @@ pub(crate) fn process_events(
 
         // Feed anomaly detector with per-process behavior.
         if !comm.is_empty() {
-            let alerts = dna.anomaly_detector.process_events(&comm, &[atom_key.clone()], now);
+            let alerts = dna.anomaly_detector.process_events(&comm, std::slice::from_ref(&atom_key), now);
             for alert in &alerts {
                 let kind = match alert.alert_type {
                     innerwarden_dna::anomaly::AnomalyType::BehaviorDeviation => "dna.behavior_deviation",

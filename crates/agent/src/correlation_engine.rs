@@ -496,8 +496,6 @@ fn classify_layer(source: &str, kind: &str) -> Layer {
         || kind == "mprotect"
     {
         Layer::Kernel
-    } else if source == "dna" || kind.starts_with("dna.") {
-        Layer::Userspace
     } else {
         Layer::Userspace
     }

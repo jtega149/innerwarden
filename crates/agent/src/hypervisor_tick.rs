@@ -15,7 +15,7 @@ pub(crate) async fn process_hypervisor_tick(
     use innerwarden_core::incident::Incident;
 
     // Run the full hypervisor audit (blocking I/O — spawn_blocking).
-    let report = match tokio::task::spawn_blocking(|| innerwarden_hypervisor::full_audit()).await {
+    let report = match tokio::task::spawn_blocking(innerwarden_hypervisor::full_audit).await {
         Ok(report) => report,
         Err(e) => {
             warn!(error = %e, "hypervisor tick: audit task panicked");
@@ -290,9 +290,9 @@ fn notify_telegram(
 /// Check if the cached hypervisor environment indicates a VM.
 /// Used by firmware_tick to decide severity downgrade.
 pub(crate) fn is_virtual_machine(state: &AgentState) -> bool {
-    match &state.hypervisor_environment {
-        Some(innerwarden_hypervisor::Environment::VirtualMachine { .. }) => true,
-        Some(innerwarden_hypervisor::Environment::UnknownHypervisor) => true,
-        _ => false,
-    }
+    matches!(
+        &state.hypervisor_environment,
+        Some(innerwarden_hypervisor::Environment::VirtualMachine { .. })
+            | Some(innerwarden_hypervisor::Environment::UnknownHypervisor)
+    )
 }
