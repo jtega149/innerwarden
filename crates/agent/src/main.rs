@@ -2732,23 +2732,23 @@ async fn process_narrative_tick(
 
     state.telemetry.observe_events(&events_entries);
 
-    // Track operator IPs: when a trusted user logs in via SSH, whitelist their IP.
+    // Track operator IPs: any SSH login via publickey is an operator (has the private key).
     for ev in &events_entries {
         if ev.kind == "ssh.login_success"
             || ev.kind == "auth.login_success"
             || ev.kind == "auth.session_opened"
         {
-            if let Some(user) = ev.details.get("user").and_then(|v| v.as_str()) {
-                if cfg.allowlist.trusted_users.iter().any(|u| u == user) {
-                    let ip = ev
-                        .details
-                        .get("ip")
-                        .or_else(|| ev.details.get("src_ip"))
-                        .and_then(|v| v.as_str());
-                    if let Some(ip) = ip {
-                        if state.operator_ips.insert(ip.to_string()) {
-                            info!(user, ip, "operator session detected — IP whitelisted");
-                        }
+            let method = ev.details.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            if method == "publickey" {
+                let ip = ev
+                    .details
+                    .get("ip")
+                    .or_else(|| ev.details.get("src_ip"))
+                    .and_then(|v| v.as_str());
+                if let Some(ip) = ip {
+                    if state.operator_ips.insert(ip.to_string()) {
+                        let user = ev.details.get("user").and_then(|v| v.as_str()).unwrap_or("?");
+                        info!(user, ip, "operator session detected (publickey) — IP whitelisted");
                     }
                 }
             }
