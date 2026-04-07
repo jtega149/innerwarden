@@ -2294,9 +2294,7 @@ fn refresh_operator_ips(state: &mut AgentState, allowlist: &config::AllowlistCon
             let parts: Vec<&str> = line.split_whitespace().collect();
             if let (Some(user), Some(ip_raw)) = (parts.first(), parts.last()) {
                 let ip = ip_raw.trim_matches(|c| c == '(' || c == ')');
-                if allowlist.trusted_users.iter().any(|u| u == *user)
-                    && !ip.is_empty()
-                    && ip != ":"
+                if allowlist.trusted_users.iter().any(|u| u == *user) && !ip.is_empty() && ip != ":"
                 {
                     active_ips.insert(ip.to_string(), now);
                 }
@@ -2790,7 +2788,9 @@ async fn process_narrative_tick(
                     .and_then(|v| v.as_str());
                 if let Some(ip) = ip {
                     let is_new = !state.operator_ips.contains_key(ip);
-                    state.operator_ips.insert(ip.to_string(), std::time::Instant::now());
+                    state
+                        .operator_ips
+                        .insert(ip.to_string(), std::time::Instant::now());
                     if is_new {
                         let user = ev
                             .details
@@ -3101,7 +3101,7 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
-        last_operator_refresh: std::time::Instant::now(),
+            last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3375,7 +3375,7 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
-        last_operator_refresh: std::time::Instant::now(),
+            last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3544,7 +3544,7 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
-        last_operator_refresh: std::time::Instant::now(),
+            last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3688,7 +3688,7 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
-        last_operator_refresh: std::time::Instant::now(),
+            last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3844,7 +3844,7 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
-        last_operator_refresh: std::time::Instant::now(),
+            last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3977,7 +3977,7 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
-        last_operator_refresh: std::time::Instant::now(),
+            last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -4122,7 +4122,7 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
-        last_operator_refresh: std::time::Instant::now(),
+            last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
