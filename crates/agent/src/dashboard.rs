@@ -1702,9 +1702,30 @@ struct LiveFeedResponse {
 
 /// `GET /api/live-feed` - last 30 incidents with totals for the day (public).
 async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResponse> {
-    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let incidents = read_jsonl::<Incident>(&dated_path(&state.data_dir, "incidents", &date));
-    let decisions = read_jsonl::<DecisionEntry>(&dated_path(&state.data_dir, "decisions", &date));
+    let now = chrono::Utc::now();
+    let date = now.format("%Y-%m-%d").to_string();
+    let yesterday = (now - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let cutoff = now - chrono::Duration::hours(24);
+
+    // Read today + yesterday for rolling 24h window.
+    let mut incidents = read_jsonl::<Incident>(&dated_path(&state.data_dir, "incidents", &yesterday));
+    incidents.extend(read_jsonl::<Incident>(&dated_path(
+        &state.data_dir,
+        "incidents",
+        &date,
+    )));
+    incidents.retain(|i| i.ts >= cutoff);
+
+    let mut decisions =
+        read_jsonl::<DecisionEntry>(&dated_path(&state.data_dir, "decisions", &yesterday));
+    decisions.extend(read_jsonl::<DecisionEntry>(&dated_path(
+        &state.data_dir,
+        "decisions",
+        &date,
+    )));
+    decisions.retain(|d| d.ts >= cutoff);
     let decision_map: HashMap<String, &DecisionEntry> = decisions
         .iter()
         .map(|d| (d.incident_id.clone(), d))
