@@ -287,7 +287,7 @@ fn notify_telegram(
             );
             let tg = tg.clone();
             tokio::spawn(async move {
-                let _ = tg.send_raw_html(&msg).await;
+                let _ = tg.send_alert_html(&msg).await;
             });
         }
     }

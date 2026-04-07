@@ -274,7 +274,7 @@ pub(crate) async fn process_firmware_tick(
             let tg = tg.clone();
             let msg_owned = msg;
             tokio::spawn(async move {
-                let _ = tg.send_raw_html(&msg_owned).await;
+                let _ = tg.send_alert_html(&msg_owned).await;
             });
         }
     }
