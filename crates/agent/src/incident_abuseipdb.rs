@@ -46,6 +46,16 @@ pub(crate) async fn try_handle_abuseipdb_autoblock(
         return false;
     }
 
+    // Never auto-block active operator sessions (publickey SSH from trusted_users).
+    if state.operator_ips.contains_key(&ip) {
+        info!(
+            ip = %ip,
+            incident_id = %incident.incident_id,
+            "AbuseIPDB auto-block skipped: active operator session"
+        );
+        return false;
+    }
+
     if cloud_safelist::is_cloud_provider_ip(&ip) {
         let provider = cloud_safelist::identify_provider(&ip).unwrap_or("Unknown Cloud");
         warn!(

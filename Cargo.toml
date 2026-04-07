@@ -6,13 +6,17 @@ members = [
   "crates/ctl",
   "crates/sensor-ebpf-types",
   "crates/agent-guard",
+  "crates/smm",
+  "crates/hypervisor",
+  "crates/killchain",
+  "crates/dna",
 ]
 exclude = ["crates/sensor-ebpf"]
 # crates/sensor-ebpf compiles to bpfel-unknown-none target (separate build)
 resolver = "2"
 
 [workspace.package]
-version = "0.9.3"
+version = "0.9.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/InnerWarden/innerwarden"

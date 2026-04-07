@@ -59,6 +59,14 @@ pub(crate) fn evaluate_pre_ai_flow(
         return PreAiFlowDecision::PipelineTestHandled;
     }
 
+    // Neural model is advisory only — observes and logs but never triggers
+    // blocks or notifications. The brain records its suggestion in brain-log.json
+    // for operator review; actual blocking is left to rule-based detectors.
+    let detector = incident.incident_id.split(':').next().unwrap_or("");
+    if detector == "neural_anomaly" || detector == "host_drift" {
+        return PreAiFlowDecision::SkipHandled;
+    }
+
     if !ai_enabled {
         return PreAiFlowDecision::SkipHandled;
     }

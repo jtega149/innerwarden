@@ -53,6 +53,15 @@ pub struct AgentConfig {
     /// Firmware security monitoring (innerwarden-smm)
     #[serde(default)]
     pub firmware: FirmwareConfig,
+    /// Hypervisor security monitoring (innerwarden-hypervisor)
+    #[serde(default)]
+    pub hypervisor: HypervisorConfig,
+    /// Kill chain detection (innerwarden-killchain)
+    #[serde(default)]
+    pub killchain: KillchainConfig,
+    /// Threat DNA behavioral fingerprinting (innerwarden-dna)
+    #[serde(default)]
+    pub dna: DnaConfig,
     /// Security settings (2FA, etc.)
     #[serde(default)]
     pub security: Option<SecurityConfig>,
@@ -138,6 +147,115 @@ fn default_firmware_poll_secs() -> u64 {
 }
 fn default_firmware_trust_threshold() -> f64 {
     0.85
+}
+
+/// Hypervisor security monitoring via innerwarden-hypervisor.
+#[derive(Debug, Deserialize)]
+pub struct HypervisorConfig {
+    /// Enable periodic hypervisor audits. Default: true.
+    #[serde(default = "default_hypervisor_enabled")]
+    pub enabled: bool,
+    /// Audit interval in seconds. Default: 300 (5 minutes).
+    #[serde(default = "default_hypervisor_poll_secs")]
+    pub poll_secs: u64,
+    /// Trust score threshold for emitting incidents. Default: 0.80.
+    #[serde(default = "default_hypervisor_trust_threshold")]
+    pub trust_score_threshold: f64,
+}
+
+impl Default for HypervisorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_secs: default_hypervisor_poll_secs(),
+            trust_score_threshold: default_hypervisor_trust_threshold(),
+        }
+    }
+}
+
+fn default_hypervisor_enabled() -> bool {
+    true
+}
+fn default_hypervisor_poll_secs() -> u64 {
+    300
+}
+fn default_hypervisor_trust_threshold() -> f64 {
+    0.80
+}
+
+/// Kill chain detection — inline PID tracking against 8 attack patterns.
+#[derive(Debug, Deserialize)]
+pub struct KillchainConfig {
+    /// Enable kill chain detection on eBPF events. Default: true.
+    #[serde(default = "default_killchain_enabled")]
+    pub enabled: bool,
+    /// Pre-chain warning threshold (0.0-1.0). Default: 0.6.
+    #[serde(default = "default_killchain_pre_chain_threshold")]
+    pub pre_chain_threshold: f32,
+    /// PID session timeout in seconds. Default: 60.
+    #[serde(default = "default_killchain_session_timeout")]
+    pub session_timeout_secs: i64,
+}
+
+impl Default for KillchainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pre_chain_threshold: default_killchain_pre_chain_threshold(),
+            session_timeout_secs: default_killchain_session_timeout(),
+        }
+    }
+}
+
+fn default_killchain_enabled() -> bool {
+    true
+}
+fn default_killchain_pre_chain_threshold() -> f32 {
+    0.6
+}
+fn default_killchain_session_timeout() -> i64 {
+    60
+}
+
+/// Threat DNA behavioral fingerprinting.
+#[derive(Debug, Deserialize)]
+pub struct DnaConfig {
+    /// Enable inline DNA fingerprinting. Default: true.
+    #[serde(default = "default_dna_enabled")]
+    pub enabled: bool,
+    /// Minimum behavior sequence length to fingerprint. Default: 3.
+    #[serde(default = "default_dna_min_sequence")]
+    pub min_sequence: usize,
+    /// Anomaly detection threshold (z-score). Default: 3.0.
+    #[serde(default = "default_dna_anomaly_threshold")]
+    pub anomaly_threshold: f64,
+    /// Session inactivity timeout in seconds. Default: 300.
+    #[serde(default = "default_dna_session_timeout")]
+    pub session_timeout_secs: i64,
+}
+
+impl Default for DnaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_sequence: default_dna_min_sequence(),
+            anomaly_threshold: default_dna_anomaly_threshold(),
+            session_timeout_secs: default_dna_session_timeout(),
+        }
+    }
+}
+
+fn default_dna_enabled() -> bool {
+    true
+}
+fn default_dna_min_sequence() -> usize {
+    3
+}
+fn default_dna_anomaly_threshold() -> f64 {
+    3.0
+}
+fn default_dna_session_timeout() -> i64 {
+    300
 }
 
 /// Mesh network config - mirrors innerwarden_mesh::MeshConfig

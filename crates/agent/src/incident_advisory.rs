@@ -50,7 +50,7 @@ pub(crate) async fn handle_advisory_violation(
             advisory.signals.join(", "),
             advisory.advisory_id,
         );
-        if let Err(e) = tg.send_raw_html(&msg).await {
+        if let Err(e) = tg.send_alert_html(&msg).await {
             warn!("failed to send advisory ignored alert: {e:#}");
         }
     }

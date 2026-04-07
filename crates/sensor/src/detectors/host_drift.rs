@@ -13,8 +13,11 @@ const TRUSTED_PATHS: &[&str] = &[
     "/usr/libexec/",
     "/bin/",
     "/sbin/",
+    "/lib/",
+    "/lib64/",
     "/opt/",
     "/snap/",
+    "/nix/store/",
 ];
 
 /// Paths where executables are expected but not from package managers.

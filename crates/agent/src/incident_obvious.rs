@@ -49,6 +49,16 @@ pub(crate) async fn try_handle_obvious_incident(
         return false;
     };
 
+    // Never auto-block active operator sessions (publickey SSH from trusted_users).
+    if state.operator_ips.contains_key(ip) {
+        info!(
+            ip,
+            incident_id = %incident.incident_id,
+            "obvious gate: skipping auto-block — active operator session"
+        );
+        return false;
+    }
+
     info!(
         incident_id = %incident.incident_id,
         "skipping AI for obvious incident: {detector} from {ip}"

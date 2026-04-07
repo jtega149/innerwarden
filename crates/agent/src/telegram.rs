@@ -156,6 +156,9 @@ pub struct PendingConfirmation {
 // Client
 // ---------------------------------------------------------------------------
 
+/// Maximum automated alert messages per hour (excludes bot command responses).
+const MAX_ALERTS_PER_HOUR: u32 = 30;
+
 pub struct TelegramClient {
     bot_token: String,
     chat_id: String,
@@ -165,6 +168,10 @@ pub struct TelegramClient {
     http: reqwest::Client,
     /// Rate limiter: tracks last send time to stay within Telegram's 30 msg/sec limit.
     last_send: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+    /// Hourly alert counter to prevent notification floods.
+    alerts_this_hour: Arc<std::sync::atomic::AtomicU32>,
+    /// Hour when the alert counter was last reset.
+    alert_counter_hour: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl TelegramClient {
@@ -187,6 +194,14 @@ impl TelegramClient {
             http,
             last_send: Arc::new(tokio::sync::Mutex::new(
                 tokio::time::Instant::now() - Duration::from_secs(1),
+            )),
+            alerts_this_hour: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            alert_counter_hour: Arc::new(std::sync::atomic::AtomicU32::new(
+                chrono::Utc::now()
+                    .format("%H")
+                    .to_string()
+                    .parse()
+                    .unwrap_or(0),
             )),
         })
     }
@@ -391,6 +406,39 @@ impl TelegramClient {
 
     /// Send a raw HTML message (no formatting helpers).
     /// Used for mesh network notifications and other custom messages.
+    /// Send an automated alert with hourly rate limiting.
+    /// Use this for all automated notifications (not bot command responses).
+    /// Returns Ok(()) silently if the hourly cap is reached.
+    pub async fn send_alert_html(&self, html: &str) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let current_hour: u32 = chrono::Utc::now()
+            .format("%H")
+            .to_string()
+            .parse()
+            .unwrap_or(0);
+        let stored_hour = self.alert_counter_hour.load(Ordering::Relaxed);
+        if current_hour != stored_hour {
+            self.alerts_this_hour.store(0, Ordering::Relaxed);
+            self.alert_counter_hour
+                .store(current_hour, Ordering::Relaxed);
+        }
+        let count = self.alerts_this_hour.fetch_add(1, Ordering::Relaxed);
+        if count >= MAX_ALERTS_PER_HOUR {
+            if count == MAX_ALERTS_PER_HOUR {
+                // Send one final warning, then stop
+                let warning = format!(
+                    "\u{26a0}\u{fe0f} <b>Alert flood detected</b>\n\n\
+                     {} alerts this hour — pausing automated notifications.\n\
+                     Check the dashboard for details. Alerts resume next hour.",
+                    count
+                );
+                self.send_raw_html(&warning).await.ok();
+            }
+            return Ok(());
+        }
+        self.send_raw_html(html).await
+    }
+
     pub async fn send_raw_html(&self, html: &str) -> anyhow::Result<()> {
         let body = serde_json::json!({
             "chat_id": self.chat_id,
@@ -447,7 +495,7 @@ impl TelegramClient {
             escape_html(&signals_str),
             atr_line,
         );
-        self.send_raw_html(&html).await
+        self.send_alert_html(&html).await
     }
 
     /// Send the onboarding/welcome message when the operator opens the bot.

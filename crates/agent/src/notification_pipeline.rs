@@ -366,12 +366,18 @@ const IMMEDIATE_THREAT_DETECTORS: &[&str] = &[
 /// an immediate Telegram notification.  Critical severity always qualifies
 /// regardless of detector.
 pub(crate) fn is_immediate_threat(incident: &Incident) -> bool {
+    let detector = incident.incident_id.split(':').next().unwrap_or("unknown");
+
+    // Neural model is advisory only — never triggers notifications.
+    // It observes and logs for operator review in the Brain dashboard tab.
+    if detector == "neural_anomaly" || detector == "host_drift" {
+        return false;
+    }
+
     // Critical is always immediate — no exceptions.
     if matches!(incident.severity, Severity::Critical) {
         return true;
     }
-
-    let detector = incident.incident_id.split(':').next().unwrap_or("unknown");
 
     is_immediate_threat_detector(detector)
 }

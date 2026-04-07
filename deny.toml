@@ -2,8 +2,10 @@
 ignore = [
     # rsa timing sidechannel via russh - no fix available upstream
     "RUSTSEC-2023-0071",
-    # libcrux-sha3 XOF output bug - pinned by russh, does not affect our SSH usage
+    # libcrux-sha3 XOF output bug - pinned by russh 0.58, does not affect our SSH usage
     "RUSTSEC-2026-0074",
+    # notify crate unmaintained - used only by DNA daemon binary, not the library
+    "RUSTSEC-2024-0384",
 ]
 
 [licenses]
@@ -34,5 +36,4 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/InnerWarden/innerwarden-mesh",
-    "https://github.com/InnerWarden/innerwarden-smm",
 ]

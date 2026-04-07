@@ -20,30 +20,26 @@ pub(crate) fn load_suppressed_ids(data_dir: &Path) -> HashSet<String> {
 }
 
 /// Detect if running inside a virtual machine.
-fn is_virtual_machine() -> bool {
-    // Check common VM indicators
-    if Path::new("/sys/hypervisor/type").exists() {
-        return true;
+/// Uses cached hypervisor environment when available (from hypervisor_tick),
+/// falls back to basic detection if hypervisor audit hasn't run yet.
+fn is_virtual_machine(state: &AgentState) -> bool {
+    if state.hypervisor_environment.is_some() {
+        return crate::hypervisor_tick::is_virtual_machine(state);
     }
-    if let Ok(dmi) = std::fs::read_to_string("/sys/class/dmi/id/product_name") {
-        let lower = dmi.to_lowercase();
-        if lower.contains("virtual")
-            || lower.contains("kvm")
-            || lower.contains("qemu")
-            || lower.contains("vmware")
-            || lower.contains("xen")
-            || lower.contains("oracle")
-            || lower.contains("hyper-v")
-        {
-            return true;
-        }
-    }
-    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
-        if cpuinfo.contains("hypervisor") {
-            return true;
-        }
-    }
-    false
+    // Fallback: basic detection before first hypervisor tick.
+    Path::new("/sys/hypervisor/type").exists()
+        || std::fs::read_to_string("/sys/class/dmi/id/product_name")
+            .map(|s| {
+                let l = s.to_lowercase();
+                l.contains("virtual")
+                    || l.contains("kvm")
+                    || l.contains("qemu")
+                    || l.contains("vmware")
+            })
+            .unwrap_or(false)
+        || std::fs::read_to_string("/proc/cpuinfo")
+            .map(|s| s.contains("hypervisor"))
+            .unwrap_or(false)
 }
 
 /// Periodic firmware audit. Runs innerwarden-smm's full_audit(), compares
@@ -118,7 +114,7 @@ pub(crate) async fn process_firmware_tick(
         }
 
         // --- VM detection: reduce severity on VMs where firmware is inaccessible ---
-        let on_vm = is_virtual_machine();
+        let on_vm = is_virtual_machine(state);
         let severity = if on_vm {
             // On VMs, firmware checks are unreliable — downgrade to Info
             tracing::debug!("firmware: running on VM, downgrading severity to Info");
@@ -278,7 +274,7 @@ pub(crate) async fn process_firmware_tick(
             let tg = tg.clone();
             let msg_owned = msg;
             tokio::spawn(async move {
-                let _ = tg.send_raw_html(&msg_owned).await;
+                let _ = tg.send_alert_html(&msg_owned).await;
             });
         }
     }

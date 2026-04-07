@@ -6,10 +6,14 @@ Sensor (eBPF) + Agent (AI triage) + CTL (CLI). Open source (Apache-2.0).
 
 ```
 crates/
-  sensor/       49 detectors, 40 eBPF hooks, 20 collectors
+  sensor/       49 detectors, 40 eBPF hooks, 22 collectors
   agent/        AI pipeline, dashboard, skills, correlation, notifications
   ctl/          CLI: setup, configure, scan, harden, upgrade
   agent-guard/  AI agent protection (ATR rules, MCP inspection)
+  smm/          Ring -2 firmware/UEFI/SMM security audit (migrated from standalone repo)
+  hypervisor/   Ring -1 hypervisor security — VM detection, KVM monitoring (migrated from standalone repo)
+  killchain/    Kill chain detection — 8 attack patterns via bitmask tracking (migrated from standalone repo)
+  dna/          Threat DNA — behavioral fingerprinting, anomaly detection, MITRE chain tracking (migrated from standalone repo)
   core/         Shared types: Event, Incident, Severity
   sensor-ebpf/  eBPF bytecode (no_std, bpfel target)
   sensor-ebpf-types/  Shared eBPF ↔ userspace types
@@ -32,7 +36,7 @@ make replay-qa    # validacao E2E
 
 ## Estado (2026-04-04)
 
-- 49 detectors, 40 eBPF hooks, 65 MITRE IDs, 40 correlation rules (CL-001 to CL-040, includes 5 AlphaZero V4 discoveries)
+- 49 detectors, 40 eBPF hooks, 65 MITRE IDs, 43 correlation rules (CL-001 to CL-043, includes 5 AlphaZero V4 discoveries + 3 hypervisor rules)
 - Server producao: ver config local (nao expor no repo publico)
 - Branches: main = stable, develop = bleeding edge
 - CI: `make check` + `make test` + `make spec-check`

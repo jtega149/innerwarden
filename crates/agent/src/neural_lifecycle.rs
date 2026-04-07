@@ -388,7 +388,7 @@ impl Default for AnomalyConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("/var/lib/innerwarden"),
-            threshold: 0.5,
+            threshold: 0.75,
             training_timeout_secs: 1800, // 30 min
             training_max_ram_mb: 500,
             training_retention_days: 7,

@@ -38,6 +38,16 @@ pub(crate) async fn try_handle_crowdsec_autoblock(
         return false;
     }
 
+    // Never auto-block active operator sessions (publickey SSH from trusted_users).
+    if state.operator_ips.contains_key(&ip) {
+        info!(
+            ip = %ip,
+            incident_id = %incident.incident_id,
+            "CrowdSec auto-block skipped: active operator session"
+        );
+        return false;
+    }
+
     info!(
         incident_id = %incident.incident_id,
         ip,
