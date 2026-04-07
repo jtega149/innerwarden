@@ -33,6 +33,9 @@ mod environment_profile;
 mod fail2ban;
 mod firmware_tick;
 mod forensics;
+mod hypervisor_tick;
+mod dna_inline;
+mod killchain_inline;
 mod geoip;
 mod honeypot_always_on;
 mod honeypot_post_session;
@@ -422,6 +425,23 @@ struct AgentState {
     /// Firmware incident cooldown: timestamp of last firmware trust_degraded incident.
     /// Prevents duplicate alerts when trust score is persistently low (e.g., VMs).
     last_firmware_incident_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Hypervisor incident cooldown: timestamp of last hypervisor trust_degraded incident.
+    last_hypervisor_incident_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Cached hypervisor environment classification (updated by hypervisor_tick).
+    /// Used by firmware_tick for VM detection and by other modules for context.
+    hypervisor_environment: Option<innerwarden_hypervisor::Environment>,
+    /// Kill chain PID tracker — processes eBPF events and detects attack patterns.
+    killchain_tracker: innerwarden_killchain::tracker::PidTracker,
+    /// Timestamp of last kill chain stale-PID cleanup.
+    last_killchain_cleanup: std::time::Instant,
+    /// Threat DNA engine — behavioral fingerprinting, anomaly detection, attack chain tracking.
+    dna_state: dna_inline::DnaState,
+    /// Shared deep security snapshot for dashboard API.
+    deep_security_snapshot: Option<std::sync::Arc<std::sync::RwLock<dashboard::DeepSecuritySnapshot>>>,
+    /// Timestamp of last DNA state persistence.
+    last_dna_save: std::time::Instant,
+    /// IPs of active operator SSH sessions (trusted_users). Never blocked.
+    operator_ips: std::collections::HashSet<String>,
     /// Suppressed incident patterns (user-configurable via CLI/dashboard).
     suppressed_incident_ids: std::collections::HashSet<String>,
     /// Threat feed client for external intelligence (None when disabled).
@@ -541,6 +561,11 @@ async fn main() -> Result<()> {
     // Initialize cloud provider IP safelist (Google, AWS, Azure, Cloudflare, etc.)
     cloud_safelist::init();
 
+    // Deep security snapshot: shared between agent (updates) and dashboard (reads).
+    let deep_security_snapshot = std::sync::Arc::new(std::sync::RwLock::new(
+        dashboard::DeepSecuritySnapshot::default(),
+    ));
+
     // Advisory cache: shared between dashboard (writes advisory denials) and
     // the incident processing loop (checks for advisory violations).
     let advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>> =
@@ -609,6 +634,7 @@ async fn main() -> Result<()> {
         );
 
         let agent_alert_tx = agent_alert_tx.clone();
+        let deep_security = deep_security_snapshot.clone();
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -622,6 +648,7 @@ async fn main() -> Result<()> {
                 dashboard_advisory_cache,
                 rule_engine,
                 agent_alert_tx,
+                deep_security,
             )
             .await
             {
@@ -1012,6 +1039,21 @@ async fn main() -> Result<()> {
         pcap_capture: pcap_capture::PcapCapture::new(&cli.data_dir),
         scoring_engine: scoring::ScoringEngine::new(0.95),
         last_firmware_incident_at: None,
+        last_hypervisor_incident_at: None,
+        hypervisor_environment: None,
+        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new()
+            .with_timeout(cfg.killchain.session_timeout_secs)
+            .with_pre_chain_threshold(cfg.killchain.pre_chain_threshold),
+        last_killchain_cleanup: std::time::Instant::now(),
+        dna_state: dna_inline::DnaState::new(
+            &cli.data_dir.join("dna"),
+            cfg.dna.min_sequence,
+            cfg.dna.anomaly_threshold,
+            cfg.dna.session_timeout_secs,
+        ),
+        last_dna_save: std::time::Instant::now(),
+        deep_security_snapshot: Some(deep_security_snapshot.clone()),
+        operator_ips: std::collections::HashSet::new(),
         suppressed_incident_ids: firmware_tick::load_suppressed_ids(&cli.data_dir),
         threat_feed: None, // initialized below if configured
         last_baseline_anomaly_ts: None,
@@ -1020,6 +1062,24 @@ async fn main() -> Result<()> {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
     };
+
+    // Seed operator IPs from active SSH sessions (who -i).
+    if let Ok(output) = std::process::Command::new("who").arg("-i").output() {
+        let who_out = String::from_utf8_lossy(&output.stdout);
+        for line in who_out.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let (Some(user), Some(ip_raw)) = (parts.first(), parts.last()) {
+                let ip = ip_raw.trim_matches(|c| c == '(' || c == ')');
+                if cfg.allowlist.trusted_users.iter().any(|u| u == *user)
+                    && !ip.is_empty()
+                    && ip != ":"
+                {
+                    state.operator_ips.insert(ip.to_string());
+                    info!(user, ip, "startup: operator session detected");
+                }
+            }
+        }
+    }
 
     // Load attacker intelligence profiles from persistent store
     state.attacker_profiles = attacker_intel::load_from_store(&state.store);
@@ -1219,6 +1279,9 @@ async fn main() -> Result<()> {
             tokio::time::interval(tokio::time::Duration::from_secs(cfg.mesh.poll_secs.max(10)));
         let mut firmware_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
             cfg.firmware.poll_secs.max(60),
+        ));
+        let mut hypervisor_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
+            cfg.hypervisor.poll_secs.max(60),
         ));
 
         // SIGTERM / SIGINT
@@ -1571,6 +1634,13 @@ async fn main() -> Result<()> {
                     }
                     false
                 }
+                _ = hypervisor_ticker.tick() => {
+                    if cfg.hypervisor.enabled {
+                        hypervisor_tick::process_hypervisor_tick(&cli.data_dir, &cfg, &mut state)
+                            .await;
+                    }
+                    false
+                }
                 _ = sigterm.recv() => {
                     info!("SIGTERM received - shutting down");
                     true
@@ -1697,6 +1767,13 @@ async fn main() -> Result<()> {
                 _ = firmware_ticker.tick() => {
                     if cfg.firmware.enabled {
                         firmware_tick::process_firmware_tick(&cli.data_dir, &cfg, &mut state)
+                            .await;
+                    }
+                    false
+                }
+                _ = hypervisor_ticker.tick() => {
+                    if cfg.hypervisor.enabled {
+                        hypervisor_tick::process_hypervisor_tick(&cli.data_dir, &cfg, &mut state)
                             .await;
                     }
                     false
@@ -1933,6 +2010,17 @@ async fn process_incidents(
 
     let all_incidents: Vec<&innerwarden_core::incident::Incident> =
         new_incidents.entries.iter().chain(neural.iter()).collect();
+
+    // Feed incidents into DNA attack chain tracker (MITRE ATT&CK progression).
+    if cfg.dna.enabled {
+        let incident_refs: Vec<innerwarden_core::incident::Incident> =
+            all_incidents.iter().map(|i| (*i).clone()).collect();
+        dna_inline::process_incidents(
+            &mut state.dna_state,
+            &incident_refs,
+            &mut state.correlation_engine,
+        );
+    }
 
     for incident in &all_incidents {
         state.telemetry.observe_incident(incident);
@@ -2644,6 +2732,29 @@ async fn process_narrative_tick(
 
     state.telemetry.observe_events(&events_entries);
 
+    // Track operator IPs: any SSH login via publickey is an operator (has the private key).
+    for ev in &events_entries {
+        if ev.kind == "ssh.login_success"
+            || ev.kind == "auth.login_success"
+            || ev.kind == "auth.session_opened"
+        {
+            let method = ev.details.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            if method == "publickey" {
+                let ip = ev
+                    .details
+                    .get("ip")
+                    .or_else(|| ev.details.get("src_ip"))
+                    .and_then(|v| v.as_str());
+                if let Some(ip) = ip {
+                    if state.operator_ips.insert(ip.to_string()) {
+                        let user = ev.details.get("user").and_then(|v| v.as_str()).unwrap_or("?");
+                        info!(user, ip, "operator session detected (publickey) — IP whitelisted");
+                    }
+                }
+            }
+        }
+    }
+
     // Feed new events into the narrative accumulator (incremental, no file re-read)
     state.narrative_acc.reset_for_date(&today);
     state.narrative_acc.ingest_events(&events_entries);
@@ -2665,6 +2776,38 @@ async fn process_narrative_tick(
         }
     }
 
+    // Feed eBPF events through kill chain tracker (inline pattern detection).
+    if cfg.killchain.enabled {
+        let kc_incidents = killchain_inline::process_events(
+            &mut state.killchain_tracker,
+            &events_entries,
+            &mut state.correlation_engine,
+        );
+        killchain_inline::write_incidents(data_dir, &kc_incidents);
+        killchain_inline::notify_telegram(&state.telegram_client, &kc_incidents);
+
+        // Periodic stale PID cleanup (every 60s).
+        if state.last_killchain_cleanup.elapsed().as_secs() >= 60 {
+            killchain_inline::cleanup_stale(&mut state.killchain_tracker);
+            state.last_killchain_cleanup = std::time::Instant::now();
+        }
+    }
+
+    // Feed events through threat DNA engine (behavioral fingerprinting + anomaly detection).
+    if cfg.dna.enabled {
+        dna_inline::process_events(
+            &mut state.dna_state,
+            &events_entries,
+            &mut state.correlation_engine,
+        );
+
+        // Periodic DNA state persistence (every 5 min).
+        if state.last_dna_save.elapsed().as_secs() >= 300 {
+            dna_inline::save(&state.dna_state);
+            state.last_dna_save = std::time::Instant::now();
+        }
+    }
+
     narrative_anomaly::process_anomalies(data_dir, &today, &events_entries, state);
 
     narrative_incident_ingest::ingest_new_incidents(data_dir, &today, state)?;
@@ -2679,6 +2822,26 @@ async fn process_narrative_tick(
     .await;
 
     narrative_autofp::maybe_suggest_allowlist_from_fp_reports(data_dir, state).await;
+
+    // Update deep security snapshot for dashboard.
+    if let Some(ref ds) = state.deep_security_snapshot {
+        let (kc_tracked, kc_pre, kc_full) = killchain_inline::stats(&state.killchain_tracker);
+        let snap = dashboard::DeepSecuritySnapshot {
+            firmware_trust_score: None, // updated by firmware_tick
+            firmware_last_audit: None,
+            hypervisor_environment: state.hypervisor_environment.as_ref().map(|e| format!("{e:?}")),
+            hypervisor_trust_score: None, // updated by hypervisor_tick
+            killchain_pids_tracked: kc_tracked,
+            killchain_pre_chains: kc_pre,
+            killchain_full_matches: kc_full,
+            dna_fingerprints: state.dna_state.store.len(),
+            dna_anomaly_alerts: state.dna_state.anomaly_detector.anomaly_count(),
+            dna_attack_chains: state.dna_state.chain_tracker.len(),
+        };
+        if let Ok(mut guard) = ds.write() {
+            *guard = snap;
+        }
+    }
 
     telemetry_tick::write_tick_snapshot(state, "narrative_tick");
 
@@ -2870,7 +3033,18 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(data_dir),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+        last_hypervisor_incident_at: None,
+        hypervisor_environment: None,
+        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+        last_killchain_cleanup: std::time::Instant::now(),
+        dna_state: dna_inline::DnaState::new(
+            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+            3, 3.0, 300,
+        ),
+        last_dna_save: std::time::Instant::now(),
+        deep_security_snapshot: None,
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3130,7 +3304,18 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+        last_hypervisor_incident_at: None,
+        hypervisor_environment: None,
+        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+        last_killchain_cleanup: std::time::Instant::now(),
+        dna_state: dna_inline::DnaState::new(
+            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+            3, 3.0, 300,
+        ),
+        last_dna_save: std::time::Instant::now(),
+        deep_security_snapshot: None,
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3285,7 +3470,18 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+        last_hypervisor_incident_at: None,
+        hypervisor_environment: None,
+        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+        last_killchain_cleanup: std::time::Instant::now(),
+        dna_state: dna_inline::DnaState::new(
+            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+            3, 3.0, 300,
+        ),
+        last_dna_save: std::time::Instant::now(),
+        deep_security_snapshot: None,
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3415,7 +3611,18 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+        last_hypervisor_incident_at: None,
+        hypervisor_environment: None,
+        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+        last_killchain_cleanup: std::time::Instant::now(),
+        dna_state: dna_inline::DnaState::new(
+            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+            3, 3.0, 300,
+        ),
+        last_dna_save: std::time::Instant::now(),
+        deep_security_snapshot: None,
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3557,7 +3764,18 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+        last_hypervisor_incident_at: None,
+        hypervisor_environment: None,
+        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+        last_killchain_cleanup: std::time::Instant::now(),
+        dna_state: dna_inline::DnaState::new(
+            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+            3, 3.0, 300,
+        ),
+        last_dna_save: std::time::Instant::now(),
+        deep_security_snapshot: None,
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3676,7 +3894,18 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+        last_hypervisor_incident_at: None,
+        hypervisor_environment: None,
+        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+        last_killchain_cleanup: std::time::Instant::now(),
+        dna_state: dna_inline::DnaState::new(
+            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+            3, 3.0, 300,
+        ),
+        last_dna_save: std::time::Instant::now(),
+        deep_security_snapshot: None,
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3807,7 +4036,18 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+        last_hypervisor_incident_at: None,
+        hypervisor_environment: None,
+        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+        last_killchain_cleanup: std::time::Instant::now(),
+        dna_state: dna_inline::DnaState::new(
+            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+            3, 3.0, 300,
+        ),
+        last_dna_save: std::time::Instant::now(),
+        deep_security_snapshot: None,
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,

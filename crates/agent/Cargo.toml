@@ -17,7 +17,10 @@ tikv-jemallocator = "0.6"
 innerwarden_core = { path = "../core" }
 innerwarden-agent-guard = { path = "../agent-guard" }
 innerwarden-mesh = { git = "https://github.com/InnerWarden/innerwarden-mesh.git", rev = "bed851214af56cf658159dd2e7bf04eaf191be3c" }
-innerwarden-smm = { git = "https://github.com/InnerWarden/innerwarden-smm.git" }
+innerwarden-smm = { path = "../smm" }
+innerwarden-hypervisor = { path = "../hypervisor" }
+innerwarden-killchain = { path = "../killchain" }
+innerwarden-dna = { path = "../dna" }
 anyhow = "1"
 dotenvy = "0.15"
 chrono = { version = "0.4", features = ["serde"] }

@@ -34,5 +34,4 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/InnerWarden/innerwarden-mesh",
-    "https://github.com/InnerWarden/innerwarden-smm",
 ]

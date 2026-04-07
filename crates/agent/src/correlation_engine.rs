@@ -28,6 +28,7 @@ use innerwarden_core::incident::Incident;
 #[serde(rename_all = "lowercase")]
 pub enum Layer {
     Firmware,
+    Hypervisor,
     Kernel,
     Userspace,
     Network,
@@ -356,6 +357,45 @@ impl CorrelationEngine {
             details,
         }
     }
+
+    /// Create a CorrelationEvent from hypervisor audit results.
+    pub fn hypervisor_event(kind: &str, details: serde_json::Value) -> CorrelationEvent {
+        CorrelationEvent {
+            ts: Utc::now(),
+            layer: Layer::Hypervisor,
+            source: "hypervisor".to_string(),
+            kind: kind.to_string(),
+            severity: Severity::High,
+            entities: vec![],
+            details,
+        }
+    }
+
+    /// Create a CorrelationEvent from kill chain detection.
+    pub fn killchain_event(kind: &str, details: serde_json::Value) -> CorrelationEvent {
+        CorrelationEvent {
+            ts: Utc::now(),
+            layer: Layer::Kernel,
+            source: "killchain".to_string(),
+            kind: kind.to_string(),
+            severity: Severity::Critical,
+            entities: vec![],
+            details,
+        }
+    }
+
+    /// Create a CorrelationEvent from threat DNA analysis.
+    pub fn dna_event(kind: &str, details: serde_json::Value) -> CorrelationEvent {
+        CorrelationEvent {
+            ts: Utc::now(),
+            layer: Layer::Userspace,
+            source: "dna".to_string(),
+            kind: kind.to_string(),
+            severity: Severity::Medium,
+            entities: vec![],
+            details,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -419,8 +459,16 @@ fn entity_type_str(et: &EntityType) -> &'static str {
 }
 
 fn classify_layer(source: &str, kind: &str) -> Layer {
-    // Check firmware first (most specific)
-    if source == "smm"
+    // Check hypervisor (Ring -1)
+    if source == "hypervisor"
+        || kind.starts_with("hypervisor.")
+        || kind.contains("cpuid")
+        || kind.contains("vmexit")
+        || kind.contains("blue_pill")
+    {
+        Layer::Hypervisor
+    // Check firmware (Ring -2)
+    } else if source == "smm"
         || kind.starts_with("firmware.")
         || kind.contains("msr")
         || kind.contains("acpi")
@@ -439,6 +487,8 @@ fn classify_layer(source: &str, kind: &str) -> Layer {
     } else if kind.starts_with("honeypot") {
         Layer::Honeypot
     } else if source == "ebpf"
+        || source == "killchain"
+        || kind.starts_with("killchain.")
         || kind.starts_with("privilege.")
         || kind.starts_with("lsm.")
         || kind == "kernel_module_load"
@@ -446,6 +496,8 @@ fn classify_layer(source: &str, kind: &str) -> Layer {
         || kind == "mprotect"
     {
         Layer::Kernel
+    } else if source == "dna" || kind.starts_with("dna.") {
+        Layer::Userspace
     } else {
         Layer::Userspace
     }
@@ -1450,6 +1502,81 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             min_confidence: 0.90,
             severity: Severity::Critical,
         },
+        // CL-041: Blue Pill — stealth hypervisor installation detected
+        // Environment drifts from bare metal to VM + CPUID inconsistency + timing anomaly.
+        CorrelationRule {
+            id: "CL-041".into(),
+            name: "Blue Pill Rootkit Detection".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Hypervisor),
+                    kind_patterns: vec!["hypervisor.environment_drift".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Hypervisor),
+                    kind_patterns: vec!["hypervisor.hv_*".into(), "hypervisor.cpuid_*".into()],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 600,
+            min_confidence: 0.95,
+            severity: Severity::Critical,
+        },
+        // CL-042: VM Escape Chain — hypervisor anomaly + privilege escalation + lateral movement.
+        CorrelationRule {
+            id: "CL-042".into(),
+            name: "VM Escape Attack Chain".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Hypervisor),
+                    kind_patterns: vec!["hypervisor.vmexit_*".into(), "hypervisor.hv_*".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Kernel),
+                    kind_patterns: vec!["privilege.escalation".into(), "kernel_module_load".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Network),
+                    kind_patterns: vec!["lateral_movement".into(), "data_exfiltration".into()],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-043: Firmware + Hypervisor Compromise — deep persistent threat across Ring -2 and -1.
+        CorrelationRule {
+            id: "CL-043".into(),
+            name: "Deep Ring Compromise (Firmware + Hypervisor)".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Firmware),
+                    kind_patterns: vec!["firmware.*".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Hypervisor),
+                    kind_patterns: vec!["hypervisor.*".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Kernel),
+                    kind_patterns: vec![
+                        "kernel_module_load".into(),
+                        "privilege.escalation".into(),
+                        "rootkit".into(),
+                    ],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 3600,
+            min_confidence: 0.90,
+            severity: Severity::Critical,
+        },
     ]
 }
 
@@ -1566,7 +1693,7 @@ mod tests {
     #[test]
     fn engine_starts_empty() {
         let engine = CorrelationEngine::new();
-        assert_eq!(engine.rule_count(), 40);
+        assert_eq!(engine.rule_count(), 43);
         assert_eq!(engine.pending_count(), 0);
     }
 

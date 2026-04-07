@@ -20,6 +20,15 @@ pub(crate) async fn execute_block_ip_decision(
         return ("skipped: block decision has empty IP".to_string(), false);
     }
 
+    // Safeguard: never block operator IPs (active SSH sessions from trusted_users).
+    if state.operator_ips.contains(ip) {
+        info!(ip, "operator IP protected — skipping block (active trusted session)");
+        return (
+            format!("skipped: {ip} is an active operator session"),
+            false,
+        );
+    }
+
     // Safeguard: rate limit.
     // Prevent false-positive cascades - max N blocks per minute.
     let now_utc = chrono::Utc::now();

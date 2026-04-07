@@ -219,6 +219,23 @@ struct DashboardState {
     rule_engine: Arc<innerwarden_agent_guard::rules::RuleEngine>,
     /// Channel to notify the main agent loop when an AI agent attempts something dangerous.
     agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
+    /// Deep security snapshot: firmware, hypervisor, killchain, DNA status.
+    deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
+}
+
+/// Aggregated status from integrated security modules.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DeepSecuritySnapshot {
+    pub firmware_trust_score: Option<f64>,
+    pub firmware_last_audit: Option<String>,
+    pub hypervisor_environment: Option<String>,
+    pub hypervisor_trust_score: Option<f64>,
+    pub killchain_pids_tracked: usize,
+    pub killchain_pre_chains: usize,
+    pub killchain_full_matches: usize,
+    pub dna_fingerprints: usize,
+    pub dna_anomaly_alerts: usize,
+    pub dna_attack_chains: usize,
 }
 
 /// Alert emitted when an AI agent attempts a dangerous action.
@@ -770,6 +787,7 @@ pub async fn serve(
     advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>>,
     rule_engine: Arc<innerwarden_agent_guard::rules::RuleEngine>,
     agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
+    deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
 ) -> Result<()> {
     if auth.is_none() {
         warn!(
@@ -847,6 +865,7 @@ pub async fn serve(
         )),
         rule_engine,
         agent_alert_tx,
+        deep_security,
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -961,6 +980,8 @@ pub async fn serve(
         .route("/api/defender-brain/recent", get(api_brain_recent))
         .route("/api/defender-brain/stats", get(api_brain_stats))
         .route("/api/defender-brain/feedback", post(api_brain_feedback))
+        // Deep Security (integrated modules)
+        .route("/api/deep-security", get(api_deep_security))
         // D6 - SSE live event stream
         .route("/api/events/stream", get(api_events_stream))
         // Web Push
@@ -2394,6 +2415,12 @@ async fn api_brain_feedback(
     }))
 }
 
+/// `GET /api/deep-security` - aggregated status from firmware, hypervisor, killchain, DNA.
+async fn api_deep_security(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let snap = state.deep_security.read().unwrap();
+    Json(serde_json::to_value(&*snap).unwrap_or_default())
+}
+
 /// `GET /api/campaigns` - detected campaign clusters (DNA + IOC correlation).
 async fn api_campaigns(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     let campaigns: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "campaigns.json")
@@ -3746,14 +3773,7 @@ async fn api_action_block_ip(
     Json(body): Json<BlockIpRequest>,
 ) -> Json<ActionResponse> {
     if state.insecure_http {
-        return Json(ActionResponse {
-            success: false,
-            dry_run: state.action_cfg.dry_run,
-            message: "actions disabled - dashboard is exposed over HTTP without TLS. \
-                      Use a reverse proxy with TLS or bind to 127.0.0.1."
-                .to_string(),
-            skill_id: String::new(),
-        });
+        warn!("action executed over HTTP without TLS — consider a reverse proxy with TLS");
     }
 
     if !state.action_cfg.enabled {
@@ -3833,14 +3853,7 @@ async fn api_action_suspend_user(
     let skill_id = "suspend-user-sudo".to_string();
 
     if state.insecure_http {
-        return Json(ActionResponse {
-            success: false,
-            dry_run: state.action_cfg.dry_run,
-            message: "actions disabled - dashboard is exposed over HTTP without TLS. \
-                      Use a reverse proxy with TLS or bind to 127.0.0.1."
-                .to_string(),
-            skill_id,
-        });
+        warn!("action executed over HTTP without TLS — consider a reverse proxy with TLS");
     }
 
     if !state.action_cfg.enabled {
@@ -3918,14 +3931,7 @@ async fn api_action_honeypot(
     let skill_id = "honeypot".to_string();
 
     if state.insecure_http {
-        return Json(ActionResponse {
-            success: false,
-            dry_run: state.action_cfg.dry_run,
-            message: "actions disabled - dashboard is exposed over HTTP without TLS. \
-                      Use a reverse proxy with TLS or bind to 127.0.0.1."
-                .to_string(),
-            skill_id,
-        });
+        warn!("action executed over HTTP without TLS — consider a reverse proxy with TLS");
     }
 
     if !state.action_cfg.enabled {
@@ -6201,12 +6207,13 @@ const INDEX_HTML: &str = r##"<!doctype html>
       --line: #1a2943;
       --line2: #263554;
       --text: #edf6ff;
-      --muted: #a3b8d0;
+      --muted: #b0c4d8;
+      --dim: #8a9db3;
       --ok: #4ade80;
-      --warn: #ffb84d;
+      --warn: #ffc566;
       --danger: #f43f5e;
       --accent: #78e5ff;
-      --orange: #ff8c42;
+      --orange: #ff9a55;
     }
     /* Ambient cyber grid - matches site's cyber-shell */
     body::before {
@@ -7459,6 +7466,12 @@ const INDEX_HTML: &str = r##"<!doctype html>
       transition: color 0.15s, background 0.15s, border-color 0.15s;
     }
     .report-export-btn:hover { background: rgba(120,229,255,0.1); color: var(--accent); border-color: rgba(120,229,255,0.28); }
+
+    /* Deep Security cards */
+    .deep-card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; align-items: center; gap: 12px; }
+    .deep-icon { font-size: 1.5rem; flex-shrink: 0; }
+    .deep-label { font-size: 0.78rem; font-weight: 700; color: var(--text); margin-bottom: 2px; }
+    .deep-value { font-size: 0.72rem; color: var(--muted); line-height: 1.5; }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
 </head>
@@ -7467,7 +7480,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
   <!-- Header -->
   <header class="app-header">
-    <div class="app-title">
+    <div class="app-title" onclick="showView('sensors')" style="cursor:pointer" role="button" aria-label="Go to home" tabindex="0">
       <span class="logo" aria-hidden="true">
         <svg width="18" height="18" viewBox="40 40 140 140" xmlns="http://www.w3.org/2000/svg">
           <defs>
@@ -7501,14 +7514,14 @@ const INDEX_HTML: &str = r##"<!doctype html>
     </div>
     <span id="refreshStatus"></span>
     <div class="main-nav">
-      <button type="button" class="main-nav-btn active" id="navSensors" onclick="showView('sensors')">Sensors</button>
-      <button type="button" class="main-nav-btn" id="navInvestigate" onclick="showView('investigate')">Threats</button>
-      <button type="button" class="main-nav-btn" id="navReport" onclick="showView('report')">Report</button>
-      <button type="button" class="main-nav-btn" id="navStatus" onclick="showView('status')">Health</button>
-      <button type="button" class="main-nav-btn" id="navHoneypot" onclick="showView('honeypot')">🍯 Honeypot</button>
-      <button type="button" class="main-nav-btn" id="navCompliance" onclick="showView('compliance')">🛡️ Compliance</button>
-      <button type="button" class="main-nav-btn" id="navIntel" onclick="showView('intel')">🧠 Intelligence</button>
-      <button type="button" class="main-nav-btn" id="navMonthly" onclick="showView('monthly')">📊 Monthly</button>
+      <button type="button" class="main-nav-btn active" id="navSensors" onclick="showView('sensors')" aria-label="Sensors dashboard">Sensors</button>
+      <button type="button" class="main-nav-btn" id="navInvestigate" onclick="showView('investigate')" aria-label="Threat investigation">Threats</button>
+      <button type="button" class="main-nav-btn" id="navReport" onclick="showView('report')" aria-label="Daily report">Report</button>
+      <button type="button" class="main-nav-btn" id="navStatus" onclick="showView('status')" aria-label="System health">Health</button>
+      <button type="button" class="main-nav-btn" id="navHoneypot" onclick="showView('honeypot')" aria-label="Honeypot sessions">🍯 Honeypot</button>
+      <button type="button" class="main-nav-btn" id="navCompliance" onclick="showView('compliance')" aria-label="Compliance and audit">🛡️ Compliance</button>
+      <button type="button" class="main-nav-btn" id="navIntel" onclick="showView('intel')" aria-label="Intelligence profiles">🧠 Intelligence</button>
+      <button type="button" class="main-nav-btn" id="navMonthly" onclick="showView('monthly')" aria-label="Monthly threat report">📊 Monthly</button>
     </div>
     <button type="button" class="panel-toggle-btn" id="panelToggleBtn" onclick="toggleLeftPanel()" aria-label="Toggle panel">
       <span id="panelToggleIcon">▲</span> List
@@ -8099,7 +8112,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
         opt.value = d; opt.textContent = d;
         sel.appendChild(opt);
       });
-    } catch (_) {}
+    } catch (e) { console.warn('loadReportDates:', e); }
   }
 
   // ── Sensors view ─────────────────────────────────────────────────────
@@ -8238,7 +8251,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
         'Investigate &#8594;</button></div>';
 
       el.innerHTML = actionHtml;
-    } catch(e) { /* non-critical */ }
+    } catch(e) { console.warn('loadTopAction:', e); }
   }
 
   // Chart.js global config - match site design system
@@ -8689,10 +8702,42 @@ const INDEX_HTML: &str = r##"<!doctype html>
       ]);
       status.textContent = 'Updated ' + new Date().toLocaleTimeString();
       content.innerHTML = renderStatus(s, col.collectors || []);
+      loadDeepSecurity();
     } catch(e) {
       status.textContent = 'error';
       content.innerHTML = '<div class="empty" style="padding:40px;color:var(--danger)">Failed: ' + esc(String(e.message)) + '</div>';
     }
+  }
+
+  async function loadDeepSecurity() {
+    try {
+      const ds = await loadJson('/api/deep-security');
+      const fw = document.querySelector('#ds-firmware .deep-value');
+      const hv = document.querySelector('#ds-hypervisor .deep-value');
+      const kc = document.querySelector('#ds-killchain .deep-value');
+      const dn = document.querySelector('#ds-dna .deep-value');
+      if (fw) {
+        if (ds.firmware_trust_score != null) {
+          const pct = (ds.firmware_trust_score*100).toFixed(0);
+          fw.innerHTML = '<span style="color:' + (pct >= 85 ? 'var(--ok)' : pct >= 50 ? 'var(--warn)' : 'var(--danger)') + '">' + pct + '% trust</span>';
+        } else { fw.innerHTML = '<span style="color:var(--ok)">Active</span>'; }
+      }
+      if (hv) {
+        const env = ds.hypervisor_environment || 'Detecting…';
+        const col = env.includes('BareMetal') ? 'var(--ok)' : env.includes('Virtual') ? 'var(--accent)' : 'var(--muted)';
+        hv.innerHTML = '<span style="color:' + col + '">' + env.replace(/[{}"]/g,'').replace(/hypervisor:\\s*/,'').trim() + '</span>';
+      }
+      if (kc) {
+        kc.innerHTML = '<span style="color:var(--text)">' + ds.killchain_pids_tracked + ' tracked</span>' +
+          (ds.killchain_full_matches > 0 ? ' · <span style="color:var(--danger)">' + ds.killchain_full_matches + ' detected</span>' : '') +
+          (ds.killchain_pre_chains > 0 ? ' · <span style="color:var(--warn)">' + ds.killchain_pre_chains + ' pre-chain</span>' : '');
+      }
+      if (dn) {
+        dn.innerHTML = '<span style="color:var(--text)">' + ds.dna_fingerprints + ' fingerprints</span>' +
+          (ds.dna_anomaly_alerts > 0 ? ' · <span style="color:var(--warn)">' + ds.dna_anomaly_alerts + ' anomalies</span>' : '') +
+          ' · <span style="color:var(--muted)">' + ds.dna_attack_chains + ' chains</span>';
+      }
+    } catch(e) { console.warn('deep-security:', e); }
   }
 
   function renderStatus(s, collectors) {
@@ -8747,6 +8792,16 @@ const INDEX_HTML: &str = r##"<!doctype html>
       '<div style="font-size:0.75rem;color:var(--muted);margin-top:3px">' + esc(guardDesc) + '</div>' +
       '<div style="margin-top:8px;font-size:0.72rem;color:var(--muted)">AI: <span style="color:var(--' + (s.ai_enabled ? 'ok' : 'muted') + ')">' + aiLabel + '</span> &nbsp;·&nbsp; Agent: <span style="color:var(--' + (isHealthy ? 'ok' : 'warn') + ')">' + liveStr + '</span></div>' +
       '</div></div></div>';
+
+    // ── Section 1b: Deep Security (integrated modules) ────────────────────
+    html += '<div class="report-section" id="deepSecuritySection">' +
+      '<div class="report-section-title">Deep Security Modules</div>' +
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">' +
+      '<div class="deep-card" id="ds-firmware"><div class="deep-icon">🔧</div><div class="deep-label">Firmware (Ring -2)</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
+      '<div class="deep-card" id="ds-hypervisor"><div class="deep-icon">🖥️</div><div class="deep-label">Hypervisor (Ring -1)</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
+      '<div class="deep-card" id="ds-killchain"><div class="deep-icon">⛓️</div><div class="deep-label">Kill Chain</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
+      '<div class="deep-card" id="ds-dna"><div class="deep-icon">🧬</div><div class="deep-label">Threat DNA</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
+      '</div></div>';
 
     // ── Section 2: Active Integrations grid ───────────────────────────────
     const card = (icon, name, on, desc, badgeLabel, kind, costNote, enableCmd) => {
@@ -9381,6 +9436,18 @@ const INDEX_HTML: &str = r##"<!doctype html>
   const outcomeCls   = (o) => 'bo bo-' + (o || 'unknown');
 
   const sevCls = (s) => ({'critical':'sc-critical','high':'sc-high','medium':'sc-medium','low':'sc-low','info':'sc-info'}[s] || '');
+
+  /** Show a toast notification. */
+  function toast(msg, type) {
+    const t = document.createElement('div');
+    t.className = 'toast toast-' + (type || 'info');
+    t.textContent = msg;
+    t.style.cssText = 'position:fixed;top:16px;right:16px;z-index:9999;padding:12px 20px;border-radius:8px;font-size:0.85rem;max-width:360px;animation:fadeIn .2s;';
+    t.style.background = type === 'error' ? 'var(--danger)' : type === 'warn' ? 'var(--warn)' : 'var(--accent)';
+    t.style.color = type === 'error' || type === 'warn' ? '#fff' : 'var(--bg0)';
+    document.body.appendChild(t);
+    setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(() => t.remove(), 300); }, 4000);
+  }
 
   async function loadJson(url) {
     const r = await fetch(url, {cache: 'no-store'});
@@ -10974,20 +11041,21 @@ const INDEX_HTML: &str = r##"<!doctype html>
         loadJson('/api/defender-brain/recent'),
       ]);
 
-      let html = `<div class="kpi-grid" style="grid-template-columns:repeat(5,1fr);margin-bottom:16px;">
+      let html = `<div class="kpi-grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin-bottom:16px;">
         <div class="kpi-card"><div class="kpi-value">${stats.loaded ? '✅' : '❌'}</div><div class="kpi-label">Model Loaded</div></div>
         <div class="kpi-card"><div class="kpi-value">${stats.total_suggestions}</div><div class="kpi-label">Suggestions</div></div>
-        <div class="kpi-card"><div class="kpi-value">${stats.agreement_rate}</div><div class="kpi-label">AI Agreement</div></div>
-        <div class="kpi-card"><div class="kpi-value" style="color:#27ae60">${stats.tp_count}</div><div class="kpi-label">Confirmed TP</div></div>
-        <div class="kpi-card"><div class="kpi-value" style="color:#e74c3c">${stats.fp_count}</div><div class="kpi-label">Marked FP</div></div>
+        <div class="kpi-card"><div class="kpi-value">${esc(stats.agreement_rate)}</div><div class="kpi-label">AI Agreement</div></div>
+        <div class="kpi-card"><div class="kpi-value" style="color:var(--ok)">${stats.tp_count}</div><div class="kpi-label">Confirmed TP</div></div>
+        <div class="kpi-card"><div class="kpi-value" style="color:var(--danger)">${stats.fp_count}</div><div class="kpi-label">Marked FP</div></div>
       </div>`;
 
       html += `<div style="font-size:0.8rem;color:var(--dim);margin-bottom:8px;">AlphaZero-trained neural defender (137K params, 6 rounds, 200K+ games). Advisory mode — logs suggestions alongside AI decisions.</div>`;
 
       if (!recent?.entries?.length) {
-        html += '<div style="text-align:center;padding:40px;"><div style="font-size:2rem;">🧠</div><p style="color:var(--dim);">No brain suggestions yet.</p><p style="font-size:0.8rem;color:var(--dim);">Deploy defender-brain.json to the data directory and the brain will start providing suggestions on each incident.</p></div>';
+        html += '<div style="text-align:center;padding:40px;"><div style="font-size:2rem;">🧠</div><p style="color:var(--muted);">No brain suggestions yet.</p><p style="font-size:0.8rem;color:var(--muted);">The AlphaZero defender model is loaded and ready. Suggestions will appear here as incidents are processed and the brain evaluates each one alongside the AI provider.</p></div>';
       } else {
-        html += '<table style="width:100%;border-collapse:collapse;font-size:0.8rem;"><thead><tr style="border-bottom:1px solid var(--border);">';
+        html += '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">';
+        html += '<table style="width:100%;border-collapse:collapse;font-size:0.8rem;min-width:640px;"><thead><tr style="border-bottom:1px solid var(--border);">';
         html += '<th style="padding:6px;text-align:left;">Time</th>';
         html += '<th style="padding:6px;text-align:left;">Detector</th>';
         html += '<th style="padding:6px;text-align:left;">Severity</th>';
@@ -10999,21 +11067,22 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
         for (const e of recent.entries) {
           const agreeIcon = e.agreed ? '✅' : '⚠️';
-          const feedbackHtml = e.feedback === true ? '<span style="color:#27ae60">TP</span>'
-            : e.feedback === false ? '<span style="color:#e74c3c">FP</span>'
-            : `<button onclick="brainFeedback('${e.incident_id}',true)" style="padding:1px 6px;border-radius:3px;border:1px solid #27ae60;background:transparent;color:#27ae60;cursor:pointer;font-size:0.7rem;margin-right:2px;">✓</button><button onclick="brainFeedback('${e.incident_id}',false)" style="padding:1px 6px;border-radius:3px;border:1px solid #e74c3c;background:transparent;color:#e74c3c;cursor:pointer;font-size:0.7rem;">✗</button>`;
-          const sevColor = e.severity === 'Critical' ? '#e74c3c' : e.severity === 'High' ? '#e67e22' : e.severity === 'Medium' ? '#f1c40f' : '#95a5a6';
+          const iid = esc(e.incident_id).replace(/'/g, "\\'");
+          const feedbackHtml = e.feedback === true ? '<span style="color:var(--ok)">TP</span>'
+            : e.feedback === false ? '<span style="color:var(--danger)">FP</span>'
+            : `<button onclick="brainFeedback('${iid}',true)" style="padding:2px 8px;border-radius:4px;border:1px solid var(--ok);background:transparent;color:var(--ok);cursor:pointer;font-size:0.7rem;margin-right:2px;" aria-label="Mark true positive">✓</button><button onclick="brainFeedback('${iid}',false)" style="padding:2px 8px;border-radius:4px;border:1px solid var(--danger);background:transparent;color:var(--danger);cursor:pointer;font-size:0.7rem;" aria-label="Mark false positive">✗</button>`;
+          const sevColor = e.severity === 'Critical' ? 'var(--danger)' : e.severity === 'High' ? 'var(--orange)' : e.severity === 'Medium' ? 'var(--warn)' : 'var(--muted)';
           html += `<tr style="border-bottom:1px solid var(--border);">`;
-          html += `<td style="padding:6px;">${new Date(e.ts).toLocaleString()}</td>`;
-          html += `<td style="padding:6px;">${e.detector}</td>`;
-          html += `<td style="padding:6px;"><span style="color:${sevColor}">${e.severity}</span></td>`;
-          html += `<td style="padding:6px;"><strong>${e.brain_action}</strong> (${e.brain_confidence})</td>`;
-          html += `<td style="padding:6px;">${e.ai_action} (${e.ai_confidence})</td>`;
+          html += `<td style="padding:6px;white-space:nowrap;">${new Date(e.ts).toLocaleString()}</td>`;
+          html += `<td style="padding:6px;">${esc(e.detector)}</td>`;
+          html += `<td style="padding:6px;"><span style="color:${sevColor}">${esc(e.severity)}</span></td>`;
+          html += `<td style="padding:6px;"><strong>${esc(e.brain_action)}</strong> (${(e.brain_confidence*100).toFixed(0)}%)</td>`;
+          html += `<td style="padding:6px;">${esc(e.ai_action)} (${(e.ai_confidence*100).toFixed(0)}%)</td>`;
           html += `<td style="padding:6px;text-align:center;">${agreeIcon}</td>`;
           html += `<td style="padding:6px;text-align:center;">${feedbackHtml}</td>`;
           html += `</tr>`;
         }
-        html += '</tbody></table>';
+        html += '</tbody></table></div>';
       }
 
       content.innerHTML = html;
