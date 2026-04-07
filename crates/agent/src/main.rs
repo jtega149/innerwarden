@@ -442,7 +442,10 @@ struct AgentState {
     /// Timestamp of last DNA state persistence.
     last_dna_save: std::time::Instant,
     /// IPs of active operator SSH sessions (trusted_users). Never blocked.
-    operator_ips: std::collections::HashSet<String>,
+    /// Value = last time the session was confirmed active via `who`.
+    operator_ips: std::collections::HashMap<String, std::time::Instant>,
+    /// Last time we refreshed operator_ips from `who -i`.
+    last_operator_refresh: std::time::Instant,
     /// Suppressed incident patterns (user-configurable via CLI/dashboard).
     suppressed_incident_ids: std::collections::HashSet<String>,
     /// Threat feed client for external intelligence (None when disabled).
@@ -1054,7 +1057,8 @@ async fn main() -> Result<()> {
         ),
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
-        operator_ips: std::collections::HashSet::new(),
+        operator_ips: std::collections::HashMap::new(),
+        last_operator_refresh: std::time::Instant::now(),
         suppressed_incident_ids: firmware_tick::load_suppressed_ids(&cli.data_dir),
         threat_feed: None, // initialized below if configured
         last_baseline_anomaly_ts: None,
@@ -1064,29 +1068,11 @@ async fn main() -> Result<()> {
         redis_reader: None,
     };
 
-    // Seed operator IPs from allowlist.trusted_ips — these must NEVER be blocked.
-    for tip in &cfg.allowlist.trusted_ips {
-        state.operator_ips.insert(tip.clone());
-        info!(ip = %tip, "startup: trusted IP added to operator protection");
-    }
-
     // Seed operator IPs from active SSH sessions (who -i).
-    if let Ok(output) = std::process::Command::new("who").arg("-i").output() {
-        let who_out = String::from_utf8_lossy(&output.stdout);
-        for line in who_out.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let (Some(user), Some(ip_raw)) = (parts.first(), parts.last()) {
-                let ip = ip_raw.trim_matches(|c| c == '(' || c == ')');
-                if cfg.allowlist.trusted_users.iter().any(|u| u == *user)
-                    && !ip.is_empty()
-                    && ip != ":"
-                {
-                    state.operator_ips.insert(ip.to_string());
-                    info!(user, ip, "startup: operator session detected");
-                }
-            }
-        }
-    }
+    // Only publickey SSH sessions from trusted_users are considered operators.
+    // IPs are dynamic — they expire when the session ends (refreshed every 30s).
+    refresh_operator_ips(&mut state, &cfg.allowlist);
+    state.last_operator_refresh = std::time::Instant::now();
 
     // Load attacker intelligence profiles from persistent store
     state.attacker_profiles = attacker_intel::load_from_store(&state.store);
@@ -1342,6 +1328,13 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                    }
+
+                    // Refresh operator IPs from active SSH sessions (every 30s).
+                    // Expired sessions are removed so dynamic IPs don't stay protected forever.
+                    if state.last_operator_refresh.elapsed() >= std::time::Duration::from_secs(30) {
+                        refresh_operator_ips(&mut state, &cfg.allowlist);
+                        state.last_operator_refresh = std::time::Instant::now();
                     }
 
                     // Autoencoder nightly training — at 3 AM UTC.
@@ -2288,6 +2281,45 @@ async fn process_incidents(
     handled
 }
 
+/// Refresh operator IPs from active SSH sessions.
+/// Replaces the entire set — IPs whose sessions ended are automatically removed.
+fn refresh_operator_ips(state: &mut AgentState, allowlist: &config::AllowlistConfig) {
+    let now = std::time::Instant::now();
+    let mut active_ips = std::collections::HashMap::new();
+
+    // Check active sessions via `who -i`
+    if let Ok(output) = std::process::Command::new("who").arg("-i").output() {
+        let who_out = String::from_utf8_lossy(&output.stdout);
+        for line in who_out.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let (Some(user), Some(ip_raw)) = (parts.first(), parts.last()) {
+                let ip = ip_raw.trim_matches(|c| c == '(' || c == ')');
+                if allowlist.trusted_users.iter().any(|u| u == *user)
+                    && !ip.is_empty()
+                    && ip != ":"
+                {
+                    active_ips.insert(ip.to_string(), now);
+                }
+            }
+        }
+    }
+
+    // Log removed sessions
+    for old_ip in state.operator_ips.keys() {
+        if !active_ips.contains_key(old_ip) {
+            info!(ip = %old_ip, "operator session ended — IP protection removed");
+        }
+    }
+    // Log new sessions
+    for new_ip in active_ips.keys() {
+        if !state.operator_ips.contains_key(new_ip) {
+            info!(ip = %new_ip, "operator session detected — IP protected");
+        }
+    }
+
+    state.operator_ips = active_ips;
+}
+
 /// Execute an AI decision by finding and running the appropriate skill.
 /// Returns (execution_message, cloudflare_pushed).
 pub(crate) async fn execute_decision(
@@ -2757,7 +2789,9 @@ async fn process_narrative_tick(
                     .or_else(|| ev.details.get("src_ip"))
                     .and_then(|v| v.as_str());
                 if let Some(ip) = ip {
-                    if state.operator_ips.insert(ip.to_string()) {
+                    let is_new = !state.operator_ips.contains_key(ip);
+                    state.operator_ips.insert(ip.to_string(), std::time::Instant::now());
+                    if is_new {
                         let user = ev
                             .details
                             .get("user")
@@ -2765,7 +2799,7 @@ async fn process_narrative_tick(
                             .unwrap_or("?");
                         info!(
                             user,
-                            ip, "operator session detected (publickey) — IP whitelisted"
+                            ip, "operator session detected (publickey) — IP protected"
                         );
                     }
                 }
@@ -3066,7 +3100,8 @@ mod tests {
             ),
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashMap::new(),
+        last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3339,7 +3374,8 @@ mod tests {
             ),
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashMap::new(),
+        last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3507,7 +3543,8 @@ mod tests {
             ),
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashMap::new(),
+        last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3650,7 +3687,8 @@ mod tests {
             ),
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashMap::new(),
+        last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3805,7 +3843,8 @@ mod tests {
             ),
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashMap::new(),
+        last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -3937,7 +3976,8 @@ mod tests {
             ),
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashMap::new(),
+        last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
@@ -4081,7 +4121,8 @@ mod tests {
             ),
             last_dna_save: std::time::Instant::now(),
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashMap::new(),
+        last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,

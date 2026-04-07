@@ -49,12 +49,12 @@ pub(crate) async fn try_handle_obvious_incident(
         return false;
     };
 
-    // Never auto-block operator IPs or trusted IPs.
-    if state.operator_ips.contains(ip) || cfg.allowlist.trusted_ips.iter().any(|t| t == ip) {
+    // Never auto-block active operator sessions (publickey SSH from trusted_users).
+    if state.operator_ips.contains_key(ip) {
         info!(
             ip,
             incident_id = %incident.incident_id,
-            "obvious gate: skipping auto-block for trusted/operator IP"
+            "obvious gate: skipping auto-block — active operator session"
         );
         return false;
     }
