@@ -5,7 +5,8 @@
     clippy::manual_swap,
     clippy::manual_memcpy,
     clippy::single_match,
-    clippy::collapsible_if
+    clippy::collapsible_if,
+    clippy::io_other_error
 )]
 
 //! InnerWarden SMM — Ring -2 firmware security monitoring.
