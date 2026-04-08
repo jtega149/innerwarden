@@ -136,9 +136,16 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
                 }
             }
 
+            // Track agreement for brain evolution stats
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            state.brain_stats.record(brain_agrees, &today);
+
             state.brain_history.record(log_entry);
         }
     }
+
+    // Persist brain stats every call (lightweight — just a small JSON)
+    state.brain_stats.save(data_dir);
 }
 
 /// Build 72-dim feature vector for the defender brain from incident + agent state.
