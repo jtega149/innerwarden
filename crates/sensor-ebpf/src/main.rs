@@ -761,6 +761,9 @@ fn try_privesc(ctx: &ProbeContext) -> Result<(), i64> {
 /// Policy map - controls LSM enforcement.
 /// Key 0 = master switch: 0 = disabled (observe only), 1 = enforce (block).
 /// Key 1 = sensitive write protection: 0 = observe only, 1 = block writes.
+/// Key 2 = gradual mode (overrides key 0/1 when set):
+///   0 = disabled, 1 = log-only (allow, emit event), 2 = warn (allow, emit WARN event),
+///   3 = enforce (block + emit event). When key 2 > 0, it takes priority over keys 0/1.
 /// Managed by the agent via bpftool on the pinned map.
 #[map]
 static LSM_POLICY: HashMap<u32, u32> = HashMap::with_max_entries(16, 0);
@@ -834,11 +837,26 @@ fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
     }
 
     // ── Guard mode enforcement ──
-    // Check if enforcement is enabled (key 0 in policy map)
-    let enabled = unsafe { LSM_POLICY.get(&0u32) };
-    if enabled.is_none() || *enabled.unwrap() == 0 {
-        return Ok(0); // policy disabled - allow everything
+    // Key 2 (gradual mode) takes priority over key 0 when set.
+    // Mode: 0=disabled, 1=log, 2=warn, 3=enforce
+    let gradual_mode = unsafe { LSM_POLICY.get(&2u32) }.copied().unwrap_or(0);
+    if gradual_mode > 0 {
+        // Gradual mode active: 1=log (allow all), 2=warn (allow all), 3=enforce
+        if gradual_mode < 3 {
+            // Log/warn mode: events are always emitted by the code below,
+            // but we never return -EPERM. The agent reads the events and
+            // decides severity based on mode (warn = High, log = Info).
+            // Fall through to detection logic but override the block at the end.
+        }
+        // Mode 3 (enforce) falls through to normal blocking logic.
+    } else {
+        // Legacy: check key 0 (master switch)
+        let enabled = unsafe { LSM_POLICY.get(&0u32) };
+        if enabled.is_none() || *enabled.unwrap() == 0 {
+            return Ok(0); // policy disabled - allow everything
+        }
     }
+    let should_block = gradual_mode == 0 || gradual_mode >= 3;
 
     // Kill chain detection: check both PID and TGID (thread group leader).
     // When a process forks (subprocess.run, os.system), the child has a new PID
@@ -974,7 +992,12 @@ fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
         entry.submit(0);
     }
 
-    Ok(-1) // -EPERM: deny execution
+    // Gradual mode: log/warn modes allow execution, only enforce blocks.
+    if should_block {
+        Ok(-1) // -EPERM: deny execution
+    } else {
+        Ok(0) // log/warn mode: allow but event was already emitted above
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,7 +1262,16 @@ fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         entry.submit(0);
     }
 
-    // Check if guard mode is enabled (LSM_POLICY key 1)
+    // Check enforcement mode: key 2 (gradual) takes priority over key 1.
+    let gradual_mode = unsafe { LSM_POLICY.get(&2u32) }.copied().unwrap_or(0);
+    if gradual_mode >= 3 {
+        return Ok(-1); // enforce mode: block the write
+    }
+    if gradual_mode > 0 {
+        return Ok(0); // log/warn mode: allow but event was already emitted above
+    }
+
+    // Legacy: key 1 (binary on/off)
     let guard_writes = unsafe { LSM_POLICY.get(&1u32) };
     if guard_writes.is_some() && *guard_writes.unwrap() == 1 {
         return Ok(-1); // -EPERM: block the write
