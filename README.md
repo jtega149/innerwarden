@@ -62,8 +62,6 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 <h3 align="center">
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
-  &nbsp;·&nbsp;
-  <a href="https://vimeo.com/1175992244">3-minute explainer video</a>
 </h3>
 
 https://github.com/user-attachments/assets/b55967a6-a2d0-4158-9007-05e689d5bf0c
