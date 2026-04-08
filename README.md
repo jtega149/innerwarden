@@ -69,13 +69,7 @@ https://github.com/user-attachments/assets/b55967a6-a2d0-4158-9007-05e689d5bf0c
 https://github.com/user-attachments/assets/6ea1e124-52c2-48fe-8600-4b2f3d670116
 
 <p align="center">
-  <img src="docs/images/dashboard-sensors.png" alt="Dashboard: sensor HUD with eBPF activity, threat gauge, and detector charts" width="820">
-</p>
-<p align="center">
-  <img src="docs/images/dashboard-threats.png" alt="Dashboard: real-time threat overview" width="820">
-</p>
-<p align="center">
-  <img src="docs/images/dashboard-investigate.png" alt="Dashboard: IP investigation view" width="820">
+  <img src="docs/images/innerwarden-demo.gif" alt="InnerWarden dashboard demo — sensors, threats, investigation, attacker intelligence" width="820">
 </p>
 
 ---
