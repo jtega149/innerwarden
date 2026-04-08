@@ -173,7 +173,10 @@ fn ip_to_bpf_map_and_key(ip: &str) -> Result<(&'static str, String)> {
         let b = v4.octets();
         Ok((
             "blocklist",
-            format!("0x{:02x} 0x{:02x} 0x{:02x} 0x{:02x}", b[0], b[1], b[2], b[3]),
+            format!(
+                "0x{:02x} 0x{:02x} 0x{:02x} 0x{:02x}",
+                b[0], b[1], b[2], b[3]
+            ),
         ))
     } else if let Ok(v6) = ip.parse::<Ipv6Addr>() {
         let b = v6.octets();

@@ -465,7 +465,7 @@ pub fn compute_risk_score(profile: &mut AttackerProfile) {
     }
 
     // Shield DDoS involvement (+5 per block, max 10)
-    score += (profile.shield_blocks as u32 * 5).min(10);
+    score += (profile.shield_blocks * 5).min(10);
 
     profile.risk_score = score.min(100) as u8;
 }

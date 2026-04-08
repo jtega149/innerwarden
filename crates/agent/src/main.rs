@@ -2970,10 +2970,7 @@ async fn process_narrative_tick(
                 } else {
                     "shield.escalation.transition"
                 };
-                let corr = correlation_engine::CorrelationEngine::shield_event(
-                    kind,
-                    inc.clone(),
-                );
+                let corr = correlation_engine::CorrelationEngine::shield_event(kind, inc.clone());
                 state.correlation_engine.observe(corr);
             }
         }

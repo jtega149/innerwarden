@@ -1707,13 +1707,11 @@ fn builtin_rules() -> Vec<CorrelationRule> {
         CorrelationRule {
             id: "CL-047".into(),
             name: "Attacker IP Rotation Detected".into(),
-            stages: vec![
-                RuleStage {
-                    layer: Some(Layer::Userspace),
-                    kind_patterns: vec!["dna.ip_rotation".into()],
-                    entity_must_match: false,
-                },
-            ],
+            stages: vec![RuleStage {
+                layer: Some(Layer::Userspace),
+                kind_patterns: vec!["dna.ip_rotation".into()],
+                entity_must_match: false,
+            }],
             window_secs: 1, // single event is enough
             min_confidence: 0.95,
             severity: Severity::Critical,

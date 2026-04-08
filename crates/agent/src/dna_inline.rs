@@ -53,7 +53,10 @@ pub(crate) fn process_events(
     dna: &mut DnaState,
     events: &[innerwarden_core::event::Event],
     correlation_engine: &mut correlation_engine::CorrelationEngine,
-    attacker_profiles: &mut std::collections::HashMap<String, crate::attacker_intel::AttackerProfile>,
+    attacker_profiles: &mut std::collections::HashMap<
+        String,
+        crate::attacker_intel::AttackerProfile,
+    >,
 ) {
     let now = chrono::Utc::now();
 
@@ -152,9 +155,10 @@ pub(crate) fn process_events(
 
                         // Apply inheritance to the new IP's profile.
                         if inherited_risk > 0 {
-                            let new_profile = attacker_profiles
-                                .entry(ip.clone())
-                                .or_insert_with(|| crate::attacker_intel::new_profile(&ip, chrono::Utc::now()));
+                            let new_profile =
+                                attacker_profiles.entry(ip.clone()).or_insert_with(|| {
+                                    crate::attacker_intel::new_profile(&ip, chrono::Utc::now())
+                                });
                             // Floor: new IP starts at least at the previous risk level.
                             if new_profile.risk_score < inherited_risk {
                                 new_profile.risk_score = inherited_risk;

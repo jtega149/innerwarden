@@ -2397,10 +2397,9 @@ async fn api_brain_stats(State(state): State<DashboardState>) -> Json<serde_json
     let model_exists = true; // embedded in binary since v0.9.4
 
     // Load retrain stats from brain-stats.json
-    let brain_stats: serde_json::Value =
-        safe_read_data_file(&state.data_dir, "brain-stats.json")
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(serde_json::json!({}));
+    let brain_stats: serde_json::Value = safe_read_data_file(&state.data_dir, "brain-stats.json")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::json!({}));
 
     Json(serde_json::json!({
         "loaded": model_exists,

@@ -668,9 +668,7 @@ impl DefenderBrain {
 
                     // Update weights and biases
                     let mut grad_input = vec![0.0f32; input.len()];
-                    for (j, (w_row, &g)) in
-                        layer.weights.iter_mut().zip(grad.iter()).enumerate()
-                    {
+                    for (j, (w_row, &g)) in layer.weights.iter_mut().zip(grad.iter()).enumerate() {
                         layer.biases[j] -= lr * g;
                         for (k, w) in w_row.iter_mut().enumerate() {
                             grad_input[k] += *w * g;
@@ -807,7 +805,10 @@ mod tests {
         assert!(suggestion.value >= -1.0 && suggestion.value <= 1.0);
         eprintln!(
             "V5 suggestion: {} ({:.1}%), value={:.3}, top3: {:?}",
-            suggestion.action_name, suggestion.confidence * 100.0, suggestion.value, suggestion.top_actions
+            suggestion.action_name,
+            suggestion.confidence * 100.0,
+            suggestion.value,
+            suggestion.top_actions
         );
     }
 
@@ -829,9 +830,21 @@ mod tests {
         scan[5] = 0.2;
         let scan_s = brain.suggest(&scan).unwrap();
 
-        eprintln!("Quiet: {} ({:.1}%)", quiet.action_name, quiet.confidence * 100.0);
-        eprintln!("Ransomware: {} ({:.1}%)", ransom_s.action_name, ransom_s.confidence * 100.0);
-        eprintln!("Port scan: {} ({:.1}%)", scan_s.action_name, scan_s.confidence * 100.0);
+        eprintln!(
+            "Quiet: {} ({:.1}%)",
+            quiet.action_name,
+            quiet.confidence * 100.0
+        );
+        eprintln!(
+            "Ransomware: {} ({:.1}%)",
+            ransom_s.action_name,
+            ransom_s.confidence * 100.0
+        );
+        eprintln!(
+            "Port scan: {} ({:.1}%)",
+            scan_s.action_name,
+            scan_s.confidence * 100.0
+        );
 
         // V5 50M: trained on self-play, not production data.
         // Currently suggests same action for all scenarios (low confidence).

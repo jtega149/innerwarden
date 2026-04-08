@@ -106,7 +106,11 @@ pub(crate) fn process_events(
                 .get("bytes")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(64);
-            if risk > 60 { raw * 2 } else { raw }
+            if risk > 60 {
+                raw * 2
+            } else {
+                raw
+            }
         };
 
         // Feed rate limiter
