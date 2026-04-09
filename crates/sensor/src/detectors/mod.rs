@@ -120,3 +120,8 @@ pub mod sigma_rule;
 #[allow(dead_code)]
 pub mod stego_detect;
 pub mod yara_scan;
+
+// v0.10.1 detectors — MITRE gap closers
+pub mod data_encoding;
+pub mod dns_c2;
+pub mod sandbox_evasion;

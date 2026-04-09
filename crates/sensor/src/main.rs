@@ -133,6 +133,9 @@ struct DetectorSet {
     yara_scan: Option<detectors::yara_scan::YaraScanDetector>,
     sigma_rule: Option<detectors::sigma_rule::SigmaRuleDetector>,
     mitre_hunt: Option<detectors::mitre_hunt::MitreHuntDetector>,
+    dns_c2: Option<detectors::dns_c2::DnsC2Detector>,
+    data_encoding: Option<detectors::data_encoding::DataEncodingDetector>,
+    sandbox_evasion: Option<detectors::sandbox_evasion::SandboxEvasionDetector>,
 }
 
 #[derive(Default)]
@@ -684,6 +687,18 @@ async fn main() -> Result<()> {
         mitre_hunt: Some({
             info!("mitre_hunt detector enabled (10 MITRE ATT&CK techniques)");
             detectors::mitre_hunt::MitreHuntDetector::new(&cfg.agent.host_id, 300)
+        }),
+        dns_c2: Some({
+            info!("dns_c2 detector enabled (T1071.004 DNS C2 channel detection)");
+            detectors::dns_c2::DnsC2Detector::new(&cfg.agent.host_id, 6, 300)
+        }),
+        data_encoding: Some({
+            info!("data_encoding detector enabled (T1132 encoded C2/exfil traffic)");
+            detectors::data_encoding::DataEncodingDetector::new(&cfg.agent.host_id, 3, 300)
+        }),
+        sandbox_evasion: Some({
+            info!("sandbox_evasion detector enabled (T1497 VM/sandbox evasion checks)");
+            detectors::sandbox_evasion::SandboxEvasionDetector::new(&cfg.agent.host_id, 3, 60)
         }),
     };
 
@@ -1657,6 +1672,24 @@ fn process_event(
     }
 
     if let Some(ref mut det) = detectors.mitre_hunt {
+        if let Some(incident) = det.process(&ev) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    if let Some(ref mut det) = detectors.dns_c2 {
+        if let Some(incident) = det.process(&ev) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    if let Some(ref mut det) = detectors.data_encoding {
+        if let Some(incident) = det.process(&ev) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    if let Some(ref mut det) = detectors.sandbox_evasion {
         if let Some(incident) = det.process(&ev) {
             write_incident(writer, stats, incident, syslog, dedup_cache);
         }
