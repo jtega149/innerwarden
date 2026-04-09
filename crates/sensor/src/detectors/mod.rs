@@ -126,4 +126,5 @@ pub mod data_encoding;
 pub mod dns_c2;
 pub mod sandbox_evasion;
 pub mod datasets;
+pub mod proto_anomaly;
 pub mod threat_intel;

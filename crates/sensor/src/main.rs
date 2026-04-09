@@ -137,6 +137,7 @@ struct DetectorSet {
     data_encoding: Option<detectors::data_encoding::DataEncodingDetector>,
     sandbox_evasion: Option<detectors::sandbox_evasion::SandboxEvasionDetector>,
     threat_intel: Option<detectors::threat_intel::ThreatIntelDetector>,
+    proto_anomaly: Option<detectors::proto_anomaly::ProtoAnomalyDetector>,
 }
 
 #[derive(Default)]
@@ -704,6 +705,10 @@ async fn main() -> Result<()> {
         threat_intel: Some({
             info!("threat_intel detector enabled (O(1) dataset matching)");
             detectors::threat_intel::ThreatIntelDetector::new(&cfg.agent.host_id, 600)
+        }),
+        proto_anomaly: Some({
+            info!("proto_anomaly detector enabled (protocol violation detection)");
+            detectors::proto_anomaly::ProtoAnomalyDetector::new(&cfg.agent.host_id, 300)
         }),
     };
 
@@ -1730,6 +1735,13 @@ fn process_event(
     // Threat intelligence dataset matching (O(1) per lookup).
     if let Some(ref mut det) = detectors.threat_intel {
         if let Some(incident) = det.process(&ev, threat_datasets) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // Protocol anomaly detection (works on tcp_stream events).
+    if let Some(ref mut det) = detectors.proto_anomaly {
+        for incident in det.process(&ev) {
             write_incident(writer, stats, incident, syslog, dedup_cache);
         }
     }
