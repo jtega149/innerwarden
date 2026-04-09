@@ -2421,6 +2421,32 @@ async fn process_incidents(
             state,
         );
 
+        // Feed decision into knowledge graph
+        {
+            let (action_type, action_target) = match &decision.action {
+                ai::AiAction::BlockIp { ip, .. } => ("block_ip", Some(ip.as_str())),
+                ai::AiAction::Monitor { ip } => ("monitor", Some(ip.as_str())),
+                ai::AiAction::Honeypot { ip } => ("honeypot", Some(ip.as_str())),
+                ai::AiAction::SuspendUserSudo { user, .. } => ("suspend_user_sudo", Some(user.as_str())),
+                ai::AiAction::KillProcess { user, .. } => ("kill_process", Some(user.as_str())),
+                ai::AiAction::BlockContainer { container_id, .. } => ("block_container", Some(container_id.as_str())),
+                ai::AiAction::Ignore { .. } => ("ignore", None),
+                ai::AiAction::RequestConfirmation { .. } => ("request_confirmation", None),
+                ai::AiAction::KillChainResponse { .. } => ("kill_chain_response", None),
+            };
+            let auto_executed = decision.auto_execute && !execution_result.is_empty();
+            let mut graph = state.knowledge_graph.write().unwrap();
+            graph.ingest_decision(
+                &incident.incident_id,
+                action_type,
+                action_target,
+                decision.confidence,
+                &decision.reason,
+                auto_executed,
+                chrono::Utc::now(),
+            );
+        }
+
         incident_playbook::maybe_evaluate_and_persist_playbook(incident, data_dir, state);
 
         incident_action_report::maybe_send_post_execution_telegram_report(

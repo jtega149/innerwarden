@@ -171,6 +171,82 @@ impl KnowledgeGraph {
         }
     }
 
+    /// Ingest an AI decision into the graph.
+    /// Updates the Incident node with the decision and creates action edges.
+    pub fn ingest_decision(
+        &mut self,
+        incident_id: &str,
+        action_type: &str,
+        action_target: Option<&str>,
+        confidence: f32,
+        reason: &str,
+        auto_executed: bool,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) {
+        // Update the Incident node
+        if let Some(inc_node_id) = self.find_by_incident(incident_id) {
+            if let Some(Node::Incident {
+                decision: ref mut dec,
+                confidence: ref mut conf,
+                ..
+            }) = self.get_node_mut(inc_node_id)
+            {
+                *dec = Some(action_type.to_string());
+                *conf = Some(confidence);
+            }
+
+            // Create action-specific edges
+            match action_type {
+                "block_ip" => {
+                    if let Some(ip_str) = action_target {
+                        let ip_id = self.ensure_ip(ip_str, ts);
+                        let sys_id = self.ensure_system(""); // will find existing singleton
+                        let edge = Edge::new(ip_id, sys_id, Relation::BlockedBy, ts)
+                            .with_prop("reason", serde_json::Value::from(reason.to_string()))
+                            .with_prop("incident_id", serde_json::Value::from(incident_id.to_string()))
+                            .with_prop("auto_executed", serde_json::Value::from(auto_executed))
+                            .with_prop("confidence", serde_json::Value::from(confidence));
+                        self.add_edge(edge);
+                    }
+                }
+                "monitor" => {
+                    // Monitor: no structural change, just update decision field (done above)
+                }
+                "honeypot" => {
+                    if let Some(ip_str) = action_target {
+                        let ip_id = self.ensure_ip(ip_str, ts);
+                        let sys_id = self.ensure_system("");
+                        let edge = Edge::new(ip_id, sys_id, Relation::BlockedBy, ts)
+                            .with_prop("reason", serde_json::Value::from("honeypot_diversion"))
+                            .with_prop("incident_id", serde_json::Value::from(incident_id.to_string()));
+                        self.add_edge(edge);
+                    }
+                }
+                "suspend_user_sudo" => {
+                    if let Some(user_str) = action_target {
+                        let user_id = self.ensure_user(user_str);
+                        let sys_id = self.ensure_system("");
+                        let edge = Edge::new(user_id, sys_id, Relation::BlockedBy, ts)
+                            .with_prop("reason", serde_json::Value::from("sudo_suspended"))
+                            .with_prop("incident_id", serde_json::Value::from(incident_id.to_string()));
+                        self.add_edge(edge);
+                    }
+                }
+                "kill_process" => {
+                    if let Some(user_str) = action_target {
+                        let user_id = self.ensure_user(user_str);
+                        let sys_id = self.ensure_system("");
+                        let edge = Edge::new(user_id, sys_id, Relation::BlockedBy, ts)
+                            .with_prop("reason", serde_json::Value::from("process_killed"))
+                            .with_prop("incident_id", serde_json::Value::from(incident_id.to_string()));
+                        self.add_edge(edge);
+                    }
+                }
+                _ => {} // ignore, request_confirmation, kill_chain_response
+            }
+        }
+    }
+
     // ── Shell & Execution ───────────────────────────────────────────
 
     fn ingest_shell_command_exec(&mut self, event: &Event) {
