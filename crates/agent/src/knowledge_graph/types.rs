@@ -92,6 +92,9 @@ pub enum Node {
         mitre_ids: Vec<String>,
         decision: Option<String>,
         confidence: Option<f32>,
+        decision_reason: Option<String>,
+        decision_target: Option<String>,
+        auto_executed: bool,
     },
     Campaign {
         campaign_id: String,

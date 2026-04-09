@@ -146,6 +146,9 @@ impl KnowledgeGraph {
             mitre_ids,
             decision: None,
             confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
         });
 
         // Create TriggeredBy edges from Incident to each entity
@@ -188,11 +191,17 @@ impl KnowledgeGraph {
             if let Some(Node::Incident {
                 decision: ref mut dec,
                 confidence: ref mut conf,
+                decision_reason: ref mut dr,
+                decision_target: ref mut dt,
+                auto_executed: ref mut ae,
                 ..
             }) = self.get_node_mut(inc_node_id)
             {
                 *dec = Some(action_type.to_string());
                 *conf = Some(confidence);
+                *dr = Some(reason.to_string());
+                *dt = action_target.map(|s| s.to_string());
+                *ae = auto_executed;
             }
 
             // Create action-specific edges

@@ -2800,6 +2800,9 @@ async fn api_incidents(
                 mitre_ids,
                 decision,
                 confidence: _,
+                decision_reason: _,
+                decision_target: _,
+                auto_executed: _,
             }) = graph.get_node(id)
             {
                 // Collect entities from TriggeredBy edges
@@ -2855,26 +2858,46 @@ async fn api_decisions(
 ) -> Json<DecisionListResponse> {
     let date = resolve_date(query.date.as_deref());
     let limit = normalize_limit(query.limit);
-    let path = dated_path(&state.data_dir, "decisions", &date);
-    let mut decisions = read_jsonl::<DecisionEntry>(&path);
-    decisions.sort_by(|a, b| b.ts.cmp(&a.ts));
-    let total = decisions.len();
-    let items = decisions
-        .into_iter()
-        .take(limit)
-        .map(|d| DecisionView {
-            ts: d.ts,
-            incident_id: d.incident_id,
-            action_type: d.action_type,
-            target_ip: d.target_ip,
-            skill_id: d.skill_id,
-            confidence: d.confidence,
-            auto_executed: d.auto_executed,
-            dry_run: d.dry_run,
-            reason: d.reason,
-            execution_result: d.execution_result,
+
+    use crate::knowledge_graph::types::{Node, NodeType};
+    let graph = state.knowledge_graph.read().unwrap();
+
+    let mut views: Vec<DecisionView> = graph
+        .nodes_of_type(NodeType::Incident)
+        .iter()
+        .filter_map(|&id| {
+            if let Some(Node::Incident {
+                incident_id,
+                ts,
+                decision: Some(action_type),
+                confidence,
+                decision_reason,
+                decision_target,
+                auto_executed,
+                ..
+            }) = graph.get_node(id)
+            {
+                Some(DecisionView {
+                    ts: *ts,
+                    incident_id: incident_id.clone(),
+                    action_type: action_type.clone(),
+                    target_ip: decision_target.clone(),
+                    skill_id: None, // not stored in graph (audit trail detail)
+                    confidence: confidence.unwrap_or(0.0),
+                    auto_executed: *auto_executed,
+                    dry_run: false,
+                    reason: decision_reason.clone().unwrap_or_default(),
+                    execution_result: if *auto_executed { "ok".to_string() } else { "skipped".to_string() },
+                })
+            } else {
+                None
+            }
         })
         .collect();
+
+    views.sort_by(|a, b| b.ts.cmp(&a.ts));
+    let total = views.len();
+    let items: Vec<DecisionView> = views.into_iter().take(limit).collect();
 
     Json(DecisionListResponse { date, total, items })
 }
@@ -2975,7 +2998,8 @@ async fn api_journey(
         });
     }
 
-    Json(build_journey(
+    Json(build_journey_from_graph(
+        &state.knowledge_graph,
         &state.data_dir,
         &date,
         subject_type,
@@ -5552,6 +5576,245 @@ fn build_cluster_items(
 }
 
 /// Build the full journey timeline for a selected subject on a given date.
+/// Build a journey timeline from the knowledge graph (live, no JSONL).
+/// Falls back to honeypot JSONL for honeypot sessions (not in graph yet).
+fn build_journey_from_graph(
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    data_dir: &Path,
+    date: &str,
+    subject_type: PivotKind,
+    subject: &str,
+    _filters: &InvestigationFilters,
+    window_seconds: Option<u64>,
+) -> JourneyResponse {
+    use crate::knowledge_graph::types::*;
+
+    let graph = kg.read().unwrap();
+
+    // Find the center node
+    let center = match subject_type {
+        PivotKind::Ip => graph.find_by_ip(subject),
+        PivotKind::User => graph.find_by_user(subject),
+        PivotKind::Detector => None, // detector pivot doesn't map to a single node
+    };
+
+    let center_id = match center {
+        Some(id) => id,
+        None => {
+            return empty_journey(subject_type, subject, date);
+        }
+    };
+
+    // Get neighborhood (depth=3 for rich context)
+    let sub = graph.neighborhood(center_id, 3);
+    let mut entries: Vec<JourneyEntry> = Vec::new();
+    let mut related_ips: BTreeSet<String> = BTreeSet::new();
+    let mut related_users: BTreeSet<String> = BTreeSet::new();
+    let mut related_detectors: BTreeSet<String> = BTreeSet::new();
+    let mut has_incident = false;
+
+    // Convert graph edges to timeline entries
+    let mut sorted_edges: Vec<&Edge> = sub.edges.iter().filter(|e| !e.is_snapshot()).collect();
+    sorted_edges.sort_by_key(|e| e.ts);
+
+    for edge in &sorted_edges {
+        let from_node = sub.nodes.get(&edge.from);
+        let to_node = sub.nodes.get(&edge.to);
+        let from_label = from_node.map(|n| n.label()).unwrap_or_default();
+        let to_label = to_node.map(|n| n.label()).unwrap_or_default();
+        let rel = format!("{:?}", edge.relation);
+
+        // Collect related entities
+        if let Some(Node::Ip { addr, .. }) = from_node {
+            related_ips.insert(addr.clone());
+        }
+        if let Some(Node::Ip { addr, .. }) = to_node {
+            related_ips.insert(addr.clone());
+        }
+        if let Some(Node::User { name, .. }) = from_node {
+            related_users.insert(name.clone());
+        }
+        if let Some(Node::User { name, .. }) = to_node {
+            related_users.insert(name.clone());
+        }
+
+        // Build summary from edge
+        let summary = format!("{} → {} ({})", from_label, to_label, rel);
+        let severity = match edge.relation {
+            Relation::ConnectedTo | Relation::AcceptedFrom => "info",
+            Relation::Wrote | Relation::Read | Relation::Executed => "low",
+            Relation::EscalatedTo | Relation::PtraceAttached | Relation::MprotectExec => "high",
+            Relation::BlockedBy => "medium",
+            Relation::RedirectedFd | Relation::CreatedMemfd => "high",
+            _ => "info",
+        };
+
+        entries.push(JourneyEntry {
+            ts: edge.ts,
+            kind: "event".to_string(),
+            data: serde_json::json!({
+                "severity": severity,
+                "source": "knowledge_graph",
+                "event_kind": rel,
+                "summary": summary,
+                "details": edge.properties,
+                "tags": [],
+            }),
+        });
+    }
+
+    // Add incident entries from Incident nodes in the subgraph
+    for (id, node) in &sub.nodes {
+        if let Node::Incident {
+            incident_id,
+            detector,
+            severity,
+            title,
+            summary,
+            ts,
+            mitre_ids,
+            decision,
+            confidence,
+            decision_reason,
+            decision_target,
+            auto_executed,
+        } = node
+        {
+            has_incident = true;
+            related_detectors.insert(detector.clone());
+
+            entries.push(JourneyEntry {
+                ts: *ts,
+                kind: "incident".to_string(),
+                data: serde_json::json!({
+                    "incident_id": incident_id,
+                    "severity": severity.to_lowercase(),
+                    "title": title,
+                    "summary": summary,
+                    "tags": mitre_ids,
+                    "detector": detector,
+                }),
+            });
+
+            // Add decision entry if present
+            if let Some(action) = decision {
+                entries.push(JourneyEntry {
+                    ts: *ts,
+                    kind: "decision".to_string(),
+                    data: serde_json::json!({
+                        "action_type": action,
+                        "confidence": confidence.unwrap_or(0.0),
+                        "auto_executed": auto_executed,
+                        "reason": decision_reason.as_deref().unwrap_or(""),
+                        "target_ip": decision_target,
+                        "incident_id": incident_id,
+                        "execution_result": if *auto_executed { "ok" } else { "skipped" },
+                    }),
+                });
+            }
+        }
+    }
+
+    // Honeypot sessions from JSONL (not yet in graph)
+    let mut honeypot_ips = related_ips.clone();
+    if subject_type == PivotKind::Ip {
+        honeypot_ips.insert(subject.to_string());
+    }
+    let mut hp_entries = scan_honeypot_sessions(data_dir, date, &honeypot_ips);
+    entries.append(&mut hp_entries);
+
+    // Sort and window
+    entries.sort_by_key(|e| e.ts);
+    if let Some(window) = window_seconds {
+        if let Some(last_ts) = entries.last().map(|e| e.ts) {
+            let cutoff = last_ts - chrono::Duration::seconds(window as i64);
+            entries.retain(|entry| entry.ts >= cutoff);
+        }
+    }
+
+    let first_seen = entries.first().map(|e| e.ts);
+    let last_seen = entries.last().map(|e| e.ts);
+
+    // Determine outcome from Incident decisions
+    let outcome = sub
+        .nodes
+        .values()
+        .filter_map(|n| {
+            if let Node::Incident { decision: Some(d), .. } = n {
+                Some(d.as_str())
+            } else {
+                None
+            }
+        })
+        .find_map(|d| match d {
+            "block_ip" => Some("blocked"),
+            "honeypot" => Some("honeypot"),
+            "monitor" => Some("monitoring"),
+            _ => None,
+        })
+        .unwrap_or(if has_incident { "active" } else { "unknown" })
+        .to_string();
+
+    let summary = build_journey_summary(
+        &entries,
+        &outcome,
+        subject_type,
+        subject,
+        &related_ips,
+        &related_users,
+        &related_detectors,
+    );
+    let verdict = derive_verdict(&entries, &outcome);
+    let chapters = derive_chapters(&entries);
+
+    JourneyResponse {
+        subject_type: subject_type.as_str().to_string(),
+        subject: subject.to_string(),
+        date: date.to_string(),
+        first_seen,
+        last_seen,
+        outcome,
+        summary,
+        verdict,
+        chapters,
+        entries,
+    }
+}
+
+fn empty_journey(subject_type: PivotKind, subject: &str, date: &str) -> JourneyResponse {
+    JourneyResponse {
+        subject_type: subject_type.as_str().to_string(),
+        subject: subject.to_string(),
+        date: date.to_string(),
+        first_seen: None,
+        last_seen: None,
+        outcome: "unknown".to_string(),
+        summary: JourneySummary {
+            total_entries: 0,
+            events_count: 0,
+            incidents_count: 0,
+            decisions_count: 0,
+            honeypot_count: 0,
+            first_event: None,
+            first_incident: None,
+            first_decision: None,
+            first_honeypot: None,
+            pivot_shortcuts: vec![],
+            hints: vec!["No data found for this entity in the knowledge graph.".to_string()],
+        },
+        verdict: JourneyVerdict {
+            entry_vector: "unknown".to_string(),
+            access_status: "inconclusive".to_string(),
+            privilege_status: "inconclusive".to_string(),
+            containment_status: "unknown".to_string(),
+            honeypot_status: "not_engaged".to_string(),
+            confidence: "low".to_string(),
+        },
+        chapters: vec![],
+        entries: vec![],
+    }
+}
+
 fn build_journey(
     data_dir: &Path,
     date: &str,
