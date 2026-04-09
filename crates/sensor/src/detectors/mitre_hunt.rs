@@ -926,6 +926,21 @@ impl MitreHuntDetector {
             return None;
         }
 
+        // Skip if spawned by InnerWarden itself (pcap_capture spawns tcpdump).
+        let ppid = event.details.get("ppid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let parent_comm = event.details.get("parent_comm").and_then(|v| v.as_str()).unwrap_or("");
+        if parent_comm.starts_with("innerwarden") {
+            return None;
+        }
+        // Also check if parent is the sensor by reading /proc/ppid/comm (best-effort).
+        if ppid > 0 {
+            if let Ok(pcomm) = std::fs::read_to_string(format!("/proc/{ppid}/comm")) {
+                if pcomm.trim().starts_with("innerwarden") {
+                    return None;
+                }
+            }
+        }
+
         self.emit(
             "network_sniffing",
             Severity::Medium,

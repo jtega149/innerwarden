@@ -29,6 +29,13 @@ const DEVELOPMENT_PATHS: &[&str] = &[
     "/run/",            // runtime mounts
     "/proc/",           // procfs
     "/sys/",            // sysfs
+    "/tmp/cargo-",      // cargo build temp files
+    "/tmp/rustc",       // rustc temp files
+    "/tmp/npm-",        // npm temp files
+    "/tmp/pip-",        // pip temp files
+    "/var/cache/",      // package manager caches
+    "/usr/lib/rustlib/", // Rust toolchain
+    "/usr/share/cargo/", // cargo shared
 ];
 
 /// Processes that legitimately execute from non-standard paths.
@@ -45,12 +52,28 @@ const ALLOWED_PROCESSES: &[&str] = &[
     "flatpak",
     "pip",
     "npm",
+    "npx",
     "cargo",
+    "rustc",
+    "cc",
+    "cc1",
+    "gcc",
+    "g++",
+    "ld",
+    "as",
+    "ar",
+    "make",
+    "cmake",
     "go",
     "python",
+    "python3",
     "node",
     "java",
     "innerwarden",
+    "prometheus",
+    "telegraf",
+    "node_export",
+    "grafana",
 ];
 
 /// Detects execution of binaries from unexpected filesystem locations.

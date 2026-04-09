@@ -481,6 +481,13 @@ struct OverviewResponse {
     events_count: usize,
     incidents_count: usize,
     decisions_count: usize,
+    /// Incidents where AI decided to act (block, kill, honeypot, monitor).
+    /// This is the "real threat" count. incidents_count - confirmed = noise/ignored.
+    ai_confirmed: usize,
+    /// Incidents where AI executed a response action (block_ip, kill_process, etc).
+    ai_responded: usize,
+    /// Incidents where AI decided to ignore (false positive or low risk).
+    ai_ignored: usize,
     top_detectors: Vec<DetectorCount>,
     latest_telemetry: Option<TelemetrySnapshot>,
 }
@@ -2533,6 +2540,9 @@ async fn api_overview(
             events_count: 0,
             incidents_count: 0,
             decisions_count: 0,
+            ai_confirmed: 0,
+            ai_responded: 0,
+            ai_ignored: 0,
             top_detectors: vec![],
             latest_telemetry: crate::telemetry::read_latest_snapshot(&state.data_dir, &date),
         });
@@ -4921,11 +4931,28 @@ fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse {
     top_detectors.sort_by(|a, b| b.count.cmp(&a.count).then(a.detector.cmp(&b.detector)));
     top_detectors.truncate(6);
 
+    // Classify AI decisions: confirmed (action taken) vs ignored
+    let ai_confirmed = decisions
+        .iter()
+        .filter(|d| d.action_type != "ignore" && d.action_type != "request_confirmation")
+        .count();
+    let ai_responded = decisions
+        .iter()
+        .filter(|d| d.auto_executed && d.action_type != "ignore" && d.action_type != "monitor")
+        .count();
+    let ai_ignored = decisions
+        .iter()
+        .filter(|d| d.action_type == "ignore")
+        .count();
+
     OverviewResponse {
         date: date.to_string(),
         events_count,
         incidents_count: incidents.len(),
         decisions_count: decisions.len(),
+        ai_confirmed,
+        ai_responded,
+        ai_ignored,
         top_detectors,
         latest_telemetry: crate::telemetry::read_latest_snapshot(data_dir, date),
     }
@@ -7741,11 +7768,12 @@ const INDEX_HTML: &str = r##"<!doctype html>
     <aside class="left-panel">
 
       <!-- Today summary strip -->
-      <div class="kpi-grid" style="grid-template-columns: repeat(4,1fr)">
-        <div class="kpi-card"><div class="kpi-label">Date</div><div class="kpi-value" id="kpi-date" style="font-size:0.7rem">-</div></div>
+      <div class="kpi-grid" style="grid-template-columns: repeat(5,1fr)">
         <div class="kpi-card"><div class="kpi-label">Events</div><div class="kpi-value" id="kpi-events">0</div></div>
-        <div class="kpi-card"><div class="kpi-label">Incidents</div><div class="kpi-value" id="kpi-incidents" style="color:var(--ok)">0</div></div>
-        <div class="kpi-card"><div class="kpi-label">Contained</div><div class="kpi-value" id="kpi-decisions" style="color:var(--ok)">100%</div></div>
+        <div class="kpi-card"><div class="kpi-label">Threats</div><div class="kpi-value" id="kpi-confirmed" style="color:#e74c3c">0</div></div>
+        <div class="kpi-card"><div class="kpi-label">Responded</div><div class="kpi-value" id="kpi-responded" style="color:#27ae60">0</div></div>
+        <div class="kpi-card"><div class="kpi-label">Noise</div><div class="kpi-value" id="kpi-noise" style="color:var(--dim);font-size:0.7rem">0</div></div>
+        <div class="kpi-card"><div class="kpi-label">Raw incidents</div><div class="kpi-value" id="kpi-incidents" style="color:var(--dim);font-size:0.7rem">0</div></div>
       </div>
 
       <!-- Date + advanced filters (hidden by default) -->
@@ -10541,8 +10569,10 @@ const INDEX_HTML: &str = r##"<!doctype html>
       const items = entityData.items || [];
 
       updateKpi('kpi-events',    ov.events_count);
+      updateKpi('kpi-confirmed', ov.ai_confirmed || 0);
+      updateKpi('kpi-responded', ov.ai_responded || 0);
+      updateKpi('kpi-noise',     ov.ai_ignored || 0);
       updateKpi('kpi-incidents', ov.incidents_count);
-      updateKpi('kpi-decisions', ov.decisions_count);
       updateKpi('kpi-attackers', items.length);
 
       const list = document.getElementById('attackerList');
@@ -10609,10 +10639,11 @@ const INDEX_HTML: &str = r##"<!doctype html>
       const items = entityData.items || [];
       state.clusters = clusterData.items || [];
 
-      document.getElementById('kpi-date').textContent      = ov.date;
       document.getElementById('kpi-events').textContent    = ov.events_count;
+      document.getElementById('kpi-confirmed').textContent = ov.ai_confirmed || 0;
+      document.getElementById('kpi-responded').textContent = ov.ai_responded || 0;
+      document.getElementById('kpi-noise').textContent     = ov.ai_ignored || 0;
       document.getElementById('kpi-incidents').textContent = ov.incidents_count;
-      document.getElementById('kpi-decisions').textContent = ov.decisions_count;
       const kpiAtt = document.getElementById('kpi-attackers');
       if (kpiAtt) kpiAtt.textContent = items.length;
 
@@ -12142,6 +12173,9 @@ mod tests {
                 events_count: 10,
                 incidents_count: 2,
                 decisions_count: 1,
+                ai_confirmed: 1,
+                ai_responded: 0,
+                ai_ignored: 0,
                 top_detectors: vec![],
                 latest_telemetry: None,
             },
