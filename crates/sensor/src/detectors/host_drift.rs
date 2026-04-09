@@ -254,9 +254,16 @@ fn is_development_path(path: &str) -> bool {
 }
 
 fn is_allowed_process(comm: &str) -> bool {
-    ALLOWED_PROCESSES
-        .iter()
-        .any(|p| comm == *p || comm.starts_with(p))
+    // Short names (cc, ld, as, ar) require exact match to avoid false allowlisting
+    // (e.g., "cca" is not "cc"). Longer names use starts_with for variants
+    // (e.g., "cargo-build" starts with "cargo").
+    ALLOWED_PROCESSES.iter().any(|p| {
+        if p.len() <= 3 {
+            comm == *p
+        } else {
+            comm == *p || comm.starts_with(p)
+        }
+    })
 }
 
 fn classify_path_severity(path: &str) -> Severity {

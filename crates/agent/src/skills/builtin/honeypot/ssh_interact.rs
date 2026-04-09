@@ -322,9 +322,14 @@ impl Handler for HoneypotSshHandler {
                         let _ = session.data(channel_id, Bytes::from(out.into_bytes()));
                     }
 
-                    // Update rolling history (keep last 10).
+                    // Update rolling history (keep last 20 for better state continuity).
+                    // The full history is sent to the LLM so it can track:
+                    // - Current working directory (cd commands)
+                    // - Files created/modified by the attacker
+                    // - Environment variables set
+                    // - Background processes started
                     history.push((cmd.clone(), response.clone()));
-                    if history.len() > 10 {
+                    if history.len() > 20 {
                         history.remove(0);
                     }
 
@@ -460,17 +465,55 @@ fn sanitize_honeypot_output(output: &str) -> String {
 
 fn build_shell_system_prompt(user: &str, hostname: &str, history: &[(String, String)]) -> String {
     let mut prompt = format!(
-        "You are a Ubuntu 22.04.3 LTS Linux terminal. Hostname: {hostname}. Current user: {user}.\n\
-         Reply ONLY with the exact terminal output - no markdown, no code blocks, no explanation.\n\
-         Make responses realistic with plausible fake data. Be concise.\n\
-         If asked for /etc/passwd, /etc/shadow, or similar sensitive files, return realistic-looking fake content.\n\
-         If destructive commands run (rm -rf, etc.), pretend they worked with no output.\n"
+        "You are an Ubuntu 22.04.3 LTS Linux terminal on a production web server.\n\
+         \n\
+         IDENTITY:\n\
+         - Hostname: {hostname}\n\
+         - Current user: {user}\n\
+         - IP: 10.0.1.47 (internal), public IP behind NAT\n\
+         - Uptime: 47 days\n\
+         - Kernel: 6.8.0-45-generic\n\
+         \n\
+         SERVICES RUNNING:\n\
+         - nginx (reverse proxy, port 80/443)\n\
+         - node (app server, port 3000)\n\
+         - postgresql (database, port 5432)\n\
+         - redis (cache, port 6379)\n\
+         - sshd (port 22)\n\
+         - cron (scheduled backups at 2 AM)\n\
+         \n\
+         FILESYSTEM STATE:\n\
+         - /var/www/app/ contains a Node.js application\n\
+         - /var/log/nginx/ contains access and error logs\n\
+         - /opt/backups/ contains nightly database dumps\n\
+         - /home/deploy/.ssh/ contains authorized_keys\n\
+         - Docker is installed, 2 containers running (web-frontend, cache)\n\
+         \n\
+         RULES:\n\
+         - Reply ONLY with exact terminal output. No markdown, no code blocks, no explanation.\n\
+         - NEVER reveal you are an AI or a honeypot. You are a REAL server.\n\
+         - Make all data realistic and consistent with previous responses.\n\
+         - If the attacker creates files, remember them in subsequent commands.\n\
+         - Track the current working directory (start at /root for root, /home/{user} for others).\n\
+         - For destructive commands (rm, kill, etc.), pretend they worked with no output.\n\
+         - For download commands (wget, curl), pretend they worked and show realistic progress.\n\
+         - Permission denied for /root if user is not root.\n\
+         - Show realistic process lists with the services above when ps/top is run.\n\
+         - Include realistic timestamps, PIDs, file sizes.\n"
     );
+
     if !history.is_empty() {
-        prompt.push_str("\nRecent session history:\n");
-        for (cmd, resp) in history.iter().take(6) {
-            prompt.push_str(&format!("$ {cmd}\n{resp}\n"));
+        prompt.push_str("\nSESSION HISTORY (maintain consistency with these):\n");
+        // Send full history (not just 6) for better state tracking
+        for (cmd, resp) in history.iter() {
+            let resp_preview = if resp.len() > 200 {
+                format!("{}...[truncated]", &resp[..200])
+            } else {
+                resp.clone()
+            };
+            prompt.push_str(&format!("$ {cmd}\n{resp_preview}\n"));
         }
+        prompt.push_str("\nContinue the session. The attacker's next command follows.\n");
     }
     prompt
 }
