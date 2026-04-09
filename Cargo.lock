@@ -1671,6 +1671,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "ed25519-dalek",
  "fs2",
  "futures-core",
  "hkdf",

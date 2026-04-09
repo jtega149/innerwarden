@@ -977,6 +977,8 @@ pub async fn serve(
         .route("/api/baseline-status", get(api_baseline_status))
         .route("/api/playbook-log", get(api_playbook_log))
         .route("/api/responses", get(api_responses))
+        .route("/api/mitre/navigator", get(api_mitre_navigator))
+        .route("/api/mitre/coverage", get(api_mitre_coverage))
         // Defender Brain (AlphaZero)
         .route("/api/defender-brain/recent", get(api_brain_recent))
         .route("/api/defender-brain/stats", get(api_brain_stats))
@@ -4855,6 +4857,37 @@ async fn api_responses(State(state): State<DashboardState>) -> axum::response::R
                 .into_response()
         }
     }
+}
+
+/// GET /api/mitre/navigator — ATT&CK Navigator layer JSON.
+/// Download and load at https://mitre-attack.github.io/attack-navigator/
+async fn api_mitre_navigator() -> axum::response::Response {
+    let layer = crate::mitre::generate_navigator_layer();
+    axum::response::Response::builder()
+        .header("content-type", "application/json")
+        .header("content-disposition", "attachment; filename=\"innerwarden-coverage.json\"")
+        .body(Body::from(serde_json::to_string_pretty(&layer).unwrap_or_default()))
+        .unwrap()
+        .into_response()
+}
+
+/// GET /api/mitre/coverage — summary of MITRE ATT&CK coverage.
+async fn api_mitre_coverage() -> axum::response::Response {
+    let ids = crate::mitre::all_technique_ids();
+    let layer = crate::mitre::generate_navigator_layer();
+    let techniques = layer["techniques"].as_array().map(|a| a.len()).unwrap_or(0);
+
+    let summary = serde_json::json!({
+        "total_techniques": techniques,
+        "technique_ids": ids,
+        "navigator_url": "/api/mitre/navigator",
+    });
+
+    axum::response::Response::builder()
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&summary).unwrap_or_default()))
+        .unwrap()
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

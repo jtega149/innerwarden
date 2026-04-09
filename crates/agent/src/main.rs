@@ -450,6 +450,11 @@ struct AgentState {
         Option<std::sync::Arc<std::sync::RwLock<dashboard::DeepSecuritySnapshot>>>,
     /// Timestamp of last DNA state persistence.
     last_dna_save: std::time::Instant,
+    /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
+    /// Hot-reloaded every 60s. Merged with static config allowlist at check time.
+    dynamic_trusted_ips: Vec<String>,
+    dynamic_trusted_users: Vec<String>,
+    dynamic_trusted_processes: Vec<String>,
     /// IPs of active operator SSH sessions (trusted_users). Never blocked.
     /// Value = last time the session was confirmed active via `who`.
     operator_ips: std::collections::HashMap<String, std::time::Instant>,
@@ -1080,6 +1085,9 @@ async fn main() -> Result<()> {
         },
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
+        dynamic_trusted_ips: Vec::new(),
+        dynamic_trusted_users: Vec::new(),
+        dynamic_trusted_processes: Vec::new(),
         operator_ips: std::collections::HashMap::new(),
         last_operator_refresh: std::time::Instant::now(),
         suppressed_incident_ids: firmware_tick::load_suppressed_ids(&cli.data_dir),
@@ -1359,6 +1367,27 @@ async fn main() -> Result<()> {
                     if state.last_operator_refresh.elapsed() >= std::time::Duration::from_secs(30) {
                         refresh_operator_ips(&mut state, &cfg.allowlist);
                         state.last_operator_refresh = std::time::Instant::now();
+                    }
+
+                    // Hot-reload dynamic allowlist from /etc/innerwarden/allowlist.toml.
+                    // Operators can add IPs/users/processes via Telegram or by editing the file.
+                    {
+                        let allowlist_path = std::path::Path::new("/etc/innerwarden/allowlist.toml");
+                        if allowlist_path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(allowlist_path) {
+                                if let Ok(table) = content.parse::<toml::Table>() {
+                                    let extract = |key: &str| -> Vec<String> {
+                                        table.get(key)
+                                            .and_then(|v| v.as_table())
+                                            .map(|t| t.keys().cloned().collect())
+                                            .unwrap_or_default()
+                                    };
+                                    state.dynamic_trusted_ips = extract("ips");
+                                    state.dynamic_trusted_users = extract("users");
+                                    state.dynamic_trusted_processes = extract("processes");
+                                }
+                            }
+                        }
                     }
 
                     // Autoencoder nightly training — at 3 AM UTC.
@@ -3198,7 +3227,10 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_ips: Vec::new(),
+        dynamic_trusted_users: Vec::new(),
+        dynamic_trusted_processes: Vec::new(),
+        operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -3476,7 +3508,10 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_ips: Vec::new(),
+        dynamic_trusted_users: Vec::new(),
+        dynamic_trusted_processes: Vec::new(),
+        operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -3649,7 +3684,10 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_ips: Vec::new(),
+        dynamic_trusted_users: Vec::new(),
+        dynamic_trusted_processes: Vec::new(),
+        operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -3797,7 +3835,10 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_ips: Vec::new(),
+        dynamic_trusted_users: Vec::new(),
+        dynamic_trusted_processes: Vec::new(),
+        operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -3957,7 +3998,10 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_ips: Vec::new(),
+        dynamic_trusted_users: Vec::new(),
+        dynamic_trusted_processes: Vec::new(),
+        operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -4094,7 +4138,10 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_ips: Vec::new(),
+        dynamic_trusted_users: Vec::new(),
+        dynamic_trusted_processes: Vec::new(),
+        operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -4243,7 +4290,10 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
-            operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_ips: Vec::new(),
+        dynamic_trusted_users: Vec::new(),
+        dynamic_trusted_processes: Vec::new(),
+        operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,

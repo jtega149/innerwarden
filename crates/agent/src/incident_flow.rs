@@ -72,19 +72,24 @@ pub(crate) fn evaluate_pre_ai_flow(
     }
 
     // Allowlist gate - skip AI for explicitly trusted IPs and users.
+    // Merges static config allowlist with dynamic allowlist.toml (hot-reloaded every 30s).
     {
         use innerwarden_core::entities::EntityType;
         let ip_allowlisted = incident
             .entities
             .iter()
             .find(|e| e.r#type == EntityType::Ip)
-            .is_some_and(|e| allowlist::is_ip_allowlisted(&e.value, &cfg.allowlist.trusted_ips));
+            .is_some_and(|e| {
+                allowlist::is_ip_allowlisted(&e.value, &cfg.allowlist.trusted_ips)
+                    || allowlist::is_ip_allowlisted(&e.value, &state.dynamic_trusted_ips)
+            });
         let user_allowlisted = incident
             .entities
             .iter()
             .find(|e| e.r#type == EntityType::User)
             .is_some_and(|e| {
                 allowlist::is_user_allowlisted(&e.value, &cfg.allowlist.trusted_users)
+                    || allowlist::is_user_allowlisted(&e.value, &state.dynamic_trusted_users)
             });
         if ip_allowlisted || user_allowlisted {
             info!(

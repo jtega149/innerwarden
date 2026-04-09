@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use collectors::{
     auth_log::AuthLogCollector, cloudtrail::CloudTrailCollector, docker::DockerCollector,
@@ -1762,7 +1762,7 @@ fn apply_seccomp_profile(path: &Path) -> Result<usize> {
         .with_context(|| format!("read seccomp profile: {}", path.display()))?;
 
     // Parse the JSON profile to get the syscall allowlist
-    let profile: serde_json::Value = serde_json::from_str(&data)
+    let profile = serde_json::from_str::<serde_json::Value>(&data)
         .context("parse seccomp profile JSON")?;
 
     let syscalls = profile["allowed_syscalls"]
