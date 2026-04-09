@@ -1079,6 +1079,17 @@ async fn main() -> Result<()> {
         });
     }
 
+    // TCP stream reassembly engine (AF_PACKET, all TCP traffic)
+    // Reassembles bidirectional streams, detects protocols on any port,
+    // enables deep packet inspection for HTTP, SSH, SMB, etc.
+    {
+        let tx_tcp = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::tcp_stream::run(tx_tcp, host_id).await;
+        });
+    }
+
     // Drop the original tx - each collector holds its own clone.
     // When all collector tasks finish, all senders drop and rx.recv() returns None.
     drop(tx);
