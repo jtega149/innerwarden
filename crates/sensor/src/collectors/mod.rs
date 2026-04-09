@@ -18,10 +18,15 @@ pub mod proc_maps;
 pub mod suricata_eve;
 pub mod syslog_firewall;
 pub mod file_extract;
+pub mod net_snapshot;
 pub mod proto_http;
 pub mod proto_smb;
 pub mod proto_ssh;
+pub mod suid_inventory;
+pub mod sysctl_drift;
+pub mod systemd_inventory;
 pub mod tcp_stream;
+pub mod usb_monitor;
 #[cfg(feature = "ebpf")]
 pub mod tls_fingerprint;
 pub mod wazuh_alerts;

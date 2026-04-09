@@ -1084,6 +1084,51 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Network snapshot: periodic /proc/net/tcp scan with PID resolution
+    {
+        let tx_net = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::net_snapshot::run(tx_net, host_id, 30).await;
+        });
+    }
+
+    // USB device monitoring: detects BadUSB, rubber ducky, unauthorized storage
+    {
+        let tx_usb = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::usb_monitor::run(tx_usb, host_id, 5).await;
+        });
+    }
+
+    // SUID binary inventory: baseline + drift detection
+    {
+        let tx_suid = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::suid_inventory::run(tx_suid, host_id, 300).await;
+        });
+    }
+
+    // Sysctl drift: monitors 20 security-critical kernel parameters
+    {
+        let tx_sysctl = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::sysctl_drift::run(tx_sysctl, host_id, 60).await;
+        });
+    }
+
+    // Systemd unit inventory: detects new/suspicious services
+    {
+        let tx_sysd = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::systemd_inventory::run(tx_sysd, host_id, 300).await;
+        });
+    }
+
     // TCP stream reassembly engine (AF_PACKET, all TCP traffic)
     // Reassembles bidirectional streams, detects protocols on any port,
     // enables deep packet inspection for HTTP, SSH, SMB, etc.
