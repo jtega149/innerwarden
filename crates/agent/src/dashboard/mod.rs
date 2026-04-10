@@ -1,3 +1,11 @@
+pub(crate) mod state;
+pub(crate) mod types;
+
+#[allow(unused_imports)]
+use state::*;
+#[allow(unused_imports)]
+use types::*;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -35,35 +43,7 @@ use innerwarden_core::entities::{EntityRef, EntityType};
 use innerwarden_core::event::Severity;
 use innerwarden_core::incident::Incident;
 
-// ---------------------------------------------------------------------------
-// D6 - SSE types
-// ---------------------------------------------------------------------------
-
-/// Minimal SSE payload pushed to connected clients.
-#[derive(Debug, Clone, Serialize)]
-struct SsePayload {
-    kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
-}
-
-type EventTx = broadcast::Sender<SsePayload>;
-
-// ---------------------------------------------------------------------------
-// SSE connection limit
-// ---------------------------------------------------------------------------
-
-static SSE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-const MAX_SSE_CONNECTIONS: usize = 50;
-
-/// RAII guard that decrements the SSE connection counter on drop.
-struct SseGuard;
-
-impl Drop for SseGuard {
-    fn drop(&mut self) {
-        SSE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
-    }
-}
+// SSE types moved to state.rs
 
 // ---------------------------------------------------------------------------
 // Security headers middleware

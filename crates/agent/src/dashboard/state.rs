@@ -1,0 +1,232 @@
+use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+
+use chrono::{DateTime, Utc};
+use rand_core::{OsRng, RngCore};
+use serde::Serialize;
+use tokio::sync::broadcast;
+
+use super::types::AdvisoryEntry;
+
+// ── SSE types ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SsePayload {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+pub(crate) type EventTx = broadcast::Sender<SsePayload>;
+
+pub(crate) static SSE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) const MAX_SSE_CONNECTIONS: usize = 50;
+
+pub(crate) struct SseGuard;
+
+impl Drop for SseGuard {
+    fn drop(&mut self) {
+        SSE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Configuration for dashboard-initiated actions (D3).
+/// Mirrors `ResponderConfig` but is owned by the dashboard independently.
+#[derive(Debug, Clone)]
+pub struct DashboardActionConfig {
+    /// Show action buttons in the UI. When false, actions are hidden entirely.
+    pub enabled: bool,
+    /// Dry-run mode: log intent but do not execute system commands.
+    pub dry_run: bool,
+    /// Firewall backend for IP blocking: "ufw" | "iptables" | "nftables".
+    pub block_backend: String,
+    /// Skills the operator is allowed to invoke from the dashboard.
+    pub allowed_skills: Vec<String>,
+    /// Whether the AI analysis is enabled.
+    pub ai_enabled: bool,
+    /// AI provider name (openai | anthropic | ollama).
+    pub ai_provider: String,
+    /// AI model in use.
+    pub ai_model: String,
+    /// Whether fail2ban integration is enabled.
+    pub fail2ban_enabled: bool,
+    /// Whether GeoIP enrichment is enabled.
+    pub geoip_enabled: bool,
+    /// Whether AbuseIPDB enrichment is enabled.
+    pub abuseipdb_enabled: bool,
+    /// AbuseIPDB auto-block threshold (0 = disabled).
+    pub abuseipdb_auto_block_threshold: u8,
+    /// Honeypot mode: "off" | "demo" | "listener".
+    pub honeypot_mode: String,
+    /// Whether Telegram notifications are enabled.
+    pub telegram_enabled: bool,
+    /// Whether Slack notifications are enabled.
+    pub slack_enabled: bool,
+    /// Whether Cloudflare integration is enabled.
+    pub cloudflare_enabled: bool,
+    /// Whether CrowdSec integration is enabled.
+    pub crowdsec_enabled: bool,
+    /// Webhook payload format: "default" | "pagerduty" | "opsgenie".
+    pub webhook_format: String,
+    /// Whether sudo_protection detector is enabled.
+    pub sudo_protection_enabled: bool,
+    /// Whether execution_guard detector is enabled.
+    pub execution_guard_enabled: bool,
+    /// Whether mesh collaborative defense is enabled.
+    pub mesh_enabled: bool,
+    /// Whether web push notifications are configured.
+    pub web_push_enabled: bool,
+    /// Whether Shield DDoS module is enabled.
+    pub shield_enabled: bool,
+    /// Whether Threat DNA fingerprinting is enabled.
+    pub dna_enabled: bool,
+    /// Data retention: events keep days.
+    pub retention_events_days: usize,
+    /// Data retention: incidents keep days.
+    pub retention_incidents_days: usize,
+    /// Data retention: decisions keep days (audit trail).
+    pub retention_decisions_days: usize,
+    /// Data retention: telemetry keep days.
+    pub retention_telemetry_days: usize,
+    /// Data retention: reports keep days.
+    pub retention_reports_days: usize,
+}
+
+impl Default for DashboardActionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dry_run: true,
+            block_backend: "ufw".to_string(),
+            allowed_skills: vec!["block-ip-ufw".to_string()],
+            ai_enabled: false,
+            ai_provider: "openai".to_string(),
+            ai_model: "gpt-4o-mini".to_string(),
+            fail2ban_enabled: false,
+            geoip_enabled: false,
+            abuseipdb_enabled: false,
+            abuseipdb_auto_block_threshold: 0,
+            honeypot_mode: "off".to_string(),
+            telegram_enabled: false,
+            slack_enabled: false,
+            cloudflare_enabled: false,
+            crowdsec_enabled: false,
+            webhook_format: "default".to_string(),
+            sudo_protection_enabled: false,
+            execution_guard_enabled: false,
+            mesh_enabled: false,
+            web_push_enabled: false,
+            shield_enabled: false,
+            dna_enabled: false,
+            retention_events_days: 7,
+            retention_incidents_days: 30,
+            retention_decisions_days: 90,
+            retention_telemetry_days: 14,
+            retention_reports_days: 30,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DashboardState {
+    data_dir: PathBuf,
+    /// D3: operator-initiated action configuration.
+    action_cfg: Arc<DashboardActionConfig>,
+    /// D6: SSE broadcast channel sender.
+    event_tx: EventTx,
+    /// Web Push: VAPID public key (base64url) served to subscribing browsers.
+    /// Empty string when web push is not configured.
+    web_push_vapid_public_key: String,
+    /// True when auth is configured but dashboard is exposed over HTTP on
+    /// a non-localhost address. Actions are disabled in this mode.
+    insecure_http: bool,
+    /// Auto-sleep: timestamp of last request. After 15 min of inactivity,
+    /// the dashboard returns a lightweight "sleeping" page instead of
+    /// reading JSONL files.
+    last_activity: Arc<std::sync::atomic::AtomicU64>,
+    /// Cached sensor API response (30s TTL) to avoid re-reading events file on every request.
+    sensor_cache: Arc<tokio::sync::Mutex<(u64, serde_json::Value)>>,
+    /// Trusted reverse-proxy IPs - only honour X-Forwarded-For / X-Real-IP
+    /// when the connecting socket IP is in this set.
+    trusted_proxies: Arc<Vec<IpAddr>>,
+    /// Active sessions: token → Session.
+    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    /// Session inactivity timeout in minutes.
+    session_timeout_minutes: u64,
+    /// Maximum concurrent sessions.
+    max_sessions: usize,
+    /// Advisory cache: recent deny/review command analyses for correlation.
+    advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>>,
+    /// Agent Guard registry: connected AI agents and their sessions.
+    agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>>,
+    /// ATR rule engine for command analysis.
+    rule_engine: Arc<innerwarden_agent_guard::rules::RuleEngine>,
+    /// Channel to notify the main agent loop when an AI agent attempts something dangerous.
+    agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
+    /// Deep security snapshot: firmware, hypervisor, killchain, DNA status.
+    deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
+    /// Shared knowledge graph for live queries (not snapshot file).
+    knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+}
+
+/// Aggregated status from integrated security modules.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DeepSecuritySnapshot {
+    pub firmware_trust_score: Option<f64>,
+    pub firmware_last_audit: Option<String>,
+    pub hypervisor_environment: Option<String>,
+    pub hypervisor_trust_score: Option<f64>,
+    pub killchain_pids_tracked: usize,
+    pub killchain_pre_chains: usize,
+    pub killchain_full_matches: usize,
+    pub dna_fingerprints: usize,
+    pub dna_anomaly_alerts: usize,
+    pub dna_attack_chains: usize,
+}
+
+/// Alert emitted when an AI agent attempts a dangerous action.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentGuardAlert {
+    pub ts: chrono::DateTime<Utc>,
+    pub agent_name: String,
+    pub command: String,
+    pub risk_score: u32,
+    pub severity: String,
+    pub recommendation: String,
+    pub signals: Vec<String>,
+    pub atr_rule_ids: Vec<String>,
+    pub explanation: String,
+}
+
+// ── Session ─────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub(crate) struct Session {
+    username: String,
+    created_at: DateTime<Utc>,
+    last_activity: Arc<AtomicI64>,
+    client_ip: String,
+}
+
+impl Session {
+    pub(crate) fn is_expired(&self, timeout_minutes: u64) -> bool {
+        let last = self.last_activity.load(Ordering::Relaxed);
+        let last_dt = DateTime::from_timestamp(last, 0).unwrap_or(self.created_at);
+        Utc::now().signed_duration_since(last_dt).num_minutes() as u64 > timeout_minutes
+    }
+
+    pub(crate) fn touch(&self) {
+        self.last_activity
+            .store(Utc::now().timestamp(), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn generate_session_token() -> String {
+    let mut bytes = [0u8; 32]; // 256 bits
+    OsRng.fill_bytes(&mut bytes);
+    // Format as hex without external crate
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
