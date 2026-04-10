@@ -41,7 +41,8 @@ pub(super) static LOGIN_RATE_LIMITER: LazyLock<Mutex<HashMap<String, Vec<std::ti
 // ---------------------------------------------------------------------------
 
 /// Max requests per IP per minute before returning 429.
-pub(super) const GLOBAL_RATE_LIMIT_PER_MIN: usize = 120;
+/// Dashboard SPA makes ~6 parallel requests per page load + SSE refreshes.
+pub(super) const GLOBAL_RATE_LIMIT_PER_MIN: usize = 300;
 
 /// Global request rate limiter: maps IP → ring of timestamps.
 /// Pruned lazily; entries older than 60s are ignored in count.
