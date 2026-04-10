@@ -132,44 +132,44 @@ impl Default for DashboardActionConfig {
 
 #[derive(Clone)]
 pub(crate) struct DashboardState {
-    data_dir: PathBuf,
+    pub(super) data_dir: PathBuf,
     /// D3: operator-initiated action configuration.
-    action_cfg: Arc<DashboardActionConfig>,
+    pub(super) action_cfg: Arc<DashboardActionConfig>,
     /// D6: SSE broadcast channel sender.
-    event_tx: EventTx,
+    pub(super) event_tx: EventTx,
     /// Web Push: VAPID public key (base64url) served to subscribing browsers.
     /// Empty string when web push is not configured.
-    web_push_vapid_public_key: String,
+    pub(super) web_push_vapid_public_key: String,
     /// True when auth is configured but dashboard is exposed over HTTP on
     /// a non-localhost address. Actions are disabled in this mode.
-    insecure_http: bool,
+    pub(super) insecure_http: bool,
     /// Auto-sleep: timestamp of last request. After 15 min of inactivity,
     /// the dashboard returns a lightweight "sleeping" page instead of
     /// reading JSONL files.
-    last_activity: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) last_activity: Arc<std::sync::atomic::AtomicU64>,
     /// Cached sensor API response (30s TTL) to avoid re-reading events file on every request.
-    sensor_cache: Arc<tokio::sync::Mutex<(u64, serde_json::Value)>>,
+    pub(super) sensor_cache: Arc<tokio::sync::Mutex<(u64, serde_json::Value)>>,
     /// Trusted reverse-proxy IPs - only honour X-Forwarded-For / X-Real-IP
     /// when the connecting socket IP is in this set.
-    trusted_proxies: Arc<Vec<IpAddr>>,
+    pub(super) trusted_proxies: Arc<Vec<IpAddr>>,
     /// Active sessions: token → Session.
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    pub(super) sessions: Arc<RwLock<HashMap<String, Session>>>,
     /// Session inactivity timeout in minutes.
-    session_timeout_minutes: u64,
+    pub(super) session_timeout_minutes: u64,
     /// Maximum concurrent sessions.
-    max_sessions: usize,
+    pub(super) max_sessions: usize,
     /// Advisory cache: recent deny/review command analyses for correlation.
-    advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>>,
+    pub(super) advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>>,
     /// Agent Guard registry: connected AI agents and their sessions.
-    agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>>,
+    pub(super) agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>>,
     /// ATR rule engine for command analysis.
-    rule_engine: Arc<innerwarden_agent_guard::rules::RuleEngine>,
+    pub(super) rule_engine: Arc<innerwarden_agent_guard::rules::RuleEngine>,
     /// Channel to notify the main agent loop when an AI agent attempts something dangerous.
-    agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
+    pub(super) agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
     /// Deep security snapshot: firmware, hypervisor, killchain, DNA status.
-    deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
+    pub(super) deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
     /// Shared knowledge graph for live queries (not snapshot file).
-    knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    pub(super) knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
 }
 
 /// Aggregated status from integrated security modules.
@@ -205,10 +205,10 @@ pub struct AgentGuardAlert {
 
 #[derive(Clone)]
 pub(crate) struct Session {
-    username: String,
-    created_at: DateTime<Utc>,
-    last_activity: Arc<AtomicI64>,
-    client_ip: String,
+    pub(super) username: String,
+    pub(super) created_at: DateTime<Utc>,
+    pub(super) last_activity: Arc<AtomicI64>,
+    pub(super) client_ip: String,
 }
 
 impl Session {

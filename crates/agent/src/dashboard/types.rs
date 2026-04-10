@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::telemetry::TelemetrySnapshot;
 
+#[derive(Clone, Debug)]
 pub struct AdvisoryEntry {
     pub advisory_id: String,
     pub command_hash: String,
@@ -22,40 +23,40 @@ pub struct AdvisoryEntry {
 #[derive(Debug, Deserialize)]
 pub(crate) struct BlockIpRequest {
     /// Target IP address to block.
-    ip: String,
+    pub(super) ip: String,
     /// Operator-supplied reason (mandatory - becomes the audit trail entry).
-    reason: String,
+    pub(super) reason: String,
     /// Optional incident ID to associate this action with.
-    incident_id: Option<String>,
+    pub(super) incident_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SuspendUserRequest {
     /// Linux username to suspend from sudo.
-    user: String,
+    pub(super) user: String,
     /// Operator-supplied reason (mandatory).
-    reason: String,
+    pub(super) reason: String,
     /// How long to suspend (seconds). Defaults to 3600 (1 hour).
-    duration_secs: Option<u64>,
+    pub(super) duration_secs: Option<u64>,
     /// Optional incident ID to associate this action with.
-    incident_id: Option<String>,
+    pub(super) incident_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct HoneypotTestRequest {
     /// Operator-supplied reason (mandatory).
-    reason: String,
+    pub(super) reason: String,
     /// Duration in seconds for the honeypot session (default: 120).
-    duration_secs: Option<u64>,
+    pub(super) duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ActionResponse {
-    success: bool,
-    dry_run: bool,
-    message: String,
+    pub(super) success: bool,
+    pub(super) dry_run: bool,
+    pub(super) message: String,
     /// Echoes back the skill ID that was invoked (or would have been).
-    skill_id: String,
+    pub(super) skill_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,59 +65,59 @@ pub(crate) struct ActionResponse {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListQuery {
-    limit: Option<usize>,
-    date: Option<String>,
+    pub(super) limit: Option<usize>,
+    pub(super) date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EntitiesQuery {
-    limit: Option<usize>,
-    date: Option<String>,
-    severity_min: Option<String>,
-    detector: Option<String>,
-    group_by: Option<String>,
+    pub(super) limit: Option<usize>,
+    pub(super) date: Option<String>,
+    pub(super) severity_min: Option<String>,
+    pub(super) detector: Option<String>,
+    pub(super) group_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JourneyQuery {
-    subject_type: Option<String>,
-    subject: Option<String>,
+    pub(super) subject_type: Option<String>,
+    pub(super) subject: Option<String>,
     // Backward compatibility with D2.1 clients
-    ip: Option<String>,
-    date: Option<String>,
-    severity_min: Option<String>,
-    detector: Option<String>,
-    window_seconds: Option<u64>,
+    pub(super) ip: Option<String>,
+    pub(super) date: Option<String>,
+    pub(super) severity_min: Option<String>,
+    pub(super) detector: Option<String>,
+    pub(super) window_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ClusterQuery {
-    limit: Option<usize>,
-    date: Option<String>,
-    severity_min: Option<String>,
-    detector: Option<String>,
-    window_seconds: Option<u64>,
+    pub(super) limit: Option<usize>,
+    pub(super) date: Option<String>,
+    pub(super) severity_min: Option<String>,
+    pub(super) detector: Option<String>,
+    pub(super) window_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExportQuery {
-    date: Option<String>,
-    format: Option<String>,
-    subject_type: Option<String>,
-    subject: Option<String>,
+    pub(super) date: Option<String>,
+    pub(super) format: Option<String>,
+    pub(super) subject_type: Option<String>,
+    pub(super) subject: Option<String>,
     // Backward compatibility with D2.1 clients
-    ip: Option<String>,
-    severity_min: Option<String>,
-    detector: Option<String>,
-    group_by: Option<String>,
-    limit: Option<usize>,
-    window_seconds: Option<u64>,
+    pub(super) ip: Option<String>,
+    pub(super) severity_min: Option<String>,
+    pub(super) detector: Option<String>,
+    pub(super) group_by: Option<String>,
+    pub(super) limit: Option<usize>,
+    pub(super) window_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReportQuery {
     /// Optional specific date (YYYY-MM-DD). Defaults to latest available.
-    date: Option<String>,
+    pub(super) date: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,69 +126,69 @@ pub(crate) struct ReportQuery {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct OverviewResponse {
-    date: String,
-    events_count: usize,
-    incidents_count: usize,
-    decisions_count: usize,
+    pub(super) date: String,
+    pub(super) events_count: usize,
+    pub(super) incidents_count: usize,
+    pub(super) decisions_count: usize,
     /// Incidents where AI decided to act (block, kill, honeypot, monitor).
     /// This is the "real threat" count. incidents_count - confirmed = noise/ignored.
-    ai_confirmed: usize,
+    pub(super) ai_confirmed: usize,
     /// Incidents where AI executed a response action (block_ip, kill_process, etc).
-    ai_responded: usize,
+    pub(super) ai_responded: usize,
     /// Incidents where AI decided to ignore (false positive or low risk).
-    ai_ignored: usize,
-    top_detectors: Vec<DetectorCount>,
-    latest_telemetry: Option<TelemetrySnapshot>,
+    pub(super) ai_ignored: usize,
+    pub(super) top_detectors: Vec<DetectorCount>,
+    pub(super) latest_telemetry: Option<TelemetrySnapshot>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DetectorCount {
-    detector: String,
-    count: usize,
+    pub(super) detector: String,
+    pub(super) count: usize,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct IncidentListResponse {
-    date: String,
-    total: usize,
-    items: Vec<IncidentView>,
+    pub(super) date: String,
+    pub(super) total: usize,
+    pub(super) items: Vec<IncidentView>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DecisionListResponse {
-    date: String,
-    total: usize,
-    items: Vec<DecisionView>,
+    pub(super) date: String,
+    pub(super) total: usize,
+    pub(super) items: Vec<DecisionView>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct IncidentView {
-    ts: chrono::DateTime<Utc>,
-    incident_id: String,
-    severity: String,
-    title: String,
-    summary: String,
-    entities: Vec<String>,
-    tags: Vec<String>,
+    pub(super) ts: chrono::DateTime<Utc>,
+    pub(super) incident_id: String,
+    pub(super) severity: String,
+    pub(super) title: String,
+    pub(super) summary: String,
+    pub(super) entities: Vec<String>,
+    pub(super) tags: Vec<String>,
     /// Resolution status: "blocked", "suspended", "monitored", "ignored", or "open"
-    outcome: String,
+    pub(super) outcome: String,
     /// What action was taken (e.g. "block-ip-ufw", "fail2ban:sshd")
     #[serde(skip_serializing_if = "Option::is_none")]
-    action_taken: Option<String>,
+    pub(super) action_taken: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DecisionView {
-    ts: chrono::DateTime<Utc>,
-    incident_id: String,
-    action_type: String,
-    target_ip: Option<String>,
-    skill_id: Option<String>,
-    confidence: f32,
-    auto_executed: bool,
-    dry_run: bool,
-    reason: String,
-    execution_result: String,
+    pub(super) ts: chrono::DateTime<Utc>,
+    pub(super) incident_id: String,
+    pub(super) action_type: String,
+    pub(super) target_ip: Option<String>,
+    pub(super) skill_id: Option<String>,
+    pub(super) confidence: f32,
+    pub(super) auto_executed: bool,
+    pub(super) dry_run: bool,
+    pub(super) reason: String,
+    pub(super) execution_result: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,45 +198,45 @@ pub(crate) struct DecisionView {
 /// Summarizes an attacker (IP with at least one incident) for the left panel.
 #[derive(Debug, Serialize)]
 pub(crate) struct AttackerSummary {
-    ip: String,
-    first_seen: chrono::DateTime<Utc>,
-    last_seen: chrono::DateTime<Utc>,
-    max_severity: String,
-    detectors: Vec<String>,
+    pub(super) ip: String,
+    pub(super) first_seen: chrono::DateTime<Utc>,
+    pub(super) last_seen: chrono::DateTime<Utc>,
+    pub(super) max_severity: String,
+    pub(super) detectors: Vec<String>,
     /// "blocked" | "monitoring" | "honeypot" | "active" | "unknown"
-    outcome: String,
-    incident_count: usize,
-    event_count: usize,
+    pub(super) outcome: String,
+    pub(super) incident_count: usize,
+    pub(super) event_count: usize,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct EntitiesResponse {
-    date: String,
-    attackers: Vec<AttackerSummary>,
+    pub(super) date: String,
+    pub(super) attackers: Vec<AttackerSummary>,
 }
 
 /// One timestamped entry in an attacker's journey timeline.
 #[derive(Debug, Serialize)]
 pub(crate) struct JourneyEntry {
-    ts: chrono::DateTime<Utc>,
+    pub(super) ts: chrono::DateTime<Utc>,
     /// "event" | "incident" | "decision" | "honeypot_ssh" | "honeypot_http" | "honeypot_banner"
-    kind: String,
-    data: serde_json::Value,
+    pub(super) kind: String,
+    pub(super) data: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct JourneySummary {
-    total_entries: usize,
-    events_count: usize,
-    incidents_count: usize,
-    decisions_count: usize,
-    honeypot_count: usize,
-    first_event: Option<chrono::DateTime<Utc>>,
-    first_incident: Option<chrono::DateTime<Utc>>,
-    first_decision: Option<chrono::DateTime<Utc>>,
-    first_honeypot: Option<chrono::DateTime<Utc>>,
-    pivot_shortcuts: Vec<String>,
-    hints: Vec<String>,
+    pub(super) total_entries: usize,
+    pub(super) events_count: usize,
+    pub(super) incidents_count: usize,
+    pub(super) decisions_count: usize,
+    pub(super) honeypot_count: usize,
+    pub(super) first_event: Option<chrono::DateTime<Utc>>,
+    pub(super) first_incident: Option<chrono::DateTime<Utc>>,
+    pub(super) first_decision: Option<chrono::DateTime<Utc>>,
+    pub(super) first_honeypot: Option<chrono::DateTime<Utc>>,
+    pub(super) pivot_shortcuts: Vec<String>,
+    pub(super) hints: Vec<String>,
 }
 
 /// D5 - High-level attack assessment derived from the journey entries.
@@ -243,17 +244,17 @@ pub(crate) struct JourneySummary {
 pub(crate) struct JourneyVerdict {
     /// Detected attack vector: "ssh_bruteforce" | "credential_stuffing" |
     /// "port_scan" | "sudo_abuse" | "unknown"
-    entry_vector: String,
+    pub(super) entry_vector: String,
     /// "no_evidence_of_success" | "likely_success" | "confirmed_success" | "inconclusive"
-    access_status: String,
+    pub(super) access_status: String,
     /// "no_evidence" | "attempted" | "confirmed" | "inconclusive"
-    privilege_status: String,
+    pub(super) privilege_status: String,
     /// "blocked" | "monitored" | "honeypot" | "active" | "unknown"
-    containment_status: String,
+    pub(super) containment_status: String,
     /// "engaged" | "diverted" | "not_engaged"
-    honeypot_status: String,
+    pub(super) honeypot_status: String,
     /// "high" | "medium" | "low"
-    confidence: String,
+    pub(super) confidence: String,
 }
 
 /// D5 - A logical phase of the attack story derived from consecutive entries.
@@ -261,87 +262,87 @@ pub(crate) struct JourneyVerdict {
 pub(crate) struct JourneyChapter {
     /// Stage label: "reconnaissance" | "initial_access_attempt" | "access_success" |
     /// "privilege_abuse" | "response" | "containment" | "honeypot_interaction" | "unknown"
-    stage: String,
-    title: String,
-    summary: String,
-    start_ts: chrono::DateTime<Utc>,
-    end_ts: chrono::DateTime<Utc>,
-    entry_count: usize,
+    pub(super) stage: String,
+    pub(super) title: String,
+    pub(super) summary: String,
+    pub(super) start_ts: chrono::DateTime<Utc>,
+    pub(super) end_ts: chrono::DateTime<Utc>,
+    pub(super) entry_count: usize,
     /// Key facts / evidence highlights (usernames, ports, credentials, etc.)
-    evidence_highlights: Vec<String>,
+    pub(super) evidence_highlights: Vec<String>,
     /// Indices into the parent `entries` array for drill-down
-    entry_indices: Vec<usize>,
+    pub(super) entry_indices: Vec<usize>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct JourneyResponse {
-    subject_type: String,
-    subject: String,
-    date: String,
-    first_seen: Option<chrono::DateTime<Utc>>,
-    last_seen: Option<chrono::DateTime<Utc>>,
-    outcome: String,
-    summary: JourneySummary,
+    pub(super) subject_type: String,
+    pub(super) subject: String,
+    pub(super) date: String,
+    pub(super) first_seen: Option<chrono::DateTime<Utc>>,
+    pub(super) last_seen: Option<chrono::DateTime<Utc>>,
+    pub(super) outcome: String,
+    pub(super) summary: JourneySummary,
     /// D5 - high-level attack assessment
-    verdict: JourneyVerdict,
+    pub(super) verdict: JourneyVerdict,
     /// D5 - logical attack chapters derived from entries
-    chapters: Vec<JourneyChapter>,
-    entries: Vec<JourneyEntry>,
+    pub(super) chapters: Vec<JourneyChapter>,
+    pub(super) entries: Vec<JourneyEntry>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct PivotItem {
-    group_by: String,
-    value: String,
-    first_seen: chrono::DateTime<Utc>,
-    last_seen: chrono::DateTime<Utc>,
-    max_severity: String,
-    incident_count: usize,
-    event_count: usize,
-    outcome: String,
-    detectors: Vec<String>,
+    pub(super) group_by: String,
+    pub(super) value: String,
+    pub(super) first_seen: chrono::DateTime<Utc>,
+    pub(super) last_seen: chrono::DateTime<Utc>,
+    pub(super) max_severity: String,
+    pub(super) incident_count: usize,
+    pub(super) event_count: usize,
+    pub(super) outcome: String,
+    pub(super) detectors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct PivotResponse {
-    date: String,
-    group_by: String,
-    total: usize,
-    items: Vec<PivotItem>,
+    pub(super) date: String,
+    pub(super) group_by: String,
+    pub(super) total: usize,
+    pub(super) items: Vec<PivotItem>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ClusterItem {
-    cluster_id: String,
-    pivot: String,
-    pivot_type: String,
-    pivot_value: String,
-    start_ts: DateTime<Utc>,
-    end_ts: DateTime<Utc>,
-    incident_count: usize,
-    detector_kinds: Vec<String>,
-    incident_ids: Vec<String>,
+    pub(super) cluster_id: String,
+    pub(super) pivot: String,
+    pub(super) pivot_type: String,
+    pub(super) pivot_value: String,
+    pub(super) start_ts: DateTime<Utc>,
+    pub(super) end_ts: DateTime<Utc>,
+    pub(super) incident_count: usize,
+    pub(super) detector_kinds: Vec<String>,
+    pub(super) incident_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ClusterResponse {
-    date: String,
-    total: usize,
-    items: Vec<ClusterItem>,
+    pub(super) date: String,
+    pub(super) total: usize,
+    pub(super) items: Vec<ClusterItem>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct InvestigationExport {
-    generated_at: DateTime<Utc>,
-    date: String,
-    filters: serde_json::Value,
-    group_by: String,
-    subject_type: Option<String>,
-    subject: Option<String>,
-    overview: OverviewResponse,
-    pivots: Vec<PivotItem>,
-    clusters: Vec<ClusterItem>,
-    journey: Option<JourneyResponse>,
+    pub(super) generated_at: DateTime<Utc>,
+    pub(super) date: String,
+    pub(super) filters: serde_json::Value,
+    pub(super) group_by: String,
+    pub(super) subject_type: Option<String>,
+    pub(super) subject: Option<String>,
+    pub(super) overview: OverviewResponse,
+    pub(super) pivots: Vec<PivotItem>,
+    pub(super) clusters: Vec<ClusterItem>,
+    pub(super) journey: Option<JourneyResponse>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,8 +372,8 @@ impl PivotKind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct InvestigationFilters {
-    severity_min: Option<u8>,
-    detector: Option<String>,
+    pub(super) severity_min: Option<u8>,
+    pub(super) detector: Option<String>,
 }
 
 impl InvestigationFilters {
@@ -404,14 +405,14 @@ impl InvestigationFilters {
 
 #[derive(Default)]
 pub(crate) struct IpAccumulator {
-    first_seen: Option<chrono::DateTime<Utc>>,
-    last_seen: Option<chrono::DateTime<Utc>>,
-    max_severity: u8,
-    max_severity_str: String,
-    detectors: BTreeSet<String>,
-    ips: BTreeSet<String>,
-    incident_count: usize,
-    event_count: usize,
+    pub(super) first_seen: Option<chrono::DateTime<Utc>>,
+    pub(super) last_seen: Option<chrono::DateTime<Utc>>,
+    pub(super) max_severity: u8,
+    pub(super) max_severity_str: String,
+    pub(super) detectors: BTreeSet<String>,
+    pub(super) ips: BTreeSet<String>,
+    pub(super) incident_count: usize,
+    pub(super) event_count: usize,
 }
 
 impl IpAccumulator {

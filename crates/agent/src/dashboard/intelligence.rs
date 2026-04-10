@@ -1,0 +1,367 @@
+// Auto-extracted from mod.rs — dashboard intelligence handlers
+
+use super::*;
+
+// ── Attacker Intelligence & Monthly Reports ────────────────────────
+
+/// `GET /api/attacker-profiles` - list attacker profiles sorted by risk.
+pub(super) async fn api_attacker_profiles(
+    State(state): State<DashboardState>,
+    Query(query): Query<AttackerProfilesQuery>,
+) -> Json<serde_json::Value> {
+    let limit = query.limit.unwrap_or(50).min(500);
+    let offset = query.offset.unwrap_or(0);
+    let min_risk = query.min_risk.unwrap_or(0);
+    let sort = query.sort.as_deref().unwrap_or("risk_score");
+
+    let profiles: Vec<serde_json::Value> =
+        safe_read_data_file(&state.data_dir, "attacker-profiles.json")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+    let mut filtered: Vec<serde_json::Value> = profiles
+        .into_iter()
+        .filter(|p| p["risk_score"].as_u64().unwrap_or(0) >= min_risk as u64)
+        .collect();
+
+    match sort {
+        "last_seen" => {
+            filtered.sort_by(|a, b| b["last_seen"].as_str().cmp(&a["last_seen"].as_str()))
+        }
+        "incidents" => filtered.sort_by(|a, b| {
+            b["total_incidents"]
+                .as_u64()
+                .cmp(&a["total_incidents"].as_u64())
+        }),
+        _ => filtered.sort_by(|a, b| b["risk_score"].as_u64().cmp(&a["risk_score"].as_u64())),
+    }
+
+    let total = filtered.len();
+    let page: Vec<serde_json::Value> = filtered.into_iter().skip(offset).take(limit).collect();
+
+    Json(serde_json::json!({
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "profiles": page,
+    }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct AttackerProfilesQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    sort: Option<String>,
+    min_risk: Option<u8>,
+}
+
+/// `GET /api/attacker-profiles/:ip` - single attacker profile detail.
+pub(super) async fn api_attacker_profile_detail(
+    State(state): State<DashboardState>,
+    axum::extract::Path(ip): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let profiles: Vec<serde_json::Value> =
+        safe_read_data_file(&state.data_dir, "attacker-profiles.json")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+    let profile = profiles.into_iter().find(|p| p["ip"].as_str() == Some(&ip));
+    match profile {
+        Some(p) => Json(p),
+        None => Json(serde_json::json!({"error": "profile not found"})),
+    }
+}
+
+/// `GET /api/threat-report?month=YYYY-MM` - monthly threat report.
+pub(super) async fn api_threat_report(
+    State(state): State<DashboardState>,
+    Query(query): Query<ThreatReportQuery>,
+) -> Json<serde_json::Value> {
+    let month = query.month.unwrap_or_else(|| {
+        // Default to previous month if available, else current
+        let today = chrono::Local::now().date_naive();
+        if today.day() >= 2 {
+            let prev = today - chrono::Duration::days(today.day() as i64);
+            prev.format("%Y-%m").to_string()
+        } else {
+            today.format("%Y-%m").to_string()
+        }
+    });
+
+    // Validate month format to prevent path traversal via crafted month param
+    if !month.chars().all(|c| c.is_ascii_digit() || c == '-') || month.len() > 7 {
+        return Json(serde_json::json!({"error": "invalid month format"}));
+    }
+    let filename = format!("monthly-report-{month}.json");
+    if let Some(content) = safe_read_data_file(&state.data_dir, &filename) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            return Json(val);
+        }
+    }
+
+    // Report doesn't exist - generate on demand
+    let data_dir = state.data_dir.clone();
+    let month_clone = month.clone();
+    match tokio::task::spawn_blocking(move || {
+        // Load profiles from snapshot for generation
+        let profiles: std::collections::HashMap<String, crate::attacker_intel::AttackerProfile> =
+            safe_read_data_file(&data_dir, "attacker-profiles.json")
+                .and_then(|s| {
+                    serde_json::from_str::<Vec<crate::attacker_intel::AttackerProfile>>(&s).ok()
+                })
+                .map(|v| v.into_iter().map(|p| (p.ip.clone(), p)).collect())
+                .unwrap_or_default();
+        crate::threat_report::generate_monthly(&data_dir, &month_clone, &profiles).and_then(
+            |report| {
+                crate::threat_report::write_report(&report, &data_dir)?;
+                Ok(report)
+            },
+        )
+    })
+    .await
+    {
+        Ok(Ok(report)) => match serde_json::to_value(&report) {
+            Ok(val) => Json(val),
+            Err(_) => Json(serde_json::json!({"error": "serialization failed"})),
+        },
+        Ok(Err(e)) => Json(serde_json::json!({"error": format!("{e:#}")})),
+        Err(e) => Json(serde_json::json!({"error": format!("task failed: {e}")})),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct ThreatReportQuery {
+    month: Option<String>,
+}
+
+/// `GET /api/threat-report/months` - list available months.
+pub(super) async fn api_threat_report_months(State(state): State<DashboardState>) -> Json<Vec<String>> {
+    Json(crate::threat_report::available_months(&state.data_dir))
+}
+
+/// `GET /api/correlation-chains` - recent attack chain detections.
+pub(super) async fn api_correlation_chains(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let chains: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "attack-chains.json")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "total": chains.len(),
+        "chains": chains,
+    }))
+}
+
+/// `GET /api/graph/stats` - knowledge graph metrics (live from shared graph).
+pub(super) async fn api_graph_stats(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let graph = state.knowledge_graph.read().unwrap();
+    let metrics = graph.metrics();
+    Json(serde_json::to_value(&metrics).unwrap_or_default())
+}
+
+/// `GET /api/graph/view` - live graph as Cytoscape.js elements (capped at 500 nodes).
+pub(super) async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    use crate::knowledge_graph::types::*;
+
+    let graph = state.knowledge_graph.read().unwrap();
+
+    if graph.node_count() == 0 {
+        return Json(serde_json::json!({"nodes": [], "edges": []}));
+    }
+
+    // Top 50 non-Incident nodes by degree. Strict cap to prevent browser crash.
+    let mut scored: Vec<(NodeId, usize)> = graph
+        .nodes()
+        .iter()
+        .filter(|(_, n)| n.node_type() != NodeType::Incident)
+        .map(|(&id, _)| {
+            let out = graph.outgoing.get(&id).map(|v| v.len()).unwrap_or(0);
+            let inc = graph.incoming.get(&id).map(|v| v.len()).unwrap_or(0);
+            (id, out + inc)
+        })
+        .filter(|(_, degree)| *degree >= 2)
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.truncate(50);
+    let node_ids: Vec<NodeId> = scored.into_iter().map(|(id, _)| id).collect();
+    let keep: std::collections::HashSet<NodeId> = node_ids.iter().copied().collect();
+
+    let cy_nodes: Vec<serde_json::Value> = node_ids
+        .iter()
+        .filter_map(|&id| {
+            graph.get_node(id).map(|n| {
+                serde_json::json!({
+                    "data": {
+                        "id": format!("n{}", id),
+                        "label": n.label(),
+                        "type": format!("{:?}", n.node_type()),
+                        "sensitive": n.is_sensitive_file(),
+                    }
+                })
+            })
+        })
+        .collect();
+
+    let cy_edges: Vec<serde_json::Value> = graph
+        .edges_slice()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| keep.contains(&e.from) && keep.contains(&e.to) && !e.is_snapshot())
+        .take(200) // Hard cap — prevent browser crash
+        .map(|(i, e)| {
+            serde_json::json!({
+                "data": {
+                    "id": format!("e{}", i),
+                    "source": format!("n{}", e.from),
+                    "target": format!("n{}", e.to),
+                    "relation": format!("{:?}", e.relation),
+                    "ts": e.ts.to_rfc3339(),
+                }
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "nodes": cy_nodes,
+        "edges": cy_edges,
+    }))
+}
+
+/// `GET /api/graph/neighborhood?type=ip&value=1.2.3.4&depth=2` — subgraph around a node.
+pub(super) async fn api_graph_neighborhood(
+    State(state): State<DashboardState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    use crate::knowledge_graph::types::*;
+
+    let subject_type = params.get("type").map(|s| s.as_str()).unwrap_or("ip");
+    let subject_value = match params.get("value") {
+        Some(v) => v.clone(),
+        None => return Json(serde_json::json!({"nodes": [], "edges": []})),
+    };
+    let depth: usize = params
+        .get("depth")
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(2)
+        .min(4);
+
+    let graph = state.knowledge_graph.read().unwrap();
+    if graph.node_count() == 0 {
+        return Json(serde_json::json!({"nodes": [], "edges": []}));
+    }
+
+    // Find center node
+    let center = match subject_type {
+        "ip" => graph.find_by_ip(&subject_value),
+        "user" => graph.find_by_user(&subject_value),
+        "path" | "file" => graph.find_by_path(&subject_value),
+        "container" => graph.find_by_container(&subject_value),
+        "domain" => graph.find_by_domain(&subject_value),
+        "incident" => graph.find_by_incident(&subject_value),
+        _ => graph.find_by_ip(&subject_value),
+    };
+
+    let center_id = match center {
+        Some(id) => id,
+        None => return Json(serde_json::json!({"nodes": [], "edges": []})),
+    };
+
+    let sub = graph.neighborhood(center_id, depth);
+
+    let cy_nodes: Vec<serde_json::Value> = sub
+        .nodes
+        .iter()
+        .map(|(id, n)| {
+            serde_json::json!({
+                "data": {
+                    "id": format!("n{}", id),
+                    "label": n.label(),
+                    "type": format!("{:?}", n.node_type()),
+                    "sensitive": n.is_sensitive_file(),
+                    "center": *id == center_id,
+                }
+            })
+        })
+        .collect();
+
+    let cy_edges: Vec<serde_json::Value> = sub
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_snapshot())
+        .map(|(i, e)| {
+            serde_json::json!({
+                "data": {
+                    "id": format!("ne{}", i),
+                    "source": format!("n{}", e.from),
+                    "target": format!("n{}", e.to),
+                    "relation": format!("{:?}", e.relation),
+                    "ts": e.ts.to_rfc3339(),
+                }
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "center": format!("n{}", center_id),
+        "nodes": cy_nodes,
+        "edges": cy_edges,
+    }))
+}
+
+pub(super) fn node_priority(node: Option<&crate::knowledge_graph::types::Node>) -> u8 {
+    use crate::knowledge_graph::types::Node;
+    match node {
+        Some(Node::Incident { .. }) => 10,
+        Some(Node::Ip {
+            datasets,
+            risk_score,
+            ..
+        }) if !datasets.is_empty() || *risk_score > 50 => 9,
+        Some(Node::Ip { is_tor: true, .. }) => 8,
+        Some(Node::Campaign { .. }) => 8,
+        Some(Node::Process { .. }) => 5,
+        Some(Node::File {
+            is_sensitive: true, ..
+        }) => 6,
+        Some(Node::User { .. }) => 4,
+        Some(Node::Ip { .. }) => 3,
+        Some(Node::Domain { .. }) => 3,
+        Some(Node::File { .. }) => 2,
+        Some(Node::Port { .. }) => 1,
+        _ => 0,
+    }
+}
+
+/// `GET /api/baseline-status` - baseline learning status and recent anomalies.
+pub(super) async fn api_baseline_status(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let baseline: serde_json::Value = safe_read_data_file(&state.data_dir, "baseline.json")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::json!({"mature": false, "training_days": 0}));
+    Json(baseline)
+}
+
+/// `GET /api/playbook-log` - recent playbook executions.
+pub(super) async fn api_playbook_log(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let log: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "playbook-log.json")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "total": log.len(),
+        "executions": log,
+    }))
+}
+/// `GET /api/deep-security` - aggregated status from firmware, hypervisor, killchain, DNA.
+pub(super) async fn api_deep_security(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let snap = state.deep_security.read().unwrap();
+    Json(serde_json::to_value(&*snap).unwrap_or_default())
+}
+
+/// `GET /api/campaigns` - detected campaign clusters (DNA + IOC correlation).
+pub(super) async fn api_campaigns(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let campaigns: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "campaigns.json")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "total": campaigns.len(),
+        "campaigns": campaigns,
+    }))
+}
