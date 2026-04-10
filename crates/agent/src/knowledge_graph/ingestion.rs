@@ -30,8 +30,23 @@ fn detail_i64(event: &Event, key: &str) -> Option<i64> {
 }
 
 impl KnowledgeGraph {
+    /// Record event source/kind for sensors tab telemetry.
+    /// Stored in a lightweight counter, not on every edge.
+    pub fn record_event_telemetry(&mut self, source: &str, kind: &str, ts: chrono::DateTime<chrono::Utc>) {
+        let hour = ts.format("%H").to_string();
+        let min: usize = ts.format("%M").to_string().parse().unwrap_or(0);
+        let bucket = format!("{}:{:02}", hour, (min / 5) * 5);
+
+        *self.source_counts.entry(source.to_string()).or_insert(0) += 1;
+        *self.kind_counts.entry(kind.to_string()).or_insert(0) += 1;
+        *self.event_timeline.entry(bucket).or_default().entry(source.to_string()).or_insert(0) += 1;
+        self.total_events_ingested += 1;
+    }
+
     /// Ingest a sensor event into the graph, creating/updating nodes and edges.
     pub fn ingest(&mut self, event: &Event) {
+        // Record telemetry for sensors tab
+        self.record_event_telemetry(&event.source, &event.kind, event.ts);
         match event.kind.as_str() {
             // ── Shell & Execution ───────────────────────────────────
             "shell.command_exec" => self.ingest_shell_command_exec(event),

@@ -2424,18 +2424,14 @@ async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json:
         return Json(serde_json::json!({"nodes": [], "edges": []}));
     }
 
-    // Only show nodes with 2+ edges (interesting topology, not leaf noise).
-    // Then cap at 200 to keep the visualization readable.
+    // Top 150 non-Incident nodes by degree (most connected first).
+    // Incidents hidden by default filter — included if user selects "All".
     let mut node_ids: Vec<(NodeId, usize)> = graph.nodes().iter()
-        .filter(|(_, n)| n.node_type() != NodeType::Incident) // incidents hidden by default
-        .map(|(&id, _)| {
-            let degree = graph.all_edges(id).len();
-            (id, degree)
-        })
-        .filter(|(_, degree)| *degree >= 2) // skip leaf nodes
+        .filter(|(_, n)| n.node_type() != NodeType::Incident)
+        .map(|(&id, _)| (id, graph.all_edges(id).len()))
         .collect();
-    node_ids.sort_by(|a, b| b.1.cmp(&a.1)); // highest degree first
-    node_ids.truncate(200);
+    node_ids.sort_by(|a, b| b.1.cmp(&a.1));
+    node_ids.truncate(150);
     let node_ids: Vec<NodeId> = node_ids.into_iter().map(|(id, _)| id).collect();
     let keep: std::collections::HashSet<NodeId> = node_ids.iter().copied().collect();
 
@@ -3703,45 +3699,24 @@ async fn api_sensors(State(state): State<DashboardState>) -> Json<serde_json::Va
 }
 
 async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
-    use crate::knowledge_graph::types::*;
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
+    use crate::knowledge_graph::types::{Node, NodeType};
     let graph = state.knowledge_graph.read().unwrap();
-    let metrics = graph.metrics();
 
-    // Count edges by relation type (approximates event kind distribution)
-    let mut relation_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut timeline: std::collections::BTreeMap<String, std::collections::HashMap<String, usize>> =
-        std::collections::BTreeMap::new();
+    // Event telemetry from graph (recorded during ingest)
+    let mut sources: Vec<_> = graph.source_counts.iter().map(|(s, &c)| (s.clone(), c)).collect();
+    sources.sort_by(|a, b| b.1.cmp(&a.1));
 
-    for edge in graph.edges_slice() {
-        if edge.is_snapshot() { continue; }
-        let rel = format!("{:?}", edge.relation);
-        *relation_counts.entry(rel.clone()).or_insert(0) += 1;
-
-        let ts = edge.ts.format("%H:%M").to_string();
-        if ts.len() >= 5 {
-            let hour = &ts[0..2];
-            let min: usize = ts[3..5].parse().unwrap_or(0);
-            let bucket = format!("{}:{:02}", hour, (min / 5) * 5);
-            *timeline.entry(bucket).or_default().entry(rel).or_insert(0) += 1;
-        }
-    }
-
-    // Source counts: approximate from node types
-    let mut source_counts: Vec<(String, usize)> = vec![
-        ("ebpf".to_string(), graph.nodes_of_type(NodeType::Process).len()),
-        ("network".to_string(), graph.nodes_of_type(NodeType::Ip).len()),
-        ("dns".to_string(), graph.nodes_of_type(NodeType::Domain).len()),
-        ("filesystem".to_string(), graph.nodes_of_type(NodeType::File).len()),
-        ("auth".to_string(), graph.nodes_of_type(NodeType::User).len()),
-    ];
-    source_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut kinds: Vec<_> = graph.kind_counts.iter().map(|(k, &c)| (k.clone(), c)).collect();
+    kinds.sort_by(|a, b| b.1.cmp(&a.1));
+    kinds.truncate(15);
 
     // Detector counts from Incident nodes
     let mut detector_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut detector_timeline: std::collections::BTreeMap<String, std::collections::HashMap<String, usize>> =
         std::collections::BTreeMap::new();
+    let total_incidents = graph.nodes_of_type(NodeType::Incident).len();
 
     for id in graph.nodes_of_type(NodeType::Incident) {
         if let Some(Node::Incident { detector, ts, .. }) = graph.get_node(id) {
@@ -3756,21 +3731,17 @@ async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
         }
     }
 
-    let mut kinds: Vec<_> = relation_counts.into_iter().collect();
-    kinds.sort_by(|a, b| b.1.cmp(&a.1));
-    kinds.truncate(15);
-
     let mut detectors: Vec<_> = detector_counts.into_iter().collect();
     detectors.sort_by(|a, b| b.1.cmp(&a.1));
 
     serde_json::json!({
         "date": today,
-        "total_events": metrics.edge_count,
-        "total_incidents": metrics.incident_nodes,
-        "sources": source_counts.iter().map(|(s, c)| serde_json::json!({"name": s, "count": c})).collect::<Vec<_>>(),
+        "total_events": graph.total_events_ingested,
+        "total_incidents": total_incidents,
+        "sources": sources.iter().map(|(s, c)| serde_json::json!({"name": s, "count": c})).collect::<Vec<_>>(),
         "top_kinds": kinds.iter().map(|(k, c)| serde_json::json!({"name": k, "count": c})).collect::<Vec<_>>(),
         "detectors": detectors.iter().map(|(d, c)| serde_json::json!({"name": d, "count": c})).collect::<Vec<_>>(),
-        "event_timeline": timeline,
+        "event_timeline": graph.event_timeline,
         "detector_timeline": detector_timeline,
     })
 }
@@ -5284,31 +5255,17 @@ fn build_pivots_from_graph(
     };
 
     // Identify the host's own IPs to exclude from attacker pivots
-    let host_ips: std::collections::HashSet<String> = graph
-        .nodes_of_type(NodeType::System)
+    // Exclude ALL internal IPs from attacker pivots — they're the server, not attackers.
+    let internal_ips: std::collections::HashSet<String> = graph
+        .nodes_of_type(NodeType::Ip)
         .iter()
-        .flat_map(|&id| {
-            // The system node's hostname; also collect IPs marked internal
-            // that have only outgoing Resolved/dns edges (self-generated traffic)
-            std::iter::once(graph.get_node(id).map(|n| n.label()).unwrap_or_default())
+        .filter_map(|&id| {
+            if let Some(crate::knowledge_graph::types::Node::Ip { addr, is_internal: true, .. }) = graph.get_node(id) {
+                Some(addr.clone())
+            } else {
+                None
+            }
         })
-        .chain(
-            graph.nodes_of_type(NodeType::Ip).iter().filter_map(|&id| {
-                if let Some(crate::knowledge_graph::types::Node::Ip { addr, is_internal: true, .. }) = graph.get_node(id) {
-                    // Internal IPs that only appear as source in DNS/connect (not as attack target)
-                    let incoming_attacks = graph.incoming_edges(id).iter().any(|e| {
-                        matches!(e.relation, Relation::TriggeredBy)
-                    });
-                    if !incoming_attacks {
-                        Some(addr.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }),
-        )
         .collect();
 
     if group_by == PivotKind::Detector {
@@ -5355,8 +5312,8 @@ fn build_pivots_from_graph(
             if let Some(node) = graph.get_node(edge.to) {
                 if node.node_type() == node_type {
                     let label = node.label();
-                    // Skip host's own IPs — they're the victim, not the attacker
-                    if node_type == NodeType::Ip && host_ips.contains(&label) {
+                    // Skip internal IPs — they're the server, not the attacker
+                    if node_type == NodeType::Ip && internal_ips.contains(&label) {
                         continue;
                     }
                     pivot_data

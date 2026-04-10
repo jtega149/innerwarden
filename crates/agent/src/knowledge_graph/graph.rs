@@ -35,6 +35,12 @@ pub struct KnowledgeGraph {
     pub(crate) tombstoned_edges: usize,
     pub max_memory: usize,
     pub created_at: DateTime<Utc>,
+
+    // ── Event telemetry (for sensors tab) ──
+    pub(crate) source_counts: HashMap<String, usize>,
+    pub(crate) kind_counts: HashMap<String, usize>,
+    pub(crate) event_timeline: std::collections::BTreeMap<String, HashMap<String, usize>>,
+    pub(crate) total_events_ingested: usize,
 }
 
 impl KnowledgeGraph {
@@ -60,6 +66,10 @@ impl KnowledgeGraph {
             memory_estimate: 0,
             tombstoned_edges: 0,
             max_memory: 50 * 1024 * 1024, // 50 MB
+            source_counts: HashMap::new(),
+            kind_counts: HashMap::new(),
+            event_timeline: std::collections::BTreeMap::new(),
+            total_events_ingested: 0,
             created_at: Utc::now(),
         }
     }
