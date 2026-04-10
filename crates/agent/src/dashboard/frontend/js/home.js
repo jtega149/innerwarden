@@ -8,14 +8,19 @@ async function loadHome() {
       loadJson('/api/sensors')
     ]);
     window._lastOverview = overview;
-    updateHomeBanner(status, overview);
+    // Count open incidents (no decision) to fix "All Contained" while OPEN exists
+    const items = incidentList.items || [];
+    const openHighCritical = items.filter(i =>
+      i.outcome === 'open' && (i.severity === 'high' || i.severity === 'critical')
+    ).length;
+    updateHomeBanner(status, overview, openHighCritical);
     updateHomeKpis(overview);
-    buildHomeFeed(incidentList.items || []);
+    buildHomeFeed(items);
     updateCollectorStrip(sensors);
   } catch(e) { console.warn('loadHome error:', e); }
 }
 
-function updateHomeBanner(status, overview) {
+function updateHomeBanner(status, overview, openHighCritical) {
   var hero = document.getElementById('homeHero');
   var icon = document.getElementById('homeHeroIcon');
   var title = document.getElementById('homeHeroTitle');
@@ -26,11 +31,13 @@ function updateHomeBanner(status, overview) {
   var u = getUnresolved();
   var noise = overview.ai_ignored || 0;
   var events = overview.events_count || 0;
+  // Include open high/critical incidents in unresolved count
+  var totalUnresolved = u.unresolved + (openHighCritical || 0);
 
-  if (u.unresolved > 0) {
+  if (totalUnresolved > 0) {
     hero.className = 'status-hero danger';
     icon.textContent = '\u26A0\uFE0F';
-    title.textContent = 'Action Required \u2014 ' + u.unresolved + ' unresolved threat' + (u.unresolved > 1 ? 's' : '');
+    title.textContent = 'Action Required \u2014 ' + totalUnresolved + ' unresolved threat' + (totalUnresolved > 1 ? 's' : '');
     sub.textContent = u.handled + ' contained \u00B7 ' + noise + ' noise filtered';
   } else if (u.total > 0) {
     hero.className = 'status-hero safe';

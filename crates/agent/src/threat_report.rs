@@ -196,7 +196,12 @@ pub fn available_months(data_dir: &Path) -> Vec<String> {
                 .strip_prefix("incidents-")
                 .and_then(|s| s.strip_suffix(".jsonl"))
             {
-                if date.len() >= 7 {
+                // Validate YYYY-MM-DD format (reject incidents-graph-*, incidents-trigger-*, etc.)
+                if date.len() >= 7
+                    && date.as_bytes().get(4) == Some(&b'-')
+                    && date[..4].chars().all(|c| c.is_ascii_digit())
+                    && date[5..7].chars().all(|c| c.is_ascii_digit())
+                {
                     months.insert(date[..7].to_string());
                 }
             }

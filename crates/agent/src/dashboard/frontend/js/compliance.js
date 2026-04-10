@@ -81,8 +81,11 @@ async function loadCompliance() {
     if (ctrlEl && iso.controls) {
       const met = iso.controls.filter(c => c.met);
       const notMet = iso.controls.filter(c => !c.met);
-      const pct = iso.total > 0 ? Math.round((iso.met / iso.total) * 100) : 0;
-      const barColor = pct === 100 ? 'var(--ok)' : pct >= 80 ? 'var(--warn)' : 'var(--danger)';
+      // If hash chain is broken, reduce ISO readiness (audit integrity compromised)
+      const hashBroken = compliance.hash_chain && !compliance.hash_chain.intact;
+      const effectiveMet = hashBroken ? Math.max(iso.met - 1, 0) : iso.met;
+      const pct = iso.total > 0 ? Math.round((effectiveMet / iso.total) * 100) : 0;
+      const barColor = hashBroken ? 'var(--danger)' : pct === 100 ? 'var(--ok)' : pct >= 80 ? 'var(--warn)' : 'var(--danger)';
 
       let isoHtml = '';
 

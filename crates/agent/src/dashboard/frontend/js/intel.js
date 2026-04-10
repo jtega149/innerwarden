@@ -31,11 +31,11 @@ async function loadIntel() {
         </div><span style="color:${riskColor};font-weight:600;">${p.risk_score}</span></div>`;
       const country = p.geo?.country_code || '??';
       const detectors = (p.detectors_triggered || []).slice(0, 3).join(', ');
-      const pattern = p.dna?.pattern_class || 'unknown';
+      const patternRaw = p.dna?.pattern_class || 'unknown';
       const dnaShort = (p.dna?.hash || '').slice(0, 10);
-      const lastSeen = p.last_seen ? new Date(p.last_seen).toLocaleDateString() : '—';
+      const lastSeen = p.last_seen ? new Date(p.last_seen).toLocaleDateString() : '\u2014';
       const patternLabels = { regular_scanner:'Regular Scanner', targeted:'Targeted Attack', opportunistic:'Opportunistic', unknown:'Unknown' };
-      pattern = patternLabels[pattern] || pattern.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+      const pattern = patternLabels[patternRaw] || patternRaw.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
       const patternBadge = pattern === 'Regular Scanner' ? '🔄' : pattern === 'Targeted Attack' ? '🎯' : pattern === 'Opportunistic' ? '🎲' : '❓';
 
       html += `<tr style="border-bottom:1px solid var(--border);cursor:pointer;" onclick="showProfileDetail('${p.ip}')">

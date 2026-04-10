@@ -11,6 +11,15 @@ struct GraphSnapshot {
     nodes: HashMap<NodeId, Node>,
     edges: Vec<Edge>,
     next_id: NodeId,
+    /// Event telemetry counters (added Phase 6A — persisted so Sensors tab works after restart)
+    #[serde(default)]
+    source_counts: HashMap<String, usize>,
+    #[serde(default)]
+    kind_counts: HashMap<String, usize>,
+    #[serde(default)]
+    event_timeline: std::collections::BTreeMap<String, HashMap<String, usize>>,
+    #[serde(default)]
+    total_events_ingested: usize,
 }
 
 impl KnowledgeGraph {
@@ -20,6 +29,10 @@ impl KnowledgeGraph {
             nodes: self.nodes.clone(),
             edges: self.edges.clone(),
             next_id: self.next_id,
+            source_counts: self.source_counts.clone(),
+            kind_counts: self.kind_counts.clone(),
+            event_timeline: self.event_timeline.clone(),
+            total_events_ingested: self.total_events_ingested,
         };
 
         let data = serde_json::to_vec(&snapshot)?;
@@ -98,6 +111,12 @@ impl KnowledgeGraph {
             graph.memory_estimate += Self::estimate_edge_size(edge);
         }
         graph.edges = snapshot.edges;
+
+        // Restore event telemetry counters (Phase 6A: Sensors tab needs these after restart)
+        graph.source_counts = snapshot.source_counts;
+        graph.kind_counts = snapshot.kind_counts;
+        graph.event_timeline = snapshot.event_timeline;
+        graph.total_events_ingested = snapshot.total_events_ingested;
 
         // T027: integrity check — verify indexes are consistent
         let node_count = graph.nodes.len();

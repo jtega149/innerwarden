@@ -15,7 +15,7 @@
 
   <!-- Header -->
   <header class="app-header">
-    <div class="app-title" onclick="showView('home')" style="cursor:pointer" role="button" aria-label="Go to home" tabindex="0">
+    <div class="app-title" onclick="showView('home')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showView('home')}" style="cursor:pointer" role="button" aria-label="Go to home" tabindex="0">
       <span class="logo" aria-hidden="true">
         <svg width="18" height="18" viewBox="40 40 140 140" xmlns="http://www.w3.org/2000/svg">
           <defs>
