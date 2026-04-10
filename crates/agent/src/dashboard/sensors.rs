@@ -254,36 +254,29 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
             .unwrap_or(false)
     };
 
-    // Count events by source — prefer graph counters, fall back to JSONL scan
-    // when graph has no data (e.g. after restart before new events are ingested)
+    // Count events by source — prefer graph counters, fall back to telemetry snapshot
     let graph = state.knowledge_graph.read().unwrap();
     let graph_source_counts = graph.source_counts.clone();
     let graph_total = graph.total_events_ingested;
     drop(graph);
 
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let events_file = state.data_dir.join(format!("events-{today}.jsonl"));
+    let telem_source_counts: std::collections::HashMap<String, usize> = if graph_total > 0 {
+        graph_source_counts
+    } else {
+        // Graph counters empty (cursor/snapshot race after restart).
+        // Fall back to telemetry snapshot which the agent writes every 30s.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        crate::telemetry::read_latest_snapshot(&state.data_dir, &today)
+            .map(|t| {
+                t.events_by_collector
+                    .into_iter()
+                    .map(|(k, v)| (k, v as usize))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let count_source = move |source: &str| -> u64 {
-        // If graph has data, use it (fast, O(1))
-        if graph_total > 0 {
-            return graph_source_counts.get(source).copied().unwrap_or(0) as u64;
-        }
-        // Fallback: scan JSONL (slower, but works when graph counters are empty)
-        use std::io::{BufRead, BufReader};
-        let f = match std::fs::File::open(&events_file) {
-            Ok(f) => f,
-            Err(_) => return 0,
-        };
-        let needle = format!("\"source\":\"{source}\"");
-        let needle2 = format!("\"source\": \"{source}\"");
-        let mut count = 0u64;
-        for line in BufReader::new(f).lines() {
-            let Ok(l) = line else { break };
-            if l.contains(&needle) || l.contains(&needle2) {
-                count += 1;
-            }
-        }
-        count
+        telem_source_counts.get(source).copied().unwrap_or(0) as u64
     };
 
     // Recency threshold: active if file modified within last 2 hours
