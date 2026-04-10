@@ -139,7 +139,8 @@ document.getElementById('flt-compare-date').addEventListener('change', () => {
 document.getElementById('flt-window').addEventListener('change', () => refreshLeft(true));
 document.getElementById('entitySearch').addEventListener('input', applyEntitySearch);
 
-// Initial data load
+// Initial data load — route first, then load data for visible view
+initRouter();
 refreshLeft(false).then(() => {
   applyEntitySearch();
   if (state.selected.value) {

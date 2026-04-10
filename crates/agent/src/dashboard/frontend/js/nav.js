@@ -1,5 +1,18 @@
 'use strict';
 
+// ── Hash-based URL routing ────────────────────────────────────────────
+function initRouter() {
+  var hash = location.hash.replace('#', '') || 'home';
+  // Map common aliases
+  if (hash === 'threats') hash = 'investigate';
+  showView(hash);
+}
+window.addEventListener('hashchange', function() {
+  var hash = location.hash.replace('#', '') || 'home';
+  if (hash === 'threats') hash = 'investigate';
+  showView(hash);
+});
+
 // ── Mobile panel toggle ────────────────────────────────────────────────
 let leftPanelOpen = true;
 function toggleLeftPanel() {
@@ -22,6 +35,11 @@ function toggleMoreMenu() {
 function showView(name) {
   const views = { home: 'viewHome', sensors: 'viewSensors', investigate: 'viewInvestigate', report: 'viewReport', status: 'viewStatus', honeypot: 'viewHoneypot', compliance: 'viewCompliance', intel: 'viewIntel', monthly: 'viewMonthly', responses: 'viewResponses', graph: 'viewGraph' };
   const btns  = { home: 'navHome', sensors: 'navSensors', investigate: 'navInvestigate', report: 'navReport', status: 'navStatus', honeypot: 'navHoneypot', compliance: 'navCompliance', intel: 'navIntel', monthly: 'navMonthly', responses: 'navResponses', graph: 'navGraph' };
+  // Update URL hash (use friendly name for threats)
+  var hashName = name === 'investigate' ? 'threats' : name;
+  if (location.hash !== '#' + hashName) {
+    history.replaceState(null, '', '#' + hashName);
+  }
   Object.keys(views).forEach(k => {
     const el = document.getElementById(views[k]);
     const btn = document.getElementById(btns[k]);

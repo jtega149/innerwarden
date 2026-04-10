@@ -37,7 +37,12 @@ function updateHomeBanner(status, overview, openHighCritical) {
   if (totalUnresolved > 0) {
     hero.className = 'status-hero danger';
     icon.textContent = '\u26A0\uFE0F';
-    title.textContent = 'Action Required \u2014 ' + totalUnresolved + ' unresolved threat' + (totalUnresolved > 1 ? 's' : '');
+    title.innerHTML = totalUnresolved + ' Unresolved Threat' + (totalUnresolved > 1 ? 's' : '') +
+      ' <button onclick="showView(\'investigate\')" style="' +
+      'margin-left:12px;padding:6px 16px;border-radius:8px;border:1px solid var(--danger);' +
+      'background:rgba(244,63,94,0.1);color:var(--danger);font-size:0.75rem;font-weight:700;' +
+      'cursor:pointer;vertical-align:middle' +
+      '">Review Threats \u2192</button>';
     sub.textContent = u.handled + ' contained \u00B7 ' + noise + ' noise filtered';
   } else if (u.total > 0) {
     hero.className = 'status-hero safe';
