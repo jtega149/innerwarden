@@ -2424,15 +2424,19 @@ async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json:
         return Json(serde_json::json!({"nodes": [], "edges": []}));
     }
 
-    // Top 150 non-Incident nodes by degree (most connected first).
-    // Incidents hidden by default filter — included if user selects "All".
-    let mut node_ids: Vec<(NodeId, usize)> = graph.nodes().iter()
+    // Top 50 non-Incident nodes by degree. Strict cap to prevent browser crash.
+    let mut scored: Vec<(NodeId, usize)> = graph.nodes().iter()
         .filter(|(_, n)| n.node_type() != NodeType::Incident)
-        .map(|(&id, _)| (id, graph.all_edges(id).len()))
+        .map(|(&id, _)| {
+            let out = graph.outgoing.get(&id).map(|v| v.len()).unwrap_or(0);
+            let inc = graph.incoming.get(&id).map(|v| v.len()).unwrap_or(0);
+            (id, out + inc)
+        })
+        .filter(|(_, degree)| *degree >= 2)
         .collect();
-    node_ids.sort_by(|a, b| b.1.cmp(&a.1));
-    node_ids.truncate(150);
-    let node_ids: Vec<NodeId> = node_ids.into_iter().map(|(id, _)| id).collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.truncate(50);
+    let node_ids: Vec<NodeId> = scored.into_iter().map(|(id, _)| id).collect();
     let keep: std::collections::HashSet<NodeId> = node_ids.iter().copied().collect();
 
     let cy_nodes: Vec<serde_json::Value> = node_ids
@@ -2456,6 +2460,7 @@ async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json:
         .iter()
         .enumerate()
         .filter(|(_, e)| keep.contains(&e.from) && keep.contains(&e.to) && !e.is_snapshot())
+        .take(200) // Hard cap — prevent browser crash
         .map(|(i, e)| {
             serde_json::json!({
                 "data": {
@@ -5596,86 +5601,33 @@ fn build_journey_from_graph(
         }
     };
 
-    // Get neighborhood (depth=2 — center + direct connections + their connections)
-    let sub = graph.neighborhood(center_id, 2);
     let mut entries: Vec<JourneyEntry> = Vec::new();
     let mut related_ips: BTreeSet<String> = BTreeSet::new();
     let mut related_users: BTreeSet<String> = BTreeSet::new();
     let mut related_detectors: BTreeSet<String> = BTreeSet::new();
     let mut has_incident = false;
 
-    // Convert graph edges to timeline entries using stored event metadata
-    let mut sorted_edges: Vec<&Edge> = sub.edges.iter().filter(|e| !e.is_snapshot()).collect();
-    sorted_edges.sort_by_key(|e| e.ts);
-
-    // Cap at 500 entries to prevent overload
-    if sorted_edges.len() > 500 {
-        sorted_edges = sorted_edges[sorted_edges.len() - 500..].to_vec();
-    }
-
-    for edge in &sorted_edges {
-        let from_node = sub.nodes.get(&edge.from);
-        let to_node = sub.nodes.get(&edge.to);
-        let from_label = from_node.map(|n| n.label()).unwrap_or_default();
-        let to_label = to_node.map(|n| n.label()).unwrap_or_default();
-
-        // Collect related entities
-        if let Some(Node::Ip { addr, .. }) = from_node { related_ips.insert(addr.clone()); }
-        if let Some(Node::Ip { addr, .. }) = to_node { related_ips.insert(addr.clone()); }
-        if let Some(Node::User { name, .. }) = from_node { related_users.insert(name.clone()); }
-        if let Some(Node::User { name, .. }) = to_node { related_users.insert(name.clone()); }
-
-        // Use stored event metadata (source, kind, summary) if available
-        let event_source = edge.properties.get("event_source")
-            .and_then(|v| v.as_str()).unwrap_or("graph").to_string();
-        let event_kind = edge.properties.get("event_kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&format!("{:?}", edge.relation)).to_string();
-        let summary = edge.properties.get("summary")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{} → {}", from_label, to_label));
-        let severity = edge.properties.get("severity")
-            .and_then(|v| v.as_str()).unwrap_or("info").to_string();
-
-        // Filter out noise: skip internal-only edges (dns queries from self, etc.)
-        // Only include edges where at least one side is the subject or an attacker
-        let involves_subject = from_label == subject || to_label == subject;
-        let involves_external_ip = from_node.map_or(false, |n| matches!(n, Node::Ip { is_internal: false, .. }))
-            || to_node.map_or(false, |n| matches!(n, Node::Ip { is_internal: false, .. }));
-        let is_incident_edge = matches!(edge.relation, Relation::TriggeredBy | Relation::BlockedBy | Relation::CorrelatedWith);
-
-        if !involves_subject && !involves_external_ip && !is_incident_edge {
-            continue;
-        }
-
-        entries.push(JourneyEntry {
-            ts: edge.ts,
-            kind: "event".to_string(),
-            data: serde_json::json!({
-                "severity": severity,
-                "source": event_source,
-                "event_kind": event_kind,
-                "summary": summary,
-                "details": {
-                    "from": from_label,
-                    "to": to_label,
-                    "relation": format!("{:?}", edge.relation),
-                },
-                "tags": [],
-            }),
+    // 1. Find all Incident nodes connected to this entity via TriggeredBy
+    for inc_id in graph.nodes_of_type(NodeType::Incident) {
+        let connected = graph.outgoing_edges(inc_id).iter().any(|e| {
+            e.relation == Relation::TriggeredBy && e.to == center_id
         });
-    }
+        if !connected { continue; }
 
-    // Add incident + decision entries from Incident nodes in the subgraph
-    for (_id, node) in &sub.nodes {
-        if let Node::Incident {
+        if let Some(Node::Incident {
             incident_id, detector, severity, title, summary, ts, mitre_ids,
             decision, confidence, decision_reason, decision_target, auto_executed,
-        } = node
-        {
+        }) = graph.get_node(inc_id) {
             has_incident = true;
             related_detectors.insert(detector.clone());
+
+            // Collect other entities from this incident
+            for edge in graph.outgoing_edges(inc_id) {
+                if edge.relation == Relation::TriggeredBy && edge.to != center_id {
+                    if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) { related_ips.insert(addr.clone()); }
+                    if let Some(Node::User { name, .. }) = graph.get_node(edge.to) { related_users.insert(name.clone()); }
+                }
+            }
 
             entries.push(JourneyEntry {
                 ts: *ts,
@@ -5708,6 +5660,42 @@ fn build_journey_from_graph(
         }
     }
 
+    // 2. Direct edges from/to this node (depth=1 only, capped)
+    let direct_edges = graph.all_edges(center_id);
+    for edge in direct_edges.iter().rev().take(50) {
+        if edge.is_snapshot() { continue; }
+
+        let from_label = graph.get_node(edge.from).map(|n| n.label()).unwrap_or_default();
+        let to_label = graph.get_node(edge.to).map(|n| n.label()).unwrap_or_default();
+        let event_source = edge.properties.get("event_source").and_then(|v| v.as_str()).unwrap_or("sensor");
+        let event_kind = edge.properties.get("event_kind").and_then(|v| v.as_str()).unwrap_or("");
+        let summary = edge.properties.get("summary").and_then(|v| v.as_str())
+            .unwrap_or("").to_string();
+        let severity = edge.properties.get("severity").and_then(|v| v.as_str()).unwrap_or("info");
+
+        // Skip edges that are just TriggeredBy (already covered by incidents above)
+        if matches!(edge.relation, Relation::TriggeredBy) { continue; }
+
+        let display_summary = if !summary.is_empty() {
+            summary
+        } else {
+            format!("{} {} → {}", event_kind, from_label, to_label)
+        };
+
+        entries.push(JourneyEntry {
+            ts: edge.ts,
+            kind: "event".to_string(),
+            data: serde_json::json!({
+                "severity": severity,
+                "source": event_source,
+                "event_kind": if event_kind.is_empty() { format!("{:?}", edge.relation) } else { event_kind.to_string() },
+                "summary": display_summary,
+                "details": edge.properties,
+                "tags": [],
+            }),
+        });
+    }
+
     // Honeypot sessions from JSONL (not yet in graph)
     let mut honeypot_ips = related_ips.clone();
     if subject_type == PivotKind::Ip {
@@ -5728,17 +5716,10 @@ fn build_journey_from_graph(
     let first_seen = entries.first().map(|e| e.ts);
     let last_seen = entries.last().map(|e| e.ts);
 
-    // Determine outcome from Incident decisions
-    let outcome = sub
-        .nodes
-        .values()
-        .filter_map(|n| {
-            if let Node::Incident { decision: Some(d), .. } = n {
-                Some(d.as_str())
-            } else {
-                None
-            }
-        })
+    // Determine outcome from journey entries
+    let outcome = entries.iter()
+        .filter(|e| e.kind == "decision")
+        .filter_map(|e| e.data.get("action_type").and_then(|v| v.as_str()))
         .find_map(|d| match d {
             "block_ip" => Some("blocked"),
             "honeypot" => Some("honeypot"),
