@@ -47,6 +47,12 @@ impl KnowledgeGraph {
     pub fn ingest(&mut self, event: &Event) {
         // Record telemetry for sensors tab
         self.record_event_telemetry(&event.source, &event.kind, event.ts);
+
+        // Store event metadata for this ingest cycle (used by add_edge_with_event)
+        self._current_event_source = Some(event.source.clone());
+        self._current_event_kind = Some(event.kind.clone());
+        self._current_event_summary = Some(event.summary.clone());
+        self._current_event_severity = Some(format!("{:?}", event.severity).to_lowercase());
         match event.kind.as_str() {
             // ── Shell & Execution ───────────────────────────────────
             "shell.command_exec" => self.ingest_shell_command_exec(event),

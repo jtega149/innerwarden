@@ -41,6 +41,12 @@ pub struct KnowledgeGraph {
     pub(crate) kind_counts: HashMap<String, usize>,
     pub(crate) event_timeline: std::collections::BTreeMap<String, HashMap<String, usize>>,
     pub(crate) total_events_ingested: usize,
+
+    // ── Transient: current event metadata (set during ingest, used by add_edge) ──
+    pub(crate) _current_event_source: Option<String>,
+    pub(crate) _current_event_kind: Option<String>,
+    pub(crate) _current_event_summary: Option<String>,
+    pub(crate) _current_event_severity: Option<String>,
 }
 
 impl KnowledgeGraph {
@@ -70,6 +76,10 @@ impl KnowledgeGraph {
             kind_counts: HashMap::new(),
             event_timeline: std::collections::BTreeMap::new(),
             total_events_ingested: 0,
+            _current_event_source: None,
+            _current_event_kind: None,
+            _current_event_summary: None,
+            _current_event_severity: None,
             created_at: Utc::now(),
         }
     }
@@ -205,7 +215,32 @@ impl KnowledgeGraph {
     // ── Edge CRUD ───────────────────────────────────────────────────────
 
     /// Add an edge. Edges are never deduplicated — each represents a discrete event.
-    pub fn add_edge(&mut self, edge: Edge) -> usize {
+    /// If event metadata is set (during ingest), automatically adds source/kind/summary.
+    pub fn add_edge(&mut self, mut edge: Edge) -> usize {
+        // Enrich edge with current event metadata if available
+        if let Some(ref src) = self._current_event_source {
+            if !edge.properties.contains_key("event_source") {
+                edge.properties.insert("event_source".into(), serde_json::Value::from(src.as_str()));
+            }
+        }
+        if let Some(ref kind) = self._current_event_kind {
+            if !edge.properties.contains_key("event_kind") {
+                edge.properties.insert("event_kind".into(), serde_json::Value::from(kind.as_str()));
+            }
+        }
+        if let Some(ref summary) = self._current_event_summary {
+            if !summary.is_empty() && !edge.properties.contains_key("summary") {
+                // Truncate summary to save memory
+                let trunc = if summary.len() > 200 { &summary[..200] } else { summary.as_str() };
+                edge.properties.insert("summary".into(), serde_json::Value::from(trunc));
+            }
+        }
+        if let Some(ref sev) = self._current_event_severity {
+            if !edge.properties.contains_key("severity") {
+                edge.properties.insert("severity".into(), serde_json::Value::from(sev.as_str()));
+            }
+        }
+
         let idx = self.edges.len();
         self.outgoing.entry(edge.from).or_default().push(idx);
         self.incoming.entry(edge.to).or_default().push(idx);
