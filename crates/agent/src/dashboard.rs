@@ -2424,29 +2424,19 @@ async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json:
         return Json(serde_json::json!({"nodes": [], "edges": []}));
     }
 
-    // Cap at 300 non-Incident nodes + 50 top Incidents (prevent grid-of-dots)
-    let mut topo_ids: Vec<NodeId> = graph.nodes().iter()
-        .filter(|(_, n)| n.node_type() != NodeType::Incident)
-        .map(|(&id, _)| id)
+    // Only show nodes with 2+ edges (interesting topology, not leaf noise).
+    // Then cap at 200 to keep the visualization readable.
+    let mut node_ids: Vec<(NodeId, usize)> = graph.nodes().iter()
+        .filter(|(_, n)| n.node_type() != NodeType::Incident) // incidents hidden by default
+        .map(|(&id, _)| {
+            let degree = graph.all_edges(id).len();
+            (id, degree)
+        })
+        .filter(|(_, degree)| *degree >= 2) // skip leaf nodes
         .collect();
-    topo_ids.sort_by(|a, b| {
-        let pri_a = node_priority(graph.get_node(*a));
-        let pri_b = node_priority(graph.get_node(*b));
-        pri_b.cmp(&pri_a)
-    });
-    topo_ids.truncate(300);
-
-    let mut inc_ids: Vec<NodeId> = graph.nodes_of_type(NodeType::Incident);
-    inc_ids.sort_by(|a, b| {
-        // Most recent first
-        let ts_a = match graph.get_node(*a) { Some(Node::Incident { ts, .. }) => *ts, _ => chrono::DateTime::<Utc>::MIN_UTC };
-        let ts_b = match graph.get_node(*b) { Some(Node::Incident { ts, .. }) => *ts, _ => chrono::DateTime::<Utc>::MIN_UTC };
-        ts_b.cmp(&ts_a)
-    });
-    inc_ids.truncate(50);
-
-    let mut node_ids: Vec<NodeId> = topo_ids;
-    node_ids.extend(inc_ids);
+    node_ids.sort_by(|a, b| b.1.cmp(&a.1)); // highest degree first
+    node_ids.truncate(200);
+    let node_ids: Vec<NodeId> = node_ids.into_iter().map(|(id, _)| id).collect();
     let keep: std::collections::HashSet<NodeId> = node_ids.iter().copied().collect();
 
     let cy_nodes: Vec<serde_json::Value> = node_ids
