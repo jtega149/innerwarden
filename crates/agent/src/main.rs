@@ -1197,6 +1197,27 @@ async fn main() -> Result<()> {
     let state_path = cli.data_dir.join("agent-state.json");
     let mut cursor = reader::AgentCursor::load(&state_path)?;
 
+    // Phase 6: detect stale cursor — if graph event counters are empty but cursor
+    // is advanced, reset cursor to re-ingest events and rebuild telemetry counters.
+    {
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let graph_has_counters = {
+            let g = state.knowledge_graph.read().unwrap();
+            g.total_events_ingested > 0
+        };
+        let cursor_offset = cursor.events_offset(&today);
+        if !graph_has_counters && cursor_offset > 0 {
+            info!(
+                old_offset = cursor_offset,
+                "resetting events cursor: graph counters empty but cursor advanced (snapshot/cursor race)"
+            );
+            cursor.set_events_offset(&today, 0);
+        }
+    }
+
     // Initialize narrative offset from cursor so we don't re-read all incidents on restart
     {
         let today = chrono::Local::now()
