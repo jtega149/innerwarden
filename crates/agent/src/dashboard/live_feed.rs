@@ -43,6 +43,9 @@ pub(super) struct LiveFeedItem {
     /// MITRE ATT&CK mapping derived from the detector name.
     #[serde(skip_serializing_if = "Option::is_none")]
     mitre: Option<LiveFeedMitre>,
+    /// Detector that triggered this incident (e.g. "ssh_bruteforce").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detector: Option<String>,
 }
 
 /// On-disk representation of LocalIpReputation (written by agent main loop).
@@ -85,7 +88,7 @@ pub(super) struct LiveFeedResponse {
     items: Vec<LiveFeedItem>,
 }
 
-/// `GET /api/live-feed` - last 30 incidents with totals for the day (public).
+/// `GET /api/live-feed` - last 200 incidents with totals for the day (public).
 pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResponse> {
     let now = chrono::Utc::now();
     let reputation_map = load_ip_reputation_map(&state.data_dir);
@@ -257,7 +260,7 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
     let mut items: Vec<LiveFeedItem> = real_incidents
         .iter()
         .rev()
-        .take(30)
+        .take(200)
         .map(|inc| {
             let ip = inc
                 .entities
@@ -290,6 +293,7 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
                 "ignore" => "ignored",
                 _ => "resolved",
             }.to_string());
+            let det_name = if detector.is_empty() { None } else { Some(detector.to_string()) };
             LiveFeedItem {
                 ts: inc.ts.to_rfc3339(),
                 severity: format!("{:?}", inc.severity).to_lowercase(),
@@ -301,6 +305,7 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
                 reason: dec.map(|d| live_feed_reason(detector, &d.action_type)),
                 reputation,
                 mitre: mitre_info,
+                detector: det_name,
             }
         })
         .collect();
