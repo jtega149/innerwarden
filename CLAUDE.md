@@ -36,7 +36,7 @@ make replay-qa    # validacao E2E
 
 ## Estado (2026-04-04)
 
-- 49 sensor detectors + 8 graph detectors, 40 eBPF hooks, 65 MITRE IDs, 43 correlation rules (CL-001 to CL-043)
+- 49 sensor detectors + 27 graph detectors (Phase 3A-C complete), 40 eBPF hooks, 65 MITRE IDs, 43 correlation rules + 10 graph correlation rules
 - Knowledge graph: in-memory directed graph (11 node types, 50 relation types, 60 event kinds mapped). Dashboard tab + AI triage integration + 58-feature autoencoder (10 graph structural features). **Phase 6 complete**: graph is primary read source for dashboard, bot, agent context, reports. ~25 JSONL reads eliminated, 2 redundant writes removed. Snapshot rotation (3 backups) + integrity check + corruption fallback.
 - Server producao: ver config local (nao expor no repo publico)
 - Branches: main = stable, develop = bleeding edge
@@ -90,6 +90,7 @@ ADR: `docs/internal/adr/0001-project-taxonomy.md`
 | 004 | Setup Zero Friction | Concluida |
 | 005 | Intelligent Notifications | Spec pronto. Grouping + channel filter + env calibration + AI batch triage |
 | 012 | Eliminate JSONL Dependency (Phase 6) | **Concluida**. 6A-6F done. Graph primary for dashboard/bot/reports. Deferred: FP tracking, multi-day snapshots, telemetry (spec 013) |
+| 010 | Detector Migration (Phase 3) | **3A-3C Done**: 27 graph detectors + 10 correlation rules + dedup + config flag. 3D partial (metrics deferred). 29 tests. |
 | 013 | Graph Single Source of Truth (Phase 7) | Spec pronto. 5 gaps from Phase 6: FP tracking, daily snapshots, telemetry, monthly report, event timestamps |
 
 ## Divida tecnica

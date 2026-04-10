@@ -86,6 +86,11 @@ pub struct AgentConfig {
     /// Config signing verification (Active Defence).
     #[serde(default)]
     pub config_signing: ConfigSigningConfig,
+    /// Detectors that run graph-only (sensor version suppressed).
+    /// After parallel validation, add detector names here to disable the sensor version.
+    /// Example: ["threat_intel", "lateral_movement", "persistence"]
+    #[serde(default)]
+    pub graph_only_detectors: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

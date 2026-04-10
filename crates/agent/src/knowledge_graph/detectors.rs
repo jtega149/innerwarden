@@ -123,6 +123,8 @@ pub fn run_all(
     incidents.extend(detect_scanner_ua(graph, state, host, now));
     incidents.extend(detect_c2_beacon(graph, state, host, now));
 
+    incidents.extend(detect_cgroup_abuse(graph, state, host, now));
+
     // Phase 3B: aggregation detectors
     incidents.extend(detect_host_drift_aggregated(graph, state, host, now));
     incidents.extend(detect_proto_anomaly_aggregated(graph, state, host, now));
@@ -2073,7 +2075,8 @@ fn detect_sudo_abuse(
             continue; // root doesn't need sudo
         }
 
-        let sudo_count = graph.outgoing_edges(uid)
+        // SudoAs edges go Process→User, so look at incoming edges on User
+        let sudo_count = graph.incoming_edges(uid)
             .iter()
             .filter(|e| e.relation == Relation::SudoAs && now - e.ts < window)
             .count();
@@ -2434,6 +2437,78 @@ fn detect_c2_beacon(
     incidents
 }
 
+// ── Phase 3A (T009): Cgroup Abuse ──────────────────────────────────────
+// Detects processes with excessive CPU/memory usage based on cgroup monitoring
+// events. Fires when a process appears in multiple cgroup-related events
+// within a window (sustained resource abuse, e.g. cryptominer).
+
+fn detect_cgroup_abuse(
+    graph: &KnowledgeGraph,
+    state: &mut GraphDetectorState,
+    host: &str,
+    now: DateTime<Utc>,
+) -> Vec<Incident> {
+    let mut incidents = Vec::new();
+    let window = Duration::seconds(120); // 2+ ticks (60s each)
+
+    // Count cgroup-related edges per process in recent window
+    for &pid_id in graph.nodes_of_type(NodeType::Process).iter() {
+        let comm = match graph.get_node(pid_id) {
+            Some(Node::Process { comm, .. }) => comm.clone(),
+            _ => continue,
+        };
+
+        // Count edges with cgroup properties in window
+        let cgroup_events: usize = graph
+            .outgoing_edges(pid_id)
+            .iter()
+            .filter(|e| {
+                now - e.ts < window
+                    && e.properties
+                        .get("cgroup_cpu_pct")
+                        .and_then(|v| v.as_f64())
+                        .map(|pct| pct > 90.0)
+                        .unwrap_or(false)
+            })
+            .count();
+
+        if cgroup_events < 2 {
+            continue; // Need sustained abuse (2+ observations)
+        }
+
+        let key = format!("graph_cgroup:{}:{}", comm, pid_id);
+        if !state.check_and_set(&key, now, 1800) {
+            continue;
+        }
+
+        incidents.push(Incident {
+            ts: now,
+            host: host.to_string(),
+            incident_id: format!("graph_cgroup_abuse:{}:{}", comm, now.timestamp()),
+            severity: Severity::Medium,
+            title: format!("Cgroup abuse: {} sustained high CPU", comm),
+            summary: format!(
+                "Process '{}' shows sustained CPU usage >90% across {} observations in {}s. May indicate cryptominer or resource abuse.",
+                comm, cgroup_events, window.num_seconds()
+            ),
+            evidence: serde_json::json!({
+                "source": "knowledge_graph",
+                "detector": "graph_cgroup_abuse",
+                "process": comm,
+                "observations": cgroup_events,
+                "window_secs": window.num_seconds(),
+            }),
+            recommended_checks: vec![
+                format!("Check CPU: top -p $(pgrep -f {})", comm),
+                format!("Check cgroup: cat /sys/fs/cgroup/system.slice/*/cpu.stat"),
+            ],
+            tags: vec!["T1496".to_string()],
+            entities: vec![],
+        });
+    }
+    incidents
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2751,5 +2826,263 @@ mod tests {
 
         // Unknown sensor detector — never suppress
         assert!(!state.should_suppress_sensor("yara_scan", "1.2.3.4", ts(110)));
+    }
+
+    // ── Phase 3A missing tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_crypto_miner_detection() {
+        let mut g = KnowledgeGraph::new();
+        let proc_id = g.ensure_process(100, 1, "xmrig", 0, ts(0));
+        let ip_id = g.add_node(Node::Ip {
+            addr: "pool.minexmr.com".into(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: ts(0),
+            last_seen: ts(0),
+        });
+        g.add_edge(Edge::new(proc_id, ip_id, Relation::ConnectedTo, ts(10))
+            .with_prop("port", 3333u16));
+
+        let mut state = GraphDetectorState::new();
+        let result = detect_crypto_miner(&g, &mut state, "test", ts(20));
+        assert!(!result.is_empty(), "xmrig connecting to port 3333 should trigger");
+    }
+
+    #[test]
+    fn test_user_creation_detection() {
+        let mut g = KnowledgeGraph::new();
+        // Simulate a new user appearing in graph
+        g.ensure_user("hackerman");
+
+        let mut state = GraphDetectorState::new();
+        // user_creation checks user_index growth — on first run it learns baseline
+        let _ = detect_user_creation(&g, &mut state, "test", ts(10));
+        // Add another user and run again
+        g.ensure_user("backdoor_user");
+        let result = detect_user_creation(&g, &mut state, "test", ts(20));
+        // Should detect the new user
+        assert!(!result.is_empty(), "new user creation should trigger");
+    }
+
+    #[test]
+    fn test_scanner_ua_detection() {
+        let mut g = KnowledgeGraph::new();
+        let ip_id = g.add_node(Node::Ip {
+            addr: "10.0.0.99".into(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: ts(0),
+            last_seen: ts(0),
+        });
+        let sys_id = g.ensure_system("test-host");
+        g.add_edge(
+            Edge::new(ip_id, sys_id, Relation::HttpRequestTo, ts(5))
+                .with_prop("user_agent", "Nikto/2.1.6"),
+        );
+
+        let mut state = GraphDetectorState::new();
+        let result = detect_scanner_ua(&g, &mut state, "test", ts(10));
+        assert!(!result.is_empty(), "Nikto UA should trigger scanner detection");
+    }
+
+    #[test]
+    fn test_docker_anomaly_restart_detection() {
+        let mut g = KnowledgeGraph::new();
+        let cid = g.ensure_container("abc123");
+        let sys_id = g.ensure_system("test-host");
+        // Simulate 4 restarts in 5 minutes
+        for i in 0..4 {
+            g.add_edge(Edge::new(cid, sys_id, Relation::StartedOn, ts(i * 60)));
+            g.add_edge(Edge::new(cid, sys_id, Relation::DiedOn, ts(i * 60 + 30)));
+        }
+
+        let mut state = GraphDetectorState::new();
+        let result = detect_docker_anomaly(&g, &mut state, "test", ts(250));
+        assert!(
+            !result.is_empty(),
+            "4 container restarts in 5 min should trigger"
+        );
+    }
+
+    #[test]
+    fn test_host_drift_suspicious_path() {
+        let mut g = KnowledgeGraph::new();
+        let proc_id = g.ensure_process(999, 1, "payload", 0, ts(5));
+        let file_id = g.add_node(Node::File {
+            path: "/tmp/payload".into(),
+            sha256: None,
+            size: None,
+            entropy: None,
+            is_sensitive: false,
+            yara_matches: vec![],
+        });
+        g.add_edge(Edge::new(proc_id, file_id, Relation::Executed, ts(5)));
+
+        let mut state = GraphDetectorState::new();
+        let result = detect_host_drift_aggregated(&g, &mut state, "test", ts(10));
+        assert!(
+            !result.is_empty(),
+            "/tmp execution should fire individually as suspicious"
+        );
+        assert!(result[0].severity == Severity::High);
+    }
+
+    #[test]
+    fn test_credential_stuffing_detection() {
+        let mut g = KnowledgeGraph::new();
+        let ip_id = g.add_node(Node::Ip {
+            addr: "185.0.0.1".into(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: ts(0),
+            last_seen: ts(0),
+        });
+        // 5 distinct users with failed auth from same IP
+        for i in 0..5 {
+            let user_id = g.ensure_user(&format!("user{}", i));
+            g.add_edge(
+                Edge::new(user_id, ip_id, Relation::LoggedInFrom, ts(i * 10))
+                    .with_prop("success", false),
+            );
+        }
+
+        let mut state = GraphDetectorState::new();
+        let result = detect_credential_stuffing(&g, &mut state, "test", ts(60));
+        assert!(
+            !result.is_empty(),
+            "5 distinct users from same IP should trigger credential stuffing"
+        );
+    }
+
+    #[test]
+    fn test_sudo_abuse_detection() {
+        let mut g = KnowledgeGraph::new();
+        let user_id = g.ensure_user("attacker");
+        // 10 sudo commands in 50s (all within 60s window of ts(55))
+        for i in 0..10 {
+            let proc_id = g.ensure_process(100 + i, 1, "sudo", 0, ts(i as i64 * 5));
+            g.add_edge(
+                Edge::new(proc_id, user_id, Relation::SudoAs, ts(i as i64 * 5))
+                    .with_prop("command", format!("cat /etc/shadow_{}", i)),
+            );
+        }
+
+        let mut state = GraphDetectorState::new();
+        let result = detect_sudo_abuse(&g, &mut state, "test", ts(55));
+        assert!(
+            !result.is_empty(),
+            "10 sudo commands in 60s should trigger"
+        );
+    }
+
+    #[test]
+    fn test_dns_tunnel_high_entropy() {
+        let mut g = KnowledgeGraph::new();
+        let proc_id = g.ensure_process(50, 1, "dnscat2", 0, ts(0));
+        // Create 60 Resolved edges to long domains (>50 chars) — triggers dns tunnel
+        for i in 0..60 {
+            let long_name = format!(
+                "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZlcnkgbG9uZyBkb21h{:03}.evil.com",
+                i
+            );
+            let dom_id = g.add_node(Node::Domain {
+                name: long_name,
+                datasets: vec![],
+                is_dga: Some(true),
+                entropy: Some(5.2),
+            });
+            g.add_edge(Edge::new(proc_id, dom_id, Relation::Resolved, ts(i)));
+        }
+
+        let mut state = GraphDetectorState::new();
+        let result = detect_dns_tunnel(&g, &mut state, "test", ts(65));
+        assert!(
+            !result.is_empty(),
+            "60 DNS resolutions to long domains should trigger DNS tunnel detection"
+        );
+    }
+
+    #[test]
+    fn test_correlation_multi_low_elevation() {
+        let mut g = KnowledgeGraph::new();
+        let ip_id = g.add_node(Node::Ip {
+            addr: "10.0.0.50".into(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: ts(0),
+            last_seen: ts(0),
+        });
+        // Create 3 incidents from different detectors all connected to same IP
+        for (i, det) in ["port_scan", "user_agent_scanner", "discovery_burst"]
+            .iter()
+            .enumerate()
+        {
+            let inc_id = g.add_node(Node::Incident {
+                incident_id: format!("{}:test:{}", det, i),
+                detector: det.to_string(),
+                severity: "low".into(),
+                title: format!("{} test", det),
+                summary: String::new(),
+                ts: ts(i as i64 * 30),
+                mitre_ids: vec![],
+                decision: None,
+                confidence: None,
+                decision_reason: None,
+                decision_target: None,
+                auto_executed: false,
+                is_allowlisted: false,
+            });
+            g.add_edge(Edge::new(inc_id, ip_id, Relation::TriggeredBy, ts(i as i64 * 30)));
+        }
+
+        let mut state = GraphDetectorState::new();
+        let result = detect_correlation_chains(&g, &mut state, "test", ts(100));
+        assert!(
+            !result.is_empty(),
+            "3 distinct low-severity detectors from same IP should escalate to HIGH"
+        );
+        assert!(result[0]
+            .incident_id
+            .contains("CL-010"));
+    }
+
+    #[test]
+    fn test_c2_beacon_periodic_connections() {
+        let mut g = KnowledgeGraph::new();
+        let proc_id = g.ensure_process(42, 1, "backdoor", 0, ts(0));
+        let ip_id = g.add_node(Node::Ip {
+            addr: "93.184.216.34".into(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: ts(0),
+            last_seen: ts(0),
+        });
+        // 6 connections at regular 30s intervals (within 15% jitter)
+        for i in 0..6 {
+            g.add_edge(Edge::new(
+                proc_id,
+                ip_id,
+                Relation::ConnectedTo,
+                ts(i * 30),
+            ));
+        }
+
+        let mut state = GraphDetectorState::new();
+        let result = detect_c2_beacon(&g, &mut state, "test", ts(180));
+        assert!(
+            !result.is_empty(),
+            "6 periodic connections at 30s intervals should trigger C2 beacon"
+        );
     }
 }

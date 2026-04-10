@@ -2169,7 +2169,7 @@ async fn process_incidents(
     for incident in &all_incidents {
         state.telemetry.observe_incident(incident);
 
-        // Dedup: suppress sensor incident if graph already detected it for the same entity
+        // Dedup: suppress sensor incident if graph handles this detector
         {
             let sensor_detector = incident.incident_id.split(':').next().unwrap_or("");
             let entity_value = incident
@@ -2177,6 +2177,18 @@ async fn process_incidents(
                 .first()
                 .map(|e| e.value.as_str())
                 .unwrap_or("");
+
+            // Phase 3D: if detector is in graph_only_detectors, always suppress sensor version
+            if cfg.graph_only_detectors.iter().any(|d| d == sensor_detector) {
+                tracing::debug!(
+                    incident_id = %incident.incident_id,
+                    "sensor incident suppressed: detector is graph-only"
+                );
+                handled += 1;
+                continue;
+            }
+
+            // Otherwise, suppress if graph recently detected same entity
             if state
                 .graph_detector_state
                 .should_suppress_sensor(sensor_detector, entity_value, chrono::Utc::now())
