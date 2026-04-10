@@ -3,7 +3,6 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::sync::{Arc, RwLock};
-use tracing::info;
 
 use crate::knowledge_graph::KnowledgeGraph;
 use crate::knowledge_graph::types::{Node, NodeType, Relation};
@@ -15,178 +14,171 @@ pub struct Briefing {
     pub date: String,
     pub threat_level: String,
     pub summary: String,
-    pub sections: BriefingSections,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct BriefingSections {
-    pub overview: String,
-    pub campaigns: Vec<String>,
-    pub top_risks: Vec<TopRisk>,
-    pub unresolved: Vec<UnresolvedThreat>,
-    pub honeypot_intel: String,
-    pub gaps: Vec<String>,
-    pub recommendations: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TopRisk {
-    pub ip: String,
-    pub detectors: Vec<String>,
-    pub incident_count: usize,
-    pub decision: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct UnresolvedThreat {
-    pub incident_id: String,
-    pub severity: String,
-    pub title: String,
-    pub entity: String,
 }
 
 /// Build the structured context from the knowledge graph for LLM consumption.
+/// Separates contained (resolved) from unresolved, marks internal IPs,
+/// and shows actions already taken.
 pub fn build_briefing_context(
     kg: &Arc<RwLock<KnowledgeGraph>>,
 ) -> String {
     let graph = kg.read().unwrap();
 
     let incident_nodes = graph.nodes_of_type(NodeType::Incident);
-    let ip_nodes = graph.nodes_of_type(NodeType::Ip);
 
-    // Counts
-    let total_incidents = incident_nodes.len();
-    let total_ips = ip_nodes.iter().filter(|&&id| {
-        matches!(graph.get_node(id), Some(Node::Ip { is_internal: false, .. }))
-    }).count();
-
-    // Severity breakdown
-    let mut by_severity: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Categorize incidents
+    let mut contained = 0usize;
+    let mut ignored = 0usize;
+    let mut unresolved = 0usize;
+    let mut unresolved_high_crit = 0usize;
     let mut by_detector: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut decisions_count = 0usize;
-    let mut blocks = 0usize;
-    let mut unresolved_high: Vec<(String, String, String, String)> = Vec::new();
+    let mut by_severity: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut actions_taken: Vec<String> = Vec::new();
+    let mut unresolved_list: Vec<(String, String, String)> = Vec::new(); // (severity, title, entity)
 
     for &id in &incident_nodes {
         if let Some(Node::Incident {
-            incident_id, detector, severity, title, decision, ..
+            detector, severity, title, decision, decision_target, auto_executed, ..
         }) = graph.get_node(id) {
-            *by_severity.entry(severity.to_lowercase()).or_default() += 1;
             *by_detector.entry(detector.clone()).or_default() += 1;
+            *by_severity.entry(severity.to_lowercase()).or_default() += 1;
 
-            if let Some(dec) = decision {
-                decisions_count += 1;
-                if dec == "block_ip" { blocks += 1; }
-            } else {
-                let sev = severity.to_lowercase();
-                if sev == "high" || sev == "critical" {
-                    // Find entity
-                    let entity = graph.outgoing_edges(id).iter()
-                        .find(|e| e.relation == Relation::TriggeredBy)
-                        .and_then(|e| graph.get_node(e.to))
-                        .map(|n| n.label())
-                        .unwrap_or_default();
-                    unresolved_high.push((
-                        incident_id.clone(),
-                        sev,
-                        title.clone(),
-                        entity,
-                    ));
+            match decision.as_deref() {
+                Some("block_ip") => {
+                    contained += 1;
+                    let target = decision_target.as_deref().unwrap_or("?");
+                    let mode = if *auto_executed { "auto-blocked" } else { "manual" };
+                    actions_taken.push(format!("Blocked IP {} ({}) — {}", target, mode, title));
                 }
-            }
-        }
-    }
-
-    // Top attackers by incident count
-    let mut ip_incidents: std::collections::HashMap<String, (usize, Vec<String>)> =
-        std::collections::HashMap::new();
-    for &inc_id in &incident_nodes {
-        if let Some(Node::Incident { detector, .. }) = graph.get_node(inc_id) {
-            for edge in graph.outgoing_edges(inc_id) {
-                if edge.relation == Relation::TriggeredBy {
-                    if let Some(Node::Ip { addr, is_internal: false, .. }) = graph.get_node(edge.to) {
-                        let entry = ip_incidents.entry(addr.clone()).or_insert((0, Vec::new()));
-                        entry.0 += 1;
-                        if !entry.1.contains(detector) {
-                            entry.1.push(detector.clone());
+                Some("monitor") => { contained += 1; }
+                Some("honeypot") => { contained += 1; }
+                Some("kill_process") => {
+                    contained += 1;
+                    actions_taken.push(format!("Killed process — {}", title));
+                }
+                Some("suspend_user_sudo") => {
+                    contained += 1;
+                    actions_taken.push(format!("Suspended sudo — {}", title));
+                }
+                Some("ignore") => { ignored += 1; }
+                Some(_) => { contained += 1; }
+                None => {
+                    unresolved += 1;
+                    let sev = severity.to_lowercase();
+                    if sev == "high" || sev == "critical" {
+                        unresolved_high_crit += 1;
+                        let entity = graph.outgoing_edges(id).iter()
+                            .find(|e| e.relation == Relation::TriggeredBy)
+                            .and_then(|e| graph.get_node(e.to))
+                            .map(|n| n.label())
+                            .unwrap_or_default();
+                        if unresolved_list.len() < 10 {
+                            unresolved_list.push((sev, title.clone(), entity));
                         }
                     }
                 }
             }
         }
     }
-    let mut top_attackers: Vec<_> = ip_incidents.into_iter().collect();
+
+    // Top attackers — ONLY external IPs, annotate if already blocked
+    let mut ip_data: std::collections::HashMap<String, (usize, Vec<String>, bool)> =
+        std::collections::HashMap::new();
+    for &inc_id in &incident_nodes {
+        if let Some(Node::Incident { detector, decision, decision_target, .. }) = graph.get_node(inc_id) {
+            for edge in graph.outgoing_edges(inc_id) {
+                if edge.relation != Relation::TriggeredBy { continue; }
+                if let Some(Node::Ip { addr, is_internal, .. }) = graph.get_node(edge.to) {
+                    if *is_internal { continue; } // Skip server's own IPs
+                    let entry = ip_data.entry(addr.clone()).or_insert((0, Vec::new(), false));
+                    entry.0 += 1;
+                    if !entry.1.contains(detector) { entry.1.push(detector.clone()); }
+                    if decision.as_deref() == Some("block_ip") && decision_target.as_deref() == Some(addr.as_str()) {
+                        entry.2 = true; // Already blocked
+                    }
+                }
+            }
+        }
+    }
+    let mut top_attackers: Vec<_> = ip_data.into_iter().collect();
     top_attackers.sort_by(|a, b| b.1.0.cmp(&a.1.0));
     top_attackers.truncate(10);
 
-    // Top detectors
+    // Detectors sorted
     let mut sorted_detectors: Vec<_> = by_detector.into_iter().collect();
     sorted_detectors.sort_by(|a, b| b.1.cmp(&a.1));
     sorted_detectors.truncate(10);
 
-    // Threat level
-    let critical = by_severity.get("critical").copied().unwrap_or(0);
-    let high = by_severity.get("high").copied().unwrap_or(0);
-    let threat_level = if critical > 5 || unresolved_high.len() > 10 {
+    // Threat level — based on UNRESOLVED, not total
+    let threat_level = if unresolved_high_crit > 5 {
         "CRITICAL"
-    } else if critical > 0 || high > 10 || unresolved_high.len() > 3 {
+    } else if unresolved_high_crit > 0 {
         "ELEVATED"
-    } else if high > 0 || total_incidents > 50 {
+    } else if unresolved > 10 {
         "MODERATE"
     } else {
         "LOW"
     };
 
-    // Build context string for LLM
+    // Build context
+    let total = incident_nodes.len();
     let mut ctx = format!(
-        "DAILY SECURITY INTELLIGENCE BRIEFING CONTEXT\n\
-         Date: {}\n\
-         Threat Level: {}\n\n\
-         OVERVIEW:\n\
-         - Total incidents: {}\n\
-         - Unique external IPs: {}\n\
-         - AI decisions made: {}\n\
-         - IPs blocked: {}\n\
-         - Unresolved high/critical: {}\n\
-         - Severity breakdown: {:?}\n\n",
+        "SECURITY INTELLIGENCE CONTEXT — {}\n\n\
+         SITUATION STATUS:\n\
+         - Total incidents today: {}\n\
+         - CONTAINED (AI blocked/monitored/responded): {} — these are RESOLVED, not active threats\n\
+         - IGNORED by AI (noise/false positives): {} — confirmed non-threats\n\
+         - UNRESOLVED (no AI decision yet): {} — of which {} are high/critical severity\n\
+         - The system is in GUARD mode: AI auto-blocks high-confidence threats\n\n\
+         IMPORTANT: {} of {} incidents are already handled. The system is actively defending.\n\
+         Only {} incident{} need{} human attention.\n\n",
         Utc::now().format("%Y-%m-%d"),
-        threat_level,
-        total_incidents,
-        total_ips,
-        decisions_count,
-        blocks,
-        unresolved_high.len(),
-        by_severity,
+        total,
+        contained,
+        ignored,
+        unresolved, unresolved_high_crit,
+        contained + ignored, total,
+        unresolved_high_crit,
+        if unresolved_high_crit == 1 { "" } else { "s" },
+        if unresolved_high_crit == 1 { "s" } else { "" },
     );
 
-    ctx.push_str("TOP DETECTORS (by incident count):\n");
+    if !actions_taken.is_empty() {
+        ctx.push_str("ACTIONS ALREADY TAKEN BY AI:\n");
+        for (i, action) in actions_taken.iter().take(10).enumerate() {
+            ctx.push_str(&format!("  {}. {}\n", i + 1, action));
+        }
+        if actions_taken.len() > 10 {
+            ctx.push_str(&format!("  ... and {} more actions\n", actions_taken.len() - 10));
+        }
+        ctx.push('\n');
+    }
+
+    if !unresolved_list.is_empty() {
+        ctx.push_str("UNRESOLVED THREATS NEEDING ATTENTION:\n");
+        for (sev, title, entity) in &unresolved_list {
+            ctx.push_str(&format!("  - [{}] {} ({})\n", sev.to_uppercase(), title, entity));
+        }
+        ctx.push('\n');
+    }
+
+    ctx.push_str("TOP ATTACKERS (external IPs only):\n");
+    for (ip, (count, dets, blocked)) in &top_attackers {
+        let status = if *blocked { " [ALREADY BLOCKED]" } else { "" };
+        ctx.push_str(&format!("  - {} — {} incidents, detectors: {}{}\n", ip, count, dets.join(", "), status));
+    }
+
+    ctx.push_str("\nDETECTOR ACTIVITY:\n");
     for (det, count) in &sorted_detectors {
         ctx.push_str(&format!("  - {}: {}\n", det, count));
     }
 
-    ctx.push_str("\nTOP ATTACKERS:\n");
-    for (ip, (count, dets)) in &top_attackers {
-        ctx.push_str(&format!("  - {} — {} incidents, detectors: {}\n", ip, count, dets.join(", ")));
-    }
-
-    if !unresolved_high.is_empty() {
-        ctx.push_str("\nUNRESOLVED HIGH/CRITICAL THREATS:\n");
-        for (id, sev, title, entity) in &unresolved_high {
-            ctx.push_str(&format!("  - [{}] {} — {} ({})\n", sev, title, entity, id));
-        }
-    }
-
-    // Event sources
-    ctx.push_str(&format!("\nEVENT SOURCES: {} total events ingested\n", graph.total_events_ingested));
-    for (src, &count) in graph.source_counts.iter() {
-        ctx.push_str(&format!("  - {}: {}\n", src, count));
-    }
-
-    // Graph structure
-    let metrics = graph.metrics();
     ctx.push_str(&format!(
-        "\nKNOWLEDGE GRAPH: {} nodes, {} edges, {} KB\n",
-        metrics.node_count, metrics.edge_count, metrics.memory_bytes / 1024
+        "\nKNOWLEDGE GRAPH: {} nodes, {} edges\n\
+         EVENTS INGESTED: {}\n",
+        graph.metrics().node_count,
+        graph.metrics().edge_count,
+        graph.total_events_ingested,
     ));
 
     ctx
@@ -195,18 +187,24 @@ pub fn build_briefing_context(
 /// The LLM prompt for generating the briefing.
 pub fn briefing_prompt(context: &str) -> String {
     format!(
-        "You are a senior security analyst generating a daily intelligence briefing for a server operator.\n\
+        "You are a senior security analyst writing a daily briefing for a server operator.\n\
          \n\
-         Based on the security data below, write a concise, actionable briefing with these sections:\n\
+         CRITICAL RULES:\n\
+         - Incidents marked CONTAINED are RESOLVED — do NOT treat them as active threats\n\
+         - Incidents marked IGNORED are confirmed noise — do NOT recommend action on them\n\
+         - Only UNRESOLVED incidents need attention\n\
+         - IPs marked [ALREADY BLOCKED] are handled — do NOT recommend blocking them again\n\
+         - Internal IPs (10.x, 192.168.x, 127.x) are the server itself — NOT attackers\n\
+         - The system AUTO-BLOCKS threats. Most detections are already handled.\n\
          \n\
-         1. **THREAT LEVEL** — one word (CRITICAL/ELEVATED/MODERATE/LOW) with a one-sentence justification\n\
-         2. **EXECUTIVE SUMMARY** — 2-3 sentences covering the day's security posture\n\
-         3. **CAMPAIGNS** — group related attacks by behavior/IP/timing. Name each campaign descriptively.\n\
-         4. **TOP RISKS** — the 3 most dangerous unresolved threats with recommended actions\n\
-         5. **GAPS** — what's suspicious by its ABSENCE (e.g., no lateral movement = possible evasion)\n\
-         6. **RECOMMENDATIONS** — 3 specific, actionable steps the operator should take TODAY\n\
+         Write a concise briefing with these sections:\n\
+         1. **THREAT LEVEL** — one word + one sentence. Base it on UNRESOLVED count, not total.\n\
+         2. **EXECUTIVE SUMMARY** — 2-3 sentences. Be accurate about what's resolved vs active.\n\
+         3. **WHAT WAS HANDLED** — bullet list of AI actions taken (blocks, kills, monitors)\n\
+         4. **NEEDS ATTENTION** — only UNRESOLVED high/critical threats with specific actions\n\
+         5. **RECOMMENDATIONS** — 2-3 actionable steps for TODAY\n\
          \n\
-         Be direct. No filler. Use bullet points. If something is urgent, say so clearly.\n\
+         Be accurate. Do not exaggerate. If most threats are contained, say so.\n\
          \n\
          ---\n\
          \n\
@@ -216,21 +214,10 @@ pub fn briefing_prompt(context: &str) -> String {
 
 /// Parse the LLM response into a structured Briefing.
 pub fn parse_briefing(llm_response: &str, context_threat_level: &str) -> Briefing {
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-
     Briefing {
         generated_at: Utc::now(),
-        date: today,
+        date: Utc::now().format("%Y-%m-%d").to_string(),
         threat_level: context_threat_level.to_string(),
         summary: llm_response.to_string(),
-        sections: BriefingSections {
-            overview: String::new(),
-            campaigns: Vec::new(),
-            top_risks: Vec::new(),
-            unresolved: Vec::new(),
-            honeypot_intel: String::new(),
-            gaps: Vec::new(),
-            recommendations: Vec::new(),
-        },
     }
 }
