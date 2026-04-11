@@ -45,6 +45,10 @@ pub struct CorrelationEvent {
     pub severity: Severity,
     pub entities: Vec<EntityRef>,
     pub details: serde_json::Value,
+    /// Phase 014-C: incident_id when the event originated from an Incident
+    /// (set by classify_incident). Empty for raw events.
+    #[serde(default)]
+    pub incident_id: String,
 }
 
 /// A detected multi-stage attack chain.
@@ -326,6 +330,7 @@ impl CorrelationEngine {
             severity: event.severity.clone(),
             entities: event.entities.clone(),
             details: event.details.clone(),
+            incident_id: String::new(),
         }
     }
 
@@ -341,6 +346,7 @@ impl CorrelationEngine {
             severity: incident.severity.clone(),
             entities: incident.entities.clone(),
             details: incident.evidence.clone(),
+            incident_id: incident.incident_id.clone(),
         }
     }
 
@@ -355,6 +361,7 @@ impl CorrelationEngine {
             severity: Severity::High,
             entities: vec![],
             details,
+            incident_id: String::new(),
         }
     }
 
@@ -368,6 +375,7 @@ impl CorrelationEngine {
             severity: Severity::High,
             entities: vec![],
             details,
+            incident_id: String::new(),
         }
     }
 
@@ -381,6 +389,7 @@ impl CorrelationEngine {
             severity: Severity::Critical,
             entities: vec![],
             details,
+            incident_id: String::new(),
         }
     }
 
@@ -394,6 +403,7 @@ impl CorrelationEngine {
             severity: Severity::Medium,
             entities: vec![],
             details,
+            incident_id: String::new(),
         }
     }
 }
@@ -1673,6 +1683,7 @@ mod tests {
             severity: Severity::Medium,
             entities: vec![EntityRef::ip(ip)],
             details: serde_json::json!({}),
+            incident_id: String::new(),
         }
     }
 
@@ -1685,6 +1696,7 @@ mod tests {
             severity: Severity::Medium,
             entities: vec![EntityRef::ip(ip)],
             details: serde_json::json!({}),
+            incident_id: String::new(),
         }
     }
 

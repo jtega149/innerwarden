@@ -44,6 +44,18 @@ pub(crate) fn ingest_new_incidents(
                 chain.summary
             );
 
+            // Phase 014-C: Add CorrelatedWith edges between all incidents in this chain
+            let incident_ids: Vec<String> = chain
+                .events
+                .iter()
+                .filter(|e| !e.incident_id.is_empty())
+                .map(|e| e.incident_id.clone())
+                .collect();
+            if incident_ids.len() >= 2 {
+                let mut graph = state.knowledge_graph.write().unwrap();
+                graph.link_correlated_incidents(&incident_ids, &chain.chain_id);
+            }
+
             // Evaluate chain-triggered playbooks
             for incident in &new_incidents.entries {
                 if let Some(exec) = state

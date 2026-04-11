@@ -371,6 +371,28 @@ impl KnowledgeGraph {
         }
     }
 
+    /// Phase 014-C: Link incidents in a correlation chain via CorrelatedWith edges.
+    /// Given a list of incident IDs that form a multi-stage attack chain,
+    /// connects each pair with a CorrelatedWith edge for graph traversal.
+    pub fn link_correlated_incidents(&mut self, incident_ids: &[String], chain_id: &str) {
+        let node_ids: Vec<NodeId> = incident_ids
+            .iter()
+            .filter_map(|iid| self.find_by_incident(iid))
+            .collect();
+        if node_ids.len() < 2 {
+            return;
+        }
+        let now = chrono::Utc::now();
+        // Create a complete graph of CorrelatedWith edges between all pairs
+        for i in 0..node_ids.len() {
+            for j in (i + 1)..node_ids.len() {
+                let edge = Edge::new(node_ids[i], node_ids[j], Relation::CorrelatedWith, now)
+                    .with_prop("chain_id", serde_json::Value::from(chain_id));
+                self.add_edge(edge);
+            }
+        }
+    }
+
     // ── Ensure helpers (find or create) ─────────────────────────────────
 
     pub fn ensure_process(

@@ -150,6 +150,11 @@ impl KnowledgeGraph {
             "process.fd_redirect" => self.ingest_fd_redirect(event),
             "process.memfd_create" => self.ingest_memfd_create(event),
             "memory.mprotect_exec" => self.ingest_mprotect_exec(event),
+            "memory.anon_executable" => self.ingest_memory_region(event, "anon_executable"),
+            "memory.rwx_memory" => self.ingest_memory_region(event, "rwx_memory"),
+            "memory.deleted_file_mapping" => self.ingest_memory_region(event, "deleted_file_mapping"),
+            "cgroup.memory_spike" => self.ingest_cgroup_event(event, "memory_spike"),
+            "cgroup.cpu_abuse" => self.ingest_cgroup_event(event, "cpu_abuse"),
 
             // ── Hardware & IO ───────────────────────────────────────
             "hardware.usb_inserted" => self.ingest_usb(event, Relation::InsertedOn),
@@ -230,6 +235,52 @@ impl KnowledgeGraph {
                     Relation::TriggeredBy,
                     incident.ts,
                 ));
+            }
+        }
+
+        // Phase 014-D: link incident to Process node from evidence array
+        // (incident.evidence is JSON array; each item may have pid/comm/uid/filename)
+        if let Some(ev_arr) = incident.evidence.as_array() {
+            for ev in ev_arr {
+                let Some(pid) = ev.get("pid").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                if pid == 0 {
+                    continue; // Invalid PID, skip
+                }
+                let comm = ev
+                    .get("comm")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let uid = ev.get("uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let proc_id = self.ensure_process(pid as u32, 0, comm, uid, incident.ts);
+                self.add_edge(Edge::new(
+                    inc_id,
+                    proc_id,
+                    Relation::TriggeredBy,
+                    incident.ts,
+                ));
+            }
+        } else if let Some(ev_obj) = incident.evidence.as_object() {
+            // Some incidents store evidence as a single object instead of array
+            if let Some(pid) = ev_obj.get("pid").and_then(|v| v.as_u64()) {
+                if pid > 0 {
+                    let comm = ev_obj
+                        .get("comm")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let uid = ev_obj
+                        .get("uid")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let proc_id = self.ensure_process(pid as u32, 0, comm, uid, incident.ts);
+                    self.add_edge(Edge::new(
+                        inc_id,
+                        proc_id,
+                        Relation::TriggeredBy,
+                        incident.ts,
+                    ));
+                }
             }
         }
     }
@@ -1266,6 +1317,95 @@ impl KnowledgeGraph {
             edge = edge.with_prop("prot", serde_json::Value::from(prot));
         }
         self.add_edge(edge);
+    }
+
+    /// Ingest memory.* events from proc_maps (anon_executable, rwx_memory,
+    /// deleted_file_mapping). Creates a Process→MprotectExec→Process self-edge
+    /// (existing relation, semantically appropriate for in-memory anomalies)
+    /// with region_type and path properties for forensics.
+    fn ingest_memory_region(&mut self, event: &Event, region_type: &str) {
+        let Some(pid) = detail_u32(event, "pid") else {
+            return;
+        };
+        let comm = detail_str(event, "comm").unwrap_or_default();
+        let proc_id = self.ensure_process(pid, 0, &comm, 0, event.ts);
+
+        // If there's a backing file path, link to it
+        let path = detail_str(event, "path").unwrap_or_default();
+        if !path.is_empty() && path != "(anonymous)" {
+            // Strip "(deleted)" suffix for canonical file path
+            let clean_path = path.trim_end_matches(" (deleted)").to_string();
+            let file_id = self.ensure_file(&clean_path);
+            let mut edge = Edge::new(proc_id, file_id, Relation::Read, event.ts)
+                .with_prop("region_type", serde_json::Value::from(region_type))
+                .with_prop("memory_anomaly", serde_json::Value::from(true));
+            if let Some(perms) = detail_str(event, "perms") {
+                edge = edge.with_prop("perms", serde_json::Value::from(perms));
+            }
+            if path.contains("(deleted)") {
+                edge = edge.with_prop("deleted", serde_json::Value::from(true));
+            }
+            self.add_edge(edge);
+        } else {
+            // Anonymous mapping — self-edge on process indicating in-memory code
+            let mut edge = Edge::new(proc_id, proc_id, Relation::MprotectExec, event.ts)
+                .with_prop("region_type", serde_json::Value::from(region_type))
+                .with_prop("memory_anomaly", serde_json::Value::from(true));
+            if let Some(perms) = detail_str(event, "perms") {
+                edge = edge.with_prop("perms", serde_json::Value::from(perms));
+            }
+            if let Some(size) = detail_u64(event, "size_kb") {
+                edge = edge.with_prop("size_kb", serde_json::Value::from(size));
+            }
+            self.add_edge(edge);
+        }
+    }
+
+    /// Ingest cgroup.* events (memory_spike, cpu_abuse). Links the process
+    /// (if pid present) or container to the System node with abuse properties.
+    fn ingest_cgroup_event(&mut self, event: &Event, kind: &str) {
+        let sys_id = self.ensure_system(&event.host);
+
+        // Try process linkage first
+        if let Some(pid) = detail_u32(event, "pid") {
+            let comm = detail_str(event, "comm").unwrap_or_default();
+            let proc_id = self.ensure_process(pid, 0, &comm, 0, event.ts);
+            let mut edge = Edge::new(proc_id, sys_id, Relation::Signaled, event.ts)
+                .with_prop("cgroup_event", serde_json::Value::from(kind));
+            if let Some(mb) = detail_u64(event, "memory_mb") {
+                edge = edge.with_prop("memory_mb", serde_json::Value::from(mb));
+            }
+            if let Some(pct) = detail_f32(event, "cpu_usage_percent") {
+                edge = edge.with_prop("cpu_pct", serde_json::Value::from(pct));
+            }
+            self.add_edge(edge);
+            return;
+        }
+
+        // Try container linkage
+        if let Some(container_id) = detail_str(event, "container_id") {
+            if !container_id.is_empty() {
+                let cont_id = self.ensure_container(&container_id);
+                let mut edge = Edge::new(cont_id, sys_id, Relation::OomKilled, event.ts)
+                    .with_prop("cgroup_event", serde_json::Value::from(kind));
+                if let Some(mb) = detail_u64(event, "memory_mb") {
+                    edge = edge.with_prop("memory_mb", serde_json::Value::from(mb));
+                }
+                self.add_edge(edge);
+                return;
+            }
+        }
+
+        // Fall back to cgroup name → just create a system-level annotation edge
+        if let Some(cgroup) = detail_str(event, "cgroup") {
+            let mut edge = Edge::new(sys_id, sys_id, Relation::Signaled, event.ts)
+                .with_prop("cgroup_event", serde_json::Value::from(kind))
+                .with_prop("cgroup", serde_json::Value::from(cgroup));
+            if let Some(mb) = detail_u64(event, "memory_mb") {
+                edge = edge.with_prop("memory_mb", serde_json::Value::from(mb));
+            }
+            self.add_edge(edge);
+        }
     }
 
     // ── Hardware & IO ───────────────────────────────────────────────
