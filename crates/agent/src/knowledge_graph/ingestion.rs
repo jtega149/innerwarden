@@ -157,6 +157,11 @@ impl KnowledgeGraph {
             "io_uring.submit" => self.ingest_io_uring_submit(event),
             "io_uring.create" => self.ingest_io_uring_create(event),
 
+            // ── TCP Stream (Phase 014-A: network topology) ────────────
+            "tcp_stream.flow" | "tcp_stream.http" | "tcp_stream.ssh" | "tcp_stream.smb" => {
+                self.ingest_tcp_stream(event)
+            }
+
             // ── System & Misc ───────────────────────────────────────
             "system.sysctl_changed" => self.ingest_sysctl_changed(event),
             "lsm.exec_blocked" => self.ingest_lsm_exec_blocked(event),
@@ -1334,6 +1339,89 @@ impl KnowledgeGraph {
             let sys_id = self.ensure_system(&event.host);
             let edge = Edge::new(src_id, sys_id, Relation::HttpRequestTo, event.ts)
                 .with_prop("scan", serde_json::Value::from(true));
+            self.add_edge(edge);
+        }
+    }
+
+    // ── TCP Stream (Phase 014-A) ──────────────────────────────────────
+
+    /// Ingest tcp_stream.* events into the graph as Ip→ConnectedTo→Ip edges.
+    /// Deduplicates by (src_ip, dst_ip, dst_port): first occurrence creates
+    /// the edge, subsequent ones increment the flow_count and accumulate bytes.
+    fn ingest_tcp_stream(&mut self, event: &Event) {
+        let Some(src_ip) = detail_str(event, "src_ip") else {
+            return;
+        };
+        let Some(dst_ip) = detail_str(event, "dst_ip") else {
+            return;
+        };
+
+        // Skip loopback and same-host traffic
+        if src_ip == "127.0.0.1" && dst_ip == "127.0.0.1" {
+            return;
+        }
+
+        let dst_port = detail_u16(event, "dst_port").unwrap_or(0);
+        let client_bytes = detail_u64(event, "client_bytes").unwrap_or(0);
+        let server_bytes = detail_u64(event, "server_bytes").unwrap_or(0);
+        let app_proto = detail_str(event, "app_proto").unwrap_or_default();
+
+        let src_id = self.ensure_ip(&src_ip, event.ts);
+        let dst_id = self.ensure_ip(&dst_ip, event.ts);
+
+        // Dedup: look for existing ConnectedTo edge between these two IPs with same dst_port
+        let port_val = serde_json::Value::from(dst_port);
+        let existing_idx = self
+            .outgoing
+            .get(&src_id)
+            .and_then(|idxs| {
+                idxs.iter().copied().find(|&i| {
+                    if let Some(e) = self.edges.get(i) {
+                        e.to == dst_id
+                            && e.relation == Relation::ConnectedTo
+                            && e.properties.get("dst_port") == Some(&port_val)
+                    } else {
+                        false
+                    }
+                })
+            });
+
+        if let Some(idx) = existing_idx {
+            // Update existing edge: increment flow count and accumulate bytes
+            let edge = &mut self.edges[idx];
+            let count = edge
+                .properties
+                .get("flow_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                + 1;
+            edge.properties
+                .insert("flow_count".into(), serde_json::Value::from(count));
+            let total_bytes = edge
+                .properties
+                .get("total_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + client_bytes
+                + server_bytes;
+            edge.properties
+                .insert("total_bytes".into(), serde_json::Value::from(total_bytes));
+            edge.ts = event.ts; // update to latest timestamp
+        } else {
+            // Create new edge
+            let mut edge = Edge::new(src_id, dst_id, Relation::ConnectedTo, event.ts);
+            edge.properties
+                .insert("dst_port".into(), serde_json::Value::from(dst_port));
+            if !app_proto.is_empty() {
+                edge.properties
+                    .insert("app_proto".into(), serde_json::Value::from(app_proto));
+            }
+            edge.properties
+                .insert("flow_count".into(), serde_json::Value::from(1u64));
+            edge.properties.insert(
+                "total_bytes".into(),
+                serde_json::Value::from(client_bytes + server_bytes),
+            );
             self.add_edge(edge);
         }
     }
