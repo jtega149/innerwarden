@@ -8,11 +8,11 @@
 //! network → memory execution) by capturing the file FROM THE WIRE.
 //!
 //! The items in this module are consumed from the Linux-only TCP stream
-//! reassembly `run()` loop in `collectors::tcp_stream`. On non-Linux
-//! builds (local dev on macOS) `run()` is gated out, so clippy sees the
-//! types and helpers as dead. Silence that cleanly at the module level
-//! rather than gating each item with `cfg_attr`.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+//! reassembly `run()` loop in `collectors::tcp_stream`. A few result
+//! fields (`src_port`, file metadata) are populated but not yet read
+//! by downstream stages. Silence dead_code unconditionally at the
+//! module level until the downstream wiring lands.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 

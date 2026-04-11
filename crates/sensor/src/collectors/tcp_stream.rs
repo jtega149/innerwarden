@@ -18,11 +18,14 @@
 //! Memory-capped: max 10K concurrent flows, 1MB per flow, 100MB total.
 //!
 //! The `run()` packet loop and `parse_tcp_packet` helper are gated with
-//! `#[cfg(target_os = "linux")]`. On non-Linux builds (local dev on
-//! macOS) they're compiled out and clippy sees every struct/method they
-//! consume as dead. Silence that at the module level rather than gating
-//! each item individually.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+//! `#[cfg(target_os = "linux")]`. Several of the flow/stream types
+//! defined in this module are populated for eventual consumption by
+//! later detection stages but not yet read end-to-end — both on
+//! non-Linux builds (where `run()` is compiled out) and on Linux
+//! builds (where the body is compiled but the fields aren't yet
+//! consumed). Silence dead_code unconditionally at the module level
+//! rather than gating each item individually.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 
@@ -569,7 +572,7 @@ pub async fn run(tx: tokio::sync::mpsc::Sender<innerwarden_core::event::Event>, 
 
         // Periodic cleanup (every ~10K packets)
         cleanup_counter += 1;
-        if cleanup_counter % 10_000 == 0 {
+        if cleanup_counter.is_multiple_of(10_000) {
             let stale_events = table.cleanup_stale(Utc::now(), 60);
             for flow_event in stale_events {
                 let event = flow_event_to_event(&flow_event, &host_id);

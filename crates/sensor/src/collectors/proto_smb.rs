@@ -4,9 +4,11 @@
 //! remote execution via named pipes (psexec, smbexec).
 //! Works on any port (not just 445).
 //!
-//! Consumed by the Linux-only tcp_stream `run()` loop. See note in
-//! `file_extract.rs` for why dead_code is silenced on non-Linux builds.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+//! Consumed by the Linux-only tcp_stream `run()` loop. SMB session
+//! fields (shares_accessed, files_accessed) and the Smb3 variant are
+//! populated by the parser but not yet read by downstream detectors.
+//! Silence dead_code unconditionally at the module level.
+#![allow(dead_code)]
 
 /// Parsed SMB session info.
 #[derive(Debug, Clone)]
