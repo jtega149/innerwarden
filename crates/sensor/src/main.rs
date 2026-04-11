@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+// `anyhow::Context` is only consumed by the Linux-gated
+// `apply_seccomp_profile` helper. Gating the import keeps non-Linux
+// dev builds from tripping `unused_imports` under `-D warnings`.
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use clap::Parser;
 use collectors::{
     auth_log::AuthLogCollector, cloudtrail::CloudTrailCollector, docker::DockerCollector,

@@ -28,7 +28,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tracing::info;
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // Flow tracking
@@ -517,8 +518,6 @@ pub fn parse_tcp_packet(raw: &[u8]) -> Option<(FlowKey, u8, u32, &[u8])> {
 /// emits events for further analysis.
 #[cfg(target_os = "linux")]
 pub async fn run(tx: tokio::sync::mpsc::Sender<innerwarden_core::event::Event>, host_id: String) {
-    use innerwarden_core::event::{Event, Severity};
-
     info!("tcp_stream: starting TCP stream reassembly engine");
 
     let fd = unsafe {

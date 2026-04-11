@@ -24,7 +24,7 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Build CLI
-        run: cargo build --bin innerwarden --release
+        run: cargo build --bin innerwarden-ctl --release
 
       - name: Detect changed modules
         id: changed
@@ -49,7 +49,7 @@ jobs:
               continue
             fi
             echo "::group::Validating $module_id"
-            if ! ./target/release/innerwarden module validate --strict "$path"; then
+            if ! ./target/release/innerwarden-ctl module validate --strict "$path"; then
               echo "::error::$module_id failed validation"
               FAILED=1
             fi
