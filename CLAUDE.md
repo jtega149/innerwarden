@@ -54,6 +54,21 @@ make replay-qa    # validacao E2E
 - I/O errors em sinks: `warn!`, nao `?`
 - `spawn_blocking` pra I/O sincrono em tasks Tokio
 
+## Signal quality principle (spec 015)
+
+**Every node in the knowledge graph must earn its place by being useful for operator experience OR AI research and training. Noise that is useful for neither is waste.**
+
+This is a hard rule. A detector that produces high-volume false positives is worse than a detector that produces nothing: the false positives pollute correlation chains, feed wrong signals to the neural model, consume memory, and erode trust in the dashboard.
+
+Concrete checks when adding or reviewing a `detect_*` function in `crates/agent/src/knowledge_graph/detectors.rs`:
+
+- **Prefer baseline diff or event-driven emission over presence scans.** If the semantic is "something new happened", do not iterate `nodes_of_type` unconditionally — filter by a time window (`edges_in_window`, `active_nodes_since`, `now - start_ts < W`) or move the emission into the ingestion path where the event first arrives.
+- **A cooldown is not a fix for a presence scan.** It just slows the noise down. A stale node matching a static predicate will still keep firing once per cooldown window forever.
+- **Parser robustness at the ingestion boundary.** Bad data at ingestion pollutes everything downstream. Fix it at the source, not at the display layer. `ensure_user`, `ensure_ip`, `ensure_file` call sites must be reviewed any time they touch attacker-controlled input.
+- **Research data and operator data can coexist, but should be structurally distinct.** Different node types, or a tag/flag, so the operator view can filter noise out without losing training signal.
+
+Spec 015 (`/.specify/features/015-graph-signal-quality/spec.md`) caught 3,954 false-positive `graph_user_creation` incidents from a single presence-scan detector on permanent (non-expiring) User nodes. The spec contains the full audit table of all 27 graph detectors and the rationale for each pass/fail verdict.
+
 ## Fonte De Verdade
 
 - `CLAUDE.md` e o unico arquivo de navegacao e governanca do repo
