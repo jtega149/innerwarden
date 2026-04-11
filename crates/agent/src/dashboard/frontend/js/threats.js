@@ -100,10 +100,8 @@ function showContained() {
 
 function toggleAllowlistFilter() {
   state.hideAllowlisted = document.getElementById('hideAllowlisted')?.checked || false;
-  if (state.hideAllowlisted && _trustedIps.length === 0 && actionCfg) {
-    _trustedIps = actionCfg.trusted_ips || [];
-    _trustedUsers = actionCfg.trusted_users || [];
-  }
+  // _trustedIps / _trustedUsers are loaded at boot by loadActionConfig()
+  // in actions.js (called from sse.js module load). No lazy-load needed.
   refreshLeft(false);
   // Also refresh Home if visible
   if (document.getElementById('viewHome').style.display !== 'none') loadHome();

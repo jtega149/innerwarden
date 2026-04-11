@@ -78,32 +78,6 @@ function updateHomeKpis(overview) {
   if (el) el.textContent = (overview.events_count || 0).toLocaleString();
 }
 
-function isPrivateIp(ip) {
-  return ip.startsWith('10.') || ip.startsWith('127.') || ip.startsWith('192.168.') ||
-    ip.startsWith('169.254.') || ip === '::1' || ip.startsWith('fc') || ip.startsWith('fd') ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
-}
-
-function isIncidentTrusted(inc) {
-  var entities = inc.entities || [];
-  var hasExternalIp = false;
-  for (var i = 0; i < entities.length; i++) {
-    var e = entities[i];
-    var eType = (typeof e === 'string') ? (e.split(':')[0] || '') : (e.type || '');
-    var eVal = (typeof e === 'string') ? (e.split(':').slice(1).join(':') || '') : (e.value || '');
-    if (eType.toLowerCase() === 'ip') {
-      if (isIpTrusted(eVal) || isPrivateIp(eVal)) return true;
-      hasExternalIp = true;
-    }
-    if (eType.toLowerCase() === 'user') {
-      if (_trustedUsers.indexOf(eVal) >= 0) return true;
-    }
-  }
-  // No IP at all = internal/local activity = trusted
-  if (!hasExternalIp) return true;
-  return false;
-}
-
 // ── AI Intelligence Briefing ────────────────────────────────────────
 async function loadBriefing() {
   var section = document.getElementById('briefingSection');

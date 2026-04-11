@@ -20,6 +20,43 @@
       --surface: #091121;
       --bg: #040814;
     }
+    /* ── Severity-scaled alert classes (spec 017 Phase 1, 00-shared) ── */
+    /* Container-level tone classes. Text color is NOT set here so
+       existing typography keeps working. Used by hero banners, feed
+       rows, and callouts across pages. */
+    .alert-critical {
+      border: 1px solid rgba(244, 63, 94, 0.55);
+      border-left: 3px solid var(--danger);
+      background: rgba(244, 63, 94, 0.08);
+    }
+    .alert-high {
+      border: 1px solid rgba(255, 154, 85, 0.55);
+      border-left: 3px solid var(--orange);
+      background: rgba(255, 154, 85, 0.08);
+    }
+    .alert-medium {
+      border: 1px solid rgba(255, 197, 102, 0.50);
+      border-left: 3px solid var(--warn);
+      background: rgba(255, 197, 102, 0.07);
+    }
+    .alert-low {
+      border: 1px solid rgba(120, 229, 255, 0.40);
+      border-left: 3px solid var(--accent);
+      background: rgba(120, 229, 255, 0.05);
+    }
+    .alert-info {
+      border: 1px solid rgba(74, 222, 128, 0.35);
+      border-left: 3px solid var(--ok);
+      background: rgba(74, 222, 128, 0.05);
+    }
+    /* Responsive table wrapper utility. Provides horizontal scroll
+       as a safety net on narrow viewports. Page specs (e.g. Intel)
+       may extend this with stacked-card media queries. */
+    .table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      width: 100%;
+    }
     /* Ambient cyber grid - matches site's cyber-shell */
     body::before {
       content: "";
