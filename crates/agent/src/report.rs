@@ -143,7 +143,7 @@ pub struct FloatDelta {
 
 /// Statistics for a sliding 6-hour window that may span two calendar days.
 /// This is the source of truth for "last 6 hours" metrics shown in ops checks.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecentWindow {
     /// Width of the window in seconds (always 6 * 3600).
     pub window_secs: u64,
@@ -196,7 +196,7 @@ impl ParseOutcome {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Counters {
     total_events: u64,
     total_incidents: u64,
@@ -810,9 +810,36 @@ fn parse_decisions_file(path: &Path, counters: &mut Counters) -> ParseOutcome {
 /// Reads both `analyzed_date` and the previous date files, filtering entries
 /// to those with a `ts` field within the last 6 hours. This correctly handles
 /// midnight rollovers where the window spans two calendar days.
+/// Cache for compute_recent_window keyed by (date, snapshot_mtime).
+/// Same rationale as COUNTERS_CACHE: avoid disk loads on every dashboard poll.
+static RECENT_WINDOW_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, u64), RecentWindow>>,
+> = std::sync::OnceLock::new();
+
+fn recent_window_cache_handle(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(String, u64), RecentWindow>> {
+    RECENT_WINDOW_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
     const WINDOW_SECS: i64 = 6 * 3600;
     let cutoff = Utc::now() - chrono::Duration::seconds(WINDOW_SECS);
+
+    // Cache check: keyed on snapshot mtime + date.
+    let snap_path = data_dir.join(format!("graph-snapshot-{analyzed_date}.json"));
+    let mtime = std::fs::metadata(&snap_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let key = (analyzed_date.to_string(), mtime);
+    if let Ok(cache) = recent_window_cache_handle().lock() {
+        if let Some(w) = cache.get(&key) {
+            return w.clone();
+        }
+    }
 
     // Phase 7 Gap 5: try graph snapshot for approximate 6h window.
     // event_timeline uses 5-min buckets (HH:MM keys). Sum last 72 buckets.
@@ -859,7 +886,7 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
                 }
             }
 
-            return RecentWindow {
+            let result = RecentWindow {
                 window_secs: WINDOW_SECS as u64,
                 events,
                 incidents,
@@ -871,6 +898,13 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
                 latest_decision_ts: "graph".to_string(),
                 latest_telemetry_ts: "graph".to_string(),
             };
+            if let Ok(mut cache) = recent_window_cache_handle().lock() {
+                if cache.len() > 30 {
+                    cache.clear();
+                }
+                cache.insert(key.clone(), result.clone());
+            }
+            return result;
         }
     }
 
@@ -1010,7 +1044,7 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
         }
     }
 
-    RecentWindow {
+    let result = RecentWindow {
         window_secs: WINDOW_SECS as u64,
         events,
         incidents,
@@ -1021,17 +1055,71 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
         latest_incident_ts,
         latest_decision_ts,
         latest_telemetry_ts,
+    };
+    if let Ok(mut cache) = recent_window_cache_handle().lock() {
+        if cache.len() > 30 {
+            cache.clear();
+        }
+        cache.insert(key, result.clone());
     }
+    result
+}
+
+/// Cache for compute_day_counters keyed by (date, snapshot_mtime).
+/// Yesterday's snapshot is frozen, so once loaded the result is reusable
+/// for the rest of the day. This prevents the dashboard /api/report endpoint
+/// from re-loading the disk snapshot on every poll (was causing 2 graph
+/// loads + integrity-check pruning every 30s on each dashboard refresh).
+static COUNTERS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, u64), Counters>>,
+> = std::sync::OnceLock::new();
+
+fn cache_handle() -> &'static std::sync::Mutex<std::collections::HashMap<(String, u64), Counters>> {
+    COUNTERS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
-    // Phase 7: try dated graph snapshot first
-    if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, date) {
-        if graph.metrics().node_count > 0 {
-            return counters_from_graph(&graph);
+    // Cache key: (date, snapshot_mtime). If mtime hasn't changed, return cached.
+    let snap_path = data_dir.join(format!("graph-snapshot-{date}.json"));
+    let mtime = std::fs::metadata(&snap_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let key = (date.to_string(), mtime);
+    if let Ok(cache) = cache_handle().lock() {
+        if let Some(c) = cache.get(&key) {
+            return c.clone();
         }
     }
-    // Fallback: JSONL
+
+    // Phase 7: try dated graph snapshot first
+    let counters = if let Some(graph) =
+        crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, date)
+    {
+        if graph.metrics().node_count > 0 {
+            counters_from_graph(&graph)
+        } else {
+            counters_from_jsonl(data_dir, date)
+        }
+    } else {
+        counters_from_jsonl(data_dir, date)
+    };
+
+    if let Ok(mut cache) = cache_handle().lock() {
+        // Cap cache size to prevent unbounded growth
+        if cache.len() > 30 {
+            cache.clear();
+        }
+        cache.insert(key, counters.clone());
+    }
+
+    counters
+}
+
+fn counters_from_jsonl(data_dir: &Path, date: &str) -> Counters {
     let events = safe_dated_file(data_dir, "events", date, "jsonl");
     let incidents = safe_dated_file(data_dir, "incidents", date, "jsonl");
     let decisions = safe_dated_file(data_dir, "decisions", date, "jsonl");
