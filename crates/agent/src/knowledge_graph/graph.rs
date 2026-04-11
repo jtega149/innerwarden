@@ -404,6 +404,27 @@ impl KnowledgeGraph {
         ts: DateTime<Utc>,
     ) -> NodeId {
         if let Some(id) = self.find_by_pid(pid) {
+            // Backfill missing fields from later events that carry richer context.
+            // ensure_process is called from many event types (exec, exit, openat,
+            // ptrace, etc) — earlier ones may lack comm/ppid/uid. Without backfill,
+            // 70% of process nodes end up with empty comm in production.
+            if let Some(Node::Process {
+                comm: existing_comm,
+                ppid: existing_ppid,
+                uid: existing_uid,
+                ..
+            }) = self.nodes.get_mut(&id)
+            {
+                if existing_comm.is_empty() && !comm.is_empty() {
+                    *existing_comm = comm.to_string();
+                }
+                if *existing_ppid == 0 && ppid > 0 {
+                    *existing_ppid = ppid;
+                }
+                if *existing_uid == 0 && uid > 0 {
+                    *existing_uid = uid;
+                }
+            }
             return id;
         }
         self.add_node(Node::Process {
