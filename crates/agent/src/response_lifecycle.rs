@@ -151,8 +151,19 @@ pub enum FailureOutcome {
     /// retried on the next cleanup tick.
     Retrying { attempt: u32 },
     /// Retry budget exhausted. Entry moved to history with reason `orphaned`.
-    /// Caller should fire a high-severity alert — the rule may still be
-    /// active in the kernel/firewall.
+    /// The rule may still be active in the kernel/firewall — the system
+    /// admits it lost control and stops trying.
+    ///
+    /// The caller is **not** expected to route this into Telegram/Slack/
+    /// webhook notifications. Orphaned is a local/kernel state drift
+    /// condition — an observability concern for a technical operator
+    /// watching logs, Prometheus, and the responses dashboard — not an
+    /// interrupt-worthy pager event. Push notifications are reserved for
+    /// incident-level signals (real attacker activity). Surface is: WARN
+    /// log with structured fields, Prometheus counter
+    /// (`innerwarden_responses_orphaned_total`), and the entry living in
+    /// history with `reason="orphaned: <stderr>"` so the dashboard
+    /// paints it in red.
     Orphaned {
         backend: ResponseBackend,
         target: String,
@@ -1246,13 +1257,37 @@ mod tests {
 
     #[test]
     fn test_classify_revert_error_patterns() {
-        // Representative stderr strings from each backend.
+        // Representative stderr strings from each backend. These are the
+        // actual shapes emitted by the tools in practice — pulled from man
+        // pages, source code comments, and real runs. If any of these
+        // classifier expectations fail, something is drifting and we risk
+        // orphaning responses that were actually fine.
+        //
+        // Each line below is structured as the command format we run plus
+        // the stderr we need to recognise.
         let absent_cases = [
+            // ufw: `sudo ufw delete deny from <ip>` when rule doesn't exist.
+            // Source: ufw/backend.py emits this via frontend/backend.
             "ERROR: Could not delete non-existent rule",
+            // iptables: `sudo iptables -D INPUT -s <ip> -j DROP` when rule
+            // not found. The classic iptables error.
             "iptables: Bad rule (does a matching rule exist in that chain?).",
+            // iptables alternate phrasing when chain/target missing.
+            "iptables v1.8.7: No chain/target/match by that name.",
+            // nftables: `sudo nft delete rule ... handle X` when handle
+            // already gone. Shape from nftables source (libnftnl).
             "Error: Could not process rule: No such file or directory",
-            "bpftool: delete failed: No such file or directory",
+            "Error: Could not process rule: No such process",
+            // nft variant when rule referenced by handle is gone.
             "nft: rule does not exist",
+            // bpftool: `sudo bpftool map delete pinned ... key ...` when the
+            // key is already absent from the map. bpftool wraps kernel ENOENT.
+            "bpftool: delete failed: No such file or directory",
+            "Error: delete failed: No such file or directory",
+            // Generic variations that show up in wrappers.
+            "rule does not exist",
+            "key nonexistent",
+            "entry doesn't exist in map",
         ];
         for c in absent_cases {
             assert_eq!(
@@ -1262,10 +1297,20 @@ mod tests {
             );
         }
 
+        // Transient errors — genuinely retry-able. None of these mean the
+        // rule was gone, so they must NOT trip the already_absent path (if
+        // they did, we'd silently mark a rule reverted that's actually
+        // still enforced).
         let transient_cases = [
             "sudo: a terminal is required to read the password",
+            "sudo: no tty present and no askpass program specified",
             "Operation not permitted",
+            "Permission denied",
             "connection refused",
+            "Resource temporarily unavailable",
+            "Error: Could not open socket to kernel: Operation not permitted",
+            // This one is important — kernel says "busy", NOT "not found".
+            "nft: Error: Could not process rule: Device or resource busy",
         ];
         for c in transient_cases {
             assert_eq!(
@@ -1274,6 +1319,86 @@ mod tests {
                 "expected Transient for {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_rehydrate_from_snapshot_preserves_state() {
+        // Mid-retry persistence: if the agent crashes while an entry is in
+        // RevertFailed state, the snapshot should preserve attempts so we
+        // don't reset the retry budget on restart.
+        let mut lc = ResponseLifecycle::new();
+        let id = reg(&mut lc, "172.16.0.1", 0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        lc.stage_pending_reverts();
+        lc.mark_revert_failed(&id, "sudo: token expired".to_string());
+        // Entry is now RevertFailed{attempts:1}. Serialize + round-trip.
+        let snapshot = lc.to_json();
+        let active = snapshot["active"].as_array().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["state"]["kind"], "revert_failed");
+        assert_eq!(active[0]["state"]["attempts"], 1);
+
+        // Write to temp dir and reload.
+        let tmp = std::env::temp_dir().join(format!(
+            "innerwarden-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("responses.json"),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+        let reloaded = ResponseLifecycle::load_snapshot(&tmp);
+        assert_eq!(reloaded.list_active().len(), 1);
+        match &reloaded.list_active()[0].state {
+            LifecycleState::RevertFailed { attempts, .. } => {
+                assert_eq!(*attempts, 1, "attempts counter must survive reload");
+            }
+            other => panic!("expected RevertFailed after reload, got {other:?}"),
+        }
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_rehydrate_legacy_snapshot_defaults_to_active() {
+        // Backwards-compat: snapshots from before the state machine don't
+        // have a `state` field. Those entries must load as Active so legacy
+        // responses.json files Just Work on first run after upgrade.
+        let tmp = std::env::temp_dir().join(format!(
+            "innerwarden-test-legacy-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let legacy = serde_json::json!({
+            "active": [{
+                "id": "resp-1",
+                "type": "block_ip",
+                "backend": "ufw",
+                "target": "192.0.2.50",
+                "incident_id": "inc-legacy",
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "expires_at": (chrono::Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339(),
+                "ttl_secs": 3600i64,
+                // Note: no "state" field — this is legacy shape.
+            }],
+            "active_count": 1,
+            "history": [],
+            "totals": { "registered": 1, "expired": 0, "reverted": 0 }
+        });
+        std::fs::write(
+            tmp.join("responses.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+        let reloaded = ResponseLifecycle::load_snapshot(&tmp);
+        assert_eq!(reloaded.list_active().len(), 1);
+        assert!(matches!(
+            reloaded.list_active()[0].state,
+            LifecycleState::Active
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
