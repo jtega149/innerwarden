@@ -9,7 +9,9 @@ use tracing::warn;
 
 /// Hard ceiling for a single day's events file.  Incidents and decisions
 /// are exempt - they are tiny and operationally critical.
-const MAX_EVENTS_FILE_BYTES: u64 = 200 * 1024 * 1024; // 200 MB
+/// Bumped from 200 MB → 1 GB to accommodate eBPF + tcp_stream + http_capture
+/// volume (graph ingestion needs all events, not just a sample).
+const MAX_EVENTS_FILE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GB
 
 pub struct JsonlWriter {
     data_dir: PathBuf,
