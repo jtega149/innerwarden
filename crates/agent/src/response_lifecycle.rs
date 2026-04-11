@@ -187,22 +187,44 @@ enum ErrorKind {
 
 fn classify_revert_error(err: &str) -> ErrorKind {
     let lower = err.to_lowercase();
-    // Patterns per backend (stderr substrings).
-    // ufw:     "could not delete non-existent rule"
-    // iptables: "bad rule (does a matching rule exist in that chain?)"
-    // iptables: "no chain/target/match by that name"
-    // nftables: "error: could not process rule: no such file or directory"
-    // bpftool:  "error: delete failed: no such file or directory"
-    // generic:  "not found", "does not exist"
+    // Patterns per backend, verified against real stderr on Ubuntu 24.04
+    // aarch64 (kernel 6.8.0-106) by running each backend's delete command
+    // against a non-existent rule and capturing the output:
+    //
+    //   iptables-1.8.10: "iptables: Bad rule (does a matching rule exist in
+    //                     that chain?)."  exit=1
+    //   nft-1.0.9:       "Error: Could not process rule: No such file or
+    //                     directory"  exit=1
+    //   bpftool (key):   "Error: delete failed: No such file or directory"
+    //                    exit=254
+    //   bpftool (path):  "Error: bpf obj get (...): No such file or
+    //                     directory"  exit=255
+    //
+    // UFW IS DIFFERENT: `ufw delete deny from <ip>` for a non-existent rule
+    // prints "Could not delete non-existent rule" but exits 0, so run_cmd
+    // returns Ok(()) and this classifier is never called. The entry is
+    // then routed through mark_reverted("expired") rather than
+    // mark_revert_failed -> already_absent. Functionally correct (ufw is
+    // saying "nothing to do, consider it done"), but means the
+    // already_absent counter is systematically undercounted for ufw
+    // deployments. Left as-is: detecting this would require parsing stdout
+    // inside run_cmd which is invasive. The ufw marker below is kept as
+    // defense-in-depth in case a future ufw version starts returning
+    // non-zero — then the substring "non-existent" still classifies correctly.
     const ABSENT_MARKERS: &[&str] = &[
+        // Generic ENOENT variants. "No such file or directory" from any
+        // kernel syscall wrapper passes through this.
         "no such",
         "not found",
         "does not exist",
         "doesn't exist",
+        // ufw phrasing (defense-in-depth, see note above).
         "non-existent",
         "nonexistent",
+        // iptables phrasings.
         "no chain/target/match",
         "matching rule exist",
+        // nft phrasing when rule was referenced by handle that's gone.
         "rule does not exist",
     ];
     if ABSENT_MARKERS.iter().any(|m| lower.contains(m)) {
@@ -1257,35 +1279,40 @@ mod tests {
 
     #[test]
     fn test_classify_revert_error_patterns() {
-        // Representative stderr strings from each backend. These are the
-        // actual shapes emitted by the tools in practice — pulled from man
-        // pages, source code comments, and real runs. If any of these
-        // classifier expectations fail, something is drifting and we risk
-        // orphaning responses that were actually fine.
-        //
-        // Each line below is structured as the command format we run plus
-        // the stderr we need to recognise.
+        // ── Verified against real stderr captured on Ubuntu 24.04 aarch64,
+        //    kernel 6.8.0-106, by running each backend's delete command
+        //    against a non-existent rule. If any of these fail, a tool has
+        //    drifted its error message and we risk orphaning responses that
+        //    were actually fine. The "VERIFIED" cases are byte-for-byte
+        //    real output; the "defense-in-depth" cases are guesses at
+        //    variations not observed but plausible across versions.
+
         let absent_cases = [
-            // ufw: `sudo ufw delete deny from <ip>` when rule doesn't exist.
-            // Source: ufw/backend.py emits this via frontend/backend.
-            "ERROR: Could not delete non-existent rule",
-            // iptables: `sudo iptables -D INPUT -s <ip> -j DROP` when rule
-            // not found. The classic iptables error.
+            // ──── iptables (VERIFIED on iptables-1.8.10) ────
+            // `sudo iptables -D INPUT -s 198.51.100.42 -j DROP` → exit 1
             "iptables: Bad rule (does a matching rule exist in that chain?).",
-            // iptables alternate phrasing when chain/target missing.
-            "iptables v1.8.7: No chain/target/match by that name.",
-            // nftables: `sudo nft delete rule ... handle X` when handle
-            // already gone. Shape from nftables source (libnftnl).
+
+            // ──── nftables (VERIFIED on nft-1.0.9) ────
+            // `sudo nft delete rule inet iwtest input handle <gone>` → exit 1
             "Error: Could not process rule: No such file or directory",
-            "Error: Could not process rule: No such process",
-            // nft variant when rule referenced by handle is gone.
-            "nft: rule does not exist",
-            // bpftool: `sudo bpftool map delete pinned ... key ...` when the
-            // key is already absent from the map. bpftool wraps kernel ENOENT.
-            "bpftool: delete failed: No such file or directory",
+
+            // ──── bpftool (VERIFIED on bpftool from kernel 6.8) ────
+            // `sudo bpftool map delete pinned <missing_path> key ...` → exit 255
+            "Error: bpf obj get (/tmp/nonexistent_map): No such file or directory",
+            // `sudo bpftool map delete pinned <real_path> key <missing>` → exit 254
             "Error: delete failed: No such file or directory",
-            // Generic variations that show up in wrappers.
-            "rule does not exist",
+
+            // ──── ufw (defense-in-depth only) ────
+            // In practice ufw exits 0 for delete-non-existent so this path
+            // is never hit via run_cmd. Kept in case a future ufw version
+            // starts returning non-zero, or a wrapper forwards the message
+            // through some stderr-carrying channel.
+            "ERROR: Could not delete non-existent rule",
+
+            // ──── defense-in-depth: plausible variants ────
+            "iptables v1.8.7: No chain/target/match by that name.",
+            "Error: Could not process rule: No such process",
+            "nft: rule does not exist",
             "key nonexistent",
             "entry doesn't exist in map",
         ];
@@ -1300,7 +1327,7 @@ mod tests {
         // Transient errors — genuinely retry-able. None of these mean the
         // rule was gone, so they must NOT trip the already_absent path (if
         // they did, we'd silently mark a rule reverted that's actually
-        // still enforced).
+        // still enforced in the kernel/firewall).
         let transient_cases = [
             "sudo: a terminal is required to read the password",
             "sudo: no tty present and no askpass program specified",
@@ -1309,7 +1336,7 @@ mod tests {
             "connection refused",
             "Resource temporarily unavailable",
             "Error: Could not open socket to kernel: Operation not permitted",
-            // This one is important — kernel says "busy", NOT "not found".
+            // Kernel says "busy", NOT "not found" — critical distinction.
             "nft: Error: Could not process rule: Device or resource busy",
         ];
         for c in transient_cases {
