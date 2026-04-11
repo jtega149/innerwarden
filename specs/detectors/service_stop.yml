@@ -11,10 +11,10 @@ context: |
   Key architectural decisions:
   - Only triggers for systemctl or service commands (argv0_base check).
   - Only triggers for stop/disable/mask actions (not start/restart/status).
-  - Only triggers when the target service is in SECURITY_SERVICES list (24 services
+  - Only triggers when the target service is in SECURITY_SERVICES list (20 services
     covering auth, firewall, monitoring, and logging: sshd, auditd, fail2ban,
     innerwarden, apparmor, ufw, firewalld, iptables, nftables, crowdsec, ossec,
-    wazuh, clamd, clamav, aide, tripwire, snort, suricata, falco, osqueryd,
+    clamd, clamav, aide, tripwire, snort,
     syslog, rsyslog, syslog-ng, journald).
   - Root (uid=0) stopping innerwarden services is allowed because this is normal
     admin operations during deploy/upgrade. An attacker would need root anyway,
@@ -30,7 +30,7 @@ behavior:
     - "Detects systemctl stop/disable/mask of security services"
     - "Detects service stop of security services"
     - "Fires at High severity"
-    - "Covers 24 security services in SECURITY_SERVICES list"
+    - "Covers 20 security services in SECURITY_SERVICES list"
   does_not:
     - "Alert on non-security services (e.g., systemctl stop nginx)"
     - "Alert on start/restart/status/enable actions"

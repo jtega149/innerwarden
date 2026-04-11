@@ -256,20 +256,9 @@ fn human_event_kind(kind: &str) -> std::borrow::Cow<'static, str> {
         "container.privileged" => Cow::Borrowed("Privileged container started"),
         "container.sock_mount" => Cow::Borrowed("Container with Docker socket access"),
         "container.dangerous_cap" => Cow::Borrowed("Container with dangerous capabilities"),
-        "wazuh.syslog" | "wazuh.web" | "wazuh.ids" => Cow::Borrowed("Wazuh alert"),
-        "falco.syscall" | "falco.k8s_audit" => Cow::Borrowed("Falco runtime alert"),
-        // Suricata protocol events
-        "suricata.tls" => Cow::Borrowed("TLS connection observed"),
-        "suricata.dns" => Cow::Borrowed("DNS query observed"),
-        "suricata.http" => Cow::Borrowed("HTTP transaction observed"),
-        "suricata.alert" => Cow::Borrowed("Suricata IDS alert"),
-        "suricata.anomaly" => Cow::Borrowed("Network anomaly"),
         // Wildcard-style fallbacks for known prefixes
-        _ if kind.starts_with("suricata.") => Cow::Owned(format!("Suricata event ({kind})")),
         _ if kind.starts_with("docker.") => Cow::Borrowed("Docker event"),
         _ if kind.starts_with("container.") => Cow::Borrowed("Docker event"),
-        _ if kind.starts_with("osquery.") => Cow::Borrowed("osquery result"),
-        _ if kind.starts_with("falco.") => Cow::Borrowed("Falco alert"),
         // Truly unknown - show the raw kind instead of a generic label
         _ => Cow::Owned(format!("event: {kind}")),
     }

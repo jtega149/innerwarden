@@ -132,9 +132,15 @@ impl DiscoveryBurstDetector {
             return None;
         }
 
-        // Check if command is a discovery command
+        // Check if command is a discovery command.
+        // Match as prefix or whitespace-bounded token to avoid false positives
+        // (e.g. "ipset add cloudflare_cidrs" should NOT match "id").
         let lower = command.to_lowercase();
-        let is_discovery = DISCOVERY_COMMANDS.iter().any(|d| lower.contains(d));
+        let is_discovery = DISCOVERY_COMMANDS.iter().any(|d| {
+            lower.starts_with(d)
+                || lower.contains(&format!(" {d}"))
+                || lower.contains(&format!("/{d}"))
+        });
         if !is_discovery {
             return None;
         }

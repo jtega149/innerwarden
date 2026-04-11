@@ -741,7 +741,6 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use innerwarden_core::entities::EntityRef;
 
     fn make_event(kind: &str, source: &str, summary: &str) -> Event {
         Event {

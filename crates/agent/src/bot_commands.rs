@@ -38,13 +38,12 @@ pub(crate) async fn handle_telegram_bot_command(
         if cfg.telegram.bot.enabled {
             if cfg.telegram.is_simple_profile() {
                 // Simple profile: semaphore status
-                let today = chrono::Local::now()
+                let _today = chrono::Local::now()
                     .date_naive()
                     .format("%Y-%m-%d")
                     .to_string();
                 let decision_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("decisions-{today}.jsonl"))
-                        as u64;
+                    bot_helpers::graph_count(&state.knowledge_graph, "decisions") as u64;
 
                 // Check for recent critical/high incidents from narrative accumulator
                 let now_utc = chrono::Utc::now();
@@ -105,14 +104,12 @@ pub(crate) async fn handle_telegram_bot_command(
                 tg_reply(state, text);
             } else {
                 // Technical profile: full status
-                let today = chrono::Local::now()
+                let _today = chrono::Local::now()
                     .date_naive()
                     .format("%Y-%m-%d")
                     .to_string();
-                let incident_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("incidents-{today}.jsonl"));
-                let decision_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("decisions-{today}.jsonl"));
+                let incident_count = bot_helpers::graph_count(&state.knowledge_graph, "incidents");
+                let decision_count = bot_helpers::graph_count(&state.knowledge_graph, "decisions");
                 let mode = guardian_mode(cfg);
                 let mode_label = mode.label();
                 let mode_desc = mode.description();
@@ -242,11 +239,11 @@ pub(crate) async fn handle_telegram_bot_command(
     if result.incident_id == "__threats__" {
         info!(operator = %result.operator_name, "Telegram /threats command received");
         if cfg.telegram.bot.enabled {
-            let today = chrono::Local::now()
+            let _today = chrono::Local::now()
                 .date_naive()
                 .format("%Y-%m-%d")
                 .to_string();
-            let text = bot_helpers::read_last_incidents(data_dir, &today, 5);
+            let text = bot_helpers::graph_last_incidents(&state.knowledge_graph, 5);
             tg_reply(state, text);
         }
         return true;
@@ -255,11 +252,11 @@ pub(crate) async fn handle_telegram_bot_command(
     if result.incident_id == "__decisions__" {
         info!(operator = %result.operator_name, "Telegram /decisions command received");
         if cfg.telegram.bot.enabled {
-            let today = chrono::Local::now()
+            let _today = chrono::Local::now()
                 .date_naive()
                 .format("%Y-%m-%d")
                 .to_string();
-            let text = bot_helpers::read_last_decisions(data_dir, &today, 5);
+            let text = bot_helpers::graph_last_decisions(&state.knowledge_graph, 5);
             tg_reply(state, text);
         }
         return true;
@@ -502,14 +499,12 @@ pub(crate) async fn handle_telegram_bot_command(
         info!(operator = %result.operator_name, "Telegram /start command received");
         if cfg.telegram.bot.enabled {
             if let Some(ref tg) = state.telegram_client {
-                let today = chrono::Local::now()
+                let _today = chrono::Local::now()
                     .date_naive()
                     .format("%Y-%m-%d")
                     .to_string();
-                let incident_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("incidents-{today}.jsonl"));
-                let decision_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("decisions-{today}.jsonl"));
+                let incident_count = bot_helpers::graph_count(&state.knowledge_graph, "incidents");
+                let decision_count = bot_helpers::graph_count(&state.knowledge_graph, "decisions");
                 let mode = guardian_mode(cfg);
                 let host = std::env::var("HOSTNAME")
                     .or_else(|_| {
@@ -624,13 +619,13 @@ pub(crate) async fn handle_telegram_bot_command(
         let question = question.to_string();
         info!(operator = %result.operator_name, question = %question, "Telegram /ask command received");
         if cfg.telegram.bot.enabled {
-            let today = chrono::Local::now()
+            let _today = chrono::Local::now()
                 .date_naive()
                 .format("%Y-%m-%d")
                 .to_string();
             // Inject full system context so the AI knows exactly what's configured
-            let agent_ctx = build_agent_context(cfg, data_dir);
-            let recent_incidents = bot_helpers::read_last_incidents_raw(data_dir, &today, 3);
+            let agent_ctx = build_agent_context(cfg, data_dir, &state.knowledge_graph);
+            let recent_incidents = bot_helpers::graph_last_incidents_raw(&state.knowledge_graph, 3);
             let system_prompt = if recent_incidents.is_empty() {
                 format!("{}\n\n{agent_ctx}", cfg.telegram.bot.personality)
             } else {

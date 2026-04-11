@@ -291,7 +291,6 @@ fn generate_navigator_layer() -> serde_json::Value {
             "data_exfiltration, data_exfil_ebpf",
         ),
         ("T1021", "Lateral Movement", "lateral_movement"),
-        ("T1190", "Multiple", "suricata_alert"),
         ("T1546.004", "Persistence", "sensitive_write"),
         ("T1037.004", "Persistence", "sensitive_write"),
         ("T1574.006", "Persistence", "sensitive_write"),

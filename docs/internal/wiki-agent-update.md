@@ -84,14 +84,10 @@ The Sensors HUD displays all 15 collectors with live status (detected/active), e
 | 5 | `nginx_error` | nginx Error Log | native | nginx error log - web scanner and probe detection |
 | 6 | `exec_audit` | Shell Audit (auditd) | native | auditd EXECVE events - execution guard and shell command trail |
 | 7 | `ebpf` | eBPF Kernel | native | 23 kernel hooks: 19 tracepoints + 2 kprobes (privesc + EFI) + LSM (exec block) + XDP (wire-speed IP block) |
-| 8 | `suricata_eve` | Suricata IDS | external | Suricata network IDS alerts (alert, dns, http, tls, anomaly) |
-| 9 | `wazuh_alerts` | Wazuh HIDS | external | Wazuh HIDS/FIM/compliance alerts |
-| 10 | `osquery_log` | osquery | external | osquery differential results (ports, users, crontabs, processes) |
 | 11 | `syslog_firewall` | Syslog Firewall | native | iptables/nftables DROP logs from `/var/log/syslog` or `kern.log` |
 | 12 | `firmware_integrity` | Firmware Integrity | native | UEFI/EFI boot partition monitoring - detects unauthorized binaries |
 | 13 | `cloudtrail` | AWS CloudTrail | external | AWS CloudTrail JSON logs - IAM changes, S3 access, API calls |
 | 14 | `macos_log` | macOS Unified Log | native | macOS unified log stream - auth events, process exec, network |
-| 15 | `falco_log` | Falco Runtime Security | external | Falco kernel-level runtime security alerts (container + host) |
 
 Collectors 11-15 were added in v0.4.5. The eBPF description was corrected from "6 kernel programs" to "22 kernel hooks". Updated to 23 hooks in v0.5.0 (added EFI kprobe).
 

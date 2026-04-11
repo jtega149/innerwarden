@@ -89,6 +89,13 @@ impl DecisionWriter {
             self.last_hash = read_last_hash(&self.data_dir, &today);
         }
 
+        // Re-read the last hash from disk in case an external writer (e.g.
+        // always-on honeypot) appended entries since our last write.
+        let disk_hash = read_last_hash(&self.data_dir, &self.current_date);
+        if disk_hash != self.last_hash {
+            self.last_hash = disk_hash;
+        }
+
         // Build a chained entry: set prev_hash from the last written entry.
         // Serialize immediately so the borrow of self.last_hash is released
         // before we update it with the new hash.
@@ -181,6 +188,44 @@ fn open_or_create(data_dir: &Path, date: &str) -> Result<File> {
         .append(true)
         .open(&path)
         .with_context(|| format!("failed to open {}", path.display()))
+}
+
+/// Standalone hash-chained append for code paths that don't own a `DecisionWriter`
+/// (e.g. the always-on honeypot task). Reads the last hash from the file, sets
+/// `prev_hash`, writes the entry, and flushes.
+pub fn append_chained(data_dir: &Path, entry: &DecisionEntry) -> Result<()> {
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let last_hash = read_last_hash(data_dir, &today);
+    let chained = ChainedEntry {
+        ts: entry.ts,
+        incident_id: &entry.incident_id,
+        host: &entry.host,
+        ai_provider: &entry.ai_provider,
+        action_type: &entry.action_type,
+        target_ip: entry.target_ip.as_deref(),
+        target_user: entry.target_user.as_deref(),
+        skill_id: entry.skill_id.as_deref(),
+        confidence: entry.confidence,
+        auto_executed: entry.auto_executed,
+        dry_run: entry.dry_run,
+        reason: &entry.reason,
+        estimated_threat: &entry.estimated_threat,
+        execution_result: &entry.execution_result,
+        prev_hash: last_hash.as_deref(),
+    };
+    let line = serde_json::to_string(&chained).context("failed to serialize decision entry")?;
+    let path = data_dir.join(format!("decisions-{today}.jsonl"));
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    use std::io::Write;
+    writeln!(f, "{line}").context("failed to write decision entry")?;
+    f.flush().context("failed to flush decision entry")
 }
 
 // ---------------------------------------------------------------------------

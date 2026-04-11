@@ -2,7 +2,11 @@ use std::path::Path;
 
 use tracing::{info, warn};
 
-use crate::{abuseipdb, ai, config, skills, AgentState};
+use crate::{
+    abuseipdb, ai, config,
+    response_lifecycle::{ResponseBackend, ResponseType},
+    skills, AgentState,
+};
 
 /// Execute the layered `BlockIp` decision path (XDP + firewall + Cloudflare + AbuseIPDB report).
 pub(crate) async fn execute_block_ip_decision(
@@ -155,6 +159,31 @@ pub(crate) async fn execute_block_ip_decision(
 
     if any_success {
         state.blocklist.insert(ip.to_string());
+
+        // Register firewall blocks in the response lifecycle for TTL-based auto-revert.
+        // XDP is already tracked via xdp_block_times; the lifecycle tracks ufw/iptables/nftables
+        // which previously had no auto-revert (rules persisted until reboot).
+        for layer in &layers_applied {
+            let backend = match *layer {
+                "ufw" => Some(ResponseBackend::Ufw),
+                "iptables" => Some(ResponseBackend::Iptables),
+                "nftables" => Some(ResponseBackend::Nftables),
+                "XDP" => Some(ResponseBackend::Xdp),
+                _ => None,
+            };
+            if let Some(backend) = backend {
+                if !state.response_lifecycle.is_tracked(ip, &backend) {
+                    state.response_lifecycle.register(
+                        ResponseType::BlockIp,
+                        backend,
+                        ip,
+                        &incident.incident_id,
+                        block_ttl_secs,
+                        None, // TODO: store nftables handle when available
+                    );
+                }
+            }
+        }
 
         // Feedback loop: write blocked IP to file so the sensor can
         // skip events from this IP, reducing noise.

@@ -58,13 +58,7 @@ pub struct CollectorsConfig {
     #[serde(default)]
     pub nginx_error: NginxErrorConfig,
     #[serde(default)]
-    pub suricata_eve: SuricataEveConfig,
-    #[serde(default)]
-    pub osquery_log: OsqueryLogConfig,
-    #[serde(default)]
     pub macos_log: MacosLogConfig,
-    #[serde(default)]
-    pub wazuh_alerts: WazuhAlertsConfig,
     #[serde(default)]
     pub syslog_firewall: SyslogFirewallConfig,
     #[serde(default)]
@@ -75,62 +69,6 @@ pub struct CollectorsConfig {
 pub struct MacosLogConfig {
     #[serde(default)]
     pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct WazuhAlertsConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_wazuh_alerts_path")]
-    pub path: String,
-}
-
-impl Default for WazuhAlertsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            path: default_wazuh_alerts_path(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct OsqueryLogConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_osquery_log_path")]
-    pub path: String,
-}
-
-impl Default for OsqueryLogConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            path: default_osquery_log_path(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SuricataEveConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_suricata_eve_path")]
-    pub path: String,
-    /// Event types to ingest. Defaults: alert, dns, http, tls, anomaly.
-    /// Add "flow" or "stats" if needed (high volume).
-    #[serde(default = "default_suricata_event_types")]
-    pub event_types: Vec<String>,
-}
-
-impl Default for SuricataEveConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            path: default_suricata_eve_path(),
-            event_types: default_suricata_event_types(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,15 +171,11 @@ pub struct DetectorsConfig {
     #[serde(default)]
     pub execution_guard: ExecutionGuardConfig,
     #[serde(default)]
-    pub suricata_alert: SuricataAlertConfig,
-    #[serde(default)]
     pub docker_anomaly: DockerAnomalyConfig,
     #[serde(default)]
     pub integrity_alert: IntegrityAlertConfig,
     #[serde(default)]
     pub log_tampering: LogTamperingConfig,
-    #[serde(default)]
-    pub osquery_anomaly: OsqueryAnomalyConfig,
     #[serde(default)]
     pub dns_tunneling: DnsTunnelingConfig,
     #[serde(default)]
@@ -424,26 +358,6 @@ impl Default for ExecutionGuardConfig {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SuricataAlertConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_suricata_alert_threshold")]
-    pub threshold: usize,
-    #[serde(default = "default_suricata_alert_window_seconds")]
-    pub window_seconds: u64,
-}
-
-impl Default for SuricataAlertConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            threshold: default_suricata_alert_threshold(),
-            window_seconds: default_suricata_alert_window_seconds(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
 pub struct DockerAnomalyConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -493,23 +407,6 @@ impl Default for LogTamperingConfig {
         Self {
             enabled: true,
             cooldown_seconds: default_log_tampering_cooldown_seconds(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct OsqueryAnomalyConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_osquery_anomaly_cooldown_seconds")]
-    pub cooldown_seconds: u64,
-}
-
-impl Default for OsqueryAnomalyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            cooldown_seconds: default_osquery_anomaly_cooldown_seconds(),
         }
     }
 }
@@ -1058,10 +955,6 @@ fn default_dns_tunneling_window_seconds() -> u64 {
     60
 }
 
-fn default_osquery_anomaly_cooldown_seconds() -> u64 {
-    3600
-}
-
 fn default_true() -> bool {
     true
 }
@@ -1128,25 +1021,6 @@ fn default_search_abuse_window_seconds() -> u64 {
 
 fn default_search_abuse_path_prefix() -> String {
     "/api/search".to_string()
-}
-
-fn default_osquery_log_path() -> String {
-    "/var/log/osquery/osqueryd.results.log".to_string()
-}
-
-fn default_suricata_eve_path() -> String {
-    "/var/log/suricata/eve.json".to_string()
-}
-
-fn default_suricata_event_types() -> Vec<String> {
-    ["alert", "dns", "http", "tls", "anomaly"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn default_wazuh_alerts_path() -> String {
-    "/var/ossec/logs/alerts/alerts.json".to_string()
 }
 
 fn default_execution_guard_mode() -> String {
@@ -1255,14 +1129,6 @@ impl Default for CloudTrailConfig {
 
 fn default_cloudtrail_dir() -> String {
     "/var/log/cloudtrail".to_string()
-}
-
-fn default_suricata_alert_threshold() -> usize {
-    3
-}
-
-fn default_suricata_alert_window_seconds() -> u64 {
-    300
 }
 
 fn default_docker_anomaly_threshold() -> usize {

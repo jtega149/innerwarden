@@ -293,7 +293,6 @@ impl AttackClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration as CDur;
 
     fn ts(offset_secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000 + offset_secs, 0).unwrap()

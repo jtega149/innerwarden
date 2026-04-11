@@ -202,10 +202,6 @@ async fn handle_always_on_connection(
         if let Some(skill) = skill_box {
             let result = skill.execute(&ctx, dry_run).await;
             if result.success {
-                let today = chrono::Local::now()
-                    .date_naive()
-                    .format("%Y-%m-%d")
-                    .to_string();
                 let entry = decisions::DecisionEntry {
                     ts: chrono::Utc::now(),
                     incident_id: iid,
@@ -229,16 +225,8 @@ async fn handle_always_on_connection(
                     },
                     prev_hash: None,
                 };
-                let path = data_dir.join(format!("decisions-{today}.jsonl"));
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    use std::io::Write;
-                    if let Ok(line) = serde_json::to_string(&entry) {
-                        let _ = writeln!(f, "{line}");
-                    }
+                if let Err(e) = decisions::append_chained(&data_dir, &entry) {
+                    warn!("honeypot: failed to write decision: {e:#}");
                 }
                 true
             } else {
@@ -463,10 +451,6 @@ async fn always_on_abuseipdb_block(
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
         .unwrap_or_else(|_| "unknown".to_string());
-    let today = chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
     let iid = format!("honeypot:always-on:abuseipdb:{ip}");
     let skill_id = format!("block-ip-{block_backend}");
 
@@ -490,16 +474,8 @@ async fn always_on_abuseipdb_block(
         prev_hash: None,
     };
 
-    let path = data_dir.join(format!("decisions-{today}.jsonl"));
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        use std::io::Write;
-        if let Ok(line) = serde_json::to_string(&entry) {
-            let _ = writeln!(f, "{line}");
-        }
+    if let Err(e) = decisions::append_chained(data_dir, &entry) {
+        warn!("honeypot abuseipdb gate: failed to write decision: {e:#}");
     }
 
     if responder_enabled && allowed_skills.iter().any(|s| s == &skill_id) {

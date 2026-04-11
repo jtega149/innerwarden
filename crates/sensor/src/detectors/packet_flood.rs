@@ -21,7 +21,7 @@ const HTTP_FLOOD_KINDS: &[&str] = &[
 
 const UDP_KINDS: &[&str] = &[
     "network.udp_amplification",
-    "suricata.dns.query",
+    "dns.query",
     "network.connection",
 ];
 
@@ -515,13 +515,7 @@ fn is_udp_event(event: &Event) -> bool {
         .unwrap_or("");
     proto.eq_ignore_ascii_case("udp")
         || event.kind == "network.udp_amplification"
-        || (event.kind == "suricata.dns.query"
-            && event
-                .details
-                .get("proto")
-                .and_then(|v| v.as_str())
-                .unwrap_or("udp")
-                == "udp")
+        || event.kind == "dns.query"
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +547,7 @@ mod tests {
         Event {
             ts,
             host: "test".to_string(),
-            source: "suricata".to_string(),
+            source: "dns_capture".to_string(),
             kind: "network.connection".to_string(),
             severity: Severity::Info,
             summary: format!("UDP from {} to {}", src_ip, dst_ip),

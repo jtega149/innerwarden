@@ -215,7 +215,10 @@ fn connect_to_event(
     }
 
     let mut tags = vec!["ebpf".to_string(), "network".to_string()];
-    let mut entities = vec![EntityRef::ip(dst_ip.to_string())];
+    let mut entities = vec![
+        EntityRef::ip(dst_ip.to_string()),
+        EntityRef::user(uid_to_name(uid)),
+    ];
     if let Some(cid) = container_id {
         tags.push("container".to_string());
         entities.push(EntityRef::container(cid));
@@ -235,6 +238,16 @@ fn connect_to_event(
         details,
         tags,
         entities,
+    }
+}
+
+/// Resolve a uid to a user name for entity tagging. Used by eBPF events
+/// so that correlation rules with `entity_must_match` can match two events
+/// from the same user (e.g. file read + network connect → CL-008 exfil).
+fn uid_to_name(uid: u32) -> String {
+    match uid {
+        0 => "root".to_string(),
+        _ => format!("uid:{uid}"),
     }
 }
 
@@ -268,7 +281,8 @@ fn file_open_to_event(
     }
 
     let mut tags = vec!["ebpf".to_string(), "file".to_string()];
-    let mut entities = vec![];
+    let mut entities = vec![EntityRef::user(uid_to_name(uid))];
+    entities.push(EntityRef::path(filename));
     if let Some(cid) = container_id {
         tags.push("container".to_string());
         entities.push(EntityRef::container(cid));
@@ -303,8 +317,8 @@ fn file_open_to_event(
 }
 
 // Privilege escalation allowlist: uses centralized PRIVESC_ALLOWED from
-// allowlists.rs (Falco-inspired). Previously a local duplicate list lived here;
-// now unified so additions in one place cover both collector and detector.
+// allowlists.rs. Previously a local duplicate list lived here; now unified so
+// additions in one place cover both collector and detector.
 
 /// Convert a kernel privilege escalation event to an Inner Warden Event.
 fn privesc_to_event(
@@ -318,7 +332,7 @@ fn privesc_to_event(
 ) -> Option<Event> {
     let comm_base = comm.split('/').next_back().unwrap_or(comm);
 
-    // Filter legitimate escalation processes (centralized Falco-inspired allowlist).
+    // Filter legitimate escalation processes using the centralized allowlist.
     // Handles kernel task parentheses via comm_in_allowlist: (install) -> install.
     if crate::detectors::allowlists::is_innerwarden_process(old_uid as u64, comm_base)
         || crate::detectors::allowlists::comm_in_allowlist(
@@ -531,7 +545,7 @@ fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
         }
     }
 
-    // Populate INODE_SIZE map for overlayfs drift detection (Falco trick).
+    // Populate INODE_SIZE map for overlayfs drift detection.
     // sizeof(struct inode) varies by kernel config; query BTF at runtime.
     populate_inode_size(bpf);
 }
@@ -694,14 +708,14 @@ fn attach_xdp(_bpf: &mut ()) {}
 ///
 /// Events flow through the same mpsc channel as all other collectors.
 // ---------------------------------------------------------------------------
-// Kernel filter population - Falco-derived allowlists
+// Kernel filter population - shared runtime allowlists
 // ---------------------------------------------------------------------------
 //
 // Handler bitmask for COMM_ALLOWLIST:
 //   bit 0 = execve, 1 = connect, 2 = openat, 3 = ptrace,
 //   4 = setuid, 5 = bind, 6 = mount, 7 = memfd, 8 = init_module
 //
-// Sources: falcosecurity/rules (falco_rules.yaml), adapted for Inner Warden.
+// Sources: curated runtime security allowlists adapted for InnerWarden.
 
 #[cfg(feature = "ebpf")]
 fn populate_kernel_filters(bpf: &mut aya::Ebpf) {

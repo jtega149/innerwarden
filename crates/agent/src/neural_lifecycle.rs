@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 // Feature extraction (mirrored from innerwarden-gym/src/realdata.rs)
 // ---------------------------------------------------------------------------
 
-const NUM_FEATURES: usize = 48;
+const NUM_FEATURES: usize = 58;
 const WINDOW_SIZE: usize = 20;
 
 /// Map event kind to feature index (0-23).
@@ -198,7 +198,67 @@ fn window_features(kinds: &[Option<usize>]) -> Vec<f32> {
     // 47: window size normalized
     f[47] = (n / 50.0).min(1.0);
 
+    // Features 48-57 are graph structural features (filled by enrich_with_graph)
+    // Initialized to 0.0 by default — safe for inference without graph data.
+
     f
+}
+
+/// Graph structural features extracted from the knowledge graph.
+/// Used to enrich the autoencoder feature vector (slots 48-57).
+#[derive(Debug, Clone, Default)]
+pub struct GraphFeatures {
+    /// Average degree of active process nodes (fan-out).
+    pub avg_process_degree: f32,
+    /// Maximum depth of any process tree.
+    pub max_process_tree_depth: u32,
+    /// Number of IP nodes with threat intel dataset matches.
+    pub threat_intel_ip_count: u32,
+    /// Number of Wrote edges targeting /etc or /tmp.
+    pub writes_to_sensitive: u32,
+    /// Number of connected components (isolated clusters).
+    pub connected_components: u32,
+    /// Ratio of process nodes to IP nodes (normal ~5:1, attack ~1:1).
+    pub process_ip_ratio: f32,
+    /// Number of nodes with >10 edges (high-connectivity hubs).
+    pub high_degree_nodes: u32,
+    /// Number of Incident nodes in the graph.
+    pub incident_count: u32,
+    /// Total edge count (activity level).
+    pub total_edges: u32,
+    /// Number of active sessions (User→LoggedInFrom edges in last 5min).
+    pub active_sessions: u32,
+}
+
+/// Enrich a feature vector (slots 48-57) with graph structural features.
+fn enrich_features_with_graph(f: &mut [f32], gf: &GraphFeatures) {
+    if f.len() < NUM_FEATURES {
+        return;
+    }
+    // 48: average process degree normalized (0 = idle, 1 = 20+ avg connections)
+    f[48] = (gf.avg_process_degree / 20.0).min(1.0);
+    // 49: max process tree depth (deeper = more suspicious)
+    f[49] = (gf.max_process_tree_depth as f32 / 10.0).min(1.0);
+    // 50: threat intel IP count
+    f[50] = (gf.threat_intel_ip_count as f32 / 10.0).min(1.0);
+    // 51: writes to sensitive paths
+    f[51] = (gf.writes_to_sensitive as f32 / 20.0).min(1.0);
+    // 52: connected components (more = more isolated activity)
+    f[52] = (gf.connected_components as f32 / 20.0).min(1.0);
+    // 53: process/IP ratio anomaly (deviate from normal ~5:1)
+    f[53] = if gf.process_ip_ratio > 0.0 {
+        (1.0 - (gf.process_ip_ratio / 5.0).min(1.0)).abs()
+    } else {
+        0.0
+    };
+    // 54: high-degree hub count
+    f[54] = (gf.high_degree_nodes as f32 / 5.0).min(1.0);
+    // 55: incident count
+    f[55] = (gf.incident_count as f32 / 20.0).min(1.0);
+    // 56: total edge activity level
+    f[56] = (gf.total_edges as f32 / 10000.0).min(1.0);
+    // 57: active sessions
+    f[57] = (gf.active_sessions as f32 / 10.0).min(1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +339,20 @@ impl AutoencoderNet {
                 .map(|v| v.as_f64().unwrap_or(0.0) as f32)
                 .collect();
             layers.push(Layer { weights, biases });
+        }
+
+        // Validate dimensions: first layer input size must match NUM_FEATURES
+        if let Some(first) = layers.first() {
+            if let Some(row) = first.weights.first() {
+                if row.len() != NUM_FEATURES {
+                    tracing::warn!(
+                        "anomaly: model input size {} != expected {}, discarding stale model",
+                        row.len(),
+                        NUM_FEATURES
+                    );
+                    return None;
+                }
+            }
         }
 
         Some(Self { layers, lr })
@@ -416,6 +490,11 @@ pub struct AnomalyEngine {
     config: AnomalyConfig,
     /// Cooldown per source to prevent spam.
     cooldowns: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// Last computed anomaly score (0.0-1.0), updated by observe().
+    /// Used by the agent to push to the BPF NEURAL_SCORE map for kernel enforcement.
+    last_score: f32,
+    /// Cached graph structural features (updated by the agent every slow tick).
+    graph_features: Option<GraphFeatures>,
 }
 
 impl AnomalyEngine {
@@ -469,7 +548,15 @@ impl AnomalyEngine {
             training_cycles: cycles,
             config,
             cooldowns: std::collections::HashMap::new(),
+            last_score: 0.0,
+            graph_features: None,
         }
+    }
+
+    /// Update the cached graph structural features.
+    /// Called by the agent every slow-loop tick with metrics from the knowledge graph.
+    pub fn set_graph_features(&mut self, gf: GraphFeatures) {
+        self.graph_features = Some(gf);
     }
 
     /// Feed an event and return anomaly score if above threshold.
@@ -497,7 +584,11 @@ impl AnomalyEngine {
         }
 
         let kinds: Vec<Option<usize>> = self.window.iter().copied().collect();
-        let features = window_features(&kinds);
+        let mut features = window_features(&kinds);
+        // Enrich with graph features if available
+        if let Some(ref gf) = self.graph_features {
+            enrich_features_with_graph(&mut features, gf);
+        }
         let mse = net.reconstruction_error(&features);
 
         // Normalize to 0-1 via z-score + sigmoid
@@ -544,10 +635,16 @@ impl AnomalyEngine {
                 self.cooldowns.retain(|_, t| *t > cutoff);
             }
 
+            self.last_score = score;
             Some((score, weighted))
         } else {
             None
         }
+    }
+
+    /// Get the latest anomaly score (0.0-1.0). Used to push to BPF NEURAL_SCORE map.
+    pub fn latest_score(&self) -> f32 {
+        self.last_score
     }
 
     /// Run nightly training on recent events.
@@ -840,12 +937,49 @@ impl AnomalyEngine {
 // FP report helpers
 // ---------------------------------------------------------------------------
 
-/// Read fp-reports-*.jsonl files from the last `days` days.
-/// Returns a HashSet of detector names that have confirmed FP reports.
+/// Read FP reports from the last `days` days.
+/// Phase 7 Gap 1: reads from graph snapshots (Incident nodes with false_positive=true),
+/// falls back to fp-reports-*.jsonl if no snapshots found.
 pub fn read_fp_report_detectors(data_dir: &Path, days: i64) -> HashSet<String> {
     let mut detectors = HashSet::new();
     let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
 
+    // Phase 7: try graph snapshots
+    let today = chrono::Local::now().date_naive();
+    let mut loaded_from_graph = false;
+    for d in 0..days {
+        let date = today - chrono::Duration::days(d);
+        let date_str = date.format("%Y-%m-%d").to_string();
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        {
+            use crate::knowledge_graph::types::{Node, NodeType};
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    detector,
+                    false_positive,
+                    fp_reported_at,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if *false_positive {
+                        if let Some(at) = fp_reported_at {
+                            if *at >= cutoff {
+                                detectors.insert(detector.clone());
+                            }
+                        } else {
+                            detectors.insert(detector.clone());
+                        }
+                    }
+                }
+            }
+            loaded_from_graph = true;
+        }
+    }
+    if loaded_from_graph {
+        return detectors;
+    }
+
+    // Fallback: fp-reports-*.jsonl
     let entries = match std::fs::read_dir(data_dir) {
         Ok(e) => e,
         Err(_) => return detectors,
@@ -857,7 +991,6 @@ pub fn read_fp_report_detectors(data_dir: &Path, days: i64) -> HashSet<String> {
         if !name.starts_with("fp-reports-") || !name.ends_with(".jsonl") {
             continue;
         }
-        // Extract date from filename: fp-reports-YYYY-MM-DD.jsonl
         let date_part = name
             .strip_prefix("fp-reports-")
             .and_then(|s| s.strip_suffix(".jsonl"))
@@ -884,13 +1017,52 @@ pub fn read_fp_report_detectors(data_dir: &Path, days: i64) -> HashSet<String> {
     detectors
 }
 
-/// Read fp-reports and return counts by (detector, entity) pair.
-/// Entity is the first IP or comm extracted from the incident_id field.
+/// Read FP counts by (detector, entity) pair.
+/// Phase 7 Gap 1: reads from graph snapshots, falls back to fp-reports-*.jsonl.
 pub fn read_fp_report_counts(data_dir: &Path, days: i64) -> Vec<(String, String, u32)> {
     let mut counts: std::collections::HashMap<(String, String), u32> =
         std::collections::HashMap::new();
     let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
 
+    // Phase 7: try graph snapshots
+    let today = chrono::Local::now().date_naive();
+    let mut loaded_from_graph = false;
+    for d in 0..days {
+        let date = today - chrono::Duration::days(d);
+        let date_str = date.format("%Y-%m-%d").to_string();
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        {
+            use crate::knowledge_graph::types::{Node, NodeType};
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    incident_id,
+                    detector,
+                    false_positive,
+                    fp_reported_at,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if *false_positive {
+                        if let Some(at) = fp_reported_at {
+                            if *at < cutoff {
+                                continue;
+                            }
+                        }
+                        let entity = extract_entity_from_incident_id(incident_id);
+                        if !detector.is_empty() && !entity.is_empty() {
+                            *counts.entry((detector.clone(), entity)).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            loaded_from_graph = true;
+        }
+    }
+    if loaded_from_graph {
+        return counts.into_iter().map(|((d, e), c)| (d, e, c)).collect();
+    }
+
+    // Fallback: fp-reports-*.jsonl
     let entries = match std::fs::read_dir(data_dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
@@ -1219,39 +1391,71 @@ mod tests {
 // Blocked IP loader for clean training
 // ---------------------------------------------------------------------------
 
-/// Load all IPs that were blocked from decisions JSONL files.
-/// Used by train_nightly to exclude attack traffic from training data.
+/// Load all IPs that were blocked — used by train_nightly to exclude attack traffic.
+/// Phase 7: reads from dated graph snapshots (last 7 days), falls back to JSONL.
 fn load_blocked_ips(data_dir: &Path) -> HashSet<String> {
     let mut blocked = HashSet::new();
 
-    let entries = match std::fs::read_dir(data_dir) {
-        Ok(e) => e,
-        Err(_) => return blocked,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if !name.starts_with("decisions-") || !name.ends_with(".jsonl") {
-            continue;
+    // Phase 7: try dated graph snapshots (last 7 days)
+    let today = chrono::Local::now().date_naive();
+    let mut loaded_from_graph = false;
+    for days_ago in 0..7i64 {
+        let date = today - chrono::Duration::days(days_ago);
+        let date_str = date.format("%Y-%m-%d").to_string();
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        {
+            use crate::knowledge_graph::types::{Node, NodeType};
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    decision: Some(action),
+                    decision_target,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if action.contains("block") {
+                        if let Some(ip) = decision_target {
+                            if !ip.is_empty() {
+                                blocked.insert(ip.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            loaded_from_graph = true;
         }
+    }
 
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
+    if !loaded_from_graph {
+        // Fallback: read from decisions JSONL files
+        let entries = match std::fs::read_dir(data_dir) {
+            Ok(e) => e,
+            Err(_) => return blocked,
         };
 
-        for line in content.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                let action = v
-                    .get("action_type")
-                    .or_else(|| v.get("action"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("");
-                if action.contains("block") {
-                    if let Some(ip) = v.get("target_ip").and_then(|i| i.as_str()) {
-                        if !ip.is_empty() {
-                            blocked.insert(ip.to_string());
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !name.starts_with("decisions-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            for line in content.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    let action = v
+                        .get("action_type")
+                        .or_else(|| v.get("action"))
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("");
+                    if action.contains("block") {
+                        if let Some(ip) = v.get("target_ip").and_then(|i| i.as_str()) {
+                            if !ip.is_empty() {
+                                blocked.insert(ip.to_string());
+                            }
                         }
                     }
                 }

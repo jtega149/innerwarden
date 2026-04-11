@@ -143,7 +143,7 @@ pub struct FloatDelta {
 
 /// Statistics for a sliding 6-hour window that may span two calendar days.
 /// This is the source of truth for "last 6 hours" metrics shown in ops checks.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecentWindow {
     /// Width of the window in seconds (always 6 * 3600).
     pub window_secs: u64,
@@ -196,7 +196,7 @@ impl ParseOutcome {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Counters {
     total_events: u64,
     total_incidents: u64,
@@ -221,9 +221,230 @@ struct Counters {
     files_not_growing: Vec<String>,
 }
 
+/// Populate counters from the knowledge graph instead of JSONL files.
+fn populate_counters_from_graph(
+    graph: &crate::knowledge_graph::KnowledgeGraph,
+    counters: &mut Counters,
+) {
+    use crate::knowledge_graph::types::*;
+
+    // Events: count non-snapshot edges
+    counters.total_events = graph
+        .edges_slice()
+        .iter()
+        .filter(|e| !e.is_snapshot())
+        .count() as u64;
+
+    // Incidents
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident {
+            incident_id: _,
+            detector,
+            decision,
+            confidence,
+            auto_executed,
+            ..
+        }) = graph.get_node(id)
+        {
+            counters.total_incidents += 1;
+            *counters
+                .incidents_by_type
+                .entry(detector.clone())
+                .or_insert(0) += 1;
+
+            // Collect IPs from TriggeredBy edges
+            let has_entity = graph
+                .outgoing_edges(id)
+                .iter()
+                .any(|e| e.relation == Relation::TriggeredBy);
+            if !has_entity {
+                counters.incidents_without_entities += 1;
+            }
+            for edge in graph.outgoing_edges(id) {
+                if edge.relation == Relation::TriggeredBy {
+                    if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                        *counters.ip_counts.entry(addr.clone()).or_insert(0) += 1;
+                        *counters
+                            .entity_counts
+                            .entry(format!("ip:{}", addr))
+                            .or_insert(0) += 1;
+                    }
+                    if let Some(Node::User { name, .. }) = graph.get_node(edge.to) {
+                        *counters
+                            .entity_counts
+                            .entry(format!("user:{}", name))
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+
+            // Decisions
+            if let Some(action) = decision {
+                counters.total_decisions += 1;
+                *counters
+                    .decisions_by_action
+                    .entry(action.clone())
+                    .or_insert(0) += 1;
+                counters.confidence_sum += confidence.unwrap_or(0.0) as f64;
+                match action.as_str() {
+                    "ignore" => counters.ignore_count += 1,
+                    "block_ip" => counters.block_ip_count += 1,
+                    _ => {}
+                }
+                if !*auto_executed {
+                    counters.dry_run_count += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Compute a `TrialReport` from the knowledge graph (live, no JSONL).
+/// File health checks still use the filesystem.
+pub fn compute_for_date_from_graph(
+    data_dir: &Path,
+    date: Option<&str>,
+    graph: &crate::knowledge_graph::KnowledgeGraph,
+) -> TrialReport {
+    let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+    let analyzed_date = match date {
+        Some(d) => d.to_string(),
+        None => today.clone(),
+    };
+    let analyzed_is_today = analyzed_date == today;
+
+    // File health checks (still filesystem-based — that's their purpose)
+    let events_path = safe_dated_file(data_dir, "events", &analyzed_date, "jsonl");
+    let incidents_path = safe_dated_file(data_dir, "incidents", &analyzed_date, "jsonl");
+    let decisions_path = safe_dated_file(data_dir, "decisions", &analyzed_date, "jsonl");
+    let summary_path = safe_dated_file(data_dir, "summary", &analyzed_date, "md");
+    let state = data_dir.join("state.json");
+    let agent_state = data_dir.join("agent-state.json");
+
+    let mut files = Vec::new();
+    let mut counters = Counters::default();
+
+    // Quick file health (existence + size, no parsing)
+    for (name, path) in [
+        ("events", &events_path),
+        ("incidents", &incidents_path),
+        ("decisions", &decisions_path),
+    ] {
+        let exists = path.exists();
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if exists && size == 0 {
+            counters.empty_files.push(name.to_string());
+        }
+        if exists && !analyzed_is_today && size == 0 {
+            counters.files_not_growing.push(name.to_string());
+        }
+        let modified_secs_ago = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs());
+        files.push(FileHealth {
+            file: name.to_string(),
+            exists,
+            readable: exists,
+            size_bytes: size,
+            modified_secs_ago,
+            jsonl_valid: if exists { Some(true) } else { None },
+            lines: None,
+            malformed_lines: None,
+        });
+    }
+
+    let summary_info = parse_plain_file(&summary_path);
+    files.push(file_health_plain("summary", &summary_info));
+    let state_info = parse_state_file(&state);
+    files.push(file_health_plain("state", &state_info));
+    let agent_state_info = parse_state_file(&agent_state);
+    files.push(file_health_plain("agent-state", &agent_state_info));
+
+    // Populate counters from graph
+    populate_counters_from_graph(graph, &mut counters);
+
+    let expected_files_present = files.iter().all(|f| f.exists);
+    let state_json_readable = state_info.exists && state_info.readable;
+    let agent_state_json_readable = agent_state_info.exists && agent_state_info.readable;
+    let operational_telemetry = build_operational_telemetry(data_dir, &analyzed_date);
+
+    let detection_summary = DetectionSummary {
+        total_events: counters.total_events,
+        total_incidents: counters.total_incidents,
+        incidents_by_type: to_btreemap(counters.incidents_by_type.clone()),
+        top_ips: top_n(&counters.ip_counts, 10),
+        top_entities: top_n(&counters.entity_counts, 10),
+    };
+
+    let avg_conf = if counters.total_decisions > 0 {
+        counters.confidence_sum / counters.total_decisions as f64
+    } else {
+        0.0
+    };
+    let agent_ai_summary = AgentAiSummary {
+        total_decisions: counters.total_decisions,
+        decisions_by_action: to_btreemap(counters.decisions_by_action.clone()),
+        average_confidence: avg_conf,
+        ignore_count: counters.ignore_count,
+        block_ip_count: counters.block_ip_count,
+        dry_run_count: counters.dry_run_count,
+        skills_used: to_btreemap(counters.skills_used.clone()),
+    };
+
+    let data_quality = DataQuality {
+        empty_files: counters.empty_files.clone(),
+        malformed_jsonl: counters.malformed_jsonl.clone(),
+        incidents_without_entities: counters.incidents_without_entities,
+        decisions_without_action: counters.decisions_without_action,
+        files_not_growing: counters.files_not_growing.clone(),
+    };
+
+    // Trends: use previous day's JSONL counters as comparison (graph only has current state)
+    let previous_date = detect_previous_date(data_dir, &analyzed_date);
+    let previous_counters = previous_date
+        .as_ref()
+        .map(|d| compute_day_counters(data_dir, d));
+    let trend_summary = build_trend_summary(&counters, previous_counters.as_ref(), previous_date);
+    let anomaly_hints = build_anomaly_hints(
+        &detection_summary,
+        &agent_ai_summary,
+        &data_quality,
+        &trend_summary,
+        previous_counters.as_ref(),
+    );
+
+    let operational_health = OperationalHealth {
+        expected_files_present,
+        state_json_readable,
+        agent_state_json_readable,
+        files,
+    };
+
+    let recent_window = compute_recent_window(data_dir, &analyzed_date);
+
+    let mut report = TrialReport {
+        generated_at: Utc::now(),
+        analyzed_date,
+        data_dir: data_dir.display().to_string(),
+        operational_health,
+        operational_telemetry,
+        detection_summary,
+        agent_ai_summary,
+        recent_window,
+        trend_summary,
+        anomaly_hints,
+        data_quality,
+        suggested_improvements: vec![],
+    };
+    report.suggested_improvements = build_suggestions(&report);
+    report
+}
+
 /// Compute a `TrialReport` for the given date (or the latest available date if
 /// `date` is `None`) without writing any files to disk.
-/// Used by the dashboard `/api/report` endpoint.
+/// Used by the dashboard `/api/report` endpoint (JSONL fallback).
 pub fn compute_for_date(data_dir: &Path, date: Option<&str>) -> TrialReport {
     let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
     let analyzed_date = match date {
@@ -363,7 +584,13 @@ pub fn list_available_dates(data_dir: &Path) -> Vec<String> {
 
 pub fn generate(data_dir: &Path, output_dir: &Path) -> Result<GeneratedReport> {
     let report_date = Local::now().date_naive().format("%Y-%m-%d").to_string();
-    let report = compute_for_date(data_dir, None);
+    // Phase 7: prefer today's dated snapshot, fall back to JSONL if graph is empty.
+    let graph = crate::knowledge_graph::KnowledgeGraph::load_today_snapshot(data_dir);
+    let report = if graph.metrics().node_count > 0 {
+        compute_for_date_from_graph(data_dir, None, &graph)
+    } else {
+        compute_for_date(data_dir, None)
+    };
 
     let json_path = safe_dated_file(output_dir, "trial-report", &report_date, "json");
     let md_path = safe_dated_file(output_dir, "trial-report", &report_date, "md");
@@ -583,10 +810,108 @@ fn parse_decisions_file(path: &Path, counters: &mut Counters) -> ParseOutcome {
 /// Reads both `analyzed_date` and the previous date files, filtering entries
 /// to those with a `ts` field within the last 6 hours. This correctly handles
 /// midnight rollovers where the window spans two calendar days.
+/// Cache for compute_recent_window keyed by (date, snapshot_mtime).
+/// Same rationale as COUNTERS_CACHE: avoid disk loads on every dashboard poll.
+static RECENT_WINDOW_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, u64), RecentWindow>>,
+> = std::sync::OnceLock::new();
+
+fn recent_window_cache_handle(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(String, u64), RecentWindow>> {
+    RECENT_WINDOW_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
     const WINDOW_SECS: i64 = 6 * 3600;
     let cutoff = Utc::now() - chrono::Duration::seconds(WINDOW_SECS);
 
+    // Cache check: keyed on snapshot mtime + date.
+    let snap_path = data_dir.join(format!("graph-snapshot-{analyzed_date}.json"));
+    let mtime = std::fs::metadata(&snap_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let key = (analyzed_date.to_string(), mtime);
+    if let Ok(cache) = recent_window_cache_handle().lock() {
+        if let Some(w) = cache.get(&key) {
+            return w.clone();
+        }
+    }
+
+    // Phase 7 Gap 5: try graph snapshot for approximate 6h window.
+    // event_timeline uses 5-min buckets (HH:MM keys). Sum last 72 buckets.
+    if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, analyzed_date)
+    {
+        if graph.metrics().node_count > 0 {
+            use crate::knowledge_graph::types::{Node, NodeType};
+            let cutoff_key = cutoff.format("%H:%M").to_string();
+
+            // Sum events from timeline buckets in the window
+            let mut events: u64 = 0;
+            for (bucket, sources) in &graph.event_timeline {
+                if bucket.as_str() >= cutoff_key.as_str() {
+                    events += sources.values().sum::<usize>() as u64;
+                }
+            }
+
+            // Count incidents and decisions in window from Incident nodes
+            let mut incidents: u64 = 0;
+            let mut high_critical: u64 = 0;
+            let mut decisions: u64 = 0;
+            let mut decisions_by_action: BTreeMap<String, u64> = BTreeMap::new();
+            let mut latest_incident_ts = String::from("none");
+
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    ts,
+                    severity,
+                    decision,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if *ts >= cutoff {
+                        incidents += 1;
+                        let sev = severity.to_lowercase();
+                        if sev == "high" || sev == "critical" {
+                            high_critical += 1;
+                        }
+                        let ts_str = ts.to_rfc3339();
+                        if ts_str > latest_incident_ts || latest_incident_ts == "none" {
+                            latest_incident_ts = ts_str.clone();
+                        }
+                        if let Some(action) = decision {
+                            decisions += 1;
+                            *decisions_by_action.entry(action.clone()).or_default() += 1;
+                        }
+                    }
+                }
+            }
+
+            let result = RecentWindow {
+                window_secs: WINDOW_SECS as u64,
+                events,
+                incidents,
+                high_critical_incidents: high_critical,
+                decisions,
+                decisions_by_action,
+                latest_event_ts: "graph".to_string(),
+                latest_incident_ts,
+                latest_decision_ts: "graph".to_string(),
+                latest_telemetry_ts: "graph".to_string(),
+            };
+            if let Ok(mut cache) = recent_window_cache_handle().lock() {
+                if cache.len() > 30 {
+                    cache.clear();
+                }
+                cache.insert(key.clone(), result.clone());
+            }
+            return result;
+        }
+    }
+
+    // Fallback: JSONL scan
     // Determine which dates to scan (today + optionally yesterday)
     let dates_to_scan: Vec<String> = {
         let mut v = vec![analyzed_date.to_string()];
@@ -722,7 +1047,7 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
         }
     }
 
-    RecentWindow {
+    let result = RecentWindow {
         window_secs: WINDOW_SECS as u64,
         events,
         incidents,
@@ -733,10 +1058,70 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
         latest_incident_ts,
         latest_decision_ts,
         latest_telemetry_ts,
+    };
+    if let Ok(mut cache) = recent_window_cache_handle().lock() {
+        if cache.len() > 30 {
+            cache.clear();
+        }
+        cache.insert(key, result.clone());
     }
+    result
+}
+
+/// Cache for compute_day_counters keyed by (date, snapshot_mtime).
+/// Yesterday's snapshot is frozen, so once loaded the result is reusable
+/// for the rest of the day. This prevents the dashboard /api/report endpoint
+/// from re-loading the disk snapshot on every poll (was causing 2 graph
+/// loads + integrity-check pruning every 30s on each dashboard refresh).
+static COUNTERS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, u64), Counters>>,
+> = std::sync::OnceLock::new();
+
+fn cache_handle() -> &'static std::sync::Mutex<std::collections::HashMap<(String, u64), Counters>> {
+    COUNTERS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
+    // Cache key: (date, snapshot_mtime). If mtime hasn't changed, return cached.
+    let snap_path = data_dir.join(format!("graph-snapshot-{date}.json"));
+    let mtime = std::fs::metadata(&snap_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let key = (date.to_string(), mtime);
+    if let Ok(cache) = cache_handle().lock() {
+        if let Some(c) = cache.get(&key) {
+            return c.clone();
+        }
+    }
+
+    // Phase 7: try dated graph snapshot first
+    let counters =
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, date) {
+            if graph.metrics().node_count > 0 {
+                counters_from_graph(&graph)
+            } else {
+                counters_from_jsonl(data_dir, date)
+            }
+        } else {
+            counters_from_jsonl(data_dir, date)
+        };
+
+    if let Ok(mut cache) = cache_handle().lock() {
+        // Cap cache size to prevent unbounded growth
+        if cache.len() > 30 {
+            cache.clear();
+        }
+        cache.insert(key, counters.clone());
+    }
+
+    counters
+}
+
+fn counters_from_jsonl(data_dir: &Path, date: &str) -> Counters {
     let events = safe_dated_file(data_dir, "events", date, "jsonl");
     let incidents = safe_dated_file(data_dir, "incidents", date, "jsonl");
     let decisions = safe_dated_file(data_dir, "decisions", date, "jsonl");
@@ -745,6 +1130,13 @@ fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
     parse_events_file(&events, &mut counters);
     parse_incidents_file(&incidents, &mut counters);
     parse_decisions_file(&decisions, &mut counters);
+    counters
+}
+
+/// Extract report counters from a graph snapshot (Phase 7).
+fn counters_from_graph(graph: &crate::knowledge_graph::KnowledgeGraph) -> Counters {
+    let mut counters = Counters::default();
+    populate_counters_from_graph(graph, &mut counters);
     counters
 }
 

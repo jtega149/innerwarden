@@ -107,12 +107,6 @@ fn detector_to_tactic(detector: &str) -> Option<TechniqueInfo> {
             technique_id: "T1593",
             technique_name: "Search Open Websites/Domains",
         },
-        "osquery_anomaly" => TechniqueInfo {
-            tactic: "Reconnaissance",
-            technique_id: "T1082",
-            technique_name: "System Information Discovery",
-        },
-
         // --- Initial Access ---
         "ssh_bruteforce" => TechniqueInfo {
             tactic: "Initial Access",
@@ -285,13 +279,6 @@ fn detector_to_tactic(detector: &str) -> Option<TechniqueInfo> {
             technique_name: "Application Layer Protocol (C2)",
         },
 
-        // --- Suricata covers network-level IDS (maps to Reconnaissance) ---
-        "suricata_alert" => TechniqueInfo {
-            tactic: "Reconnaissance",
-            technique_id: "T1040",
-            technique_name: "Network Sniffing / IDS Alert",
-        },
-
         // --- Kill Chain (kernel eBPF LSM blocked) ---
         "kill_chain" => TechniqueInfo {
             tactic: "Execution",
@@ -310,7 +297,6 @@ pub fn all_mapped_detectors() -> HashSet<&'static str> {
         "web_scan",
         "user_agent_scanner",
         "search_abuse",
-        "osquery_anomaly",
         "ssh_bruteforce",
         "credential_stuffing",
         "distributed_ssh",
@@ -341,7 +327,6 @@ pub fn all_mapped_detectors() -> HashSet<&'static str> {
         "ransomware",
         "kernel_module_load",
         "c2_callback",
-        "suricata_alert",
         "kill_chain",
     ]
     .into_iter()
@@ -887,10 +872,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 10: Detector to tactic mapping covers all 36 detectors
+    // Test 10: Detector to tactic mapping covers all 35 detectors
     // -----------------------------------------------------------------------
     #[test]
-    fn detector_mapping_covers_all_36() {
+    fn detector_mapping_covers_all_35() {
         let all_detectors = [
             "ssh_bruteforce",
             "credential_stuffing",
@@ -908,8 +893,6 @@ mod tests {
             "web_scan",
             "user_agent_scanner",
             "execution_guard",
-            "osquery_anomaly",
-            "suricata_alert",
             "dns_tunneling",
             "fileless",
             "lateral_movement",
@@ -931,10 +914,10 @@ mod tests {
             "kill_chain",
         ];
 
-        assert_eq!(all_detectors.len(), 37, "expected 37 detectors");
+        assert_eq!(all_detectors.len(), 35, "expected 35 detectors");
 
         let mapped = all_mapped_detectors();
-        assert_eq!(mapped.len(), 37, "mapped set should have 37 entries");
+        assert_eq!(mapped.len(), 35, "mapped set should have 35 entries");
 
         for det in &all_detectors {
             assert!(

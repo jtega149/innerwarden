@@ -29,8 +29,6 @@ mkdir -p "$DATA_DIR"
 SENSOR_CFG="$TMP_DIR/sensor-replay.toml"
 AGENT_CFG="$TMP_DIR/agent-replay.toml"
 AUTH_FIXTURE="$TMP_DIR/replay-auth.log"
-SURICATA_FIXTURE="$TMP_DIR/replay-suricata-eve.jsonl"
-OSQUERY_FIXTURE="$TMP_DIR/replay-osquery.jsonl"
 
 SENSOR_LOG="$TMP_DIR/sensor.log"
 AGENT_LOG="$TMP_DIR/agent.log"
@@ -87,12 +85,6 @@ sed \
   -e 's/198\.51\.100\.5/5.6.7.8/g' \
   "$ROOT_DIR/testdata/sample-auth.log" > "$AUTH_FIXTURE"
 
-# Suricata EVE fixture: already uses routable IPs in sample
-cp "$ROOT_DIR/testdata/sample-suricata-eve.jsonl" "$SURICATA_FIXTURE"
-
-# osquery fixture: already uses routable IPs in crontab event
-cp "$ROOT_DIR/testdata/sample-osquery.jsonl" "$OSQUERY_FIXTURE"
-
 cat > "$SENSOR_CFG" <<EOF
 [agent]
 host_id = "replay-host"
@@ -116,15 +108,6 @@ enabled = false
 enabled = false
 poll_seconds = 60
 paths = []
-
-[collectors.suricata_eve]
-enabled = true
-path = "$SURICATA_FIXTURE"
-event_types = ["alert", "http"]
-
-[collectors.osquery_log]
-enabled = true
-path = "$OSQUERY_FIXTURE"
 
 [detectors.ssh_bruteforce]
 enabled = true
@@ -178,7 +161,7 @@ if [[ ! -x "$SENSOR_BIN" || ! -x "$AGENT_BIN" ]]; then
   exit 1
 fi
 
-echo "[replay] running sensor from multi-source fixtures (graceful stop)"
+echo "[replay] running sensor from fixture logs (graceful stop)"
 "$SENSOR_BIN" --config "$SENSOR_CFG" > "$SENSOR_LOG" 2>&1 &
 SENSOR_PID=$!
 sleep 4
@@ -233,27 +216,19 @@ assert_json_metric_positive "$REPORT_JSON" "total_incidents"
 assert_json_metric_positive "$REPORT_JSON" "total_decisions"
 assert_json_metric_positive "$REPORT_JSON" "ai_decision_count"
 
-# Multi-source assertions: each integration must emit at least one event
-# Source names match what collectors actually emit in the Event.source field
 assert_events_contain_source "auth.log"
-assert_events_contain_source "suricata"
-assert_events_contain_source "osquery"
 
 if ! grep -q '"ai_provider":"anthropic"' "$DECISIONS_FILE"; then
   echo "assertion failed: decisions must include anthropic provider entries"
   exit 1
 fi
 
-SURICATA_COUNT=$(grep -c '"source":"suricata"' "$EVENTS_FILE" || true)
-OSQUERY_COUNT=$(grep -c '"source":"osquery"' "$EVENTS_FILE" || true)
 AUTH_COUNT=$(grep -c '"source":"auth.log"' "$EVENTS_FILE" || true)
 
 echo "[replay] success"
 echo "  data_dir:   $DATA_DIR"
 echo "  events:     $(wc -l < "$EVENTS_FILE" | tr -d ' ') total"
 echo "    auth_log:    $AUTH_COUNT"
-echo "    suricata_eve:$SURICATA_COUNT"
-echo "    osquery_log: $OSQUERY_COUNT"
 echo "  incidents:  $(wc -l < "$INCIDENTS_FILE" | tr -d ' ')"
 echo "  decisions:  $(wc -l < "$DECISIONS_FILE" | tr -d ' ')"
 echo "  telemetry:  $(wc -l < "$TELEMETRY_FILE" | tr -d ' ')"

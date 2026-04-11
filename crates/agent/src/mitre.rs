@@ -70,7 +70,6 @@ pub fn map_detector(detector: &str) -> Option<MitreMapping> {
 
         // ── Persistence ─────────────────────────────────────────────────
         "web_shell" => m("Persistence", "T1505.003", "Web Shell"),
-        "osquery_anomaly" => m("Persistence", "T1053", "Scheduled Task/Job"),
         "ssh_key_injection" => m("Persistence", "T1098.004", "SSH Authorized Keys"),
         "kernel_module_load" => m("Persistence", "T1547.006", "Kernel Modules and Extensions"),
         "crontab_persistence" => m("Persistence", "T1053.003", "Cron"),
@@ -103,9 +102,6 @@ pub fn map_detector(detector: &str) -> Option<MitreMapping> {
 
         // ── Lateral Movement ────────────────────────────────────────────
         "lateral_movement" => m("Lateral Movement", "T1021", "Remote Services"),
-
-        // ── Multiple / Generic ──────────────────────────────────────────
-        "suricata_alert" => m("Multiple", "T1190", "Exploit Public-Facing Application"),
 
         // ── Sensitive Write detector (file-write monitoring) ───────────
         "sensitive_write" => m(
@@ -247,7 +243,6 @@ pub fn all_technique_ids() -> Vec<&'static str> {
         "rootkit",
         "process_injection",
         "web_shell",
-        "osquery_anomaly",
         "ssh_key_injection",
         "kernel_module_load",
         "crontab_persistence",
@@ -260,7 +255,6 @@ pub fn all_technique_ids() -> Vec<&'static str> {
         "dns_tunneling",
         "data_exfiltration",
         "lateral_movement",
-        "suricata_alert",
         // New detectors
         "sensitive_write",
         "at_job_persist",
@@ -313,7 +307,6 @@ pub fn generate_navigator_layer() -> serde_json::Value {
         "rootkit",
         "process_injection",
         "web_shell",
-        "osquery_anomaly",
         "ssh_key_injection",
         "kernel_module_load",
         "crontab_persistence",
@@ -326,7 +319,6 @@ pub fn generate_navigator_layer() -> serde_json::Value {
         "dns_tunneling",
         "data_exfiltration",
         "lateral_movement",
-        "suricata_alert",
         "sensitive_write",
         "at_job_persist",
         "file_permission_mod",
@@ -555,16 +547,6 @@ mod tests {
             "Lateral Movement",
             "T1021",
             "Remote Services",
-        );
-    }
-
-    #[test]
-    fn test_multiple_tactic() {
-        assert_mapping(
-            "suricata_alert",
-            "Multiple",
-            "T1190",
-            "Exploit Public-Facing Application",
         );
     }
 
@@ -800,8 +782,6 @@ mod tests {
             "privesc",
             "sudo_abuse",
             "integrity_alert",
-            "osquery_anomaly",
-            "suricata_alert",
             "log_tampering",
             "lateral_movement",
             "crypto_miner",

@@ -2,194 +2,220 @@ use std::path::Path;
 
 use tracing::{info, warn};
 
-use crate::{config, decisions, telegram, two_factor, AgentState};
+use crate::{config, decisions, knowledge_graph, telegram, two_factor, AgentState};
 
-/// Count the number of lines in a JSONL file in data_dir (fail-silent -> 0).
-pub(crate) fn count_jsonl_lines(data_dir: &Path, filename: &str) -> usize {
-    let path = data_dir.join(filename);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => contents.lines().filter(|l| !l.trim().is_empty()).count(),
-        Err(_) => 0,
+// ---------------------------------------------------------------------------
+// Phase 6B: Graph-based bot helpers (no JSONL reads)
+// ---------------------------------------------------------------------------
+
+/// Count incidents or decisions from the knowledge graph.
+/// `count_type` selects what to count: "incidents" or "decisions".
+pub(crate) fn graph_count(
+    kg: &std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
+    count_type: &str,
+) -> usize {
+    use knowledge_graph::types::{Node, NodeType};
+    let graph = kg.read().unwrap();
+    match count_type {
+        "incidents" => graph.nodes_of_type(NodeType::Incident).len(),
+        "decisions" => {
+            let mut n = 0;
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    decision: Some(_), ..
+                }) = graph.get_node(id)
+                {
+                    n += 1;
+                }
+            }
+            n
+        }
+        _ => 0,
     }
 }
 
-/// Read the last N incidents from today's incidents file, formatted for display.
-pub(crate) fn read_last_incidents(data_dir: &Path, today: &str, n: usize) -> String {
-    let path = data_dir.join(format!("incidents-{today}.jsonl"));
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return "🔇 Clean slate - no intrusion attempts today.".to_string(),
-    };
+/// Read the last N incidents from graph, formatted for Telegram display.
+pub(crate) fn graph_last_incidents(
+    kg: &std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
+    n: usize,
+) -> String {
+    use knowledge_graph::types::{Node, NodeType, Relation};
+    let graph = kg.read().unwrap();
 
-    let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut items: Vec<(chrono::DateTime<chrono::Utc>, String, String, String)> = Vec::new();
 
-    if lines.is_empty() {
-        return "🔇 Clean slate - no intrusion attempts today.".to_string();
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident {
+            severity,
+            title,
+            ts,
+            ..
+        }) = graph.get_node(id)
+        {
+            // Find first entity via TriggeredBy
+            let entity = graph
+                .outgoing_edges(id)
+                .iter()
+                .find(|e| e.relation == Relation::TriggeredBy)
+                .and_then(|e| graph.get_node(e.to))
+                .map(|n| n.label())
+                .unwrap_or_else(|| "?".to_string());
+
+            items.push((*ts, severity.to_lowercase(), title.clone(), entity));
+        }
     }
 
-    let last_n: Vec<&str> = lines.iter().rev().take(n).copied().collect::<Vec<_>>();
-    let now = chrono::Utc::now();
+    if items.is_empty() {
+        return "\u{1f507} Clean slate - no intrusion attempts today.".to_string();
+    }
 
+    // Sort by ts descending, take last N
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.truncate(n);
+
+    let now = chrono::Utc::now();
     let sev_icon = |s: &str| match s {
-        "critical" => "🔴",
-        "high" => "🟠",
-        "medium" => "🟡",
-        "low" => "🟢",
-        _ => "⚪",
+        "critical" => "\u{1f534}",
+        "high" => "\u{1f7e0}",
+        "medium" => "\u{1f7e1}",
+        "low" => "\u{1f7e2}",
+        _ => "\u{26aa}",
     };
 
-    let formatted: Vec<String> = last_n
+    let formatted: Vec<String> = items
         .into_iter()
-        .rev()
-        .filter_map(|line| {
-            let v: serde_json::Value = serde_json::from_str(line).ok()?;
-            let severity = v["severity"].as_str().unwrap_or("?");
-            let icon = sev_icon(severity);
-            let title = v["title"].as_str().unwrap_or("unknown").to_string();
-            let entity = v["entities"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|e| e["value"].as_str())
-                .unwrap_or("?")
-                .to_string();
-            let ts_str = v["ts"].as_str().unwrap_or("");
-            let age = chrono::DateTime::parse_from_rfc3339(ts_str)
-                .ok()
-                .map(|t| {
-                    let mins = now
-                        .signed_duration_since(t.with_timezone(&chrono::Utc))
-                        .num_minutes();
-                    if mins < 1 {
-                        "just now".to_string()
-                    } else if mins < 60 {
-                        format!("{mins}m ago")
-                    } else {
-                        format!("{}h ago", mins / 60)
-                    }
-                })
-                .unwrap_or_default();
-            Some(format!("{icon} {title}\n   <code>{entity}</code> · {age}"))
+        .map(|(ts, severity, title, entity)| {
+            let icon = sev_icon(&severity);
+            let mins = now.signed_duration_since(ts).num_minutes();
+            let age = if mins < 1 {
+                "just now".to_string()
+            } else if mins < 60 {
+                format!("{mins}m ago")
+            } else {
+                format!("{}h ago", mins / 60)
+            };
+            format!("{icon} {title}\n   <code>{entity}</code> \u{b7} {age}")
         })
         .collect();
 
-    if formatted.is_empty() {
-        "No parseable incidents today.".to_string()
-    } else {
-        format!(
-            "🚨 <b>Recent threats</b> (last {})\n\n{}",
-            formatted.len(),
-            formatted.join("\n\n")
-        )
-    }
+    format!(
+        "\u{1f6a8} <b>Recent threats</b> (last {})\n\n{}",
+        formatted.len(),
+        formatted.join("\n\n")
+    )
 }
 
-/// Read the last N decisions from today's decisions file, formatted for display.
-pub(crate) fn read_last_decisions(data_dir: &Path, today: &str, n: usize) -> String {
-    let path = data_dir.join(format!("decisions-{today}.jsonl"));
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return "⚖️ No decisions yet today - standing by.".to_string(),
-    };
+/// Row collected for the Telegram "last decisions" summary:
+/// (timestamp, action, target, confidence, auto_executed).
+type DecisionRow = (
+    chrono::DateTime<chrono::Utc>,
+    String,
+    String,
+    Option<f32>,
+    bool,
+);
 
-    let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+/// Read the last N decisions from graph, formatted for Telegram display.
+pub(crate) fn graph_last_decisions(
+    kg: &std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
+    n: usize,
+) -> String {
+    use knowledge_graph::types::{Node, NodeType};
+    let graph = kg.read().unwrap();
 
-    if lines.is_empty() {
-        return "⚖️ No decisions yet today - standing by.".to_string();
+    let mut items: Vec<DecisionRow> = Vec::new();
+
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident {
+            ts,
+            decision: Some(action),
+            decision_target,
+            confidence,
+            auto_executed,
+            ..
+        }) = graph.get_node(id)
+        {
+            let target = decision_target.as_deref().unwrap_or("?").to_string();
+            items.push((*ts, action.clone(), target, *confidence, *auto_executed));
+        }
     }
 
-    let last_n: Vec<&str> = lines.iter().rev().take(n).copied().collect::<Vec<_>>();
+    if items.is_empty() {
+        return "\u{2696}\u{fe0f} No decisions yet today - standing by.".to_string();
+    }
+
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.truncate(n);
 
     let action_icon = |a: &str| {
-        if a.contains("block") || a.contains("Block") {
-            "🚫"
-        } else if a.contains("suspend") || a.contains("Suspend") {
-            "👑"
-        } else if a.contains("honeypot") || a.contains("Honeypot") {
-            "🍯"
-        } else if a.contains("monitor") || a.contains("Monitor") {
-            "👁"
-        } else if a.contains("kill") || a.contains("Kill") {
-            "💀"
-        } else if a.contains("kill_chain") || a.contains("Kill chain") {
-            "🔗"
-        } else if a.contains("Ignore") || a.contains("ignore") {
-            "🙈"
+        if a.contains("block") {
+            "\u{1f6ab}"
+        } else if a.contains("suspend") {
+            "\u{1f451}"
+        } else if a.contains("honeypot") {
+            "\u{1f36f}"
+        } else if a.contains("monitor") {
+            "\u{1f441}"
+        } else if a.contains("kill") {
+            "\u{1f480}"
+        } else if a.contains("ignore") {
+            "\u{1f648}"
         } else {
-            "⚡"
+            "\u{26a1}"
         }
     };
 
-    let formatted: Vec<String> = last_n
+    let formatted: Vec<String> = items
         .into_iter()
-        .rev()
-        .filter_map(|line| {
-            let v: serde_json::Value = serde_json::from_str(line).ok()?;
-            let action = v["action_type"].as_str().unwrap_or("?").to_string();
+        .map(|(_, action, target, confidence, auto_executed)| {
             let icon = action_icon(&action);
-            let target = v["target_ip"]
-                .as_str()
-                .or_else(|| v["target_user"].as_str())
-                .unwrap_or("?")
-                .to_string();
-            let confidence = v["confidence"].as_f64().unwrap_or(0.0);
-            let pct = (confidence * 100.0) as u32;
-            let dry_run = v["dry_run"].as_bool().unwrap_or(true);
-            let mode = if dry_run { "sim" } else { "live" };
-            Some(format!(
-                "{icon} {action} <code>{target}</code>\n   {pct}% confidence · {mode}"
-            ))
+            let pct = (confidence.unwrap_or(0.0) * 100.0) as u32;
+            let mode = if auto_executed { "live" } else { "sim" };
+            format!("{icon} {action} <code>{target}</code>\n   {pct}% confidence \u{b7} {mode}")
         })
         .collect();
 
-    if formatted.is_empty() {
-        "No parseable decisions today.".to_string()
-    } else {
-        format!(
-            "⚖️ <b>Recent decisions</b> (last {})\n\n{}",
-            formatted.len(),
-            formatted.join("\n\n")
-        )
-    }
+    format!(
+        "\u{2696}\u{fe0f} <b>Recent decisions</b> (last {})\n\n{}",
+        formatted.len(),
+        formatted.join("\n\n")
+    )
 }
 
-/// Read the last N incidents as compact JSON strings (for AI context).
-pub(crate) fn read_last_incidents_raw(data_dir: &Path, today: &str, n: usize) -> String {
-    let path = data_dir.join(format!("incidents-{today}.jsonl"));
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
+/// Read the last N incidents as compact strings for AI context (graph-based).
+pub(crate) fn graph_last_incidents_raw(
+    kg: &std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
+    n: usize,
+) -> String {
+    use knowledge_graph::types::{Node, NodeType};
+    let graph = kg.read().unwrap();
 
-    let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut items: Vec<(chrono::DateTime<chrono::Utc>, String, String, String)> = Vec::new();
 
-    if lines.is_empty() {
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident {
+            severity,
+            title,
+            summary,
+            ts,
+            ..
+        }) = graph.get_node(id)
+        {
+            let short_summary: String = summary.chars().take(120).collect();
+            items.push((*ts, severity.to_lowercase(), title.clone(), short_summary));
+        }
+    }
+
+    if items.is_empty() {
         return String::new();
     }
 
-    lines
-        .iter()
-        .rev()
-        .take(n)
-        .map(|l| {
-            // Summarise to avoid sending huge JSON blobs to the AI
-            serde_json::from_str::<serde_json::Value>(l)
-                .ok()
-                .map(|v| {
-                    format!(
-                        "[{}] {} - {}",
-                        v["severity"].as_str().unwrap_or("?"),
-                        v["title"].as_str().unwrap_or("?"),
-                        v["summary"]
-                            .as_str()
-                            .unwrap_or("")
-                            .chars()
-                            .take(120)
-                            .collect::<String>()
-                    )
-                })
-                .unwrap_or_default()
-        })
-        .filter(|s| !s.is_empty())
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.truncate(n);
+
+    items
+        .into_iter()
+        .map(|(_, sev, title, summary)| format!("[{sev}] {title} - {summary}"))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -523,6 +549,13 @@ pub(crate) fn handle_telegram_triage_action(
             }
             let detector = incident_id.split(':').next().unwrap_or("unknown");
             telegram::log_false_positive(data_dir, incident_id, detector, &result.operator_name);
+            // Phase 7 Gap 1: mark incident as FP in the knowledge graph
+            {
+                let mut graph = state.knowledge_graph.write().unwrap();
+                if let Some(node_id) = graph.find_by_incident(incident_id) {
+                    graph.mark_false_positive(node_id, &result.operator_name);
+                }
+            }
             write_telegram_triage_audit(
                 state,
                 incident_id,

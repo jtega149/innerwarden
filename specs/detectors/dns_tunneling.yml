@@ -6,12 +6,12 @@ description: "Detects DNS tunneling via entropy analysis, subdomain volume, long
 context: |
   Two detection paths:
 
-  Suricata/DNS capture path (deep inspection):
+  DNS capture path (deep inspection):
   1. High Shannon entropy in subdomain labels (encoded/encrypted data)
   2. Volume of unique subdomains to same base domain (C2 channel)
   3. Unusually long domain names (data exfiltration payload)
 
-  eBPF fallback (port 53 connect analysis, works WITHOUT Suricata):
+  eBPF fallback (port 53 connect analysis):
   4. DNS beaconing — same process connects to same DNS server 20+ times in 60s
   5. Non-standard DNS server — connect to port 53 on a non-common resolver
   6. DNS burst — 50+ port 53 connections in 30s from any process
@@ -52,8 +52,9 @@ test_cases:
   true_positives:
     - description: "High-entropy subdomain query (DNS tunnel data)"
       input:
-        kind: "suricata.dns.query"
-        rrname: "aGVsbG8gd29ybGQ.evil.com"
+        kind: "dns.query"
+        source: "dns_capture"
+        domain: "aGVsbG8gd29ybGQ.evil.com"
         src_ip: "10.0.0.5"
       expected:
         alert: true
@@ -74,8 +75,9 @@ test_cases:
   true_negatives:
     - description: "Normal DNS query to google.com"
       input:
-        kind: "suricata.dns.query"
-        rrname: "www.google.com"
+        kind: "dns.query"
+        source: "dns_capture"
+        domain: "www.google.com"
         src_ip: "10.0.0.5"
       expected:
         alert: false
@@ -101,8 +103,9 @@ test_cases:
         Without the static DNS_ALLOWED_DOMAINS list, normal cloud operations
         would trigger DNS tunneling alerts.
       input:
-        kind: "suricata.dns.query"
-        rrname: "metadata.oraclecloud.com"
+        kind: "dns.query"
+        source: "dns_capture"
+        domain: "metadata.oraclecloud.com"
         src_ip: "10.0.0.5"
       expected:
         alert: false

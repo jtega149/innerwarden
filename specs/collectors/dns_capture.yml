@@ -6,8 +6,8 @@ description: "Captures DNS queries from network traffic via AF_PACKET raw socket
 context: |
   Opens an AF_PACKET raw socket to capture DNS queries (UDP port 53) from
   all interfaces. Parses Ethernet/IP/UDP headers and DNS query section to
-  extract domain name and query type. Eliminates dependency on Suricata for
-  DNS visibility. Feeds the dns_tunneling detector. Per-(src_ip, domain)
+  extract domain name and query type. Provides native DNS visibility for
+  the dns_tunneling detector. Per-(src_ip, domain)
   cooldown of 10 seconds prevents event flooding. Skips .local, .internal,
   .localhost domains.
 

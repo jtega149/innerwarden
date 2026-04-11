@@ -83,6 +83,28 @@ pub struct AgentConfig {
     #[serde(default)]
     #[cfg_attr(not(feature = "redis-reader"), allow(dead_code))]
     pub redis_stream: Option<String>,
+    /// Daily AI intelligence briefing
+    #[serde(default)]
+    pub briefing: BriefingConfig,
+    /// Config signing verification (Active Defence).
+    #[serde(default)]
+    #[allow(dead_code)] // parsed for future signing-verification integration
+    pub config_signing: ConfigSigningConfig,
+    /// Detectors that run graph-only (sensor version suppressed).
+    /// After parallel validation, add detector names here to disable the sensor version.
+    /// Example: ["threat_intel", "lateral_movement", "persistence"]
+    #[serde(default)]
+    pub graph_only_detectors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ConfigSigningConfig {
+    /// When true, agent refuses to start if signature is missing or invalid.
+    #[serde(default)]
+    pub required: bool,
+    /// Hex-encoded Ed25519 public key for signature verification.
+    #[serde(default)]
+    pub public_key: Option<String>,
 }
 
 /// Dashboard config - trusted proxy IPs and other dashboard-related settings.
@@ -366,6 +388,38 @@ impl Default for NarrativeConfig {
         Self {
             enabled: true,
             keep_days: default_keep_days(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // enabled/telegram consumed by briefing scheduler wiring in main.rs; kept accessible for inspection
+pub struct BriefingConfig {
+    /// Enable daily AI intelligence briefing (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Hour to auto-generate briefing (0-23, local time). Default: 8
+    #[serde(default = "default_briefing_hour")]
+    pub hour: u8,
+    /// Minute within the hour. Default: 0
+    #[serde(default)]
+    pub minute: u8,
+    /// Also send briefing via Telegram (default: true)
+    #[serde(default = "default_true")]
+    pub telegram: bool,
+}
+
+fn default_briefing_hour() -> u8 {
+    8
+}
+
+impl Default for BriefingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hour: 8,
+            minute: 0,
+            telegram: true,
         }
     }
 }
@@ -1432,8 +1486,121 @@ pub fn load(path: &Path) -> Result<AgentConfig> {
 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read agent config {}", path.display()))?;
+
+    // Verify config signature if [signature] section is present.
+    verify_config_signature(&content, path)?;
+
     toml::from_str(&content)
         .with_context(|| format!("failed to parse agent config {}", path.display()))
+}
+
+/// Verify Ed25519 signature of config file (Active Defence feature).
+/// If [signature] section exists and [config_signing] has a public_key, verify.
+/// If config_signing.required=true and signature is missing/invalid, fail.
+fn verify_config_signature(content: &str, path: &Path) -> Result<()> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    // Quick check: does the config have a [signature] section?
+    let has_signature = content.contains("\n[signature]") || content.starts_with("[signature]");
+
+    // Parse just the config_signing section to check settings.
+    // We parse the full config minus [signature] to avoid TOML parse errors.
+    let payload = if let Some(idx) = content.find("\n[signature]") {
+        &content[..idx]
+    } else {
+        content
+    };
+
+    // Try to extract config_signing settings from the TOML.
+    let signing_cfg: ConfigSigningConfig = match toml::from_str::<toml::Value>(payload) {
+        Ok(val) => {
+            if let Some(cs) = val.get("config_signing") {
+                cs.clone().try_into().unwrap_or_default()
+            } else {
+                ConfigSigningConfig::default()
+            }
+        }
+        Err(_) => ConfigSigningConfig::default(),
+    };
+
+    // No public key configured → skip verification (backwards compatible).
+    let Some(pub_key_hex) = &signing_cfg.public_key else {
+        if has_signature {
+            tracing::debug!(
+                "config has [signature] but no config_signing.public_key — skipping verification"
+            );
+        }
+        return Ok(());
+    };
+
+    if pub_key_hex.is_empty() {
+        return Ok(());
+    }
+
+    // No signature section but verification is required → fail.
+    if !has_signature {
+        if signing_cfg.required {
+            anyhow::bail!(
+                "config_signing.required=true but config {} has no [signature] section",
+                path.display()
+            );
+        }
+        tracing::debug!("config has config_signing.public_key but no [signature] — skipping");
+        return Ok(());
+    }
+
+    // Extract signature value from [signature] section.
+    let sig_hex = content
+        .lines()
+        .skip_while(|l| !l.starts_with("[signature]"))
+        .find_map(|l| {
+            let l = l.trim();
+            if l.starts_with("value") {
+                l.split('=')
+                    .nth(1)
+                    .map(|v| v.trim().trim_matches('"').to_string())
+            } else {
+                None
+            }
+        })
+        .context("config [signature] section has no 'value' field")?;
+
+    // Decode public key.
+    let pub_bytes: Vec<u8> = (0..pub_key_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&pub_key_hex[i..i + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("invalid hex in config_signing.public_key")?;
+
+    let verifying_key = VerifyingKey::from_bytes(
+        pub_bytes
+            .as_slice()
+            .try_into()
+            .context("config_signing.public_key must be 32 bytes (64 hex chars)")?,
+    )
+    .context("invalid Ed25519 public key in config_signing")?;
+
+    // Decode signature.
+    let sig_bytes: Vec<u8> = (0..sig_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&sig_hex[i..i + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("invalid hex in config signature value")?;
+
+    let signature = Signature::from_bytes(
+        sig_bytes
+            .as_slice()
+            .try_into()
+            .context("signature must be 64 bytes (128 hex chars)")?,
+    );
+
+    // Verify.
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .context("CONFIG SIGNATURE VERIFICATION FAILED — config may be tampered")?;
+
+    tracing::info!(config = %path.display(), "config signature verified");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

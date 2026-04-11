@@ -23,10 +23,6 @@ pub struct SystemProbes {
     pub has_docker: bool,
     pub has_nginx: bool,
     pub has_fail2ban: bool,
-    pub has_falco: bool,
-    pub has_suricata: bool,
-    pub has_osquery: bool,
-    pub has_wazuh: bool,
     pub has_ufw: bool,
     pub has_iptables: bool,
     pub has_nftables: bool,
@@ -39,10 +35,6 @@ pub struct SystemProbes {
     pub has_auth_log: bool,
     pub has_nginx_error_log: bool,
     pub has_nginx_access_log: bool,
-    pub has_falco_log: bool,
-    pub has_suricata_eve: bool,
-    pub has_osquery_log: bool,
-    pub has_wazuh_alerts: bool,
     pub has_fail2ban_client: bool,
     pub has_crowdsec: bool,
 }
@@ -108,10 +100,6 @@ pub fn run_probes() -> SystemProbes {
         has_docker: probe_file("/var/run/docker.sock") || probe_binary("docker"),
         has_nginx: probe_service("nginx", is_macos) || probe_binary("nginx"),
         has_fail2ban: probe_service("fail2ban", is_macos),
-        has_falco: probe_service("falco", is_macos) || probe_binary("falco"),
-        has_suricata: probe_service("suricata", is_macos) || probe_binary("suricata"),
-        has_osquery: probe_service("osqueryd", is_macos) || probe_binary("osqueryi"),
-        has_wazuh: probe_service("wazuh-agent", is_macos) || probe_binary("wazuh-agent"),
         has_ufw: probe_binary("ufw"),
         has_iptables: probe_binary("iptables"),
         has_nftables: probe_binary("nft"),
@@ -124,10 +112,6 @@ pub fn run_probes() -> SystemProbes {
         has_auth_log: probe_file("/var/log/auth.log"),
         has_nginx_error_log: probe_file("/var/log/nginx/error.log"),
         has_nginx_access_log: probe_file("/var/log/nginx/access.log"),
-        has_falco_log: probe_file("/var/log/falco/falco.log"),
-        has_suricata_eve: probe_file("/var/log/suricata/eve.json"),
-        has_osquery_log: probe_file("/var/log/osquery/osqueryd.results.log"),
-        has_wazuh_alerts: probe_file("/var/ossec/logs/alerts/alerts.json"),
         has_fail2ban_client: probe_binary("fail2ban-client"),
         has_crowdsec: probe_binary("cscli") || probe_binary("crowdsec"),
     }
@@ -148,10 +132,6 @@ fn print_probes(p: &SystemProbes) {
         ("Packet Filter (pf)", p.has_pf),
         ("auditd", p.has_auditd),
         ("sudo", p.has_sudo),
-        ("Falco", p.has_falco),
-        ("Suricata", p.has_suricata),
-        ("osquery", p.has_osquery),
-        ("Wazuh", p.has_wazuh),
         ("CrowdSec", p.has_crowdsec),
     ];
 
@@ -1194,8 +1174,7 @@ pub fn score_modules(p: &SystemProbes) -> Vec<ModuleRec> {
                 findings: vec![],
                 kind: IntegrationKind::Native,
                 cost_note: "Zero external cost, but high privacy impact: every shell command is captured. \
-                            Enable only with explicit host-owner consent. \
-                            If Falco is active, prefer it for exec monitoring - Falco has lower privacy impact.",
+                            Enable only with explicit host-owner consent.",
             }
         },
         // fail2ban-integration
@@ -1283,157 +1262,6 @@ pub fn score_modules(p: &SystemProbes) -> Vec<ModuleRec> {
                         Paid plans start at $50/mo for higher volume. \
                         The auto_block_threshold feature (bypass AI for known-bad IPs) is powerful \
                         but should not be combined with fail2ban auto-banning to avoid double-blocking.",
-        },
-        // falco-integration
-        {
-            let (tier, why, s, missing) = if p.has_falco_log {
-                (
-                    Tier::Essential,
-                    "Falco log found. Routes eBPF/syscall alerts into InnerWarden for AI triage."
-                        .to_string(),
-                    5,
-                    false,
-                )
-            } else {
-                (Tier::NotAvailable, "Falco not found.".to_string(), 1, true)
-            };
-            ModuleRec {
-                id: "falco-integration",
-                name: "Falco eBPF/Syscall Integration",
-                description: "Routes Falco runtime security alerts into InnerWarden for AI triage.",
-                why,
-                enable_hint: "innerwarden module install falco-integration",
-                stars: s,
-                tier,
-                needs_tool: if missing {
-                    Some("Falco (see https://falco.org)")
-                } else {
-                    None
-                },
-                docs_path: "falco-integration/docs/README.md",
-                findings: vec![],
-                kind: IntegrationKind::External,
-                cost_note: "Free and open-source. Adds ~50MB RAM (eBPF probe) or ~100MB (kernel module). \
-                            Very high value for syscall/container monitoring. \
-                            If you enable Falco, disable execution-guard - they overlap on exec detection \
-                            and will flood you with duplicate incidents.",
-            }
-        },
-        // suricata-integration
-        {
-            let (tier, why, s, missing) = if p.has_suricata_eve {
-                (
-                    Tier::Essential,
-                    "Suricata eve.json found. Routes IDS alerts into InnerWarden for AI triage."
-                        .to_string(),
-                    5,
-                    false,
-                )
-            } else {
-                (
-                    Tier::NotAvailable,
-                    "Suricata not found.".to_string(),
-                    1,
-                    true,
-                )
-            };
-            ModuleRec {
-                id: "suricata-integration",
-                name: "Suricata Network IDS Integration",
-                description: "Routes Suricata network alerts into InnerWarden for AI triage.",
-                why,
-                enable_hint: "innerwarden module install suricata-integration",
-                stars: s,
-                tier,
-                needs_tool: if missing {
-                    Some("Suricata (see https://suricata.io)")
-                } else {
-                    None
-                },
-                docs_path: "suricata-integration/docs/README.md",
-                findings: vec![],
-                kind: IntegrationKind::External,
-                cost_note: "Free and open-source. Adds ~100–200MB RAM. Requires a network tap or span port. \
-                            Very high value for network-layer detection (IDS signatures, protocol anomalies). \
-                            Suricata's port-scan detection overlaps with InnerWarden's syslog_firewall detector - \
-                            you can safely disable syslog_firewall once Suricata is active.",
-            }
-        },
-        // osquery-integration
-        {
-            let (tier, why, s, missing) = if p.has_osquery_log {
-                (
-                    Tier::Recommended,
-                    "osquery results log found. Surfaces host observability data (ports, users, crons)."
-                        .to_string(),
-                    3,
-                    false,
-                )
-            } else {
-                (
-                    Tier::NotAvailable,
-                    "osquery not found.".to_string(),
-                    1,
-                    true,
-                )
-            };
-            ModuleRec {
-                id: "osquery-integration",
-                name: "osquery Host Observability",
-                description: "Ingests osquery differential results for host-level visibility.",
-                why,
-                enable_hint: "innerwarden module install osquery-integration",
-                stars: s,
-                tier,
-                needs_tool: if missing {
-                    Some("osquery (see https://osquery.io)")
-                } else {
-                    None
-                },
-                docs_path: "osquery-integration/docs/README.md",
-                findings: vec![],
-                kind: IntegrationKind::External,
-                cost_note: "Free and lightweight (~30MB RAM). Good for host-level queries \
-                            (open ports, crontabs, user accounts, listening services). \
-                            No incident passthrough - provides context and observability, not automated response.",
-            }
-        },
-        // wazuh-integration
-        {
-            let (tier, why, s, missing) = if p.has_wazuh_alerts {
-                (
-                    Tier::Essential,
-                    "Wazuh alerts log found. Routes HIDS/FIM alerts into InnerWarden for AI triage."
-                        .to_string(),
-                    5,
-                    false,
-                )
-            } else {
-                (Tier::NotAvailable, "Wazuh not found.".to_string(), 1, true)
-            };
-            ModuleRec {
-                id: "wazuh-integration",
-                name: "Wazuh HIDS Integration",
-                description: "Routes Wazuh HIDS/FIM compliance alerts into InnerWarden.",
-                why,
-                enable_hint: "innerwarden module install wazuh-integration",
-                stars: s,
-                tier,
-                needs_tool: if missing {
-                    Some("Wazuh (see https://wazuh.com)")
-                } else {
-                    None
-                },
-                docs_path: "wazuh-integration/docs/README.md",
-                findings: vec![],
-                kind: IntegrationKind::External,
-                cost_note: "Free (self-hosted) but heavyweight: Wazuh agent adds ~100MB RAM; \
-                            the Wazuh manager server requires a separate machine (~2GB RAM). \
-                            Best for compliance-driven environments (PCI-DSS, HIPAA). \
-                            Note: Wazuh's SSH rules overlap with InnerWarden's ssh-protection - \
-                            you may get duplicate SSH brute-force alerts. Consider disabling \
-                            Wazuh's sshd rules or InnerWarden's auth_log collector when both are active.",
-            }
         },
         // crowdsec-integration
         {
@@ -1771,46 +1599,6 @@ fn detect_conflicts(recs: &[ModuleRec]) -> Vec<ConflictPair> {
 
     let mut conflicts = vec![];
 
-    // Falco + execution-guard: both detect suspicious exec
-    if available.contains("falco-integration") && available.contains("execution-guard") {
-        conflicts.push(ConflictPair {
-            module_a: "falco-integration",
-            module_b: "execution-guard",
-            overlap: "Both detect suspicious shell command execution (Falco via eBPF syscalls, \
-                      execution-guard via auditd AST analysis)",
-            recommendation: "Use Falco and disable execution-guard. Falco is more comprehensive \
-                             and has lower privacy impact. Running both will generate duplicate \
-                             exec incidents and can flood your notification channel.",
-        });
-    }
-
-    // Wazuh + ssh-protection: both detect SSH brute-force
-    if available.contains("wazuh-integration") && available.contains("ssh-protection") {
-        conflicts.push(ConflictPair {
-            module_a: "wazuh-integration",
-            module_b: "ssh-protection",
-            overlap: "Wazuh's sshd detection rules overlap with InnerWarden's auth_log SSH \
-                      brute-force detector - both produce SSH incident alerts",
-            recommendation: "Both can coexist but you will get duplicate SSH alerts. Consider \
-                             disabling InnerWarden's auth_log collector ([collectors.auth_log] \
-                             enabled = false) and letting Wazuh own SSH detection, or disable \
-                             Wazuh's sshd jail rules.",
-        });
-    }
-
-    // Suricata + network-defense (syslog_firewall): both detect port scans
-    if available.contains("suricata-integration") && available.contains("network-defense") {
-        conflicts.push(ConflictPair {
-            module_a: "suricata-integration",
-            module_b: "network-defense",
-            overlap: "Suricata's port-scan detection overlaps with InnerWarden's syslog_firewall \
-                      collector that also feeds port-scan detection",
-            recommendation: "Once Suricata is active, disable InnerWarden's syslog_firewall \
-                             collector ([collectors.syslog_firewall] enabled = false). Suricata \
-                             provides deeper network-layer scanning visibility.",
-        });
-    }
-
     // AbuseIPDB auto-block + fail2ban: both auto-block IPs
     if available.contains("abuseipdb-enrichment") && available.contains("fail2ban-integration") {
         conflicts.push(ConflictPair {
@@ -1885,21 +1673,6 @@ fn activation_sequence(probes: &SystemProbes) -> Vec<(&'static str, &'static str
         seq.push((
             "innerwarden module install nginx-error-monitor",
             "nginx scanner + error spike detection (if you run a web server)",
-        ));
-    }
-
-    // External tools only after native layer is stable
-    if probes.has_falco_log {
-        seq.push((
-            "innerwarden module install falco-integration",
-            "Falco eBPF/syscall alerts (already installed - high value, route into IW)",
-        ));
-    }
-
-    if probes.has_suricata_eve {
-        seq.push((
-            "innerwarden module install suricata-integration",
-            "Suricata IDS alerts (already installed - high value, route into IW)",
         ));
     }
 

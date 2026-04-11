@@ -22,7 +22,7 @@ pub(crate) fn cmd_list(cli: &Cli, registry: &CapabilityRegistry) -> Result<()> {
     println!("System coverage:");
     println!("  22 eBPF kernel hooks (execve, connect, ptrace, setuid, bind, mount, ...)");
     println!("  36 stateful detectors (SSH brute-force, rootkit, reverse shell, ransomware, ...)");
-    println!("  13 log collectors (auth_log, journald, docker, nginx, suricata, ...)");
+    println!("  13 log collectors (auth_log, journald, docker, nginx, cloudtrail, ...)");
     println!("  7 kill chain patterns blocked at kernel level");
     println!();
     println!("These run automatically. Capabilities above are optional add-ons.");

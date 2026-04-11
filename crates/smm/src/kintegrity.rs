@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn module_drift_detection() {
-        let mut baseline = KernelState {
+        let baseline = KernelState {
             version: "Linux 6.1".into(),
             kallsyms_hash: Some("abc123".into()),
             symbol_count: 100000,

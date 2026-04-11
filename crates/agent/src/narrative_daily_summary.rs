@@ -86,10 +86,9 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                                 let det = telegram::extract_detector_pub(&inc.incident_id);
                                 *detector_counts.entry(det.to_string()).or_insert(0) += 1;
                             }
-                            let blocks_today = bot_helpers::count_jsonl_lines(
-                                data_dir,
-                                &format!("decisions-{today}.jsonl"),
-                            ) as u32;
+                            let blocks_today =
+                                bot_helpers::graph_count(&state.knowledge_graph, "decisions")
+                                    as u32;
                             let (top_detector, top_count) = detector_counts
                                 .iter()
                                 .max_by_key(|(_, c)| *c)

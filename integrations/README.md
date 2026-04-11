@@ -12,10 +12,8 @@ see [`docs/integration-recipes.md`](../docs/integration-recipes.md).
 
 ## Available Recipes
 
-| Tool | Recipe | Mechanism | Incident passthrough |
-|------|--------|-----------|----------------------|
-| [Wazuh](https://wazuh.com) - HIDS, FIM, compliance | [`wazuh/recipe.toml`](wazuh/recipe.toml) | `file_tail` | yes (level ≥ 10) |
-| [osquery](https://osquery.io) - host observability | [`osquery/recipe.toml`](osquery/recipe.toml) | `file_tail` | no |
+There are currently no bundled external security-tool integration recipes in
+this directory.
 
 ## Adding a Recipe
 

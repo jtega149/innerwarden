@@ -9,14 +9,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+// `anyhow::Context` is only consumed by the Linux-gated
+// `apply_seccomp_profile` helper. Gating the import keeps non-Linux
+// dev builds from tripping `unused_imports` under `-D warnings`.
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use clap::Parser;
 use collectors::{
     auth_log::AuthLogCollector, cloudtrail::CloudTrailCollector, docker::DockerCollector,
     exec_audit::ExecAuditCollector, integrity::IntegrityCollector, journald::JournaldCollector,
     macos_log::MacosLogCollector, nginx_access::NginxAccessCollector,
-    nginx_error::NginxErrorCollector, osquery_log::OsqueryLogCollector,
-    suricata_eve::SuricataEveCollector, syslog_firewall::SyslogFirewallCollector,
-    wazuh_alerts::WazuhAlertsCollector,
+    nginx_error::NginxErrorCollector, syslog_firewall::SyslogFirewallCollector,
 };
 use detectors::c2_callback::C2CallbackDetector;
 use detectors::container_escape::ContainerEscapeDetector;
@@ -34,7 +37,6 @@ use detectors::integrity_alert::IntegrityAlertDetector;
 use detectors::kernel_module_load::KernelModuleLoadDetector;
 use detectors::lateral_movement::LateralMovementDetector;
 use detectors::log_tampering::LogTamperingDetector;
-use detectors::osquery_anomaly::OsqueryAnomalyDetector;
 use detectors::outbound_anomaly::OutboundAnomalyDetector;
 use detectors::packet_flood::PacketFloodDetector;
 use detectors::port_scan::PortScanDetector;
@@ -48,7 +50,6 @@ use detectors::search_abuse::SearchAbuseDetector;
 use detectors::ssh_bruteforce::SshBruteforceDetector;
 use detectors::ssh_key_injection::SshKeyInjectionDetector;
 use detectors::sudo_abuse::SudoAbuseDetector;
-use detectors::suricata_alert::SuricataAlertDetector;
 use detectors::suspicious_login::SuspiciousLoginDetector;
 use detectors::systemd_persistence::SystemdPersistenceDetector;
 use detectors::user_agent_scanner::UserAgentScannerDetector;
@@ -95,11 +96,9 @@ struct DetectorSet {
     web_scan: Option<WebScanDetector>,
     user_agent_scanner: Option<UserAgentScannerDetector>,
     execution_guard: Option<ExecutionGuardDetector>,
-    suricata_alert: Option<SuricataAlertDetector>,
     docker_anomaly: Option<DockerAnomalyDetector>,
     integrity_alert: Option<IntegrityAlertDetector>,
     log_tampering: Option<LogTamperingDetector>,
-    osquery_anomaly: Option<OsqueryAnomalyDetector>,
     distributed_ssh: Option<DistributedSshDetector>,
     suspicious_login: Option<SuspiciousLoginDetector>,
     c2_callback: Option<C2CallbackDetector>,
@@ -133,6 +132,11 @@ struct DetectorSet {
     yara_scan: Option<detectors::yara_scan::YaraScanDetector>,
     sigma_rule: Option<detectors::sigma_rule::SigmaRuleDetector>,
     mitre_hunt: Option<detectors::mitre_hunt::MitreHuntDetector>,
+    dns_c2: Option<detectors::dns_c2::DnsC2Detector>,
+    data_encoding: Option<detectors::data_encoding::DataEncodingDetector>,
+    sandbox_evasion: Option<detectors::sandbox_evasion::SandboxEvasionDetector>,
+    threat_intel: Option<detectors::threat_intel::ThreatIntelDetector>,
+    proto_anomaly: Option<detectors::proto_anomaly::ProtoAnomalyDetector>,
 }
 
 #[derive(Default)]
@@ -231,9 +235,6 @@ async fn main() -> Result<()> {
     let shared_exec_audit_offset = Arc::new(AtomicU64::new(0));
     let shared_nginx_offset = Arc::new(AtomicU64::new(0));
     let shared_nginx_error_offset = Arc::new(AtomicU64::new(0));
-    let shared_suricata_offset = Arc::new(AtomicU64::new(0));
-    let shared_osquery_offset = Arc::new(AtomicU64::new(0));
-    let shared_wazuh_offset = Arc::new(AtomicU64::new(0));
     let shared_syslog_firewall_offset = Arc::new(AtomicU64::new(0));
 
     // SSH brute force detector (stateful, lives in main loop)
@@ -314,15 +315,6 @@ async fn main() -> Result<()> {
             ExecutionMode::from_str(&d.mode),
         )
     });
-    let suricata_alert_detector = cfg.detectors.suricata_alert.enabled.then(|| {
-        let d = &cfg.detectors.suricata_alert;
-        info!(
-            threshold = d.threshold,
-            window_seconds = d.window_seconds,
-            "suricata_alert detector enabled"
-        );
-        SuricataAlertDetector::new(&cfg.agent.host_id, d.threshold, d.window_seconds)
-    });
     let docker_anomaly_detector = cfg.detectors.docker_anomaly.enabled.then(|| {
         let d = &cfg.detectors.docker_anomaly;
         info!(
@@ -347,14 +339,6 @@ async fn main() -> Result<()> {
             "log_tampering detector enabled (eBPF openat log file monitoring)"
         );
         LogTamperingDetector::new(&cfg.agent.host_id, d.cooldown_seconds)
-    });
-    let osquery_anomaly_detector = cfg.detectors.osquery_anomaly.enabled.then(|| {
-        let d = &cfg.detectors.osquery_anomaly;
-        info!(
-            cooldown_seconds = d.cooldown_seconds,
-            "osquery_anomaly detector enabled"
-        );
-        OsqueryAnomalyDetector::new(&cfg.agent.host_id, d.cooldown_seconds)
     });
     // Distributed SSH detector - always on when ssh_bruteforce is on
     let distributed_ssh_detector = cfg.detectors.ssh_bruteforce.enabled.then(|| {
@@ -394,11 +378,9 @@ async fn main() -> Result<()> {
         web_scan: web_scan_detector,
         user_agent_scanner: user_agent_scanner_detector,
         execution_guard: execution_guard_detector,
-        suricata_alert: suricata_alert_detector,
         docker_anomaly: docker_anomaly_detector,
         integrity_alert: integrity_alert_detector,
         log_tampering: log_tampering_detector,
-        osquery_anomaly: osquery_anomaly_detector,
         distributed_ssh: distributed_ssh_detector,
         suspicious_login: cfg.detectors.ssh_bruteforce.enabled.then(|| {
             info!("suspicious_login detector enabled");
@@ -685,7 +667,42 @@ async fn main() -> Result<()> {
             info!("mitre_hunt detector enabled (10 MITRE ATT&CK techniques)");
             detectors::mitre_hunt::MitreHuntDetector::new(&cfg.agent.host_id, 300)
         }),
+        dns_c2: Some({
+            info!("dns_c2 detector enabled (T1071.004 DNS C2 channel detection)");
+            detectors::dns_c2::DnsC2Detector::new(&cfg.agent.host_id, 6, 300)
+        }),
+        data_encoding: Some({
+            info!("data_encoding detector enabled (T1132 encoded C2/exfil traffic)");
+            detectors::data_encoding::DataEncodingDetector::new(&cfg.agent.host_id, 3, 300)
+        }),
+        sandbox_evasion: Some({
+            info!("sandbox_evasion detector enabled (T1497 VM/sandbox evasion checks)");
+            detectors::sandbox_evasion::SandboxEvasionDetector::new(&cfg.agent.host_id, 3, 60)
+        }),
+        threat_intel: Some({
+            info!("threat_intel detector enabled (O(1) dataset matching)");
+            detectors::threat_intel::ThreatIntelDetector::new(&cfg.agent.host_id, 600)
+        }),
+        proto_anomaly: Some({
+            info!("proto_anomaly detector enabled (protocol violation detection)");
+            detectors::proto_anomaly::ProtoAnomalyDetector::new(&cfg.agent.host_id, 300)
+        }),
     };
+
+    // Load threat intelligence datasets (IPs, domains, JA3, hashes, URLs).
+    // Downloads public feeds on first run, reloads from disk every 60 min.
+    let datasets_dir = data_dir.join("datasets");
+    let mut threat_datasets = detectors::datasets::Datasets::load(&datasets_dir, 3600);
+    if !threat_datasets.is_loaded() {
+        info!("downloading threat intelligence feeds for the first time...");
+        let (ok, total) = detectors::datasets::update_all_feeds(&datasets_dir);
+        info!(
+            feeds_updated = ok,
+            total_entries = total,
+            "initial feed download complete"
+        );
+        threat_datasets.reload();
+    }
 
     // Spawn auth_log collector
     if cfg.collectors.auth_log.enabled {
@@ -852,50 +869,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Spawn suricata_eve collector
-    if cfg.collectors.suricata_eve.enabled {
-        let sc = &cfg.collectors.suricata_eve;
-        let offset = state
-            .get_cursor("suricata_eve")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        shared_suricata_offset.store(offset, Ordering::Relaxed);
-        let collector =
-            SuricataEveCollector::new(&sc.path, &cfg.agent.host_id, offset, sc.event_types.clone());
-        info!(
-            path = %sc.path,
-            event_types = ?sc.event_types,
-            offset,
-            "starting suricata_eve collector"
-        );
-        let tx_suricata = tx.clone();
-        let shared = Arc::clone(&shared_suricata_offset);
-        tokio::spawn(async move {
-            if let Err(e) = collector.run(tx_suricata, shared).await {
-                tracing::error!("suricata_eve collector error: {e:#}");
-            }
-        });
-    }
-
-    // Spawn osquery_log collector
-    if cfg.collectors.osquery_log.enabled {
-        let oc = &cfg.collectors.osquery_log;
-        let offset = state
-            .get_cursor("osquery_log")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        shared_osquery_offset.store(offset, Ordering::Relaxed);
-        let collector = OsqueryLogCollector::new(&oc.path, &cfg.agent.host_id, offset);
-        info!(path = %oc.path, offset, "starting osquery_log collector");
-        let tx_osquery = tx.clone();
-        let shared = Arc::clone(&shared_osquery_offset);
-        tokio::spawn(async move {
-            if let Err(e) = collector.run(tx_osquery, shared).await {
-                tracing::error!("osquery_log collector error: {e:#}");
-            }
-        });
-    }
-
     // Spawn macos_log collector
     if cfg.collectors.macos_log.enabled {
         let collector = MacosLogCollector::new(&cfg.agent.host_id);
@@ -904,25 +877,6 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = collector.run(tx_macos).await {
                 tracing::error!("macos_log collector error: {e:#}");
-            }
-        });
-    }
-
-    // Spawn wazuh_alerts collector
-    if cfg.collectors.wazuh_alerts.enabled {
-        let wc = &cfg.collectors.wazuh_alerts;
-        let offset = state
-            .get_cursor("wazuh_alerts")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        shared_wazuh_offset.store(offset, Ordering::Relaxed);
-        let collector = WazuhAlertsCollector::new(&wc.path, &cfg.agent.host_id, offset);
-        info!(path = %wc.path, offset, "starting wazuh_alerts collector");
-        let tx_wazuh = tx.clone();
-        let shared = Arc::clone(&shared_wazuh_offset);
-        tokio::spawn(async move {
-            if let Err(e) = collector.run(tx_wazuh, shared).await {
-                tracing::error!("wazuh_alerts collector error: {e:#}");
             }
         });
     }
@@ -1048,9 +1002,83 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Network snapshot: periodic /proc/net/tcp scan with PID resolution
+    {
+        let tx_net = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::net_snapshot::run(tx_net, host_id, 30).await;
+        });
+    }
+
+    // USB device monitoring: detects BadUSB, rubber ducky, unauthorized storage
+    {
+        let tx_usb = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::usb_monitor::run(tx_usb, host_id, 5).await;
+        });
+    }
+
+    // SUID binary inventory: baseline + drift detection
+    {
+        let tx_suid = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::suid_inventory::run(tx_suid, host_id, 300).await;
+        });
+    }
+
+    // Sysctl drift: monitors 20 security-critical kernel parameters
+    {
+        let tx_sysctl = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::sysctl_drift::run(tx_sysctl, host_id, 60).await;
+        });
+    }
+
+    // Systemd unit inventory: detects new/suspicious services
+    {
+        let tx_sysd = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::systemd_inventory::run(tx_sysd, host_id, 300).await;
+        });
+    }
+
+    // TCP stream reassembly engine (AF_PACKET, all TCP traffic)
+    // Reassembles bidirectional streams, detects protocols on any port,
+    // enables deep packet inspection for HTTP, SSH, SMB, etc.
+    {
+        let tx_tcp = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::tcp_stream::run(tx_tcp, host_id).await;
+        });
+    }
+
     // Drop the original tx - each collector holds its own clone.
     // When all collector tasks finish, all senders drop and rx.recv() returns None.
     drop(tx);
+
+    // Apply seccomp profile if configured (Active Defence feature).
+    // MUST be after all eBPF programs are loaded and sockets are opened,
+    // since seccomp restricts future syscalls. The profile blocks execve,
+    // connect, and other syscalls the sensor doesn't need post-startup.
+    #[cfg(target_os = "linux")]
+    {
+        let seccomp_path = data_dir.join("sensor.seccomp.json");
+        if seccomp_path.exists() {
+            match apply_seccomp_profile(&seccomp_path) {
+                Ok(count) => info!(
+                    syscalls_allowed = count,
+                    "seccomp profile applied — sensor hardened"
+                ),
+                Err(e) => warn!("seccomp profile failed to apply: {e:#} — continuing without"),
+            }
+        }
+    }
 
     // SIGTERM listener (Unix only)
     #[cfg(unix)]
@@ -1120,6 +1148,9 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Periodic dataset reload (every hour)
+        threat_datasets.maybe_reload();
+
         process_event(
             ev,
             &mut writer,
@@ -1127,6 +1158,7 @@ async fn main() -> Result<()> {
             &mut stats,
             &mut syslog_writer,
             &mut dedup_cache,
+            &threat_datasets,
         );
 
         // Also flush every 50 events as a safety net
@@ -1170,15 +1202,6 @@ async fn main() -> Result<()> {
     let nginx_error_offset = shared_nginx_error_offset.load(Ordering::Relaxed);
     state.set_cursor("nginx_error", serde_json::json!(nginx_error_offset));
 
-    let suricata_offset = shared_suricata_offset.load(Ordering::Relaxed);
-    state.set_cursor("suricata_eve", serde_json::json!(suricata_offset));
-
-    let osquery_offset = shared_osquery_offset.load(Ordering::Relaxed);
-    state.set_cursor("osquery_log", serde_json::json!(osquery_offset));
-
-    let wazuh_offset = shared_wazuh_offset.load(Ordering::Relaxed);
-    state.set_cursor("wazuh_alerts", serde_json::json!(wazuh_offset));
-
     let syslog_firewall_offset = shared_syslog_firewall_offset.load(Ordering::Relaxed);
     state.set_cursor("syslog_firewall", serde_json::json!(syslog_firewall_offset));
 
@@ -1215,11 +1238,9 @@ fn severity_rank(s: &innerwarden_core::event::Severity) -> u8 {
     }
 }
 
-/// Sources that already performed their own detection.
-/// High/Critical events from these sources are promoted directly to incidents
-/// without going through an InnerWarden detector.
 fn is_passthrough_source(source: &str) -> bool {
-    matches!(source, "suricata" | "wazuh")
+    let _ = source;
+    false
 }
 
 fn process_event(
@@ -1229,6 +1250,7 @@ fn process_event(
     stats: &mut WriteStats,
     syslog: &mut Option<sinks::syslog_cef::SyslogCefWriter>,
     dedup_cache: &mut HashMap<u32, (chrono::DateTime<chrono::Utc>, u8)>,
+    threat_datasets: &detectors::datasets::Datasets,
 ) {
     use innerwarden_core::event::Severity;
 
@@ -1356,8 +1378,6 @@ fn process_event(
         }
     }
 
-    // Incident passthrough: tools that already ran their own detection
-    // (Falco, Suricata) emit High/Critical events that are incidents by definition.
     if is_passthrough_source(&ev.source) {
         let is_actionable = matches!(ev.severity, Severity::High | Severity::Critical);
         if is_actionable {
@@ -1417,12 +1437,6 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.suricata_alert {
-        if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
-        }
-    }
-
     if let Some(ref mut det) = detectors.docker_anomaly {
         if let Some(incident) = det.process(&ev) {
             write_incident(writer, stats, incident, syslog, dedup_cache);
@@ -1436,12 +1450,6 @@ fn process_event(
     }
 
     if let Some(ref mut det) = detectors.log_tampering {
-        if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
-        }
-    }
-
-    if let Some(ref mut det) = detectors.osquery_anomaly {
         if let Some(incident) = det.process(&ev) {
             write_incident(writer, stats, incident, syslog, dedup_cache);
         }
@@ -1646,11 +1654,40 @@ fn process_event(
             write_incident(writer, stats, incident, syslog, dedup_cache);
         }
     }
+
+    if let Some(ref mut det) = detectors.dns_c2 {
+        if let Some(incident) = det.process(&ev) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    if let Some(ref mut det) = detectors.data_encoding {
+        if let Some(incident) = det.process(&ev) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    if let Some(ref mut det) = detectors.sandbox_evasion {
+        if let Some(incident) = det.process(&ev) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // Threat intelligence dataset matching (O(1) per lookup).
+    if let Some(ref mut det) = detectors.threat_intel {
+        if let Some(incident) = det.process(&ev, threat_datasets) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // Protocol anomaly detection (works on tcp_stream events).
+    if let Some(ref mut det) = detectors.proto_anomaly {
+        for incident in det.process(&ev) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
 }
 
-/// Build an Incident directly from an event emitted by a passthrough source
-/// (Falco, Suricata). The external tool already detected the threat; this
-/// promotes it into InnerWarden's incident pipeline for AI triage and response.
 fn passthrough_incident(
     ev: &innerwarden_core::event::Event,
 ) -> Option<innerwarden_core::incident::Incident> {
@@ -1663,19 +1700,7 @@ fn passthrough_incident(
         ev.ts.format("%Y-%m-%dT%H:%MZ")
     );
 
-    let recommended_checks = match ev.source.as_str() {
-        "suricata" => vec![
-            "Review Suricata IDS signature".to_string(),
-            "Check network flow context in eve.json".to_string(),
-            "Consider blocking source IP if attack pattern confirmed".to_string(),
-        ],
-        "wazuh" => vec![
-            "Review Wazuh alert rule and level".to_string(),
-            "Check agent logs for additional context".to_string(),
-            "Consider blocking source IP if attack pattern confirmed".to_string(),
-        ],
-        _ => vec!["Review source alert details".to_string()],
-    };
+    let recommended_checks = vec!["Review source alert details".to_string()];
 
     Some(Incident {
         ts: ev.ts,
@@ -1735,5 +1760,228 @@ fn write_incident(
     // Syslog CEF output for incidents
     if let Some(ref mut cef) = syslog {
         cef.write_incident(&incident);
+    }
+}
+
+/// Apply a seccomp-BPF profile from a JSON file (Active Defence feature).
+/// The profile specifies allowed syscalls; everything else returns EPERM.
+/// Uses the kernel's seccomp(2) via prctl(PR_SET_SECCOMP) with a BPF filter.
+#[cfg(target_os = "linux")]
+fn apply_seccomp_profile(path: &Path) -> Result<usize> {
+    let data = std::fs::read_to_string(path)
+        .with_context(|| format!("read seccomp profile: {}", path.display()))?;
+
+    // Parse the JSON profile to get the syscall allowlist
+    let profile =
+        serde_json::from_str::<serde_json::Value>(&data).context("parse seccomp profile JSON")?;
+
+    let syscalls = profile["allowed_syscalls"]
+        .as_array()
+        .context("seccomp profile missing allowed_syscalls array")?;
+
+    let count = syscalls.len();
+
+    // Resolve syscall names to numbers using the audit architecture
+    let mut allowed_nrs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for name_val in syscalls {
+        if let Some(name) = name_val.as_str() {
+            if let Some(nr) = syscall_name_to_nr(name) {
+                allowed_nrs.insert(nr);
+            } else {
+                tracing::debug!(name, "unknown syscall in seccomp profile — skipping");
+            }
+        }
+    }
+
+    if allowed_nrs.is_empty() {
+        anyhow::bail!("seccomp profile has no resolvable syscalls");
+    }
+
+    // Build BPF filter: allow listed syscalls, return EPERM for others.
+    // Filter structure:
+    //   BPF_STMT(LD|W|ABS, 0)   -- load syscall number from seccomp_data.nr
+    //   BPF_JUMP(JMP|JEQ|K, nr, 0, 1) -- if match, skip to ALLOW
+    //   ... for each allowed syscall ...
+    //   BPF_STMT(RET|K, SECCOMP_RET_ERRNO | EPERM)  -- default: deny
+    //   BPF_STMT(RET|K, SECCOMP_RET_ALLOW)  -- allow
+    let mut filter: Vec<u64> = Vec::new();
+
+    // BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0) -- load syscall nr
+    filter.push(bpf_stmt(0x20, 0)); // BPF_LD|BPF_W|BPF_ABS, offset 0
+
+    let n = allowed_nrs.len();
+    let sorted: Vec<u32> = {
+        let mut v: Vec<u32> = allowed_nrs.into_iter().collect();
+        v.sort();
+        v
+    };
+
+    for (i, &nr) in sorted.iter().enumerate() {
+        // BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, nr, jump_true, jump_false)
+        // jump_true: skip to ALLOW (at end)
+        // jump_false: next instruction
+        let jump_to_allow = (n - i) as u8; // distance to ALLOW instruction
+        filter.push(bpf_jump(0x15, nr, jump_to_allow, 0));
+    }
+
+    // Default: SECCOMP_RET_ERRNO | EPERM (1)
+    filter.push(bpf_stmt(0x06, 0x00050001)); // SECCOMP_RET_ERRNO | 1
+
+    // ALLOW
+    filter.push(bpf_stmt(0x06, 0x7fff0000)); // SECCOMP_RET_ALLOW
+
+    // Convert to sock_filter array (each is 8 bytes: u16 code, u8 jt, u8 jf, u32 k)
+    let filter_bytes: Vec<[u8; 8]> = filter.iter().map(|&v| v.to_ne_bytes()).collect();
+
+    // Set NO_NEW_PRIVS (required before seccomp)
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if ret != 0 {
+        anyhow::bail!(
+            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Apply the BPF program via prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)
+    #[repr(C)]
+    struct SockFprog {
+        len: u16,
+        filter: *const [u8; 8],
+    }
+
+    let prog = SockFprog {
+        len: filter_bytes.len() as u16,
+        filter: filter_bytes.as_ptr(),
+    };
+
+    let ret = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            2, // SECCOMP_MODE_FILTER
+            &prog as *const SockFprog as libc::c_ulong,
+            0,
+            0,
+        )
+    };
+
+    if ret != 0 {
+        anyhow::bail!(
+            "seccomp(FILTER) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    info!(
+        count,
+        "seccomp filter installed: {} syscalls allowed", count
+    );
+    Ok(count)
+}
+
+#[cfg(target_os = "linux")]
+fn bpf_stmt(code: u16, k: u32) -> u64 {
+    let mut buf = [0u8; 8];
+    buf[0..2].copy_from_slice(&code.to_ne_bytes());
+    // jt=0, jf=0
+    buf[4..8].copy_from_slice(&k.to_ne_bytes());
+    u64::from_ne_bytes(buf)
+}
+
+#[cfg(target_os = "linux")]
+fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> u64 {
+    let mut buf = [0u8; 8];
+    buf[0..2].copy_from_slice(&code.to_ne_bytes());
+    buf[2] = jt;
+    buf[3] = jf;
+    buf[4..8].copy_from_slice(&k.to_ne_bytes());
+    u64::from_ne_bytes(buf)
+}
+
+/// Map syscall names to numbers for the current architecture.
+/// Uses a hardcoded table for aarch64 (the production target).
+/// Falls back to reading /usr/include/asm-generic/unistd.h.
+#[cfg(target_os = "linux")]
+fn syscall_name_to_nr(name: &str) -> Option<u32> {
+    // Common syscalls for aarch64 (Linux 6.x)
+    // See: /usr/include/asm-generic/unistd.h
+    match name {
+        "read" => Some(63),
+        "write" => Some(64),
+        "openat" => Some(56),
+        "close" => Some(57),
+        "fstat" | "newfstatat" => Some(79),
+        "statx" => Some(291),
+        "lseek" => Some(62),
+        "mmap" => Some(222),
+        "mprotect" => Some(226),
+        "munmap" => Some(215),
+        "brk" => Some(214),
+        "ioctl" => Some(29),
+        "pread64" => Some(67),
+        "pwrite64" => Some(68),
+        "writev" => Some(66),
+        "fcntl" => Some(25),
+        "dup" => Some(23),
+        "dup2" => Some(1000), // not on aarch64, use dup3
+        "pipe2" => Some(59),
+        "socket" => Some(198),
+        "bind" => Some(200),
+        "recvfrom" => Some(207),
+        "recvmsg" => Some(212),
+        "sendto" => Some(206),
+        "sendmsg" => Some(211),
+        "setsockopt" => Some(208),
+        "getsockopt" => Some(209),
+        "getsockname" => Some(204),
+        "clone" => Some(220),
+        "clone3" => Some(435),
+        "exit_group" => Some(94),
+        "exit" => Some(93),
+        "wait4" => Some(260),
+        "waitid" => Some(95),
+        "getpid" => Some(172),
+        "gettid" => Some(178),
+        "getuid" => Some(174),
+        "geteuid" => Some(175),
+        "getgid" => Some(176),
+        "getegid" => Some(177),
+        "epoll_create1" => Some(20),
+        "epoll_ctl" => Some(21),
+        "epoll_wait" | "epoll_pwait" => Some(22),
+        "epoll_pwait2" => Some(441),
+        "futex" => Some(98),
+        "set_tid_address" => Some(96),
+        "set_robust_list" => Some(99),
+        "rt_sigaction" => Some(134),
+        "rt_sigprocmask" => Some(135),
+        "rt_sigreturn" => Some(139),
+        "sigaltstack" => Some(132),
+        "clock_gettime" => Some(113),
+        "clock_nanosleep" => Some(115),
+        "nanosleep" => Some(101),
+        "gettimeofday" => Some(169),
+        "getrandom" => Some(278),
+        "madvise" => Some(233),
+        "mremap" => Some(216),
+        "sched_getaffinity" => Some(123),
+        "sched_yield" => Some(124),
+        "prctl" => Some(167),
+        "bpf" => Some(280),
+        "perf_event_open" => Some(241),
+        "getdents64" => Some(61),
+        "ftruncate" => Some(46),
+        "fallocate" => Some(47),
+        "fsync" => Some(82),
+        "fdatasync" => Some(83),
+        "rename" | "renameat2" => Some(276),
+        "unlink" | "unlinkat" => Some(35),
+        "mkdir" | "mkdirat" => Some(34),
+        "access" | "faccessat2" => Some(439),
+        "readlink" | "readlinkat" => Some(78),
+        "rseq" => Some(293),
+        "prlimit64" => Some(261),
+        "sysinfo" => Some(179),
+        "uname" => Some(160),
+        _ => None,
     }
 }

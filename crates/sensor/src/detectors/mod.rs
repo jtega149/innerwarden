@@ -79,14 +79,12 @@ pub mod fileless;
 pub mod integrity_alert;
 pub mod lateral_movement;
 pub mod log_tampering;
-pub mod osquery_anomaly;
 pub mod port_scan;
 pub mod privesc;
 pub mod process_tree;
 pub mod search_abuse;
 pub mod ssh_bruteforce;
 pub mod sudo_abuse;
-pub mod suricata_alert;
 pub mod user_agent_scanner;
 pub mod web_scan;
 
@@ -120,3 +118,11 @@ pub mod sigma_rule;
 #[allow(dead_code)]
 pub mod stego_detect;
 pub mod yara_scan;
+
+// v0.10.1 detectors — MITRE gap closers
+pub mod data_encoding;
+pub mod datasets;
+pub mod dns_c2;
+pub mod proto_anomaly;
+pub mod sandbox_evasion;
+pub mod threat_intel;

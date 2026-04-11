@@ -14,6 +14,7 @@ mod baseline;
 mod bot_actions;
 mod bot_commands;
 mod bot_helpers;
+mod briefing;
 mod cloud_safelist;
 mod cloudflare;
 mod config;
@@ -62,6 +63,7 @@ mod incident_reputation;
 mod ioc;
 mod ip_reputation;
 mod killchain_inline;
+mod knowledge_graph;
 mod mesh;
 mod mitre;
 mod narrative;
@@ -83,6 +85,7 @@ mod reader;
 #[cfg(feature = "redis-reader")]
 mod redis_reader;
 mod report;
+mod response_lifecycle;
 mod scoring;
 mod shield_inline;
 mod skills;
@@ -391,6 +394,9 @@ struct AgentState {
     /// XDP blocklist entries with timestamps and per-IP TTL for adaptive expiration.
     /// Periodically cleaned: IPs older than their individual TTL are removed.
     xdp_block_times: HashMap<String, (chrono::DateTime<chrono::Utc>, i64)>,
+    /// Unified response lifecycle: tracks all active responses (block IP, container,
+    /// nginx, sudo) with TTL, auto-revert, manual revert, and Prometheus metrics.
+    response_lifecycle: response_lifecycle::ResponseLifecycle,
     /// AbuseIPDB report queue - IPs are held for ABUSEIPDB_REPORT_DELAY_SECS
     /// before reporting, giving time for false-positive correction.
     abuseipdb_report_queue: Vec<(String, String, String, chrono::DateTime<chrono::Utc>)>,
@@ -446,6 +452,11 @@ struct AgentState {
         Option<std::sync::Arc<std::sync::RwLock<dashboard::DeepSecuritySnapshot>>>,
     /// Timestamp of last DNA state persistence.
     last_dna_save: std::time::Instant,
+    /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
+    /// Hot-reloaded every 60s. Merged with static config allowlist at check time.
+    dynamic_trusted_ips: Vec<String>,
+    dynamic_trusted_users: Vec<String>,
+    dynamic_trusted_processes: Vec<String>,
     /// IPs of active operator SSH sessions (trusted_users). Never blocked.
     /// Value = last time the session was confirmed active via `who`.
     operator_ips: std::collections::HashMap<String, std::time::Instant>,
@@ -464,6 +475,12 @@ struct AgentState {
     latest_anomaly_score: Option<f32>,
     /// Two-factor authentication state (pending actions, brute force protection).
     two_factor_state: two_factor::TwoFactorState,
+    /// Knowledge graph — in-memory directed graph for attack context (shared with dashboard).
+    knowledge_graph: std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
+    /// Graph-based detector state (cooldowns).
+    graph_detector_state: knowledge_graph::detectors::GraphDetectorState,
+    /// Timestamp of last knowledge graph snapshot save.
+    last_graph_snapshot: std::time::Instant,
     /// Redis stream reader for events (None when redis_url is not configured).
     #[cfg(feature = "redis-reader")]
     redis_reader: Option<redis_reader::RedisStreamReader>,
@@ -578,6 +595,11 @@ async fn main() -> Result<()> {
         dashboard::DeepSecuritySnapshot::default(),
     ));
 
+    // Shared knowledge graph: loaded from today's dated snapshot (Phase 7: daily snapshots).
+    let shared_graph = std::sync::Arc::new(std::sync::RwLock::new(
+        knowledge_graph::KnowledgeGraph::load_today_snapshot(&cli.data_dir),
+    ));
+
     // Advisory cache: shared between dashboard (writes advisory denials) and
     // the incident processing loop (checks for advisory violations).
     let advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>> =
@@ -627,6 +649,8 @@ async fn main() -> Result<()> {
             retention_decisions_days: cfg.data.decisions_keep_days,
             retention_telemetry_days: cfg.data.telemetry_keep_days,
             retention_reports_days: cfg.data.reports_keep_days,
+            trusted_ips: cfg.allowlist.trusted_ips.clone(),
+            trusted_users: cfg.allowlist.trusted_users.clone(),
         };
         let dashboard_data_dir = cli.data_dir.clone();
         let dashboard_bind = cli.dashboard_bind.clone();
@@ -647,6 +671,21 @@ async fn main() -> Result<()> {
 
         let agent_alert_tx = agent_alert_tx.clone();
         let deep_security = deep_security_snapshot.clone();
+        let dashboard_graph = shared_graph.clone();
+        let dashboard_ai: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.enabled {
+            match ai::build_provider(&cfg.ai) {
+                Ok(p) => Some(Arc::from(p)),
+                Err(e) => {
+                    warn!("briefing AI provider failed: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
+        let briefing_hour = cfg.briefing.hour;
+        let briefing_minute = cfg.briefing.minute;
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -661,6 +700,11 @@ async fn main() -> Result<()> {
                 rule_engine,
                 agent_alert_tx,
                 deep_security,
+                dashboard_graph,
+                dashboard_ai,
+                dashboard_briefing,
+                briefing_hour,
+                briefing_minute,
             )
             .await
             {
@@ -1034,6 +1078,7 @@ async fn main() -> Result<()> {
         },
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
+        response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(&cli.data_dir),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
         narrative_incidents_offset: 0,
@@ -1075,6 +1120,9 @@ async fn main() -> Result<()> {
         },
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
+        dynamic_trusted_ips: Vec::new(),
+        dynamic_trusted_users: Vec::new(),
+        dynamic_trusted_processes: Vec::new(),
         operator_ips: std::collections::HashMap::new(),
         last_operator_refresh: std::time::Instant::now(),
         suppressed_incident_ids: firmware_tick::load_suppressed_ids(&cli.data_dir),
@@ -1083,6 +1131,9 @@ async fn main() -> Result<()> {
         last_autoencoder_anomaly_ts: None,
         latest_anomaly_score: None,
         two_factor_state: two_factor::TwoFactorState::new(),
+        knowledge_graph: shared_graph.clone(),
+        graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
+        last_graph_snapshot: std::time::Instant::now(),
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
     };
@@ -1164,6 +1215,27 @@ async fn main() -> Result<()> {
 
     let state_path = cli.data_dir.join("agent-state.json");
     let mut cursor = reader::AgentCursor::load(&state_path)?;
+
+    // Phase 6: detect stale cursor — if graph event counters are empty but cursor
+    // is advanced, reset cursor to re-ingest events and rebuild telemetry counters.
+    {
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let graph_has_counters = {
+            let g = state.knowledge_graph.read().unwrap();
+            g.total_events_ingested > 0
+        };
+        let cursor_offset = cursor.events_offset(&today);
+        if !graph_has_counters && cursor_offset > 0 {
+            info!(
+                old_offset = cursor_offset,
+                "resetting events cursor: graph counters empty but cursor advanced (snapshot/cursor race)"
+            );
+            cursor.set_events_offset(&today, 0);
+        }
+    }
 
     // Initialize narrative offset from cursor so we don't re-read all incidents on restart
     {
@@ -1356,6 +1428,27 @@ async fn main() -> Result<()> {
                         state.last_operator_refresh = std::time::Instant::now();
                     }
 
+                    // Hot-reload dynamic allowlist from /etc/innerwarden/allowlist.toml.
+                    // Operators can add IPs/users/processes via Telegram or by editing the file.
+                    {
+                        let allowlist_path = std::path::Path::new("/etc/innerwarden/allowlist.toml");
+                        if allowlist_path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(allowlist_path) {
+                                if let Ok(table) = content.parse::<toml::Table>() {
+                                    let extract = |key: &str| -> Vec<String> {
+                                        table.get(key)
+                                            .and_then(|v| v.as_table())
+                                            .map(|t| t.keys().cloned().collect())
+                                            .unwrap_or_default()
+                                    };
+                                    state.dynamic_trusted_ips = extract("ips");
+                                    state.dynamic_trusted_users = extract("users");
+                                    state.dynamic_trusted_processes = extract("processes");
+                                }
+                            }
+                        }
+                    }
+
                     // Autoencoder nightly training — at 3 AM UTC.
                     {
                         let hour = chrono::Utc::now().hour();
@@ -1436,6 +1529,12 @@ async fn main() -> Result<()> {
                     persist_ip_reputations(&cli.data_dir, &state.ip_reputations);
 
                     // ── Safeguard: XDP TTL - expire old blocklist entries ──
+                    //
+                    // Only removes the local bookkeeping entry after the kernel
+                    // command succeeds (or confirms the entry was already gone).
+                    // Transient failures keep the local state so a subsequent
+                    // tick retries — preventing drift between `xdp_block_times`
+                    // and the actual blocklist BPF map.
                     {
                         let now_utc = chrono::Utc::now();
                         let expired_ips: Vec<String> = state.xdp_block_times
@@ -1447,19 +1546,168 @@ async fn main() -> Result<()> {
                             .map(|(ip, _)| ip.clone())
                             .collect();
                         for ip in &expired_ips {
-                            // Remove from XDP blocklist via bpftool
-                            if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
-                                let b = addr.octets();
-                                let _ = tokio::process::Command::new("sudo")
-                                    .args(["bpftool", "map", "delete", "pinned",
-                                        "/sys/fs/bpf/innerwarden/blocklist",
-                                        "key", &b[0].to_string(), &b[1].to_string(),
-                                        &b[2].to_string(), &b[3].to_string()])
-                                    .output().await;
-                                let ttl_secs = state.xdp_block_times.get(ip).map(|(_, t)| *t).unwrap_or(0);
-                                info!(ip, ttl_secs, "XDP adaptive TTL expired - removed from blocklist");
+                            let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else {
+                                // Not parseable — drop from state to avoid a
+                                // poison entry; can't act on kernel anyway.
+                                warn!(ip, "XDP cleanup: unparseable IP in xdp_block_times, dropping local entry");
+                                state.xdp_block_times.remove(ip);
+                                continue;
+                            };
+                            let b = addr.octets();
+                            let ttl_secs = state.xdp_block_times.get(ip).map(|(_, t)| *t).unwrap_or(0);
+                            let output = tokio::process::Command::new("sudo")
+                                .args(["bpftool", "map", "delete", "pinned",
+                                    "/sys/fs/bpf/innerwarden/blocklist",
+                                    "key", &b[0].to_string(), &b[1].to_string(),
+                                    &b[2].to_string(), &b[3].to_string()])
+                                .output().await;
+                            match output {
+                                Ok(out) if out.status.success() => {
+                                    state.xdp_block_times.remove(ip);
+                                    info!(ip, ttl_secs, "XDP adaptive TTL expired - removed from blocklist");
+                                }
+                                Ok(out) => {
+                                    let stderr = String::from_utf8_lossy(&out.stderr);
+                                    let lower = stderr.to_lowercase();
+                                    // Same classifier as response_lifecycle: if the
+                                    // entry is already gone, call it a success.
+                                    let already_absent = lower.contains("no such")
+                                        || lower.contains("not found")
+                                        || lower.contains("does not exist");
+                                    if already_absent {
+                                        state.xdp_block_times.remove(ip);
+                                        info!(ip, ttl_secs, "XDP cleanup: entry already absent in kernel map, local state cleared");
+                                    } else {
+                                        warn!(
+                                            ip,
+                                            ttl_secs,
+                                            status = ?out.status,
+                                            stderr = %stderr.trim(),
+                                            "XDP cleanup FAILED - keeping local state to retry next tick (kernel/local drift protection)"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        ip,
+                                        error = %e,
+                                        "XDP cleanup: bpftool spawn failed - keeping local state to retry next tick"
+                                    );
+                                }
                             }
-                            state.xdp_block_times.remove(ip);
+                        }
+                    }
+
+                    // ── Response Lifecycle: unified TTL cleanup ──
+                    // Handles auto-revert for ufw, iptables, nftables (backends that
+                    // didn't have TTL before). XDP/container/nginx/sudo still use
+                    // their existing cleanup above; the lifecycle tracks them for
+                    // dashboard visibility.
+                    //
+                    // State machine: stage_pending_reverts transitions Active→RevertPending
+                    // (or restages RevertFailed with retry budget); we then execute each
+                    // revert and report back via mark_reverted / mark_revert_failed.
+                    // Entries are NEVER declared complete until the backend command has
+                    // confirmed success (or been classified as already_absent). Orphaned
+                    // entries — retries exhausted — are logged at WARN level; dashboards
+                    // and Prometheus surface the drift.
+                    {
+                        let reverts = state.response_lifecycle.stage_pending_reverts();
+                        let mut n_ok = 0usize;
+                        let mut n_orphaned = 0usize;
+                        for revert in &reverts {
+                            match response_lifecycle::execute_revert(revert, cfg.responder.dry_run).await {
+                                Ok(()) => {
+                                    state.response_lifecycle.mark_reverted(&revert.id, "expired");
+                                    n_ok += 1;
+                                }
+                                Err(err) => {
+                                    let outcome = state
+                                        .response_lifecycle
+                                        .mark_revert_failed(&revert.id, err.clone());
+                                    if let response_lifecycle::FailureOutcome::Orphaned {
+                                        backend,
+                                        target,
+                                        last_error,
+                                        ..
+                                    } = outcome
+                                    {
+                                        n_orphaned += 1;
+                                        // Surface is deliberately WARN log +
+                                        // Prometheus counter + dashboard state,
+                                        // not push notification. Orphaned means
+                                        // "local/kernel state drift" — that's an
+                                        // observability concern for a technical
+                                        // operator watching logs/metrics, not an
+                                        // interrupt-worthy pager event. Telegram
+                                        // and Slack pushes are reserved for
+                                        // incident-level signals.
+                                        warn!(
+                                            id = %revert.id,
+                                            ?backend,
+                                            %target,
+                                            %last_error,
+                                            "response ORPHANED — rule may still be active; check responses dashboard"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if n_ok > 0 || n_orphaned > 0 {
+                            info!(
+                                reverted = n_ok,
+                                orphaned = n_orphaned,
+                                "response lifecycle tick"
+                            );
+                        }
+                        // Persist snapshot for dashboard /api/responses endpoint.
+                        let json = state.response_lifecycle.to_json();
+                        let path = cli.data_dir.join("responses.json");
+                        if let Ok(data) = serde_json::to_string(&json) {
+                            let _ = tokio::fs::write(&path, data).await;
+                        }
+                    }
+
+                    // ── Neural score → BPF map (Active Defence) ──
+                    // Write the latest anomaly score to the kernel's NEURAL_SCORE map
+                    // so the LSM hook can enforce ML-based decisions at wire speed.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let score = state.anomaly_engine.latest_score();
+                        if score > 0.0 {
+                            let score_fixed = (score * 65536.0) as i32; // Q16.16
+                            let threshold_fixed = (0.75_f32 * 65536.0) as i32; // default 0.75
+                            const NEURAL_SCORE_PIN: &str = "/sys/fs/bpf/innerwarden/neural_score";
+                            if std::path::Path::new(NEURAL_SCORE_PIN).exists() {
+                                // Write score (key 0)
+                                let _ = tokio::process::Command::new("sudo")
+                                    .args([
+                                        "bpftool", "map", "update", "pinned", NEURAL_SCORE_PIN,
+                                        "key", "0", "0", "0", "0",
+                                        "value",
+                                        &(score_fixed as u32 & 0xff).to_string(),
+                                        &((score_fixed as u32 >> 8) & 0xff).to_string(),
+                                        &((score_fixed as u32 >> 16) & 0xff).to_string(),
+                                        &((score_fixed as u32 >> 24) & 0xff).to_string(),
+                                        "any",
+                                    ])
+                                    .output()
+                                    .await;
+                                // Write threshold (key 1)
+                                let _ = tokio::process::Command::new("sudo")
+                                    .args([
+                                        "bpftool", "map", "update", "pinned", NEURAL_SCORE_PIN,
+                                        "key", "1", "0", "0", "0",
+                                        "value",
+                                        &(threshold_fixed as u32 & 0xff).to_string(),
+                                        &((threshold_fixed as u32 >> 8) & 0xff).to_string(),
+                                        &((threshold_fixed as u32 >> 16) & 0xff).to_string(),
+                                        &((threshold_fixed as u32 >> 24) & 0xff).to_string(),
+                                        "any",
+                                    ])
+                                    .output()
+                                    .await;
+                            }
                         }
                     }
 
@@ -2064,6 +2312,14 @@ async fn process_incidents(
     let all_incidents: Vec<&innerwarden_core::incident::Incident> =
         new_incidents.entries.iter().chain(neural.iter()).collect();
 
+    // Feed incidents into knowledge graph
+    {
+        let mut graph = state.knowledge_graph.write().unwrap();
+        for incident in &all_incidents {
+            graph.ingest_incident(incident);
+        }
+    }
+
     // Feed incidents into DNA attack chain tracker (MITRE ATT&CK progression).
     if cfg.dna.enabled {
         let incident_refs: Vec<innerwarden_core::incident::Incident> =
@@ -2077,6 +2333,44 @@ async fn process_incidents(
 
     for incident in &all_incidents {
         state.telemetry.observe_incident(incident);
+
+        // Dedup: suppress sensor incident if graph handles this detector
+        {
+            let sensor_detector = incident.incident_id.split(':').next().unwrap_or("");
+            let entity_value = incident
+                .entities
+                .first()
+                .map(|e| e.value.as_str())
+                .unwrap_or("");
+
+            // Phase 3D: if detector is in graph_only_detectors, always suppress sensor version
+            if cfg
+                .graph_only_detectors
+                .iter()
+                .any(|d| d == sensor_detector)
+            {
+                tracing::debug!(
+                    incident_id = %incident.incident_id,
+                    "sensor incident suppressed: detector is graph-only"
+                );
+                handled += 1;
+                continue;
+            }
+
+            // Otherwise, suppress if graph recently detected same entity
+            if state.graph_detector_state.should_suppress_sensor(
+                sensor_detector,
+                entity_value,
+                chrono::Utc::now(),
+            ) {
+                tracing::debug!(
+                    incident_id = %incident.incident_id,
+                    "sensor incident suppressed: graph already detected"
+                );
+                handled += 1;
+                continue;
+            }
+        }
 
         // VirusTotal enrichment: when YARA scanner detects a binary, check its
         // SHA-256 hash against VT. Result logged for operator context.
@@ -2144,6 +2438,14 @@ async fn process_incidents(
             ai_calls_this_tick,
         ) {
             incident_flow::PreAiFlowDecision::Proceed => {}
+            incident_flow::PreAiFlowDecision::SkipAllowlisted => {
+                // Mark the incident node as allowlisted in the knowledge graph
+                let mut graph = state.knowledge_graph.write().unwrap();
+                graph.set_allowlisted(&incident.incident_id, true);
+                drop(graph);
+                handled += 1;
+                continue;
+            }
             incident_flow::PreAiFlowDecision::SkipHandled
             | incident_flow::PreAiFlowDecision::PipelineTestHandled => {
                 handled += 1;
@@ -2230,6 +2532,25 @@ async fn process_incidents(
             ip_reputation.as_ref(),
         );
 
+        // Build graph context: attack narrative from knowledge graph neighborhood.
+        // Phase 015: prefer the Incident node as center (richest context after 014-D
+        // incident enrichment links incidents to processes), fall back to entity nodes.
+        let graph_context = {
+            let graph = state.knowledge_graph.read().unwrap();
+            let center_node = graph.find_by_incident(&incident.incident_id).or_else(|| {
+                incident.entities.iter().find_map(|e| match e.r#type {
+                    innerwarden_core::entities::EntityType::Ip => graph.find_by_ip(&e.value),
+                    innerwarden_core::entities::EntityType::User => graph.find_by_user(&e.value),
+                    innerwarden_core::entities::EntityType::Path => graph.find_by_path(&e.value),
+                    innerwarden_core::entities::EntityType::Container => {
+                        graph.find_by_container(&e.value)
+                    }
+                    _ => None,
+                })
+            });
+            center_node.map(|node| graph.attack_narrative(node, 3))
+        };
+
         let ctx = ai::DecisionContext {
             incident,
             recent_events: ai_context_inputs.recent_events,
@@ -2244,6 +2565,7 @@ async fn process_incidents(
                 .collect(),
             ip_reputation: ip_reputation.clone(),
             ip_geo: ip_geo.clone(),
+            graph_context,
         };
 
         state.telemetry.observe_ai_sent();
@@ -2312,6 +2634,36 @@ async fn process_incidents(
             cfg,
             state,
         );
+
+        // Feed decision into knowledge graph
+        {
+            let (action_type, action_target) = match &decision.action {
+                ai::AiAction::BlockIp { ip, .. } => ("block_ip", Some(ip.as_str())),
+                ai::AiAction::Monitor { ip } => ("monitor", Some(ip.as_str())),
+                ai::AiAction::Honeypot { ip } => ("honeypot", Some(ip.as_str())),
+                ai::AiAction::SuspendUserSudo { user, .. } => {
+                    ("suspend_user_sudo", Some(user.as_str()))
+                }
+                ai::AiAction::KillProcess { user, .. } => ("kill_process", Some(user.as_str())),
+                ai::AiAction::BlockContainer { container_id, .. } => {
+                    ("block_container", Some(container_id.as_str()))
+                }
+                ai::AiAction::Ignore { .. } => ("ignore", None),
+                ai::AiAction::RequestConfirmation { .. } => ("request_confirmation", None),
+                ai::AiAction::KillChainResponse { .. } => ("kill_chain_response", None),
+            };
+            let auto_executed = decision.auto_execute && !execution_result.is_empty();
+            let mut graph = state.knowledge_graph.write().unwrap();
+            graph.ingest_decision(
+                &incident.incident_id,
+                action_type,
+                action_target,
+                decision.confidence,
+                &decision.reason,
+                auto_executed,
+                chrono::Utc::now(),
+            );
+        }
 
         incident_playbook::maybe_evaluate_and_persist_playbook(incident, data_dir, state);
 
@@ -2864,6 +3216,96 @@ async fn process_narrative_tick(
     state.narrative_acc.reset_for_date(&today);
     state.narrative_acc.ingest_events(&events_entries);
 
+    // Feed events into knowledge graph (in-memory attack context)
+    let trigger_incidents = {
+        let mut graph = state.knowledge_graph.write().unwrap();
+        // Set host label for trigger incidents (once)
+        if graph.trigger_host.is_empty() {
+            let host_label = graph
+                .system_node()
+                .and_then(|id| graph.get_node(id))
+                .map(|n| n.label())
+                .unwrap_or_else(|| "unknown".to_string());
+            graph.set_trigger_host(&host_label);
+        }
+        for ev in &events_entries {
+            graph.ingest(ev);
+        }
+        graph.drain_trigger_incidents()
+    };
+
+    // Process real-time trigger incidents (CRITICAL detectors, <2s latency)
+    if !trigger_incidents.is_empty() {
+        tracing::info!(count = trigger_incidents.len(), "real-time triggers fired");
+        // Ingest trigger incidents into the graph
+        {
+            let mut graph = state.knowledge_graph.write().unwrap();
+            for inc in &trigger_incidents {
+                graph.ingest_incident(inc);
+            }
+        }
+        // Phase 6E: trigger incidents are already in the knowledge graph
+        // (ingested above). No separate JSONL write needed.
+    }
+
+    // Periodic graph maintenance (cleanup expired + dated snapshot every 60s)
+    if state.last_graph_snapshot.elapsed().as_secs() >= 60 {
+        {
+            let mut graph = state.knowledge_graph.write().unwrap();
+            graph.cleanup_expired(chrono::Utc::now());
+            graph.compact_edges();
+            graph.enforce_memory_limit();
+            // Phase 7: save to dated snapshot (graph-snapshot-YYYY-MM-DD.json)
+            if let Err(e) = graph.save_dated_snapshot(data_dir) {
+                warn!("knowledge graph snapshot failed: {e:#}");
+            }
+            let metrics = graph.metrics();
+            if let Ok(json) = serde_json::to_vec(&metrics) {
+                let _ = std::fs::write(data_dir.join("graph-stats.json"), json);
+            }
+            // Phase 7: cleanup old snapshots (keep 7 days)
+            knowledge_graph::KnowledgeGraph::cleanup_old_snapshots(data_dir, 7);
+        }
+        state.last_graph_snapshot = std::time::Instant::now();
+    }
+
+    // Update neural autoencoder with graph structural features
+    {
+        let graph = state.knowledge_graph.read().unwrap();
+        let gf = graph.extract_neural_features();
+        state.anomaly_engine.set_graph_features(gf);
+    }
+
+    // Run graph-based detectors (parallel to sensor detectors)
+    {
+        let (graph_incidents, _host_label) = {
+            let graph = state.knowledge_graph.read().unwrap();
+            let host = graph
+                .system_node()
+                .and_then(|id| graph.get_node(id))
+                .map(|n| n.label())
+                .unwrap_or_else(|| "unknown".to_string());
+            let incidents = knowledge_graph::detectors::run_all(
+                &graph,
+                &mut state.graph_detector_state,
+                &host,
+                chrono::Utc::now(),
+            );
+            (incidents, host)
+        };
+        {
+            let mut graph = state.knowledge_graph.write().unwrap();
+            for inc in &graph_incidents {
+                graph.ingest_incident(inc);
+            }
+        }
+        if !graph_incidents.is_empty() {
+            // Phase 6E: graph detector incidents are already in the knowledge graph
+            // (ingested above). No separate JSONL write needed.
+            tracing::info!(count = graph_incidents.len(), "graph detectors fired");
+        }
+    }
+
     // Feed events into cross-layer correlation engine and baseline learning
     for ev in &events_entries {
         let corr_event = correlation_engine::CorrelationEngine::classify_event(ev);
@@ -3189,6 +3631,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3218,6 +3661,9 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
+            dynamic_trusted_ips: Vec::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
@@ -3226,6 +3672,11 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
+            graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
+            last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
         }
@@ -3466,6 +3917,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3495,6 +3947,9 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
+            dynamic_trusted_ips: Vec::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
@@ -3503,6 +3958,11 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
+            graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
+            last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
         };
@@ -3638,6 +4098,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3667,6 +4128,9 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
+            dynamic_trusted_ips: Vec::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
@@ -3675,6 +4139,11 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
+            graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
+            last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
         };
@@ -3785,6 +4254,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3814,6 +4284,9 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
+            dynamic_trusted_ips: Vec::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
@@ -3822,6 +4295,11 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
+            graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
+            last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
         };
@@ -3944,6 +4422,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3973,6 +4452,9 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
+            dynamic_trusted_ips: Vec::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
@@ -3981,6 +4463,11 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
+            graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
+            last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
         };
@@ -4080,6 +4567,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -4109,6 +4597,9 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
+            dynamic_trusted_ips: Vec::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
@@ -4117,6 +4608,11 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
+            graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
+            last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
         };
@@ -4228,6 +4724,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -4257,6 +4754,9 @@ mod tests {
             last_dna_save: std::time::Instant::now(),
             shield_state: None,
             deep_security_snapshot: None,
+            dynamic_trusted_ips: Vec::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
@@ -4265,6 +4765,11 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
+            graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
+            last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
         };

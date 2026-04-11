@@ -170,11 +170,65 @@ pub(crate) fn load_startup_decision_state(
         // Caller is responsible for awaiting the async ufw load and inserting later.
     }
 
-    // Cap: only read the last 500KB of each decisions file to prevent OOM
-    // on hosts that accumulated thousands of CrowdSec entries.
-    const MAX_DECISION_READ: u64 = 512 * 1024;
+    // Phase 7: Try loading from dated graph snapshots (today + yesterday).
+    let dates = recent_decision_dates();
+    let mut loaded_from_graph = false;
+    for date in &dates {
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, date) {
+            use crate::knowledge_graph::types::{Node, NodeType};
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    incident_id,
+                    decision: Some(action),
+                    decision_target,
+                    ts,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if action == "block_ip" {
+                        if let Some(ip) = decision_target {
+                            blocklist.insert(ip.clone());
+                        }
+                    }
+                    // Build cooldown key from graph data
+                    let detector = crate::agent_context::incident_detector(incident_id);
+                    let key = match action.as_str() {
+                        "block_ip" | "monitor" | "honeypot" => decision_target
+                            .as_ref()
+                            .map(|ip| decision_cooldown_key(action, detector, "ip", ip)),
+                        "suspend_user_sudo" => decision_target.as_ref().map(|user| {
+                            decision_cooldown_key("suspend_user_sudo", detector, "user", user)
+                        }),
+                        _ => None,
+                    };
+                    if let Some(key) = key {
+                        cooldowns
+                            .entry(key)
+                            .and_modify(|existing| {
+                                if *ts > *existing {
+                                    *existing = *ts;
+                                }
+                            })
+                            .or_insert(*ts);
+                    }
+                }
+            }
+            loaded_from_graph = true;
+        }
+    }
 
-    for date in recent_decision_dates() {
+    if loaded_from_graph {
+        tracing::info!(
+            blocklist = blocklist.len(),
+            cooldowns = cooldowns.len(),
+            "startup decision state loaded from graph snapshots"
+        );
+        return (blocklist, cooldowns);
+    }
+
+    // Fallback: read from decisions JSONL (legacy or if no snapshots yet).
+    const MAX_DECISION_READ: u64 = 512 * 1024;
+    for date in &dates {
         let decisions_path = data_dir.join(format!("decisions-{date}.jsonl"));
         let file_size = std::fs::metadata(&decisions_path)
             .map(|m| m.len())

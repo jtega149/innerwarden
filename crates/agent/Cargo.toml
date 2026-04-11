@@ -45,6 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fs2 = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+serde_yaml = "0.9"
 russh = "0.59"
 regex = "1"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }

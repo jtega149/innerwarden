@@ -1,13 +1,21 @@
 [Unit]
 Description=Inner Warden - Sensor (host observability)
 After=network.target syslog.target
-Documentation=https://github.com/maiconburn/innerwarden
+Documentation=https://github.com/InnerWarden/innerwarden
 
 [Service]
 Type=simple
-User=innerwarden
+User=root
+# Group=innerwarden so files created by the sensor are group-owned by
+# the agent's user, allowing both sensor (root) and agent (innerwarden)
+# to write to incidents-*.jsonl without permission conflicts.
 Group=innerwarden
-SupplementaryGroups=systemd-journal docker
+SupplementaryGroups=adm systemd-journal
+# UMask 0002 makes new files mode 664 (group writable). Combined with
+# Group=innerwarden above, this lets the agent append to files created
+# by the sensor. Without this, killchain_inline incidents are silently
+# lost with "Permission denied" errors.
+UMask=0002
 ExecStart=/usr/local/bin/innerwarden-sensor --config /etc/innerwarden/config.toml
 Restart=on-failure
 RestartSec=5
@@ -17,18 +25,31 @@ TimeoutStopSec=10
 KillSignal=SIGTERM
 SendSIGKILL=yes
 
-# Logging - journald captures stdout/stderr automatically
+# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=innerwarden-sensor
 
-# Hardening
+# ── Hardening ──
+# The sensor runs as root because eBPF requires CAP_BPF + CAP_SYS_ADMIN.
+# We lock down everything else to minimize pivot risk if compromised.
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/innerwarden
-ReadOnlyPaths=/var/log /etc/innerwarden
+ReadOnlyPaths=/var/log /etc/innerwarden /proc /sys/fs/bpf
 ProtectHome=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=no
 
 [Install]
 WantedBy=multi-user.target

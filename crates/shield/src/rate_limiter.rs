@@ -669,7 +669,7 @@ mod tests {
         let mut limiter = IpRateLimiter::new(config);
         let now = ts(0);
         let mut dropped = false;
-        for i in 0..200 {
+        for _ in 0..200 {
             let d = limiter.process_packet("10.0.0.1", 100, now);
             if d == RateLimitDecision::Drop {
                 dropped = true;

@@ -4,7 +4,7 @@
 //! (same approach as JA3/JA4 TLS fingerprinting). Extracts queried domain
 //! names and emits them as `dns.query` events for the dns_tunneling detector.
 //!
-//! Eliminates the dependency on Suricata for DNS visibility.
+//! Provides native DNS visibility from packet capture.
 //!
 //! Requires: Linux, CAP_NET_RAW capability.
 //! Falls back gracefully on non-Linux or when unprivileged.

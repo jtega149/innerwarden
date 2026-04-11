@@ -58,14 +58,14 @@ const DNS_ALLOWED_COMMS: &[&str] = &[
     "snapd",        // Snap daemon — resolves snap store and update servers
 ];
 
-/// Detects DNS tunneling patterns from Suricata DNS query logs AND eBPF connect events.
+/// Detects DNS tunneling patterns from native DNS query capture and eBPF connect events.
 ///
-/// Suricata path (deep inspection):
+/// DNS capture path (deep inspection):
 /// 1. High Shannon entropy in subdomain labels (encoded/encrypted data)
 /// 2. Volume of unique subdomains to same base domain in window (C2 channel)
 /// 3. Unusually long domain names (data exfiltration payload)
 ///
-/// eBPF fallback (port 53 connect() analysis - works WITHOUT Suricata):
+/// eBPF fallback (port 53 connect() analysis):
 /// 4. DNS beaconing - same process connects to same DNS server > 20 times in 60s
 /// 5. Non-standard DNS server - connect to port 53 on a non-common resolver
 /// 6. DNS burst - > 50 port 53 connections in 30s from any process
@@ -132,117 +132,18 @@ impl DnsTunnelingDetector {
 
         // ── DNS capture path: raw socket DNS queries ────────────────────
         if event.kind == "dns.query" && event.source == "dns_capture" {
-            let domain = event.details.get("domain")?.as_str()?;
-            let src_ip = event.details.get("src_ip")?.as_str()?;
-            return self.process_dns_query(event, domain, src_ip);
-        }
-
-        // ── Suricata path: DNS query events ──────────────────────────────
-        let is_dns = event.kind == "suricata.dns.query"
-            || (event.source == "suricata" && event.kind.contains("dns"));
-        if !is_dns {
-            return None;
-        }
-
-        let rrname = event.details.get("rrname")?.as_str()?;
-        let src_ip = event.details.get("src_ip")?.as_str()?;
-
-        let now = event.ts;
-        let cutoff = now - self.window;
-
-        // Parse base domain (last 2 labels) and subdomain
-        let (base_domain, subdomain) = parse_domain(rrname)?;
-
-        let key = (src_ip.to_string(), base_domain.clone());
-        let alert_key = format!("{}:{}", src_ip, base_domain);
-
-        // Cooldown: 300s per (src_ip, base_domain)
-        if let Some(&last) = self.alerted.get(&alert_key) {
-            if now - last < Duration::seconds(300) {
-                return None;
-            }
-        }
-
-        // Update windowed state
-        let ts_ring = self.timestamps.entry(key.clone()).or_default();
-        while ts_ring.front().is_some_and(|t| *t < cutoff) {
-            ts_ring.pop_front();
-        }
-        ts_ring.push_back(now);
-
-        let subs = self.query_history.entry(key.clone()).or_default();
-        subs.insert(subdomain.clone());
-
-        // ── Check 1: Shannon entropy on subdomain labels ──────────────────
-        if !subdomain.is_empty() {
-            let entropy = shannon_entropy(&subdomain);
-            if entropy > self.entropy_threshold {
-                self.alerted.insert(alert_key, now);
-                return Some(self.build_incident(
-                    src_ip,
-                    &base_domain,
-                    now,
-                    "high_entropy",
-                    Severity::High,
-                    format!(
-                        "DNS tunneling: high-entropy queries to {} (entropy={:.2})",
-                        base_domain, entropy
-                    ),
-                ));
-            }
-        }
-
-        // ── Check 2: Unique subdomain count in window ─────────────────────
-        let unique_count = subs.len();
-        if unique_count > self.volume_threshold {
-            self.alerted.insert(alert_key, now);
-            return Some(self.build_incident(
-                src_ip,
-                &base_domain,
-                now,
-                "subdomain_volume",
-                Severity::High,
-                format!(
-                    "DNS tunneling: {} unique subdomains to {}",
-                    unique_count, base_domain
-                ),
-            ));
-        }
-
-        // ── Check 3: Total domain length ──────────────────────────────────
-        if rrname.len() > self.length_threshold {
-            self.alerted.insert(alert_key, now);
-            return Some(self.build_incident(
-                src_ip,
-                &base_domain,
-                now,
-                "long_domain",
-                Severity::Medium,
-                format!(
-                    "DNS tunneling: unusually long domain ({} chars)",
-                    rrname.len()
-                ),
-            ));
-        }
-
-        // Prune stale data
-        if self.query_history.len() > 5000 {
-            self.timestamps.retain(|_, v| {
-                v.retain(|t| *t > cutoff);
-                !v.is_empty()
-            });
-            let live_keys: HashSet<_> = self.timestamps.keys().cloned().collect();
-            self.query_history.retain(|k, _| live_keys.contains(k));
-        }
-        if self.alerted.len() > 500 {
-            self.alerted.retain(|_, ts| *ts > cutoff);
+            return self.process_dns_query(
+                event,
+                event.details.get("domain")?.as_str()?,
+                event.details.get("src_ip")?.as_str()?,
+            );
         }
 
         None
     }
 
     /// Process dns.query events from dns_capture collector.
-    /// Same analysis as Suricata path: entropy, volume, length.
+    /// Same analysis as the DNS capture path: entropy, volume, length.
     fn process_dns_query(&mut self, event: &Event, domain: &str, src_ip: &str) -> Option<Incident> {
         // Skip cloud/infrastructure domains
         let lower_domain = domain.to_lowercase();
@@ -296,7 +197,7 @@ impl DnsTunnelingDetector {
         }
 
         // Unique subdomain volume
-        if sub_count >= self.volume_threshold {
+        if sub_count > self.volume_threshold {
             self.alerted.insert(alert_key, now);
             let window_secs = self.window.num_seconds();
             return Some(self.build_incident(
@@ -313,7 +214,7 @@ impl DnsTunnelingDetector {
         }
 
         // Long domain name
-        if domain.len() >= self.length_threshold {
+        if domain.len() > self.length_threshold {
             self.alerted.insert(alert_key, now);
             let truncated = &domain[..80.min(domain.len())];
             return Some(self.build_incident(
@@ -330,11 +231,23 @@ impl DnsTunnelingDetector {
             ));
         }
 
+        if self.query_history.len() > 5000 {
+            self.timestamps.retain(|_, v| {
+                v.retain(|t| *t > cutoff);
+                !v.is_empty()
+            });
+            let live_keys: HashSet<_> = self.timestamps.keys().cloned().collect();
+            self.query_history.retain(|k, _| live_keys.contains(k));
+        }
+        if self.alerted.len() > 500 {
+            self.alerted.retain(|_, ts| *ts > cutoff);
+        }
+
         None
     }
 
     /// Process eBPF connect() events targeting port 53.
-    /// Provides DNS tunneling detection without Suricata.
+    /// Provides DNS tunneling detection even when packet-level DNS parsing is unavailable.
     fn process_ebpf_dns(&mut self, event: &Event) -> Option<Incident> {
         let dst_ip = event.details.get("dst_ip")?.as_str()?;
         let comm = event
@@ -508,7 +421,7 @@ impl DnsTunnelingDetector {
             recommended_checks: vec![
                 format!("Investigate DNS queries from {} to {}", src_ip, base_domain),
                 format!("Check if {} is a known DNS tunneling domain", base_domain),
-                "Review Suricata DNS logs for full query payload".to_string(),
+                "Review captured DNS query history for the full query sequence".to_string(),
                 "Consider blocking the domain or the source IP".to_string(),
             ],
             tags: vec!["dns-tunneling".to_string(), "exfiltration".to_string()],
@@ -635,13 +548,13 @@ mod tests {
         Event {
             ts,
             host: "test".to_string(),
-            source: "suricata".to_string(),
-            kind: "suricata.dns.query".to_string(),
+            source: "dns_capture".to_string(),
+            kind: "dns.query".to_string(),
             severity: Severity::Info,
             summary: format!("DNS query for {}", rrname),
             details: serde_json::json!({
+                "domain": rrname,
                 "src_ip": src_ip,
-                "rrname": rrname,
             }),
             tags: vec![],
             entities: vec![EntityRef::ip(src_ip)],
@@ -668,7 +581,7 @@ mod tests {
         }
     }
 
-    // ── Suricata path tests ─────────────────────────────────────────────
+    // ── DNS capture path tests ─────────────────────────────────────────
 
     #[test]
     fn high_entropy_subdomain_triggers() {

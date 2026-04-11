@@ -1,6 +1,6 @@
 //! Centralized allowlists for false positive suppression.
 //!
-//! Inspired by Falco's production-hardened rules (falcosecurity/rules).
+//! Built from production-hardened runtime security allowlists.
 //! Instead of each detector maintaining its own ad-hoc list, all detectors
 //! reference these shared lists.
 //!
@@ -353,7 +353,7 @@ pub const TRUNCATE_ALLOWED: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 /// Processes that legitimately trigger commit_creds (uid changes).
-/// Combined from Falco's login_binaries + passwd_binaries + our additions.
+/// Combined from common login/password-management binaries plus InnerWarden additions.
 pub const PRIVESC_ALLOWED: &[&str] = &[
     // Standard login/auth
     "sudo",

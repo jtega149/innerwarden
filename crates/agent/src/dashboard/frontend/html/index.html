@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Inner Warden</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <header class="app-header">
+    <div class="app-title" onclick="showView('home')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showView('home')}" style="cursor:pointer" role="button" aria-label="Go to home" tabindex="0">
+      <span class="logo" aria-hidden="true">
+        <svg width="18" height="18" viewBox="40 40 140 140" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="steel" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stop-color="#e6edf5"/>
+              <stop offset="100%" stop-color="#7d93a8"/>
+            </linearGradient>
+          </defs>
+          <g transform="rotate(-45 110 110)">
+            <rect x="106" y="50" width="8" height="120" rx="3" fill="url(#steel)"/>
+            <rect x="96" y="90" width="28" height="8" rx="2" fill="#2e6fa3"/>
+            <rect x="108" y="98" width="4" height="28" rx="2" fill="#2e6fa3"/>
+          </g>
+          <g transform="rotate(45 110 110)">
+            <rect x="106" y="50" width="8" height="120" rx="3" fill="url(#steel)"/>
+            <rect x="96" y="90" width="28" height="8" rx="2" fill="#2e6fa3"/>
+            <rect x="108" y="98" width="4" height="28" rx="2" fill="#2e6fa3"/>
+          </g>
+        </svg>
+      </span>
+      Inner Warden
+    </div>
+    <div class="status-strip">
+      <span class="status-badge status-badge-read" id="modeBadge">READ-ONLY</span>
+      <span class="status-badge status-badge-ai-off" id="aiBadge">AI: off</span>
+      <span class="status-badge" id="versionBadge" style="background:rgba(120,229,255,0.08);color:var(--accent);font-size:0.58rem"></span>
+      <label style="display:flex;align-items:center;gap:3px;font-size:0.58rem;color:var(--muted);cursor:pointer;user-select:none;margin-left:4px" title="Hide events from allowlisted IPs and users">
+        <input type="checkbox" id="hideAllowlisted" checked onchange="toggleAllowlistFilter()" style="margin:0;cursor:pointer;width:12px;height:12px"> Hide trusted
+      </label>
+    </div>
+    <span id="refreshStatus"></span>
+    <div class="main-nav">
+      <button type="button" class="main-nav-btn active" id="navHome" onclick="showView('home')" aria-label="Home overview">Home</button>
+      <button type="button" class="main-nav-btn" id="navInvestigate" onclick="showView('investigate')" aria-label="Threat investigation">Threats</button>
+      <button type="button" class="main-nav-btn" id="navStatus" onclick="showView('status')" aria-label="System health">Health</button>
+      <button type="button" class="main-nav-btn" id="navIntel" onclick="showView('intel')" aria-label="Intelligence profiles">Intel</button>
+      <div class="nav-more-wrap">
+        <button type="button" class="main-nav-btn" id="navMore" onclick="toggleMoreMenu()" aria-label="More views"><span id="moreLabel">More</span> &#9662;</button>
+        <div class="nav-more-menu" id="moreMenu" style="display:none">
+          <button type="button" class="nav-more-item" id="navSensors" onclick="showView('sensors')">Sensors</button>
+          <button type="button" class="nav-more-item" id="navReport" onclick="showView('report')">Report</button>
+          <button type="button" class="nav-more-item" id="navHoneypot" onclick="showView('honeypot')">Honeypot</button>
+          <button type="button" class="nav-more-item" id="navCompliance" onclick="showView('compliance')">Compliance</button>
+          <button type="button" class="nav-more-item" id="navMonthly" onclick="showView('monthly')">Monthly</button>
+          <button type="button" class="nav-more-item" id="navResponses" onclick="showView('responses')">Responses</button>
+          <button type="button" class="nav-more-item" id="navGraph" onclick="showView('graph')">Graph</button>
+        </div>
+      </div>
+    </div>
+    <button type="button" class="panel-toggle-btn" id="panelToggleBtn" onclick="toggleLeftPanel()" aria-label="Toggle panel">
+      <span id="panelToggleIcon">▲</span> List
+    </button>
+  </header>
+
+  <!-- ── Home view ── -->
+  <div class="report-view" id="viewHome" style="display:none">
+    <div class="status-hero safe" id="homeHero">
+      <div class="status-hero-icon" id="homeHeroIcon">✅</div>
+      <div class="status-hero-title" id="homeHeroTitle">Loading…</div>
+      <div class="status-hero-sub" id="homeHeroSub"></div>
+      <div class="home-status-meta" id="homeStatusMeta"></div>
+    </div>
+    <div class="home-kpi-row">
+      <div class="home-kpi-big" onclick="showView('investigate')">
+        <div class="kpi-value" id="homeKpiThreats" style="color:var(--accent)">0</div>
+        <div class="kpi-label">Threats Detected</div>
+      </div>
+      <div class="home-kpi-big" onclick="showContained()">
+        <div class="kpi-value" id="homeKpiResponded" style="color:#27ae60">0</div>
+        <div class="kpi-label">Contained</div>
+      </div>
+      <div class="home-kpi-big" onclick="showView('sensors')">
+        <div class="kpi-value" id="homeKpiEvents" style="color:var(--accent)">0</div>
+        <div class="kpi-label">Events Today</div>
+      </div>
+    </div>
+    <div class="home-section" id="briefingSection" style="display:none">
+      <div class="home-section-title" style="display:flex;justify-content:space-between;align-items:center">
+        <span>AI Intelligence Briefing</span>
+        <button id="briefingBtn" onclick="generateBriefing()" style="padding:5px 14px;border-radius:8px;border:1px solid var(--accent);background:transparent;color:var(--accent);font-size:0.7rem;font-weight:700;cursor:pointer">Generate Briefing</button>
+      </div>
+      <div id="briefingContent" style="font-size:0.78rem;color:var(--text);white-space:pre-wrap;line-height:1.6"></div>
+    </div>
+    <div class="home-section">
+      <div class="home-section-title"><span class="live-dot"></span> Recent Activity</div>
+      <div id="homeFeed"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="home-section home-kpi-clickable" onclick="showView('sensors')">
+      <div class="home-section-title">Data Collection</div>
+      <div class="collector-strip" id="homeCollectorStrip">
+        <div class="collector-summary-line">Loading…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Sensors view ── -->
+  <div class="report-view sensor-hud" id="viewSensors" style="display:flex;">
+    <div id="topAction" style="display:none;margin-bottom:14px;padding:16px 20px;border-radius:14px;border:1px solid rgba(244,63,94,0.3);background:rgba(244,63,94,0.06);"></div>
+    <div class="hud-stats" id="sensorCards"></div>
+    <div style="display:flex; flex-wrap:wrap; gap:6px; flex-direction:column;" id="sensorSources"></div>
+    <div class="hud-panel">
+      <h3 class="hud-panel-title">Event Timeline</h3>
+      <div style="position:relative;height:240px;"><canvas id="sensorChart"></canvas></div>
+    </div>
+    <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px;">
+      <div class="hud-panel" style="display:flex;flex-direction:column;align-items:center;">
+        <h3 class="hud-panel-title">Unresolved Threats</h3>
+        <div style="position:relative;height:160px;width:100%;"><canvas id="threatGauge"></canvas></div>
+        <div id="threatLabel" style="font-family:'JetBrains Mono',monospace;font-size:0.8rem;color:#8b9db8;margin-top:4px;"></div>
+      </div>
+      <div class="hud-panel">
+        <h3 class="hud-panel-title">Detector Activity</h3>
+        <div style="position:relative;height:200px;"><canvas id="detectorChart"></canvas></div>
+      </div>
+      <div class="hud-panel">
+        <h3 class="hud-panel-title">Event Types</h3>
+        <div id="sensorKinds" style="font-size:0.8rem;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Investigate/Threats view ── -->
+  <div class="app-body" id="viewInvestigate" style="display:none">
+    <aside class="left-panel">
+      <div class="kpi-grid" style="grid-template-columns: repeat(3,1fr)">
+        <div class="kpi-card"><div class="kpi-label">Threats</div><div class="kpi-value" id="kpi-confirmed" style="color:var(--accent)">0</div></div>
+        <div class="kpi-card"><div class="kpi-label">Contained</div><div class="kpi-value" id="kpi-responded" style="color:#27ae60">0</div></div>
+        <div class="kpi-card"><div class="kpi-label">Events</div><div class="kpi-value" id="kpi-events">0</div></div>
+      </div>
+      <div style="display:none"><span id="kpi-noise">0</span><span id="kpi-incidents">0</span><span id="kpi-attackers">0</span></div>
+      <div class="filters" style="grid-template-columns:1fr auto;margin-bottom:6px">
+        <input id="flt-date" type="date" class="full" style="grid-column:1/-1" />
+        <button id="flt-adv-toggle" type="button" class="full" style="background:transparent;border:none;color:var(--muted);font-size:0.68rem;cursor:pointer;text-align:left;padding:2px 0" onclick="toggleAdvFilters()">▸ Advanced filters</button>
+      </div>
+      <div id="advFilters" style="display:none">
+        <div class="filters">
+          <input id="flt-compare-date" type="date" title="compare date" />
+          <select id="flt-window">
+            <option value="">window: full day</option>
+            <option value="900">last 15m</option>
+            <option value="3600">last 1h</option>
+            <option value="21600">last 6h</option>
+          </select>
+          <select id="flt-severity">
+            <option value="">severity: any</option>
+            <option value="critical">critical+</option>
+            <option value="high">high+</option>
+            <option value="medium">medium+</option>
+          </select>
+          <input id="flt-detector" type="text" placeholder="filter by detector" />
+          <button id="flt-apply" class="full" type="button">Apply</button>
+        </div>
+      </div>
+      <div style="display:none">
+        <div class="pivot-tabs">
+          <button type="button" class="pivot-tab active" data-pivot="ip">IP</button>
+          <button type="button" class="pivot-tab" data-pivot="user">User</button>
+          <button type="button" class="pivot-tab" data-pivot="detector">Detector</button>
+        </div>
+        <div id="clusterList"></div>
+        <div id="topDetectors"></div>
+      </div>
+      <div class="search-wrap">
+        <input id="entitySearch" type="search" placeholder="search threats…" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="section-title" id="entityTitle">Defense Activity</div>
+      <div id="attackerList"><div class="empty">Loading…</div></div>
+    </aside>
+    <main class="right-panel" id="rightPanel">
+      <div id="homeState" style="padding:40px 20px;text-align:center">
+        <div style="font-size:1.5rem;margin-bottom:8px">🔍</div>
+        <div style="color:var(--muted);font-size:0.85rem">Select a threat to investigate</div>
+      </div>
+      <div id="journeyContent" style="display:none"></div>
+    </main>
+  </div>
+
+  <!-- ── Report view ── -->
+  <div class="report-view" id="viewReport" style="display:none">
+    <div class="report-toolbar">
+      <label class="report-label">Date</label>
+      <button type="button" class="report-nav-btn" id="reportPrev" onclick="navigateReport(-1)" title="Previous day">←</button>
+      <select id="reportDateSelect" onchange="loadReport()"><option value="">latest</option></select>
+      <button type="button" class="report-nav-btn" id="reportNext" onclick="navigateReport(1)" title="Next day">→</button>
+      <button type="button" class="report-refresh-btn" onclick="loadReport()">↻ Refresh</button>
+      <button type="button" class="report-export-btn" onclick="exportReport()" title="Export as Markdown">↓ Export</button>
+      <span id="reportStatus" class="report-status"></span>
+    </div>
+    <div id="reportContent" class="report-content">
+      <div class="empty" style="padding:40px;text-align:center">Loading report…</div>
+    </div>
+  </div>
+
+  <!-- ── Status/Health view ── -->
+  <div class="report-view" id="viewStatus" style="display:none">
+    <div class="report-toolbar">
+      <button type="button" class="report-refresh-btn" onclick="loadStatus()">↻ Refresh</button>
+      <span id="statusViewStatus" class="report-status"></span>
+    </div>
+    <div id="statusContent" class="report-content">
+      <div class="empty" style="padding:40px;text-align:center">Loading…</div>
+    </div>
+  </div>
+
+  <!-- ── Honeypot view ── -->
+  <div class="report-view" id="viewHoneypot" style="display:none">
+    <div class="report-toolbar">
+      <button type="button" class="report-refresh-btn" onclick="loadHoneypot()">↻ Refresh</button>
+      <span id="honeypotViewStatus" class="report-status"></span>
+    </div>
+    <div id="honeypotContent" class="report-content">
+      <div class="empty" style="padding:40px;text-align:center">Loading…</div>
+    </div>
+  </div>
+
+  <!-- ── Compliance view ── -->
+  <div class="report-view" id="viewCompliance" style="display:none">
+    <div class="report-toolbar">
+      <button type="button" class="report-refresh-btn" onclick="loadCompliance()">↻ Refresh</button>
+      <span id="complianceViewStatus" class="report-status"></span>
+    </div>
+    <div id="complianceContent" class="report-content" style="padding:16px;">
+      <div class="kpi-grid" style="grid-template-columns: repeat(4, 1fr);">
+        <div class="kpi-card"><div class="kpi-label">Active Sessions</div><div class="kpi-value" id="comp-sessions">-</div></div>
+        <div class="kpi-card"><div class="kpi-label">Admin Actions Today</div><div class="kpi-value" id="comp-admin-actions">-</div></div>
+        <div class="kpi-card"><div class="kpi-label">ISO 27001 Controls</div><div class="kpi-value" id="comp-iso-score" style="color:var(--ok)">-</div></div>
+        <div class="kpi-card"><div class="kpi-label">Hash Chain</div><div class="kpi-value" id="comp-chain-status">-</div></div>
+      </div>
+      <h3 style="margin:24px 0 12px;color:var(--text);">Audit Trail Hash Chain</h3>
+      <div id="comp-chain-detail" class="card" style="padding:14px;"><div class="muted">Loading...</div></div>
+      <h3 style="margin:24px 0 12px;color:var(--text);">Data Retention Policy</h3>
+      <div id="comp-retention" class="card" style="padding:14px;"><div class="muted">Loading...</div></div>
+      <h3 style="margin:24px 0 12px;color:var(--text);">ISO 27001 Control Mapping</h3>
+      <div id="comp-iso-controls" class="card" style="max-height:500px;overflow-y:auto;padding:14px;"><div class="muted">Loading...</div></div>
+      <h3 style="margin:24px 0 12px;color:var(--text);">Recent Admin Actions</h3>
+      <div id="comp-admin-list" class="card" style="max-height:400px;overflow-y:auto;padding:12px;"><div class="muted">Loading...</div></div>
+      <h3 style="margin:24px 0 12px;color:var(--text);">Active Advisories (Trusted Advisor)</h3>
+      <div id="comp-advisory-list" class="card" style="max-height:300px;overflow-y:auto;padding:12px;"><div class="muted">Loading...</div></div>
+      <h3 style="margin:24px 0 12px;color:var(--text);">Active Sessions</h3>
+      <div id="comp-session-list" class="card" style="max-height:300px;overflow-y:auto;padding:12px;"><div class="muted">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- ── Action modal ── -->
+  <div class="modal-overlay" id="actionModal" onclick="handleModalBg(event)">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-title" id="modalTitle">Action</div>
+      <div class="modal-subtitle" id="modalSubtitle"></div>
+      <div class="modal-field">
+        <label class="modal-label" for="modalReason">Reason <span style="color:var(--danger)">*</span></label>
+        <textarea class="modal-textarea" id="modalReason" rows="3" placeholder="Describe why you are taking this action - recorded in the audit trail…"></textarea>
+      </div>
+      <div class="modal-field" id="modalDurationField" style="display:none">
+        <label class="modal-label" for="modalDuration">Duration (seconds)</label>
+        <input class="modal-input" type="number" id="modalDuration" value="3600" min="60" max="86400" />
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn-cancel" onclick="closeActionModal()">Cancel</button>
+        <button type="button" class="btn-confirm danger" id="modalConfirm" onclick="submitAction()">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Intelligence view ── -->
+  <div class="report-view" id="viewIntel" style="display:none">
+    <div class="report-toolbar">
+      <button type="button" class="report-refresh-btn" onclick="loadIntel()">↻ Refresh</button>
+      <button type="button" id="intelTabProfiles" onclick="switchIntelTab('profiles')" style="margin-left:8px;padding:4px 12px;border-radius:4px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;">Profiles</button>
+      <button type="button" id="intelTabCampaigns" onclick="switchIntelTab('campaigns')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Campaigns</button>
+      <button type="button" id="intelTabChains" onclick="switchIntelTab('chains')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Chains</button>
+      <button type="button" id="intelTabBaseline" onclick="switchIntelTab('baseline')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Baseline</button>
+      <button type="button" id="intelTabPlaybooks" onclick="switchIntelTab('playbooks')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Playbooks</button>
+      <button type="button" id="intelTabBrain" onclick="switchIntelTab('brain')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">🧠 Brain</button>
+      <select id="intelSort" onchange="loadIntel()" style="margin-left:8px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);">
+        <option value="risk_score">Sort: Risk Score</option>
+        <option value="last_seen">Sort: Last Seen</option>
+        <option value="incidents">Sort: Incidents</option>
+      </select>
+      <input type="number" id="intelMinRisk" placeholder="Min risk" min="0" max="100" value="0" onchange="loadIntel()" style="margin-left:8px;width:80px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);">
+      <span id="intelViewStatus" class="report-status"></span>
+    </div>
+    <div id="intelContent" class="report-content" style="padding:16px;">
+      <p style="color:var(--dim);">Loading attacker profiles...</p>
+    </div>
+  </div>
+
+  <!-- ── Monthly view ── -->
+  <div class="report-view" id="viewMonthly" style="display:none">
+    <div class="report-toolbar">
+      <button type="button" class="report-refresh-btn" onclick="loadMonthly()">↻ Refresh</button>
+      <select id="monthlyPicker" onchange="loadMonthly()" style="margin-left:8px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);"></select>
+      <span id="monthlyViewStatus" class="report-status"></span>
+    </div>
+    <div id="monthlyContent" class="report-content" style="padding:16px;">
+      <p style="color:var(--dim);">Select a month to view the threat report...</p>
+    </div>
+  </div>
+
+  <!-- ── Responses view ── -->
+  <div class="report-view" id="viewResponses" style="display:none">
+    <div class="report-toolbar">
+      <button type="button" class="report-refresh-btn" onclick="loadResponses()">↻ Refresh</button>
+      <span id="responsesViewStatus" class="report-status"></span>
+    </div>
+    <div id="responsesContent" class="report-content" style="padding:16px;">
+      <p style="color:var(--dim);">Loading responses...</p>
+    </div>
+  </div>
+
+  <!-- ── Graph view ── -->
+  <div class="report-view" id="viewGraph" style="display:none">
+    <div class="report-toolbar">
+      <button type="button" class="report-refresh-btn" onclick="loadGraph()">↻ Refresh</button>
+      <select id="graphFilter" onchange="filterGraph()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 8px;margin-left:8px;">
+        <option value="topology">Topology (no incidents)</option>
+        <option value="all">All nodes</option>
+        <option value="Process">Processes</option>
+        <option value="Ip">IPs</option>
+        <option value="File">Files</option>
+        <option value="Incident">Incidents only</option>
+        <option value="threat">Threat Intel only</option>
+      </select>
+      <input type="text" id="graphSearch" placeholder="Search IP, process, domain…" oninput="searchGraph()" style="margin-left:8px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);width:180px;">
+      <button type="button" onclick="exportGraphPng()" style="margin-left:4px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;font-size:0.72rem;">Export PNG</button>
+      <span id="graphViewStatus" class="report-status"></span>
+    </div>
+    <div id="graphStats" style="padding:8px 16px;display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--dim);"></div>
+    <div id="graphContainer" style="flex:1;min-height:500px;background:var(--bg);border:1px solid var(--border);margin:8px 16px;border-radius:8px;"></div>
+    <div id="graphNodeDetail" style="display:none;padding:8px 16px;font-size:13px;color:var(--text);background:var(--surface);margin:0 16px 8px;border-radius:6px;border:1px solid var(--border);max-height:200px;overflow-y:auto;"></div>
+  </div>
+
+  <!-- Toast notification -->
+  <div class="toast" id="toast"></div>
+
+</div>
+
+<script src="/js/api.js"></script>
+<script src="/js/helpers.js"></script>
+<script src="/js/state.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/home.js"></script>
+<script src="/js/threats.js"></script>
+<script src="/js/journey.js"></script>
+<script src="/js/sensors.js"></script>
+<script src="/js/reports.js"></script>
+<script src="/js/status.js"></script>
+<script src="/js/compliance.js"></script>
+<script src="/js/honeypot.js"></script>
+<script src="/js/intel.js"></script>
+<script src="/js/graph.js"></script>
+<script src="/js/monthly.js"></script>
+<script src="/js/responses.js"></script>
+<script src="/js/actions.js"></script>
+<script src="/js/sse.js"></script>
+</body>
+</html>

@@ -5,8 +5,8 @@
 //! Emits `http.request` events for web_scan, user_agent_scanner, and
 //! web_shell detectors.
 //!
-//! Eliminates the dependency on nginx access logs or Suricata for HTTP
-//! visibility. Only captures inbound requests to monitored ports.
+//! Provides native HTTP visibility without relying on access-log parsing.
+//! Only captures inbound requests to monitored ports.
 //!
 //! Requires: Linux, CAP_NET_RAW capability.
 

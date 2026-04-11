@@ -23,12 +23,19 @@ const TRUSTED_PATHS: &[&str] = &[
 /// Paths where executables are expected but not from package managers.
 /// These are NOT flagged as drift.
 const DEVELOPMENT_PATHS: &[&str] = &[
-    "/home/",           // user binaries, development
-    "/root/",           // root home
-    "/var/lib/docker/", // container layers
-    "/run/",            // runtime mounts
-    "/proc/",           // procfs
-    "/sys/",            // sysfs
+    "/home/",            // user binaries, development
+    "/root/",            // root home
+    "/var/lib/docker/",  // container layers
+    "/run/",             // runtime mounts
+    "/proc/",            // procfs
+    "/sys/",             // sysfs
+    "/tmp/cargo-",       // cargo build temp files
+    "/tmp/rustc",        // rustc temp files
+    "/tmp/npm-",         // npm temp files
+    "/tmp/pip-",         // pip temp files
+    "/var/cache/",       // package manager caches
+    "/usr/lib/rustlib/", // Rust toolchain
+    "/usr/share/cargo/", // cargo shared
 ];
 
 /// Processes that legitimately execute from non-standard paths.
@@ -45,12 +52,28 @@ const ALLOWED_PROCESSES: &[&str] = &[
     "flatpak",
     "pip",
     "npm",
+    "npx",
     "cargo",
+    "rustc",
+    "cc",
+    "cc1",
+    "gcc",
+    "g++",
+    "ld",
+    "as",
+    "ar",
+    "make",
+    "cmake",
     "go",
     "python",
+    "python3",
     "node",
     "java",
     "innerwarden",
+    "prometheus",
+    "telegraf",
+    "node_export",
+    "grafana",
 ];
 
 /// Detects execution of binaries from unexpected filesystem locations.
@@ -231,9 +254,16 @@ fn is_development_path(path: &str) -> bool {
 }
 
 fn is_allowed_process(comm: &str) -> bool {
-    ALLOWED_PROCESSES
-        .iter()
-        .any(|p| comm == *p || comm.starts_with(p))
+    // Short names (cc, ld, as, ar) require exact match to avoid false allowlisting
+    // (e.g., "cca" is not "cc"). Longer names use starts_with for variants
+    // (e.g., "cargo-build" starts with "cargo").
+    ALLOWED_PROCESSES.iter().any(|p| {
+        if p.len() <= 3 {
+            comm == *p
+        } else {
+            comm == *p || comm.starts_with(p)
+        }
+    })
 }
 
 fn classify_path_severity(path: &str) -> Severity {

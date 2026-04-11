@@ -25,7 +25,7 @@ detection:
             - 'packetbeat'     # elastic network logger/shipper
             - 'filebeat'       # elastic log file shipper
             - 'auditbeat'      # elastic auditing agent/log shipper
-            - 'osqueryd'       # facebook osquery
+            - 'osqueryd'       # host inventory/query daemon
             - 'cbagentd'       # carbon black
             - 'falcond'        # crowdstrike falcon
     condition: selection

@@ -442,7 +442,7 @@ Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid
 
     #[test]
     fn diff_detects_removed_feature() {
-        let mut baseline = CpuFeatures::parse(SAMPLE_X86_FLAGS);
+        let baseline = CpuFeatures::parse(SAMPLE_X86_FLAGS);
         let mut current = baseline.clone();
         current.flags.remove("smep"); // attacker disabled SMEP
 

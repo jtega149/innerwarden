@@ -1706,7 +1706,7 @@ fn format_incident_message(
 #[allow(dead_code)]
 fn incident_quip(incident: &Incident) -> &'static str {
     let title = incident.title.to_lowercase();
-    let tags: Vec<&str> = incident.tags.iter().map(|s| s.as_str()).collect();
+    let _tags: Vec<&str> = incident.tags.iter().map(|s| s.as_str()).collect();
 
     if title.contains("brute") || (title.contains("ssh") && title.contains("fail")) {
         return "💥 Script kiddie hammering the front door. Dictionary attack, classic.";
@@ -1737,15 +1737,6 @@ fn incident_quip(incident: &Incident) -> &'static str {
     }
     if title.contains("container") || title.contains("docker") {
         return "🐳 Suspicious container spun up. Checking for --privileged escapes.";
-    }
-    if tags.contains(&"falco") {
-        return "🔬 Falco snagged a kernel-level anomaly. That's deep in the stack - serious.";
-    }
-    if tags.contains(&"suricata") {
-        return "🌐 Suricata flagged dirty traffic. Network-layer IOC confirmed.";
-    }
-    if tags.contains(&"wazuh") {
-        return "🛡 Wazuh HIDS tripped. Host-based intrusion signatures firing.";
     }
     "👾 Anomaly in the noise. Threat actor or misconfigured bot - investigating."
 }
@@ -1822,13 +1813,7 @@ fn severity_label(incident: &Incident) -> &'static str {
 }
 
 fn source_icon(tags: &[String]) -> &'static str {
-    if tags.iter().any(|t| t == "falco") {
-        "🔬"
-    } else if tags.iter().any(|t| t == "suricata") {
-        "🌐"
-    } else if tags.iter().any(|t| t == "osquery") {
-        "🔍"
-    } else if tags.iter().any(|t| t == "ssh" || t == "sshd") {
+    if tags.iter().any(|t| t == "ssh" || t == "sshd") {
         "🔐"
     } else {
         "📋"
@@ -2031,7 +2016,7 @@ mod tests {
     fn format_critical_message_contains_key_fields() {
         let inc = make_incident(
             Severity::Critical,
-            vec!["falco".to_string()],
+            vec!["ssh".to_string()],
             vec![EntityRef::ip("1.2.3.4".to_string())],
         );
         let msg = format_incident_message(&inc, None, GuardianMode::Watch);
@@ -2044,7 +2029,7 @@ mod tests {
     fn format_high_message_with_dashboard_url() {
         let inc = make_incident(
             Severity::High,
-            vec!["suricata".to_string()],
+            vec!["network".to_string()],
             vec![EntityRef::ip("203.0.113.10".to_string())],
         );
         let msg = format_incident_message(&inc, Some("http://127.0.0.1:8787"), GuardianMode::Watch);
@@ -2069,9 +2054,6 @@ mod tests {
 
     #[test]
     fn source_icon_picks_correct_icon() {
-        assert_eq!(source_icon(&["falco".to_string()]), "🔬");
-        assert_eq!(source_icon(&["suricata".to_string()]), "🌐");
-        assert_eq!(source_icon(&["osquery".to_string()]), "🔍");
         assert_eq!(source_icon(&["ssh".to_string()]), "🔐");
         assert_eq!(source_icon(&["other".to_string()]), "📋");
     }

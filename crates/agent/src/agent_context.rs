@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::{bot_helpers, config, telegram};
+use crate::{bot_helpers, config, knowledge_graph, telegram};
 
 pub(crate) fn incident_detector(incident_id: &str) -> &str {
     incident_id.split(':').next().unwrap_or("unknown")
@@ -20,16 +20,18 @@ pub(crate) fn guardian_mode(cfg: &config::AgentConfig) -> telegram::GuardianMode
 /// Builds a rich system-state context string injected into every AI chat call.
 /// The AI uses this to answer self-awareness questions accurately and give
 /// correct configuration advice.
-pub(crate) fn build_agent_context(cfg: &config::AgentConfig, data_dir: &Path) -> String {
+pub(crate) fn build_agent_context(
+    cfg: &config::AgentConfig,
+    data_dir: &Path,
+    kg: &std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
+) -> String {
     let mode = guardian_mode(cfg);
     let today = chrono::Local::now()
         .date_naive()
         .format("%Y-%m-%d")
         .to_string();
-    let incident_count =
-        bot_helpers::count_jsonl_lines(data_dir, &format!("incidents-{today}.jsonl"));
-    let decision_count =
-        bot_helpers::count_jsonl_lines(data_dir, &format!("decisions-{today}.jsonl"));
+    let incident_count = bot_helpers::graph_count(kg, "incidents");
+    let decision_count = bot_helpers::graph_count(kg, "decisions");
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
         .unwrap_or_else(|_| "unknown".to_string());

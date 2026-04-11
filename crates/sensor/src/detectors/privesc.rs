@@ -46,7 +46,7 @@ impl PrivescDetector {
             .as_str()
             .map(|s| s.to_string());
 
-        // Skip known legitimate privilege escalation processes (Falco-inspired).
+        // Skip known legitimate privilege escalation processes from the shared allowlist.
         // Handles kernel task parentheses: (install) -> install via comm_in_allowlist.
         // Exploits from python, bash, etc. still fire Critical.
         if super::allowlists::is_innerwarden_process(old_uid as u64, &comm)

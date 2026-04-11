@@ -197,11 +197,7 @@ pub(crate) async fn spawn_post_session_tasks(
             if let Some(skill) = skill_box {
                 let result = skill.execute(&ctx, dry_run).await;
                 if result.success {
-                    // Write decision to audit trail
-                    let today = chrono::Local::now()
-                        .date_naive()
-                        .format("%Y-%m-%d")
-                        .to_string();
+                    // Write decision to audit trail (hash-chained)
                     let entry = decisions::DecisionEntry {
                         ts: chrono::Utc::now(),
                         incident_id: iid,
@@ -225,16 +221,8 @@ pub(crate) async fn spawn_post_session_tasks(
                         },
                         prev_hash: None,
                     };
-                    let path = data_dir.join(format!("decisions-{today}.jsonl"));
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                    {
-                        use std::io::Write;
-                        if let Ok(line) = serde_json::to_string(&entry) {
-                            let _ = writeln!(f, "{line}");
-                        }
+                    if let Err(e) = decisions::append_chained(data_dir, &entry) {
+                        tracing::warn!("honeypot post-session: failed to write decision: {e:#}");
                     }
                     true
                 } else {

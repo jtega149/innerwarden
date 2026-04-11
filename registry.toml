@@ -96,36 +96,6 @@ builtin     = true
 enables     = ["shell-audit"]
 
 [[modules]]
-id          = "suricata-integration"
-name        = "Suricata Integration"
-version     = "0.1.0"
-description = "Tails Suricata eve.json and routes severity 1-2 network IDS alerts through AI triage"
-tags        = ["suricata", "ids", "network"]
-tier        = "open"
-builtin     = true
-enables     = []
-
-[[modules]]
-id          = "osquery-integration"
-name        = "osquery Integration"
-version     = "0.1.0"
-description = "Ingests osquery differential results and emits structured events by query category"
-tags        = ["osquery", "host-observability", "compliance"]
-tier        = "open"
-builtin     = true
-enables     = []
-
-[[modules]]
-id          = "wazuh-integration"
-name        = "Wazuh Integration"
-version     = "0.1.0"
-description = "Ingests Wazuh HIDS alerts (level >= 10) and routes High+ severity incidents through InnerWarden's AI triage"
-tags        = ["wazuh", "hids", "fim", "compliance", "mitre"]
-tier        = "open"
-builtin     = true
-enables     = []
-
-[[modules]]
 id          = "nginx-error-monitor"
 name        = "Nginx Error Monitor"
 version     = "0.1.0"

@@ -36,7 +36,7 @@ pub(crate) fn process_events(
                 .unwrap_or("medium");
 
             let kind = format!("killchain.{}", pattern);
-            let corr_event = correlation_engine::CorrelationEngine::killchain_event(
+            let mut corr_event = correlation_engine::CorrelationEngine::killchain_event(
                 &kind,
                 serde_json::json!({
                     "pattern": pattern,
@@ -44,6 +44,12 @@ pub(crate) fn process_events(
                     "pid": inc.get("evidence").and_then(|e| e.get("pid")),
                 }),
             );
+            // Phase 014-C: carry incident_id so link_correlated_incidents can
+            // create CorrelatedWith edges if this kill chain pattern is part
+            // of a larger multi-stage cross-layer attack chain.
+            if let Some(iid) = inc.get("incident_id").and_then(|v| v.as_str()) {
+                corr_event.incident_id = iid.to_string();
+            }
             correlation_engine.observe(corr_event);
         }
 

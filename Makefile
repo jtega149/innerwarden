@@ -8,11 +8,12 @@ CARGO        := $(HOME)/.cargo/bin/cargo
 
 .PHONY: build
 build:
-	$(CARGO) build -p innerwarden-sensor -p innerwarden-agent -p innerwarden-ctl
+	$(CARGO) build -p innerwarden-sensor --features ebpf
+	$(CARGO) build -p innerwarden-agent -p innerwarden-ctl
 
 .PHONY: build-sensor
 build-sensor:
-	$(CARGO) build -p innerwarden-sensor
+	$(CARGO) build -p innerwarden-sensor --features ebpf
 
 .PHONY: build-agent
 build-agent:
@@ -62,7 +63,9 @@ build-linux:
 	@$(dir $(CARGO))cargo-zigbuild --version >/dev/null 2>&1 || \
 		{ echo "cargo-zigbuild not found - install with: cargo install cargo-zigbuild"; exit 1; }
 	@rustup target add $(TARGET_LINUX) 2>/dev/null || true
-	$(CARGO) zigbuild -p innerwarden-sensor -p innerwarden-agent -p innerwarden-ctl \
+	$(CARGO) zigbuild -p innerwarden-sensor --features ebpf \
+		--target $(TARGET_LINUX) --release
+	$(CARGO) zigbuild -p innerwarden-agent -p innerwarden-ctl \
 		--target $(TARGET_LINUX) --release
 	@echo "Sensor: $(RELEASE_DIR)/innerwarden-sensor"
 	@echo "Agent:  $(RELEASE_DIR)/innerwarden-agent"

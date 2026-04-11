@@ -180,11 +180,6 @@ pub fn collector_section(id: &str) -> Option<&'static str> {
         "nginx-error-log" => Some("collectors.nginx_error"),
         "syslog-firewall" => Some("collectors.syslog_firewall"),
         "macos-log" => Some("collectors.macos_log"),
-        // External collectors
-        "falco-log" => Some("collectors.falco_log"),
-        "suricata-eve" => Some("collectors.suricata_eve"),
-        "wazuh-alerts" => Some("collectors.wazuh_alerts"),
-        "osquery-log" => Some("collectors.osquery_log"),
         _ => None,
     }
 }
@@ -622,23 +617,6 @@ skill = "my-skill"
             Some("collectors.syslog_firewall")
         );
         assert_eq!(collector_section("macos-log"), Some("collectors.macos_log"));
-    }
-
-    #[test]
-    fn collector_section_external_ids() {
-        assert_eq!(collector_section("falco-log"), Some("collectors.falco_log"));
-        assert_eq!(
-            collector_section("suricata-eve"),
-            Some("collectors.suricata_eve")
-        );
-        assert_eq!(
-            collector_section("wazuh-alerts"),
-            Some("collectors.wazuh_alerts")
-        );
-        assert_eq!(
-            collector_section("osquery-log"),
-            Some("collectors.osquery_log")
-        );
     }
 
     #[test]

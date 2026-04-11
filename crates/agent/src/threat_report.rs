@@ -196,7 +196,12 @@ pub fn available_months(data_dir: &Path) -> Vec<String> {
                 .strip_prefix("incidents-")
                 .and_then(|s| s.strip_suffix(".jsonl"))
             {
-                if date.len() >= 7 {
+                // Validate YYYY-MM-DD format (reject incidents-graph-*, incidents-trigger-*, etc.)
+                if date.len() >= 7
+                    && date.as_bytes().get(4) == Some(&b'-')
+                    && date[..4].chars().all(|c| c.is_ascii_digit())
+                    && date[5..7].chars().all(|c| c.is_ascii_digit())
+                {
                     months.insert(date[..7].to_string());
                 }
             }
@@ -254,12 +259,66 @@ pub fn generate_monthly(
         .collect();
     let mut weekly_ips: Vec<HashSet<String>> = vec![HashSet::new(); 4];
 
+    // Phase 7 Gap 4: use dated graph snapshots for monthly aggregation.
+    // Falls back to JSONL for days without a snapshot.
+    tracing::info!(
+        month = %month,
+        days = days_in_month,
+        "threat_report: aggregating monthly data from graph snapshots"
+    );
+
     for day_offset in 0..days_in_month {
         let date = month_start + chrono::Duration::days(day_offset as i64);
         let date_str = date.format("%Y-%m-%d").to_string();
         let week_idx = (day_offset / 7).min(3) as usize;
 
-        // Count events
+        // Try graph snapshot first
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        {
+            use crate::knowledge_graph::types::{Node, NodeType, Relation};
+            let event_count = graph.edge_count() as u64; // approximate: edges ≈ events
+            total_events += event_count;
+            weekly[week_idx].events += event_count;
+            if event_count > 0 {
+                days_with_data += 1;
+            }
+
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    incident_id: _,
+                    detector,
+                    decision,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    total_incidents += 1;
+                    weekly[week_idx].incidents += 1;
+                    *incidents_by_detector.entry(detector.clone()).or_default() += 1;
+
+                    // Extract attacker IPs from TriggeredBy edges
+                    for edge in graph.outgoing_edges(id) {
+                        if edge.relation == Relation::TriggeredBy {
+                            if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                                attacker_ips.insert(addr.clone());
+                                weekly_ips[week_idx].insert(addr.clone());
+                            }
+                        }
+                    }
+
+                    if let Some(action) = decision {
+                        total_decisions += 1;
+                        weekly[week_idx].decisions += 1;
+                        if action == "block_ip" {
+                            total_blocks += 1;
+                            weekly[week_idx].blocks += 1;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Fallback: JSONL
         let events_path = data_dir.join(format!("events-{date_str}.jsonl"));
         if events_path.exists() {
             let count = count_jsonl_lines(&events_path);
@@ -270,7 +329,6 @@ pub fn generate_monthly(
             }
         }
 
-        // Count incidents and extract metadata
         let incidents_path = data_dir.join(format!("incidents-{date_str}.jsonl"));
         if incidents_path.exists() {
             if let Ok(file) = std::fs::File::open(&incidents_path) {
@@ -279,16 +337,12 @@ pub fn generate_monthly(
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                         total_incidents += 1;
                         weekly[week_idx].incidents += 1;
-
-                        // Extract detector from incident_id
                         if let Some(iid) = val["incident_id"].as_str() {
                             let detector = mitre::detector_from_incident_id(iid);
                             *incidents_by_detector
                                 .entry(detector.to_string())
                                 .or_default() += 1;
                         }
-
-                        // Extract attacker IPs
                         if let Some(entities) = val["entities"].as_array() {
                             for entity in entities {
                                 if entity["type"].as_str() == Some("ip") {
@@ -304,7 +358,6 @@ pub fn generate_monthly(
             }
         }
 
-        // Count decisions
         let decisions_path = data_dir.join(format!("decisions-{date_str}.jsonl"));
         if decisions_path.exists() {
             if let Ok(file) = std::fs::File::open(&decisions_path) {
