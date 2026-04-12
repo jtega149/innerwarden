@@ -336,6 +336,8 @@ pub fn is_agent_process(comm: &str) -> bool {
             | "innerwarden-watchdog"
             | "tokio-rt-worker"
             | "openclaw-gatewa"
+            | "crowdsec"
+            | "gomon"
     )
 }
 
