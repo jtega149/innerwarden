@@ -303,6 +303,16 @@ pub fn is_self_traffic_ip(ip_str: &str) -> bool {
     is_cloud_provider_ip(ip_str) || is_local_interface_ip(ip_str)
 }
 
+/// Number of local interface IPs loaded (for boot self-test).
+pub fn local_ip_count() -> usize {
+    LOCAL_INTERFACE_IPS.get().map_or(0, |v| v.len())
+}
+
+/// Number of cloud IP ranges loaded (for boot self-test).
+pub fn cloud_range_count() -> usize {
+    CLOUD_RANGES.get().map_or(0, |v| v.len())
+}
+
 /// Returns true if `ip_str` is one of the host's own locally-bound IPv4
 /// addresses (populated at startup from `/proc/net/fib_trie`). This
 /// catches the case where a sensor detector emits an incident whose

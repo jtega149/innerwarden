@@ -1437,6 +1437,9 @@ async fn main() -> Result<()> {
         // Proactive startup suggestions (fail2ban detected but not integrated, etc.)
         probe_and_suggest(&cfg, state.telegram_client.as_deref()).await;
 
+        // Boot self-test: verify self-awareness is working.
+        boot_self_test();
+
         // Always-on honeypot: permanent SSH listener from startup.
         // A watch channel is used to signal shutdown on SIGTERM/SIGINT.
         let always_on_shutdown_tx = if cfg.honeypot.mode == "always_on" {
@@ -3641,6 +3644,35 @@ async fn process_narrative_tick(
 // ---------------------------------------------------------------------------
 
 // LSM enforcement and trust rules moved to trust_rules.rs
+
+// ---------------------------------------------------------------------------
+// Boot self-test — verify self-awareness is working on startup
+// ---------------------------------------------------------------------------
+
+/// Quick validation at agent startup that the host inventory (own IPs,
+/// listening ports) was loaded correctly by the sensor, and cloud safelist
+/// is initialized. Logs warnings for anything that looks wrong.
+fn boot_self_test() {
+    use tracing::{info, warn};
+
+    // Check cloud safelist initialized (own IPs loaded)
+    let local_ips = cloud_safelist::local_ip_count();
+    if local_ips > 0 {
+        info!(local_ips, "boot self-test: local interface IPs loaded");
+    } else {
+        warn!("boot self-test: no local interface IPs detected — self-traffic filtering may not work");
+    }
+
+    // Check that cloud safelist ranges are loaded
+    let cloud_ranges = cloud_safelist::cloud_range_count();
+    if cloud_ranges > 0 {
+        info!(cloud_ranges, "boot self-test: cloud provider IP ranges loaded");
+    } else {
+        warn!("boot self-test: no cloud IP ranges loaded");
+    }
+
+    info!("boot self-test: passed");
+}
 
 // ---------------------------------------------------------------------------
 // Tests

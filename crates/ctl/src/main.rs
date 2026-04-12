@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod calibrate;
 mod capabilities;
 mod capability;
 mod commands;
@@ -1542,6 +1543,13 @@ enum SystemCommand {
         yes: bool,
     },
 
+    /// Discover running services, open ports, and outbound connections.
+    /// Generates a calibration report the operator can review and approve.
+    ///
+    /// Examples:
+    ///   innerwarden system calibrate
+    Calibrate,
+
     /// Scan this machine and recommend the best modules for your setup.
     ///
     /// Examples:
@@ -1961,6 +1969,7 @@ fn main() -> Result<()> {
             SystemCommand::Tune { days, yes } => {
                 commands::ops::cmd_tune(&cli, *days, *yes, &cli.data_dir.clone())
             }
+            SystemCommand::Calibrate => calibrate::cmd_calibrate(),
             SystemCommand::Scan { ref modules_dir } => scan::cmd_scan(modules_dir),
             SystemCommand::Watchdog {
                 threshold,

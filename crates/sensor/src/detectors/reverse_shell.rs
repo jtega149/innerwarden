@@ -197,6 +197,14 @@ impl ReverseShellDetector {
             return None;
         };
 
+        // Self-traffic guard: connection to this host's own IP is inter-service
+        // communication, not a reverse shell (e.g., agent → localhost honeypot).
+        // Note: we only filter own_ips, NOT all internal IPs — a reverse shell
+        // to another internal host is real lateral movement and must alert.
+        if !target_ip.is_empty() && super::is_own_ip(&target_ip) {
+            return None;
+        }
+
         // Cooldown check
         let key = Self::hash_command(&format!("{pattern}:{pid}"));
         if let Some(&last) = self.alerted.get(&key) {
