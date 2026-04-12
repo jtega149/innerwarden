@@ -42,6 +42,11 @@ enabled = true
 threshold = 8
 window_seconds = 300
 
+[detectors.suspicious_login]
+# Fire a Medium-severity incident when a user logs in outside their normal hours.
+# Requires 7 days of login history per user before activating (opt-in, default off).
+anomaly_hours_enabled = false
+
 [detectors.credential_stuffing]
 enabled = false
 # distinct usernames targeted by one source IP within window

@@ -383,8 +383,9 @@ async fn main() -> Result<()> {
         log_tampering: log_tampering_detector,
         distributed_ssh: distributed_ssh_detector,
         suspicious_login: cfg.detectors.ssh_bruteforce.enabled.then(|| {
-            info!("suspicious_login detector enabled");
-            SuspiciousLoginDetector::new(&cfg.agent.host_id, 300)
+            let anomaly_hours = cfg.detectors.suspicious_login.anomaly_hours_enabled;
+            info!(anomaly_hours_enabled = anomaly_hours, "suspicious_login detector enabled");
+            SuspiciousLoginDetector::new(&cfg.agent.host_id, 300, anomaly_hours)
         }),
         c2_callback: Some({
             info!("c2_callback detector enabled (eBPF network monitoring)");
