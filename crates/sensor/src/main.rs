@@ -58,9 +58,9 @@ use detectors::web_scan::WebScanDetector;
 use detectors::web_shell::WebShellDetector;
 #[cfg(feature = "redis-sink")]
 use sinks::redis_stream::{RedisStreamConfig, RedisStreamWriter};
-use sinks::{jsonl::JsonlWriter, state::State};
+use sinks::{sqlite::SqliteWriter, state::State};
 use tokio::sync::mpsc;
-use tokio::time;
+#[allow(unused_imports)]
 use tracing::{info, warn};
 
 #[derive(Parser)]
@@ -170,9 +170,8 @@ async fn main() -> Result<()> {
     let mut state = State::load(&state_path)?;
     info!(cursors = state.cursors.len(), "state loaded");
 
-    // When Redis is configured, events go to Redis Streams. JSONL still writes
-    // incidents (they're small and need persistence). Events JSONL is disabled
-    // when Redis is active to avoid disk bloat.
+    // When Redis is configured, events also go to Redis Streams for
+    // high-throughput consumer group reads by the agent.
     #[cfg(feature = "redis-sink")]
     let mut redis_writer: Option<RedisStreamWriter> = if let Some(ref url) = cfg.output.redis_url {
         let redis_cfg = RedisStreamConfig::new(
@@ -191,13 +190,11 @@ async fn main() -> Result<()> {
         None
     };
 
-    // If Redis is active, disable JSONL event writes (incidents still written).
-    #[cfg(feature = "redis-sink")]
-    let write_events_jsonl = cfg.output.write_events && redis_writer.is_none();
-    #[cfg(not(feature = "redis-sink"))]
-    let write_events_jsonl = cfg.output.write_events;
+    let write_events = cfg.output.write_events;
 
-    let mut writer = JsonlWriter::new(data_dir, write_events_jsonl)?;
+    // SQLite is the primary and only event/incident sink.
+    let sqlite_writer = SqliteWriter::new(data_dir, write_events)?;
+    info!(path = %data_dir.join("innerwarden.db").display(), "sqlite sink enabled");
     // Optional syslog CEF output (configured via env or future config section)
     let mut syslog_writer: Option<sinks::syslog_cef::SyslogCefWriter> = {
         let syslog_host = std::env::var("INNERWARDEN_SYSLOG_HOST").unwrap_or_default();
@@ -1102,10 +1099,6 @@ async fn main() -> Result<()> {
     // within a 10-second window. Only the highest severity is kept.
     let mut dedup_cache: HashMap<u32, (chrono::DateTime<chrono::Utc>, u8)> = HashMap::new();
 
-    // Flush every 5 seconds regardless of event count
-    let mut flush_ticker = time::interval(time::Duration::from_secs(5));
-    flush_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-
     'main: loop {
         // Receive next event or signal
         #[cfg(unix)]
@@ -1119,12 +1112,6 @@ async fn main() -> Result<()> {
                 info!("SIGTERM received - shutting down");
                 break 'main;
             }
-            _ = flush_ticker.tick() => {
-                if let Err(e) = writer.flush() {
-                    warn!("periodic flush failed: {e:#}");
-                }
-                continue 'main;
-            }
         };
 
         #[cfg(not(unix))]
@@ -1133,12 +1120,6 @@ async fn main() -> Result<()> {
             _ = tokio::signal::ctrl_c() => {
                 info!("SIGINT received - shutting down");
                 break 'main;
-            }
-            _ = flush_ticker.tick() => {
-                if let Err(e) = writer.flush() {
-                    warn!("periodic flush failed: {e:#}");
-                }
-                continue 'main;
             }
         };
 
@@ -1160,27 +1141,19 @@ async fn main() -> Result<()> {
 
         process_event(
             ev,
-            &mut writer,
+            &sqlite_writer,
             &mut detectors,
             &mut stats,
             &mut syslog_writer,
             &mut dedup_cache,
             &threat_datasets,
         );
-
-        // Also flush every 50 events as a safety net
-        if stats.events_written > 0 && stats.events_written % 50 == 0 {
-            if let Err(e) = writer.flush() {
-                warn!("count-based flush failed: {e:#}");
-            }
-        }
     }
 
-    writer.flush()?;
     info!(
         events_written = stats.events_written,
         incidents_written = stats.incidents_written,
-        "flushed output"
+        "sensor stopped"
     );
 
     // Persist collector state using the latest values from the shared Arcs
@@ -1250,9 +1223,10 @@ fn is_passthrough_source(source: &str) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_event(
     ev: innerwarden_core::event::Event,
-    writer: &mut JsonlWriter,
+    sqlite: &SqliteWriter,
     detectors: &mut DetectorSet,
     stats: &mut WriteStats,
     syslog: &mut Option<sinks::syslog_cef::SyslogCefWriter>,
@@ -1262,11 +1236,8 @@ fn process_event(
     use innerwarden_core::event::Severity;
 
     info!(kind = %ev.kind, summary = %ev.summary, "event");
-    if let Err(e) = writer.write_event(&ev) {
-        warn!(kind = %ev.kind, "failed to write event: {e:#}");
-    } else {
-        stats.events_written += 1;
-    }
+    sqlite.write_event(&ev);
+    stats.events_written += 1;
     // Syslog CEF output (if configured)
     if let Some(ref mut cef) = syslog {
         cef.write_event(&ev);
@@ -1310,7 +1281,7 @@ fn process_event(
             tags: ev.tags.clone(),
             entities: ev.entities.clone(),
         };
-        write_incident(writer, stats, incident, syslog, dedup_cache);
+        write_incident(sqlite, stats, incident, syslog, dedup_cache);
     }
 
     // Reload dynamic allowlist every 60s (checks file mtime, no-op if unchanged).
@@ -1323,7 +1294,7 @@ fn process_event(
 
     // Reload blocked IPs from agent feedback every 60s.
     if detectors.blocked_ips_last_check.elapsed().as_secs() > 60 {
-        let refreshed = load_blocked_ips(writer.data_dir());
+        let refreshed = load_blocked_ips(sqlite.data_dir());
         if refreshed.len() != detectors.blocked_ips.len() {
             info!(count = refreshed.len(), "blocked IPs list refreshed");
         }
@@ -1389,7 +1360,7 @@ fn process_event(
         let is_actionable = matches!(ev.severity, Severity::High | Severity::Critical);
         if is_actionable {
             if let Some(incident) = passthrough_incident(&ev) {
-                write_incident(writer, stats, incident, syslog, dedup_cache);
+                write_incident(sqlite, stats, incident, syslog, dedup_cache);
             }
         }
         // Passthrough sources don't need InnerWarden detectors - return early.
@@ -1398,253 +1369,253 @@ fn process_event(
 
     if let Some(ref mut det) = detectors.ssh {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.credential_stuffing {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.port_scan {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.sudo_abuse {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.search_abuse {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.web_scan {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.user_agent_scanner {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.execution_guard {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.docker_anomaly {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.integrity_alert {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.log_tampering {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.distributed_ssh {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.suspicious_login {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.c2_callback {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.process_tree {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.container_escape {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.privesc {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.fileless {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.dns_tunneling {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.lateral_movement {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.crypto_miner {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.outbound_anomaly {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.rootkit {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.reverse_shell {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.ssh_key_injection {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.web_shell {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.kernel_module_load {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.crontab_persistence {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.data_exfiltration {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.process_injection {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.user_creation {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.systemd_persistence {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.ransomware {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.credential_harvest {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.packet_flood {
         for incident in det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.sensitive_write {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.discovery_burst {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.io_uring_anomaly {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.container_drift {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.host_drift {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.data_exfil_ebpf {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.yara_scan {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
@@ -1652,45 +1623,45 @@ fn process_event(
         if let Some(incident) =
             det.process_with_suppressions(&ev, &detectors.dynamic_allowlist.suppress_sigma_rules)
         {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.mitre_hunt {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.dns_c2 {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.data_encoding {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     if let Some(ref mut det) = detectors.sandbox_evasion {
         if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     // Threat intelligence dataset matching (O(1) per lookup).
     if let Some(ref mut det) = detectors.threat_intel {
         if let Some(incident) = det.process(&ev, threat_datasets) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
     // Protocol anomaly detection (works on tcp_stream events).
     if let Some(ref mut det) = detectors.proto_anomaly {
         for incident in det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 }
@@ -1724,7 +1695,7 @@ fn passthrough_incident(
 }
 
 fn write_incident(
-    writer: &mut JsonlWriter,
+    sqlite: &SqliteWriter,
     stats: &mut WriteStats,
     incident: innerwarden_core::incident::Incident,
     syslog: &mut Option<sinks::syslog_cef::SyslogCefWriter>,
@@ -1759,11 +1730,8 @@ fn write_incident(
         title = %incident.title,
         "INCIDENT"
     );
-    if let Err(e) = writer.write_incident(&incident) {
-        warn!(incident_id = %incident.incident_id, "failed to write incident: {e:#}");
-    } else {
-        stats.incidents_written += 1;
-    }
+    sqlite.write_incident(&incident);
+    stats.incidents_written += 1;
     // Syslog CEF output for incidents
     if let Some(ref mut cef) = syslog {
         cef.write_incident(&incident);

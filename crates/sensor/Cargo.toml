@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 innerwarden_core = { path = "../core" }
+innerwarden-store = { path = "../store" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }

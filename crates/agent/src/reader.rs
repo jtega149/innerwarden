@@ -1,3 +1,6 @@
+// Legacy JSONL incremental reader. Production code reads from SQLite (spec 016).
+// Kept for: test helpers, telemetry JSONL reader, backfill_graph_decisions.
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
