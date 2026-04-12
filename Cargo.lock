@@ -1665,6 +1665,7 @@ dependencies = [
  "innerwarden-mesh",
  "innerwarden-shield",
  "innerwarden-smm",
+ "innerwarden-store",
  "innerwarden_core",
  "p256",
  "rand_core 0.6.4",

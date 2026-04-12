@@ -427,6 +427,7 @@ struct AgentState {
     /// Persistent state store (redb) - cooldowns, block_counts, ip_reputations,
     /// xdp_block_times, trust_rules. Primary source of truth for reads.
     store: state_store::StateStore,
+    sqlite_store: Option<innerwarden_store::Store>,
     /// Attacker intelligence profiles: IP → unified profile.
     attacker_profiles: HashMap<String, attacker_intel::AttackerProfile>,
     /// Last attacker intel consolidation timestamp (5-minute interval).
@@ -979,6 +980,11 @@ async fn main() -> Result<()> {
         state_store::StateStore::open(&std::env::temp_dir()).expect("fallback store")
     });
 
+    let sqlite_store = match innerwarden_store::Store::open(&cli.data_dir) {
+        Ok(s) => { info!(path = %cli.data_dir.join("innerwarden.db").display(), "sqlite store opened"); Some(s) }
+        Err(e) => { warn!("sqlite store unavailable: {e:#}"); None }
+    };
+
     // Seed the persistent store with decision cooldowns loaded from recent JSONL files.
     // This ensures restart continuity: IPs already decided on won't be re-evaluated.
     for (key, ts) in &startup_cooldowns {
@@ -1222,6 +1228,7 @@ async fn main() -> Result<()> {
         narrative_incidents_offset: 0,
         forensics: forensics::ForensicsCapture::new(&cli.data_dir),
         store,
+        sqlite_store,
         attacker_profiles: HashMap::new(), // loaded from redb below
         last_intel_consolidation_at: None,
         correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -2348,17 +2355,26 @@ async fn process_incidents(
         .format("%Y-%m-%d")
         .to_string();
 
-    let incidents_path = data_dir.join(format!("incidents-{today}.jsonl"));
-
-    let new_incidents = match reader::read_new_entries::<innerwarden_core::incident::Incident>(
-        &incidents_path,
-        cursor.incidents_offset(&today),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            state.telemetry.observe_error("incident_reader");
-            warn!("incident tick: failed to read incidents: {e:#}");
-            return 0;
+    let new_incidents = if let Some(ref sq) = state.sqlite_store {
+        let cval = sq.get_agent_cursor("incidents").unwrap_or(0);
+        match sq.incidents_since(cval, 5000) {
+            Ok(rows) if !rows.is_empty() => {
+                let max_id = rows.last().unwrap().0;
+                let entries = rows.into_iter().map(|(_, inc)| inc).collect();
+                let _ = sq.set_agent_cursor("incidents", max_id);
+                reader::ReadResult { entries, new_offset: 0 }
+            }
+            _ => {
+                let p = data_dir.join(format!("incidents-{today}.jsonl"));
+                reader::read_new_entries(&p, cursor.incidents_offset(&today))
+                    .unwrap_or(reader::ReadResult { entries: vec![], new_offset: cursor.incidents_offset(&today) })
+            }
+        }
+    } else {
+        let p = data_dir.join(format!("incidents-{today}.jsonl"));
+        match reader::read_new_entries(&p, cursor.incidents_offset(&today)) {
+            Ok(r) => r,
+            Err(e) => { state.telemetry.observe_error("incident_reader"); warn!("incident reader: {e:#}"); return 0; }
         }
     };
 
@@ -2443,11 +2459,12 @@ async fn process_incidents(
     let ai_enabled = cfg.ai.enabled && state.ai_provider.is_some() && !circuit_breaker_open;
     let (all_events, skill_infos, ai_provider, provider_name, already_blocked, mut blocked_set) =
         if ai_enabled {
-            let events_path = data_dir.join(format!("events-{today}.jsonl"));
-            let events =
-                reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, 0)
-                    .map(|r| r.entries)
-                    .unwrap_or_default();
+            let events = if let Some(ref sq) = state.sqlite_store {
+                sq.events_since(0, 50_000).map(|rows| rows.into_iter().map(|(_, ev)| ev).collect()).unwrap_or_default()
+            } else {
+                let events_path = data_dir.join(format!("events-{today}.jsonl"));
+                reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, 0).map(|r| r.entries).unwrap_or_default()
+            };
             let infos = state.skill_registry.infos();
             // Clone the Arc - owned handle, no borrow of `state`
             let prov: Arc<dyn ai::AiProvider> = state.ai_provider.as_ref().unwrap().clone();
@@ -3313,6 +3330,25 @@ async fn process_narrative_tick(
                 (Vec::new(), 0)
             }
         }
+    } else if let Some(ref sq) = state.sqlite_store {
+        let cval = sq.get_agent_cursor("events").unwrap_or(0);
+        match sq.events_since(cval, 5000) {
+            Ok(rows) if !rows.is_empty() => {
+                let max_id = rows.last().unwrap().0;
+                let entries: Vec<_> = rows.into_iter().map(|(_, ev)| ev).collect();
+                let count = entries.len();
+                let _ = sq.set_agent_cursor("events", max_id);
+                (entries, count)
+            }
+            _ => {
+                let events_path = data_dir.join(format!("events-{today}.jsonl"));
+                let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, cursor.events_offset(&today))
+                    .inspect_err(|_| { state.telemetry.observe_error("event_reader"); })?;
+                let count = new_events.entries.len();
+                cursor.set_events_offset(&today, new_events.new_offset);
+                (new_events.entries, count)
+            }
+        }
     } else {
         let events_path = data_dir.join(format!("events-{today}.jsonl"));
         let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(
@@ -3328,15 +3364,29 @@ async fn process_narrative_tick(
     };
 
     #[cfg(not(feature = "redis-reader"))]
-    let (events_entries, events_count) = {
+    let (events_entries, events_count) = if let Some(ref sq) = state.sqlite_store {
+        let cval = sq.get_agent_cursor("events").unwrap_or(0);
+        match sq.events_since(cval, 5000) {
+            Ok(rows) if !rows.is_empty() => {
+                let max_id = rows.last().unwrap().0;
+                let entries: Vec<_> = rows.into_iter().map(|(_, ev)| ev).collect();
+                let count = entries.len();
+                let _ = sq.set_agent_cursor("events", max_id);
+                (entries, count)
+            }
+            _ => {
+                let events_path = data_dir.join(format!("events-{today}.jsonl"));
+                let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, cursor.events_offset(&today))
+                    .inspect_err(|_| { state.telemetry.observe_error("event_reader"); })?;
+                let count = new_events.entries.len();
+                cursor.set_events_offset(&today, new_events.new_offset);
+                (new_events.entries, count)
+            }
+        }
+    } else {
         let events_path = data_dir.join(format!("events-{today}.jsonl"));
-        let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(
-            &events_path,
-            cursor.events_offset(&today),
-        )
-        .inspect_err(|_| {
-            state.telemetry.observe_error("event_reader");
-        })?;
+        let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, cursor.events_offset(&today))
+            .inspect_err(|_| { state.telemetry.observe_error("event_reader"); })?;
         let count = new_events.entries.len();
         cursor.set_events_offset(&today, new_events.new_offset);
         (new_events.entries, count)
@@ -3962,6 +4012,7 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(data_dir),
             store: state_store::StateStore::open(data_dir).unwrap(),
+            sqlite_store: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4248,6 +4299,7 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4429,6 +4481,7 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4585,6 +4638,7 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4753,6 +4807,7 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4898,6 +4953,7 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -5055,6 +5111,7 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
