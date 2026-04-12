@@ -481,7 +481,11 @@ impl KnowledgeGraph {
             ..
         }) = self.nodes.get_mut(&ip_id)
         {
-            // Move to the back if already present; otherwise push.
+            // SECURITY NOTE: these are attacker-supplied brute-force usernames
+            // (e.g., "root", "admin", "test123"), NOT real credentials. Stored
+            // in plaintext intentionally for threat DNA fingerprinting and
+            // dashboard display. CodeQL may flag this as "cleartext logging of
+            // sensitive information" — it is a false positive in this context.
             if let Some(pos) = attempted_usernames.iter().position(|u| u == username) {
                 attempted_usernames.remove(pos);
             }

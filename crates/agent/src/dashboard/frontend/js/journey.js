@@ -457,7 +457,6 @@ async function loadJourney(subjectType, subjectValue) {
 
         const topIncident = incidents.length > 0 ? incidents[0] : null;
         const topData = topIncident ? (topIncident.data || {}) : {};
-        const topDetector = topData.detector || (topData.incident_id || '').split(':')[0] || '';
         const topTitle = topData.title || '';
         const wasBlocked = blocks.length > 0;
         const isGuard = (window._agentMode || 'guard') === 'guard';

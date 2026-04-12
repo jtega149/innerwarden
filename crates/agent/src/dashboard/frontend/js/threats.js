@@ -275,7 +275,6 @@ function updateStatusHero(incidents, decisions) {
   if (!hero || !icon || !title || !sub) return;
 
   const ov = window._lastOverview || {};
-  const blocked = ov.ai_responded || 0;
   const noise = ov.ai_ignored || 0;
 
   // Count items by outcome from the current entity list

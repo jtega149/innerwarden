@@ -590,19 +590,10 @@ fn run_cleanup_015(data_dir: &std::path::Path) -> Result<()> {
         report.brute_force_user_nodes_removed
     );
     if !report.removed_user_names.is_empty() {
-        let sample: Vec<&str> = report
-            .removed_user_names
-            .iter()
-            .take(10)
-            .map(|s| s.as_str())
-            .collect();
-        println!("  removed sample       : {}", sample.join(", "));
-        if report.removed_user_names.len() > 10 {
-            println!(
-                "  …                    : +{} more",
-                report.removed_user_names.len() - 10
-            );
-        }
+        println!(
+            "  removed users        : {} (names redacted)",
+            report.removed_user_names.len()
+        );
     }
     Ok(())
 }
