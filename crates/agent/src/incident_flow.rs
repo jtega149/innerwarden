@@ -108,10 +108,8 @@ pub(crate) fn evaluate_pre_ai_flow(
     if !ai::should_invoke_ai(incident, blocked_set, &cfg.ai.parsed_min_severity()) {
         // Distinguish "below severity threshold" from other skip reasons so
         // the caller can route low-severity noise to the auto-dismiss gate.
-        let dominated_by_min = ai::is_below_severity_threshold(
-            &incident.severity,
-            &cfg.ai.parsed_min_severity(),
-        );
+        let dominated_by_min =
+            ai::is_below_severity_threshold(&incident.severity, &cfg.ai.parsed_min_severity());
         if dominated_by_min {
             info!(
                 incident_id = %incident.incident_id,

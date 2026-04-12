@@ -143,8 +143,9 @@ impl KernelModuleLoadDetector {
         // Nested shell wrappers: sudo modprobe foo, bash -c 'modprobe foo',
         // env VAR=x insmod bar, nice -n 10 rmmod baz. Walk one more token
         // under a known shell/env wrapper so we still catch real usage.
-        const WRAPPERS: &[&str] =
-            &["sudo", "doas", "bash", "sh", "zsh", "dash", "env", "nice", "nohup", "timeout"];
+        const WRAPPERS: &[&str] = &[
+            "sudo", "doas", "bash", "sh", "zsh", "dash", "env", "nice", "nohup", "timeout",
+        ];
         if WRAPPERS.contains(&first_base) {
             for tok in tokens {
                 if tok.starts_with('-') || tok.contains('=') {

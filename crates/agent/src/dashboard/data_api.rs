@@ -98,9 +98,8 @@ pub(super) async fn api_overview(
                         // Only count as "responded" if the target looks like
                         // an IP. Pre-fix FPs like sandbox_evasion blocked a
                         // PID (numeric string) which is not a real response.
-                        let target_is_ip = decision_target
-                            .as_ref()
-                            .is_some_and(|t| t.contains('.'));
+                        let target_is_ip =
+                            decision_target.as_ref().is_some_and(|t| t.contains('.'));
                         if target_is_ip {
                             ai_responded += 1;
                         }
@@ -477,14 +476,13 @@ pub(super) async fn api_ai_explain(
                     ts.format("%H:%M:%S")
                 ));
                 if let Some(dec) = decision {
-                    let reason = decision_reason
-                        .as_deref()
-                        .unwrap_or("no reason recorded");
-                    let executed = if *auto_executed { "executed" } else { "recommended" };
-                    decision_lines.push(format!(
-                        "- AI {} {}: {}",
-                        executed, dec, reason
-                    ));
+                    let reason = decision_reason.as_deref().unwrap_or("no reason recorded");
+                    let executed = if *auto_executed {
+                        "executed"
+                    } else {
+                        "recommended"
+                    };
+                    decision_lines.push(format!("- AI {} {}: {}", executed, dec, reason));
                 }
             }
         }
@@ -600,9 +598,8 @@ pub(super) fn compute_overview_from_graph(
                     }
                     _ => {
                         ai_confirmed += 1;
-                        let target_is_ip = decision_target
-                            .as_ref()
-                            .is_some_and(|t| t.contains('.'));
+                        let target_is_ip =
+                            decision_target.as_ref().is_some_and(|t| t.contains('.'));
                         if target_is_ip {
                             ai_responded += 1;
                         }

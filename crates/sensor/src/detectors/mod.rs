@@ -24,8 +24,7 @@ pub fn init_test_external_ips(ips: std::collections::HashSet<String>) {
 
 /// The host's own IP addresses (all local interfaces).
 /// Set once at startup from /proc/net/fib_trie.
-static OWN_IPS: std::sync::OnceLock<std::collections::HashSet<String>> =
-    std::sync::OnceLock::new();
+static OWN_IPS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
 
 /// Ports the host is actively listening on.
 /// Set once at startup from /proc/net/tcp + tcp6.
@@ -50,9 +49,7 @@ pub fn init_host_inventory() {
 
 /// Check if an IP belongs to this host (any local interface).
 pub fn is_own_ip(ip: &str) -> bool {
-    OWN_IPS
-        .get()
-        .is_some_and(|set| set.contains(ip))
+    OWN_IPS.get().is_some_and(|set| set.contains(ip))
 }
 
 /// Check if a port is being listened on by this host.

@@ -107,10 +107,7 @@ fn discover_listeners() -> BTreeMap<u16, BTreeSet<String>> {
     let mut result: BTreeMap<u16, BTreeSet<String>> = BTreeMap::new();
 
     // Try ss first (more info), fall back to /proc/net/tcp
-    if let Ok(output) = std::process::Command::new("ss")
-        .args(["-tlnp"])
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("ss").args(["-tlnp"]).output() {
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines().skip(1) {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -123,9 +120,7 @@ fn discover_listeners() -> BTreeMap<u16, BTreeSet<String>> {
                     // Process info in last column: users:(("sshd",pid=1234,...))
                     let proc_name = parts
                         .last()
-                        .and_then(|s| {
-                            s.split('"').nth(1).map(|n| n.to_string())
-                        })
+                        .and_then(|s| s.split('"').nth(1).map(|n| n.to_string()))
                         .unwrap_or_else(|| "?".to_string());
                     result.entry(port).or_default().insert(proc_name);
                 }
@@ -162,7 +157,13 @@ fn discover_listeners() -> BTreeMap<u16, BTreeSet<String>> {
 fn discover_services() -> BTreeSet<String> {
     let mut services = BTreeSet::new();
     if let Ok(output) = std::process::Command::new("systemctl")
-        .args(["list-units", "--type=service", "--state=running", "--no-legend", "--plain"])
+        .args([
+            "list-units",
+            "--type=service",
+            "--state=running",
+            "--no-legend",
+            "--plain",
+        ])
         .output()
     {
         let text = String::from_utf8_lossy(&output.stdout);
