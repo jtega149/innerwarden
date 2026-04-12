@@ -20,7 +20,13 @@ pub fn cmd_smm(json: bool) -> Result<()> {
     println!();
 
     for check in &report.checks {
-        print_check(check.status_icon(), check.id, check.name, check.confidence, &check.detail);
+        print_check(
+            check.status_icon(),
+            check.id,
+            check.name,
+            check.confidence,
+            &check.detail,
+        );
     }
 
     // Correlated threats.
@@ -51,10 +57,26 @@ pub fn cmd_smm(json: bool) -> Result<()> {
     }
 
     // Summary.
-    let secure = report.checks.iter().filter(|c| c.status == innerwarden_smm::CheckStatus::Secure).count();
-    let warnings = report.checks.iter().filter(|c| c.status == innerwarden_smm::CheckStatus::Warning).count();
-    let critical = report.checks.iter().filter(|c| c.status == innerwarden_smm::CheckStatus::Critical).count();
-    let unavailable = report.checks.iter().filter(|c| c.status == innerwarden_smm::CheckStatus::Unavailable).count();
+    let secure = report
+        .checks
+        .iter()
+        .filter(|c| c.status == innerwarden_smm::CheckStatus::Secure)
+        .count();
+    let warnings = report
+        .checks
+        .iter()
+        .filter(|c| c.status == innerwarden_smm::CheckStatus::Warning)
+        .count();
+    let critical = report
+        .checks
+        .iter()
+        .filter(|c| c.status == innerwarden_smm::CheckStatus::Critical)
+        .count();
+    let unavailable = report
+        .checks
+        .iter()
+        .filter(|c| c.status == innerwarden_smm::CheckStatus::Unavailable)
+        .count();
 
     println!("  ──────────────────────────────────────────");
     println!(
@@ -69,9 +91,13 @@ pub fn cmd_smm(json: bool) -> Result<()> {
     if critical > 0 || !report.correlated_threats.is_empty() {
         println!();
         if report.trust_score < 0.1 {
-            println!("  \x1b[31;1m⚠ FIRMWARE INTEGRITY COMPROMISED — investigate immediately.\x1b[0m");
+            println!(
+                "  \x1b[31;1m⚠ FIRMWARE INTEGRITY COMPROMISED — investigate immediately.\x1b[0m"
+            );
         } else if report.trust_score < 0.5 {
-            println!("  \x1b[31m⚠ Firmware trust degraded — review correlated threats above.\x1b[0m");
+            println!(
+                "  \x1b[31m⚠ Firmware trust degraded — review correlated threats above.\x1b[0m"
+            );
         }
     }
 
@@ -125,7 +151,10 @@ pub fn cmd_smm_drift() -> Result<()> {
             innerwarden_smm::baseline::DriftSeverity::Suspicious => ("?", "\x1b[33m"),
             innerwarden_smm::baseline::DriftSeverity::Critical => ("!", "\x1b[31m"),
         };
-        println!("  {color}{icon}\x1b[0m {}: {color}{}\x1b[0m", d.component, d.detail);
+        println!(
+            "  {color}{icon}\x1b[0m {}: {color}{}\x1b[0m",
+            d.component, d.detail
+        );
     }
 
     Ok(())
@@ -193,7 +222,11 @@ pub fn cmd_hypervisor(json: bool) -> Result<()> {
     }
 
     // Probe evidence.
-    let positive_probes: Vec<_> = report.probe_results.iter().filter(|p| p.score > 0).collect();
+    let positive_probes: Vec<_> = report
+        .probe_results
+        .iter()
+        .filter(|p| p.score > 0)
+        .collect();
     if !positive_probes.is_empty() {
         println!(
             "  \x1b[1m── VM Evidence ({} signals) ──\x1b[0m",
@@ -219,10 +252,26 @@ pub fn cmd_hypervisor(json: bool) -> Result<()> {
     }
 
     // Summary.
-    let secure = report.checks.iter().filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Secure).count();
-    let warnings = report.checks.iter().filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Warning).count();
-    let critical = report.checks.iter().filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Critical).count();
-    let unavail = report.checks.iter().filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Unavailable).count();
+    let secure = report
+        .checks
+        .iter()
+        .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Secure)
+        .count();
+    let warnings = report
+        .checks
+        .iter()
+        .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Warning)
+        .count();
+    let critical = report
+        .checks
+        .iter()
+        .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Critical)
+        .count();
+    let unavail = report
+        .checks
+        .iter()
+        .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Unavailable)
+        .count();
 
     println!("  ──────────────────────────────────────────");
     println!(
@@ -253,13 +302,7 @@ impl StatusIcon for innerwarden_smm::CheckResult {
     }
 }
 
-fn print_check(
-    (icon, color): (&str, &str),
-    id: &str,
-    name: &str,
-    confidence: f64,
-    detail: &str,
-) {
+fn print_check((icon, color): (&str, &str), id: &str, name: &str, confidence: f64, detail: &str) {
     let conf = if confidence > 0.0 {
         format!(" \x1b[90m({:.0}%)\x1b[0m", confidence * 100.0)
     } else {
