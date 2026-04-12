@@ -19,6 +19,7 @@ async function loadHome() {
     ]);
     window._lastOverview = overview;
     window._agentMode = status.mode || 'guard';
+    window._lastIncidentList = incidentList.items || [];
 
     // Filtered base matches what Recent Activity will render.
     var items = incidentList.items || [];
@@ -36,7 +37,8 @@ async function loadHome() {
       status: status,
       overview: overview,
       responsesData: responsesData,
-      activeHighCriticalList: activeHighCriticalList
+      activeHighCriticalList: activeHighCriticalList,
+      allIncidents: items
     });
 
     // Soft stale: telemetry a few minutes behind but not yet state 3.
@@ -138,7 +140,16 @@ function computeHomeState(payload) {
 
   // Guard ON or no active threats: AI Protection Active.
   // The operator sees confidence, not alarm.
-  var blocked = overview.ai_responded || 0;
+  // Count unique blocked IPs (same logic as KPI, not decision count)
+  var blockedSet = new Set();
+  (payload.allIncidents || []).forEach(function(inc) {
+    if (inc.outcome === 'blocked' || inc.outcome === 'contained') {
+      (inc.entities || []).forEach(function(e) {
+        if ((e.type || '').toLowerCase() === 'ip' && e.value) blockedSet.add(e.value);
+      });
+    }
+  });
+  var blocked = blockedSet.size || (overview.ai_responded || 0);
   var observing = activeList.length;
   var subParts = [];
   if (blocked > 0) subParts.push(blocked + ' blocked');
@@ -205,7 +216,16 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
   var didEl  = document.getElementById('homeNowDid');
   if (!whatEl || !didEl) return;
 
-  var contained = overview.ai_responded || 0;
+  // Use unique blocked IPs, not decision count (matches KPI + Threats)
+  var blockedIpsNow = new Set();
+  (window._lastIncidentList || []).forEach(function(inc) {
+    if (inc.outcome === 'blocked' || inc.outcome === 'contained') {
+      (inc.entities || []).forEach(function(e) {
+        if ((e.type || '').toLowerCase() === 'ip' && e.value) blockedIpsNow.add(e.value);
+      });
+    }
+  });
+  var contained = blockedIpsNow.size || (overview.ai_responded || 0);
   var total = totalEventsScanned || overview.events_count || 0;
 
   // Line 1 — Trust signal: volume scanned
@@ -234,8 +254,18 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
 
 // ── KPIs with fixed temporal sub-labels ──────────────────────────────
 function updateHomeKpis(overview, totalEventsScanned) {
+  // Count unique IPs with block decisions (matches Threats tab entity count)
+  var blockedIps = new Set();
+  var items = (window._lastIncidentList || []);
+  items.forEach(function(inc) {
+    if (inc.outcome === 'blocked' || inc.outcome === 'contained') {
+      (inc.entities || []).forEach(function(e) {
+        if ((e.type || '').toLowerCase() === 'ip' && e.value) blockedIps.add(e.value);
+      });
+    }
+  });
   var el = document.getElementById('homeKpiThreats');
-  if (el) el.textContent = overview.ai_responded || 0;
+  if (el) el.textContent = blockedIps.size || overview.ai_responded || 0;
 
   el = document.getElementById('homeKpiResponded');
   if (el) el.textContent = overview.incidents_count || 0;
