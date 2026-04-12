@@ -1821,6 +1821,7 @@ dependencies = [
  "dns-lookup",
  "flate2",
  "glob",
+ "innerwarden-store",
  "innerwarden_core",
  "libc",
  "proptest",
