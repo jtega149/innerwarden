@@ -23,10 +23,16 @@ pub struct SuspiciousLoginDetector {
     /// Suppress re-alerts per IP within window.
     alerted: HashMap<String, DateTime<Utc>>,
     host: String,
+    /// Enable time-of-day anomaly detection based on per-user login hour baseline.
+    anomaly_hours_enabled: bool,
+    /// Per-user: bitmask of hours (0-23) when logins have been observed.
+    user_login_hours: HashMap<String, [bool; 24]>,
+    /// Per-user: set of distinct dates (YYYY-MM-DD) with observed logins.
+    user_training_dates: HashMap<String, std::collections::HashSet<String>>,
 }
 
 impl SuspiciousLoginDetector {
-    pub fn new(host: impl Into<String>, window_seconds: u64) -> Self {
+    pub fn new(host: impl Into<String>, window_seconds: u64, anomaly_hours_enabled: bool) -> Self {
         Self {
             window: Duration::seconds(window_seconds as i64),
             failed_ips: HashMap::new(),
@@ -34,6 +40,9 @@ impl SuspiciousLoginDetector {
             ip_login_hours: HashMap::new(),
             alerted: HashMap::new(),
             host: host.into(),
+            anomaly_hours_enabled,
+            user_login_hours: HashMap::new(),
+            user_training_dates: HashMap::new(),
         }
     }
 
@@ -61,9 +70,38 @@ impl SuspiciousLoginDetector {
         }
 
         let user = event.details["user"].as_str().unwrap_or("unknown");
+        let hour = now.hour();
 
-        // Track known-good IPs (baseline)
-        if self.known_good_ips.contains(&ip) {
+        // Check for anomalous login hour BEFORE updating user baseline (must read prior state).
+        let is_anomaly_hour = if self.anomaly_hours_enabled {
+            let dates = self.user_training_dates.get(user);
+            let profile = self.user_login_hours.get(user);
+            match (dates, profile) {
+                (Some(d), Some(p)) if d.len() >= 7 => !p[hour as usize],
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        // Update user login baseline tracking.
+        let date_str = now.format("%Y-%m-%d").to_string();
+        self.user_training_dates
+            .entry(user.to_string())
+            .or_default()
+            .insert(date_str);
+        self.user_login_hours
+            .entry(user.to_string())
+            .or_default()[hour as usize] = true;
+
+        // Track login hours for this IP (for off-hours detection).
+        self.ip_login_hours
+            .entry(ip.clone())
+            .or_default()
+            .insert(hour);
+
+        // Known-good IPs skip detection unless an anomalous login hour is detected.
+        if self.known_good_ips.contains(&ip) && !is_anomaly_hour {
             return None;
         }
 
@@ -82,13 +120,6 @@ impl SuspiciousLoginDetector {
                 return None;
             }
         }
-
-        // Track login hours for this IP (for off-hours detection)
-        let hour = now.hour();
-        self.ip_login_hours
-            .entry(ip.clone())
-            .or_default()
-            .insert(hour);
 
         // Check for off-hours login (22:00-06:00 UTC)
         let is_off_hours = !(6..22).contains(&hour);
@@ -109,16 +140,9 @@ impl SuspiciousLoginDetector {
         } else if !self.known_good_ips.contains(&ip) && is_off_hours {
             // First-time IP during off-hours
             (true, "off_hours_new_ip", Severity::Medium)
-        } else if self.known_good_ips.contains(&ip) && is_off_hours {
-            // Known IP but unusual hour — check if this hour was seen before
-            let known_hours = self.ip_login_hours.get(&ip).map(|h| h.len()).unwrap_or(0);
-            if known_hours <= 2 {
-                // Very few login hours observed — still learning, don't alert
-                (false, "", Severity::Low)
-            } else {
-                // Enough baseline — this hour is unusual
-                (false, "", Severity::Low) // TODO: enable after baseline matures
-            }
+        } else if is_anomaly_hour {
+            // Login hour outside this user's 7-day baseline profile
+            (true, "anomaly_hours_user", Severity::Medium)
         } else {
             // Known-good IP, normal hours — no alert
             (false, "", Severity::Low)
@@ -150,6 +174,9 @@ impl SuspiciousLoginDetector {
                 format!("First-time SSH login to privileged account {user} from {ip}")
             }
             "off_hours_new_ip" => format!("Off-hours SSH login from new IP {ip} as {user}"),
+            "anomaly_hours_user" => {
+                format!("SSH login by {user} at {hour}:00 UTC — outside baseline hours")
+            }
             _ => format!("Suspicious SSH login from {ip} as {user}"),
         };
 
@@ -163,6 +190,9 @@ impl SuspiciousLoginDetector {
             ),
             "off_hours_new_ip" => format!(
                 "IP {ip} logged in as {user} at {hour}:00 UTC (off-hours) from an IP never seen before. Possible credential theft."
+            ),
+            "anomaly_hours_user" => format!(
+                "User {user} logged in at {hour}:00 UTC from {ip}. This hour has not been observed in the 7-day login baseline. Possible unauthorized access."
             ),
             _ => format!("IP {ip} logged in as {user} — suspicious pattern: {reason}"),
         };
@@ -244,7 +274,7 @@ mod tests {
 
     #[test]
     fn fires_on_success_after_failures() {
-        let mut det = SuspiciousLoginDetector::new("test", 300);
+        let mut det = SuspiciousLoginDetector::new("test", 300, false);
         let now = Utc::now();
 
         // 3 failed attempts
@@ -267,7 +297,7 @@ mod tests {
 
     #[test]
     fn critical_for_many_failures() {
-        let mut det = SuspiciousLoginDetector::new("test", 300);
+        let mut det = SuspiciousLoginDetector::new("test", 300, false);
         let now = Utc::now();
 
         for i in 0..6 {
@@ -286,7 +316,7 @@ mod tests {
 
     #[test]
     fn no_alert_for_clean_login_nonpriv() {
-        let mut det = SuspiciousLoginDetector::new("test", 300);
+        let mut det = SuspiciousLoginDetector::new("test", 300, false);
         // Use a fixed daytime hour (12:00 UTC) to avoid off-hours detection
         let now = Utc::now()
             .date_naive()
@@ -302,7 +332,7 @@ mod tests {
 
     #[test]
     fn alerts_first_time_privileged_login() {
-        let mut det = SuspiciousLoginDetector::new("test", 300);
+        let mut det = SuspiciousLoginDetector::new("test", 300, false);
         let now = Utc::now();
 
         // First-time login to privileged account should alert (V4 enhancement)
@@ -315,7 +345,7 @@ mod tests {
 
     #[test]
     fn no_alert_for_known_good_ip() {
-        let mut det = SuspiciousLoginDetector::new("test", 300);
+        let mut det = SuspiciousLoginDetector::new("test", 300, false);
         let now = Utc::now();
 
         // First login - becomes known-good
@@ -334,7 +364,7 @@ mod tests {
 
     #[test]
     fn ignores_internal_ips() {
-        let mut det = SuspiciousLoginDetector::new("test", 300);
+        let mut det = SuspiciousLoginDetector::new("test", 300, false);
         let now = Utc::now();
 
         det.process(&failed_event("192.168.1.1", now));
@@ -349,7 +379,7 @@ mod tests {
 
     #[test]
     fn suppresses_realert_within_window() {
-        let mut det = SuspiciousLoginDetector::new("test", 300);
+        let mut det = SuspiciousLoginDetector::new("test", 300, false);
         let now = Utc::now();
 
         det.process(&failed_event("1.2.3.4", now));
@@ -368,6 +398,97 @@ mod tests {
                 "root",
                 now + Duration::seconds(11)
             ))
+            .is_none());
+    }
+
+    fn success_event_at_hour(ip: &str, user: &str, date: &str, hour: u32) -> Event {
+        let ts = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .unwrap()
+            .and_hms_opt(hour, 0, 0)
+            .unwrap()
+            .and_utc();
+        Event {
+            ts,
+            host: "test".to_string(),
+            source: "auth.log".to_string(),
+            kind: "ssh.login_success".to_string(),
+            severity: Severity::Info,
+            summary: format!("Login accepted for {user} from {ip}"),
+            details: serde_json::json!({"ip": ip, "user": user}),
+            tags: vec![],
+            entities: vec![EntityRef::ip(ip), EntityRef::user(user)],
+        }
+    }
+
+    #[test]
+    fn anomaly_hours_fires_after_baseline_matures() {
+        let mut det = SuspiciousLoginDetector::new("test", 300, true);
+
+        // Build a 7-day baseline: alice logs in at 10:00 UTC from a known IP.
+        // This makes the IP known-good so the anomaly_hours branch is reached
+        // (a brand-new IP at 3am would fire off_hours_new_ip instead).
+        for day in 1..=7u32 {
+            let date = format!("2026-03-{day:02}");
+            det.process(&success_event_at_hour("1.2.3.4", "alice", &date, 10));
+        }
+
+        // Same IP (known-good), same user, but at 3:00 UTC — outside baseline.
+        let inc = det
+            .process(&success_event_at_hour("1.2.3.4", "alice", "2026-03-08", 3))
+            .expect("should fire for anomalous login hour");
+        assert_eq!(inc.severity, Severity::Medium);
+        assert!(
+            inc.title.contains("baseline hours") || inc.title.contains("3:00"),
+            "title was: {}",
+            inc.title
+        );
+        assert!(inc.summary.contains("baseline"));
+    }
+
+    #[test]
+    fn anomaly_hours_no_fire_before_baseline_matures() {
+        let mut det = SuspiciousLoginDetector::new("test", 300, true);
+
+        // Only 6 days of baseline — not yet mature.
+        for day in 1..=6u32 {
+            let date = format!("2026-03-{day:02}");
+            det.process(&success_event_at_hour("1.2.3.4", "alice", &date, 10));
+        }
+
+        // Known-good IP, but baseline not yet mature — no alert.
+        assert!(det
+            .process(&success_event_at_hour("1.2.3.4", "alice", "2026-03-07", 3))
+            .is_none());
+    }
+
+    #[test]
+    fn anomaly_hours_no_fire_when_disabled() {
+        let mut det = SuspiciousLoginDetector::new("test", 300, false);
+
+        for day in 1..=7u32 {
+            let date = format!("2026-03-{day:02}");
+            det.process(&success_event_at_hour("1.2.3.4", "alice", &date, 10));
+        }
+
+        // anomaly_hours_enabled = false, so no alert even at an unseen hour.
+        assert!(det
+            .process(&success_event_at_hour("1.2.3.4", "alice", "2026-03-08", 3))
+            .is_none());
+    }
+
+    #[test]
+    fn anomaly_hours_no_fire_for_known_hour() {
+        let mut det = SuspiciousLoginDetector::new("test", 300, true);
+
+        // Baseline includes hour 10 on 7 days.
+        for day in 1..=7u32 {
+            let date = format!("2026-03-{day:02}");
+            det.process(&success_event_at_hour("1.2.3.4", "alice", &date, 10));
+        }
+
+        // Login at 10:00 UTC (within baseline) — no alert.
+        assert!(det
+            .process(&success_event_at_hour("1.2.3.4", "alice", "2026-03-08", 10))
             .is_none());
     }
 }

@@ -210,6 +210,24 @@ pub struct DetectorsConfig {
     pub credential_harvest: CredentialHarvestConfig,
     #[serde(default)]
     pub packet_flood: PacketFloodConfig,
+    #[serde(default)]
+    pub suspicious_login: SuspiciousLoginConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SuspiciousLoginConfig {
+    /// Enable time-of-day anomaly detection based on a 7-day user login baseline.
+    /// When true, logins outside a user's normal hours fire a Medium-severity incident.
+    #[serde(default)]
+    pub anomaly_hours_enabled: bool,
+}
+
+impl Default for SuspiciousLoginConfig {
+    fn default() -> Self {
+        Self {
+            anomaly_hours_enabled: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
