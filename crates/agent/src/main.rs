@@ -44,9 +44,9 @@ mod incident_action_report;
 mod incident_advisory;
 mod incident_ai_context;
 mod incident_ai_failure;
-mod incident_autodismiss;
 mod incident_attacker_profile;
 mod incident_audit_write;
+mod incident_autodismiss;
 mod incident_crowdsec;
 mod incident_decision_eval;
 mod incident_enrichment;
@@ -1306,11 +1306,7 @@ async fn main() -> Result<()> {
                 feed_urls.len()
             );
         }
-        let client = threat_feeds::ThreatFeedClient::new(
-            vt_key,
-            feed_urls,
-            &cli.data_dir,
-        );
+        let client = threat_feeds::ThreatFeedClient::new(vt_key, feed_urls, &cli.data_dir);
         let feed_state = client.state();
         if feed_state.total_iocs > 0 {
             info!(
@@ -3777,13 +3773,18 @@ fn boot_self_test() {
     if local_ips > 0 {
         info!(local_ips, "boot self-test: local interface IPs loaded");
     } else {
-        warn!("boot self-test: no local interface IPs detected — self-traffic filtering may not work");
+        warn!(
+            "boot self-test: no local interface IPs detected — self-traffic filtering may not work"
+        );
     }
 
     // Check that cloud safelist ranges are loaded
     let cloud_ranges = cloud_safelist::cloud_range_count();
     if cloud_ranges > 0 {
-        info!(cloud_ranges, "boot self-test: cloud provider IP ranges loaded");
+        info!(
+            cloud_ranges,
+            "boot self-test: cloud provider IP ranges loaded"
+        );
     } else {
         warn!("boot self-test: no cloud IP ranges loaded");
     }

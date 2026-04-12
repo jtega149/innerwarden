@@ -1070,15 +1070,12 @@ pub(super) fn build_journey_from_graph(
         }
 
         // GeoIP from edge properties (if available)
-        let geo = graph
-            .all_edges(center_id)
-            .iter()
-            .find_map(|e| {
-                e.properties
-                    .get("country")
-                    .and_then(|v| v.as_str())
-                    .map(|c| c.to_string())
-            });
+        let geo = graph.all_edges(center_id).iter().find_map(|e| {
+            e.properties
+                .get("country")
+                .and_then(|v| v.as_str())
+                .map(|c| c.to_string())
+        });
 
         // Build human-readable intelligence hints
         let total_incidents: usize = sev_counts.values().sum();
@@ -1138,9 +1135,9 @@ pub(super) fn build_journey_from_graph(
                         .to_string(),
                 );
             } else {
-                summary.hints.push(
-                    "The AI is still evaluating this activity.".to_string(),
-                );
+                summary
+                    .hints
+                    .push("The AI is still evaluating this activity.".to_string());
             }
         }
     }

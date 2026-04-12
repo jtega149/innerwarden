@@ -93,10 +93,10 @@ const AGENT_SERVICE_RANGES: &[&str] = &[
     // correlation engine saw crowdsec outbound + CPU spike = CL-014 FP.
     // CrowdSec uses an ELB that rotates across the /16, so we safelist
     // the ranges that the eu-west-1 ELBs live in.
-    "52.48.0.0/14",   // AWS eu-west-1 ELB range (covers 52.48-51.x)
-    "63.32.0.0/14",   // AWS eu-west-1 ELB range (covers 63.32-35.x)
-    "18.200.0.0/14",  // AWS eu-west-1 ELB range (covers 18.200-203.x)
-    "3.248.0.0/13",   // AWS eu-west-1 ELB range (covers 3.248-255.x)
+    "52.48.0.0/14",  // AWS eu-west-1 ELB range (covers 52.48-51.x)
+    "63.32.0.0/14",  // AWS eu-west-1 ELB range (covers 63.32-35.x)
+    "18.200.0.0/14", // AWS eu-west-1 ELB range (covers 18.200-203.x)
+    "3.248.0.0/13",  // AWS eu-west-1 ELB range (covers 3.248-255.x)
     // ip-api.com (GeoIP enrichment used by crate::geoip)
     "208.95.112.0/24",
     // Canonical / Ubuntu archive + snapcraft + livepatch
@@ -127,9 +127,9 @@ const ORACLE_PEER_RANGES: &[&str] = &[
 /// "Slow HTTP connection (possible slowloris)" FP fired by agent host
 /// polling the OCI metadata service.
 const LINK_LOCAL_RANGES: &[&str] = &[
-    "169.254.0.0/16",  // IPv4 link-local (RFC 3927), includes all IMDS endpoints
-    "127.0.0.0/8",     // loopback — never operator-relevant as a remote dst
-    "224.0.0.0/4",     // multicast
+    "169.254.0.0/16", // IPv4 link-local (RFC 3927), includes all IMDS endpoints
+    "127.0.0.0/8",    // loopback — never operator-relevant as a remote dst
+    "224.0.0.0/4",    // multicast
 ];
 
 /// Major cloud provider CIDR ranges that should not be auto-blocked.

@@ -117,8 +117,11 @@ pub(crate) async fn backfill_enrichment(state: &mut AgentState) {
     }
 
     // Perform lookups — borrow clients immutably, then apply results.
-    let mut results: Vec<(String, Option<geoip::GeoInfo>, Option<abuseipdb::IpReputation>)> =
-        Vec::with_capacity(candidates.len());
+    let mut results: Vec<(
+        String,
+        Option<geoip::GeoInfo>,
+        Option<abuseipdb::IpReputation>,
+    )> = Vec::with_capacity(candidates.len());
 
     for (ip, needs_geo, needs_abuse) in &candidates {
         let geo = if *needs_geo {
