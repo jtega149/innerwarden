@@ -438,6 +438,7 @@ pub const C2_OUTBOUND_ALLOWED: &[&str] = &[
     "dpkg",
     // Cloud agents
     "oracle-cloud-ag",
+    "gomon",          // Oracle Cloud Agent monitoring plugin (/snap/oracle-cloud-agent/)
     "google_guest_ag",
     "waagent",
     "amazon-ssm-agen",

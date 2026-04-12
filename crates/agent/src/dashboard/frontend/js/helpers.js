@@ -191,7 +191,11 @@ function entryOutcomeClass(entry) {
 }
 
 function toggleDetail(btn) {
-  var body = btn.parentElement.nextElementSibling;
+  // Find .detail-body within the same evidence-card, not by sibling
+  // position (the header/title/context divs sit between the button
+  // and the detail body, breaking nextElementSibling).
+  var card = btn.closest('.evidence-card');
+  var body = card ? card.querySelector('.detail-body') : null;
   if (!body) return;
   body.classList.toggle('open');
   btn.textContent = body.classList.contains('open') ? 'Hide details' : 'Show details';
