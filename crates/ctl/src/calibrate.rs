@@ -66,11 +66,13 @@ pub fn cmd_calibrate() -> Result<()> {
         .collect();
     println!("expected_services = [{}]", svc_names.join(", "));
 
-    let out_names: Vec<_> = outbound
+    // Extract just the IP (without port) for the config suggestion
+    let out_ips: BTreeSet<_> = outbound
         .keys()
-        .filter(|d| !d.starts_with("127.") && !d.starts_with("10."))
-        .map(|d| format!("\"{d}\""))
+        .filter_map(|d| d.rsplit(':').nth(1)) // "1.2.3.4:443" → "1.2.3.4"
+        .filter(|ip| !ip.starts_with("127.") && !ip.starts_with("10.") && !ip.starts_with("172."))
         .collect();
+    let out_names: Vec<_> = out_ips.iter().map(|ip| format!("\"{ip}\"")).collect();
     println!("expected_outbound = [{}]", out_names.join(", "));
     println!();
     println!("Review the above and paste into /etc/innerwarden/config.toml");
@@ -186,15 +188,26 @@ fn discover_outbound() -> BTreeMap<String, BTreeSet<String>> {
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines().skip(1) {
             let parts: Vec<&str> = line.split_whitespace().collect();
+            // Format: Recv-Q Send-Q LocalAddr:Port PeerAddr:Port [Process]
             if parts.len() < 5 {
                 continue;
             }
-            // Peer address:port is in column 4
             let peer = parts[4].to_string();
-            let proc_name = parts
-                .last()
-                .and_then(|s| s.split('"').nth(1).map(|n| n.to_string()))
-                .unwrap_or_else(|| "?".to_string());
+            // Skip localhost connections
+            if peer.starts_with("127.") || peer.starts_with("[::1]") {
+                continue;
+            }
+            // Process info is in column 5+ (if running as root with -p)
+            let proc_name = if parts.len() > 5 {
+                parts[5..]
+                    .join(" ")
+                    .split('"')
+                    .nth(1)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            } else {
+                "?".to_string()
+            };
             result.entry(peer).or_default().insert(proc_name);
         }
     }
