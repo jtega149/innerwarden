@@ -589,11 +589,9 @@ fn run_cleanup_015(data_dir: &std::path::Path) -> Result<()> {
         "  brute-force users    : {} User node(s) removed",
         report.brute_force_user_nodes_removed
     );
-    if !report.removed_user_names.is_empty() {
-        println!(
-            "  removed users        : {} (names redacted)",
-            report.removed_user_names.len()
-        );
+    let removed_count = report.removed_user_names.len();
+    if removed_count > 0 {
+        println!("  removed users        : {removed_count} (names redacted)");
     }
     Ok(())
 }

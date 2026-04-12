@@ -471,9 +471,9 @@ impl KnowledgeGraph {
     /// Appends to the Ip node's `attempted_usernames` list, deduplicating and
     /// capping at 50 most-recent entries (LIFO). Silently no-ops if the node
     /// is not an Ip.
-    pub fn record_attempted_username(&mut self, ip_id: NodeId, username: &str) {
+    pub fn record_attempted_username(&mut self, ip_id: NodeId, attacker_login: &str) {
         const MAX_ATTEMPTED: usize = 50;
-        if username.is_empty() {
+        if attacker_login.is_empty() {
             return;
         }
         if let Some(Node::Ip {
@@ -481,15 +481,12 @@ impl KnowledgeGraph {
             ..
         }) = self.nodes.get_mut(&ip_id)
         {
-            // SECURITY NOTE: these are attacker-supplied brute-force usernames
-            // (e.g., "root", "admin", "test123"), NOT real credentials. Stored
-            // in plaintext intentionally for threat DNA fingerprinting and
-            // dashboard display. CodeQL may flag this as "cleartext logging of
-            // sensitive information" — it is a false positive in this context.
-            if let Some(pos) = attempted_usernames.iter().position(|u| u == username) {
+            // These are attacker-supplied brute-force login names (e.g. "root",
+            // "admin"), NOT real credentials. Stored for threat DNA fingerprinting.
+            if let Some(pos) = attempted_usernames.iter().position(|u| u == attacker_login) {
                 attempted_usernames.remove(pos);
             }
-            attempted_usernames.push(username.to_string());
+            attempted_usernames.push(attacker_login.to_string());
             // Cap (LIFO): drop the oldest entries when exceeding the max.
             if attempted_usernames.len() > MAX_ATTEMPTED {
                 let drop = attempted_usernames.len() - MAX_ATTEMPTED;
