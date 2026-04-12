@@ -365,7 +365,9 @@ pub fn compute_for_date_from_graph(
     // Populate counters from graph
     populate_counters_from_graph(graph, &mut counters);
 
-    let expected_files_present = files.iter().all(|f| f.exists);
+    // If SQLite DB exists, data files are present (JSONL no longer required)
+    let db_exists = data_dir.join("innerwarden.db").exists();
+    let expected_files_present = db_exists || files.iter().all(|f| f.exists);
     let state_json_readable = state_info.exists && state_info.readable;
     let agent_state_json_readable = agent_state_info.exists && agent_state_info.readable;
     let operational_telemetry = build_operational_telemetry(data_dir, &analyzed_date);
@@ -498,7 +500,9 @@ pub fn compute_for_date(data_dir: &Path, date: Option<&str>) -> TrialReport {
     record_plain_file_hints("agent-state", &agent_state_info, false, &mut counters);
     files.push(file_health_plain("agent-state", &agent_state_info));
 
-    let expected_files_present = files.iter().all(|f| f.exists);
+    // If SQLite DB exists, data files are present (JSONL no longer required)
+    let db_exists = data_dir.join("innerwarden.db").exists();
+    let expected_files_present = db_exists || files.iter().all(|f| f.exists);
     let state_json_readable = state_info.exists && state_info.readable;
     let agent_state_json_readable = agent_state_info.exists && agent_state_info.readable;
     let operational_telemetry = build_operational_telemetry(data_dir, &analyzed_date);
@@ -584,8 +588,14 @@ pub fn list_available_dates(data_dir: &Path) -> Vec<String> {
 
 pub fn generate(data_dir: &Path, output_dir: &Path) -> Result<GeneratedReport> {
     let report_date = Local::now().date_naive().format("%Y-%m-%d").to_string();
-    // Phase 7: prefer today's dated snapshot, fall back to JSONL if graph is empty.
-    let graph = crate::knowledge_graph::KnowledgeGraph::load_today_snapshot(data_dir);
+    // Try loading graph from SQLite store first, then file snapshot
+    let graph = {
+        let mut g = None;
+        if let Ok(store) = innerwarden_store::Store::open(data_dir) {
+            g = crate::knowledge_graph::KnowledgeGraph::load_from_store(&store);
+        }
+        g.unwrap_or_else(|| crate::knowledge_graph::KnowledgeGraph::load_today_snapshot(data_dir))
+    };
     let report = if graph.metrics().node_count > 0 {
         compute_for_date_from_graph(data_dir, None, &graph)
     } else {
@@ -624,9 +634,20 @@ fn detect_previous_date(data_dir: &Path, analyzed_date: &str) -> Option<String> 
 
 fn collect_available_dates(data_dir: &Path) -> Vec<String> {
     let mut dates = BTreeSet::new();
+
+    // Check SQLite store for graph snapshot dates
+    if let Ok(store) = innerwarden_store::Store::open(data_dir) {
+        if let Ok(snapshots) = store.list_graph_snapshots() {
+            for info in snapshots {
+                dates.insert(info.date);
+            }
+        }
+    }
+
+    // Also check filesystem for JSONL/summary files (legacy fallback)
     let entries = match fs::read_dir(data_dir) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(_) => return dates.into_iter().collect(),
     };
 
     for entry in entries.flatten() {
@@ -1098,9 +1119,19 @@ fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
         }
     }
 
-    // Phase 7: try dated graph snapshot first
-    let counters =
-        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, date) {
+    // Try SQLite store first, then dated file snapshot, then JSONL
+    let counters = {
+        let from_store = innerwarden_store::Store::open(data_dir)
+            .ok()
+            .and_then(|store| {
+                crate::knowledge_graph::KnowledgeGraph::load_dated_from_store(&store, date)
+            })
+            .filter(|g| g.metrics().node_count > 0);
+        if let Some(graph) = from_store {
+            counters_from_graph(&graph)
+        } else if let Some(graph) =
+            crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, date)
+        {
             if graph.metrics().node_count > 0 {
                 counters_from_graph(&graph)
             } else {
@@ -1108,7 +1139,8 @@ fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
             }
         } else {
             counters_from_jsonl(data_dir, date)
-        };
+        }
+    };
 
     if let Ok(mut cache) = cache_handle().lock() {
         // Cap cache size to prevent unbounded growth

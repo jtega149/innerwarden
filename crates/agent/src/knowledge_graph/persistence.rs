@@ -211,6 +211,15 @@ impl KnowledgeGraph {
         Some(graph)
     }
 
+    /// Load a graph snapshot for a specific date from the unified SQLite store.
+    pub fn load_dated_from_store(store: &innerwarden_store::Store, date: &str) -> Option<Self> {
+        let data = store.load_graph_snapshot(date).ok()??;
+        let snapshot: GraphSnapshot = serde_json::from_slice(&data).ok()?;
+        let graph = Self::reconstruct_from_snapshot(snapshot)?;
+        tracing::debug!(date = %date, "Graph loaded from SQLite store for date");
+        Some(graph)
+    }
+
     /// Delete SQLite graph snapshots older than `keep_days` days.
     pub fn cleanup_store_snapshots(store: &innerwarden_store::Store, keep_days: u32) {
         let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(keep_days as i64))
