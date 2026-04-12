@@ -1,106 +1,86 @@
-//! Persistent state store backed by redb (embedded Rust key-value database).
+//! Persistent state store backed by SQLite (via `innerwarden_store`).
 //!
-//! Replaces in-memory HashMaps that grew without limit. Data lives on disk
-//! via memory-mapped I/O - the OS caches hot pages, heap stays fixed.
+//! Replaces the previous redb implementation. Data lives in the unified
+//! `innerwarden.db` SQLite database using KV namespaces.
 //!
-//! Tables:
-//!   - ip_reputations:        IP → JSON (LocalIpReputation)
-//!   - decision_cooldowns:    key → timestamp_ms (i64)
-//!   - notification_cooldowns: key → timestamp_ms (i64)
-//!   - block_counts:          IP → count (u32)
-//!   - xdp_block_times:       IP → JSON { blocked_at_ms, ttl_secs }
-//!   - trust_rules:           "detector:action" → 1
-//!   - attacker_profiles:     IP → JSON (AttackerProfile)
+//! Namespaces:
+//!   - ip_reputations:          IP → JSON (LocalIpReputation)
+//!   - decision_cooldowns:      key → timestamp_ms (i64 LE bytes)
+//!   - notification_cooldowns:  key → timestamp_ms (i64 LE bytes)
+//!   - block_counts:            IP → count (u32 LE bytes)
+//!   - xdp_block_times:         IP → JSON { blocked_at_ms, ttl_secs }
+//!   - trust_rules:             "detector:action" → [1u8]
+//!   - attacker_profiles:       IP → JSON (AttackerProfile)
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use innerwarden_store::Store;
 use std::path::Path;
 use tracing::{info, warn};
 
-// Table definitions - key and value types must be fixed at compile time.
-const IP_REPUTATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ip_reputations");
-const DECISION_COOLDOWNS: TableDefinition<&str, i64> = TableDefinition::new("decision_cooldowns");
-const NOTIFICATION_COOLDOWNS: TableDefinition<&str, i64> =
-    TableDefinition::new("notification_cooldowns");
-const BLOCK_COUNTS: TableDefinition<&str, u32> = TableDefinition::new("block_counts");
-const XDP_BLOCK_TIMES: TableDefinition<&str, &[u8]> = TableDefinition::new("xdp_block_times");
-const TRUST_RULES: TableDefinition<&str, u8> = TableDefinition::new("trust_rules");
-const ATTACKER_PROFILES: TableDefinition<&str, &[u8]> = TableDefinition::new("attacker_profiles");
+/// Namespace constants
+const NS_IP_REPUTATIONS: &str = "ip_reputations";
+const NS_DECISION_COOLDOWNS: &str = "decision_cooldowns";
+const NS_NOTIFICATION_COOLDOWNS: &str = "notification_cooldowns";
+const NS_BLOCK_COUNTS: &str = "block_counts";
+const NS_XDP_BLOCK_TIMES: &str = "xdp_block_times";
+const NS_TRUST_RULES: &str = "trust_rules";
+const NS_ATTACKER_PROFILES: &str = "attacker_profiles";
 
 /// Persistent state store for the agent.
 pub struct StateStore {
-    db: Database,
+    store: Store,
 }
 
 #[allow(dead_code)]
 impl StateStore {
-    /// Open or create the state database at `data_dir/agent-state.redb`.
+    /// Open or create the state database at `data_dir/innerwarden.db`.
     pub fn open(data_dir: &Path) -> Result<Self> {
-        let db_path = data_dir.join("agent-state.redb");
-        let db = Database::create(&db_path)
-            .with_context(|| format!("failed to open state store: {}", db_path.display()))?;
+        let store = Store::open(data_dir)
+            .with_context(|| format!("failed to open state store: {}", data_dir.display()))?;
 
-        // Ensure all tables exist
-        let write_txn = db.begin_write()?;
-        {
-            let _ = write_txn.open_table(IP_REPUTATIONS)?;
-            let _ = write_txn.open_table(DECISION_COOLDOWNS)?;
-            let _ = write_txn.open_table(NOTIFICATION_COOLDOWNS)?;
-            let _ = write_txn.open_table(BLOCK_COUNTS)?;
-            let _ = write_txn.open_table(XDP_BLOCK_TIMES)?;
-            let _ = write_txn.open_table(TRUST_RULES)?;
-            let _ = write_txn.open_table(ATTACKER_PROFILES)?;
-        }
-        write_txn.commit()?;
-
-        info!(path = %db_path.display(), "state store opened (redb)");
-        Ok(Self { db })
+        info!(path = %data_dir.display(), "state store opened (sqlite)");
+        Ok(Self { store })
     }
 
     // ── IP Reputations ──────────────────────────────────────────────
 
     pub fn get_ip_reputation(&self, ip: &str) -> Option<serde_json::Value> {
-        let read_txn = self.db.begin_read().ok()?;
-        let table = read_txn.open_table(IP_REPUTATIONS).ok()?;
-        let entry = table.get(ip).ok()??;
-        serde_json::from_slice(entry.value()).ok()
+        match self.store.kv_get(NS_IP_REPUTATIONS, ip) {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "get_ip_reputation failed");
+                None
+            }
+        }
     }
 
     pub fn set_ip_reputation(&self, ip: &str, value: &serde_json::Value) {
         let data = serde_json::to_vec(value).unwrap_or_default();
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(IP_REPUTATIONS) {
-                let _ = table.insert(ip, data.as_slice());
-            }
-            let _ = write_txn.commit();
+        if let Err(e) = self.store.kv_set(NS_IP_REPUTATIONS, ip, &data) {
+            warn!(error = %e, "set_ip_reputation failed");
         }
     }
 
     pub fn all_ip_reputations(&self) -> Vec<(String, serde_json::Value)> {
-        let mut result = Vec::new();
-        if let Ok(read_txn) = self.db.begin_read() {
-            if let Ok(table) = read_txn.open_table(IP_REPUTATIONS) {
-                if let Ok(iter) = table.iter() {
-                    for entry in iter.flatten() {
-                        let (k, v) = entry;
-                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(v.value()) {
-                            result.push((k.value().to_string(), val));
-                        }
-                    }
-                }
+        match self.store.kv_list(NS_IP_REPUTATIONS) {
+            Ok(entries) => entries
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    serde_json::from_slice::<serde_json::Value>(&v)
+                        .ok()
+                        .map(|val| (k, val))
+                })
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "all_ip_reputations failed");
+                Vec::new()
             }
         }
-        result
     }
 
     pub fn ip_reputations_len(&self) -> usize {
-        let Ok(read_txn) = self.db.begin_read() else {
-            return 0;
-        };
-        let Ok(table) = read_txn.open_table(IP_REPUTATIONS) else {
-            return 0;
-        };
-        table.iter().map(|i| i.count()).unwrap_or(0)
+        self.store.kv_count(NS_IP_REPUTATIONS).unwrap_or(0)
     }
 
     /// Remove entries beyond `max` by keeping the most recently seen.
@@ -118,13 +98,10 @@ impl StateStore {
             ts_b.cmp(ts_a) // newest first
         });
         let to_remove: Vec<String> = all.into_iter().skip(max).map(|(k, _)| k).collect();
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(IP_REPUTATIONS) {
-                for ip in &to_remove {
-                    let _ = table.remove(ip.as_str());
-                }
+        for ip in &to_remove {
+            if let Err(e) = self.store.kv_delete(NS_IP_REPUTATIONS, ip) {
+                warn!(error = %e, ip = %ip, "trim_ip_reputations delete failed");
             }
-            let _ = write_txn.commit();
         }
     }
 
@@ -135,14 +112,22 @@ impl StateStore {
         table_def: CooldownTable,
         key: &str,
     ) -> Option<chrono::DateTime<chrono::Utc>> {
-        let read_txn = self.db.begin_read().ok()?;
-        let table = match table_def {
-            CooldownTable::Decision => read_txn.open_table(DECISION_COOLDOWNS).ok()?,
-            CooldownTable::Notification => read_txn.open_table(NOTIFICATION_COOLDOWNS).ok()?,
-        };
-        let entry = table.get(key).ok()??;
-        let ms = entry.value();
-        chrono::DateTime::from_timestamp_millis(ms)
+        let ns = table_def.namespace();
+        match self.store.kv_get(ns, key) {
+            Ok(Some(bytes)) => {
+                if bytes.len() == 8 {
+                    let ms = i64::from_le_bytes(bytes.try_into().ok()?);
+                    chrono::DateTime::from_timestamp_millis(ms)
+                } else {
+                    None
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "get_cooldown failed");
+                None
+            }
+        }
     }
 
     pub fn set_cooldown(
@@ -151,20 +136,10 @@ impl StateStore {
         key: &str,
         ts: chrono::DateTime<chrono::Utc>,
     ) {
-        let ms = ts.timestamp_millis();
-        if let Ok(write_txn) = self.db.begin_write() {
-            let result = match table_def {
-                CooldownTable::Decision => write_txn.open_table(DECISION_COOLDOWNS).map(|mut t| {
-                    let _ = t.insert(key, ms);
-                }),
-                CooldownTable::Notification => {
-                    write_txn.open_table(NOTIFICATION_COOLDOWNS).map(|mut t| {
-                        let _ = t.insert(key, ms);
-                    })
-                }
-            };
-            let _ = result;
-            let _ = write_txn.commit();
+        let ns = table_def.namespace();
+        let bytes = ts.timestamp_millis().to_le_bytes();
+        if let Err(e) = self.store.kv_set(ns, key, &bytes) {
+            warn!(error = %e, "set_cooldown failed");
         }
     }
 
@@ -178,104 +153,78 @@ impl StateStore {
         table_def: CooldownTable,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) {
+        let ns = table_def.namespace();
         let cutoff_ms = cutoff.timestamp_millis();
-        if let Ok(write_txn) = self.db.begin_write() {
-            let keys_to_remove: Vec<String> = {
-                let table = match table_def {
-                    CooldownTable::Decision => write_txn.open_table(DECISION_COOLDOWNS),
-                    CooldownTable::Notification => write_txn.open_table(NOTIFICATION_COOLDOWNS),
-                };
-                if let Ok(table) = table {
-                    table
-                        .iter()
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .filter(|(_, v)| v.value() <= cutoff_ms)
-                        .map(|(k, _)| k.value().to_string())
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            };
-            if !keys_to_remove.is_empty() {
-                let table = match table_def {
-                    CooldownTable::Decision => write_txn.open_table(DECISION_COOLDOWNS),
-                    CooldownTable::Notification => write_txn.open_table(NOTIFICATION_COOLDOWNS),
-                };
-                if let Ok(mut table) = table {
-                    for key in &keys_to_remove {
-                        let _ = table.remove(key.as_str());
+        let entries = match self.store.kv_list(ns) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "retain_cooldowns list failed");
+                return;
+            }
+        };
+        for (key, bytes) in entries {
+            if bytes.len() == 8 {
+                let ms = i64::from_le_bytes(bytes.try_into().unwrap());
+                if ms <= cutoff_ms {
+                    if let Err(e) = self.store.kv_delete(ns, &key) {
+                        warn!(error = %e, key = %key, "retain_cooldowns delete failed");
                     }
                 }
             }
-            let _ = write_txn.commit();
         }
     }
 
     // ── Block Counts ────────────────────────────────────────────────
 
     pub fn get_block_count(&self, ip: &str) -> u32 {
-        let Ok(read_txn) = self.db.begin_read() else {
-            return 0;
-        };
-        let Ok(table) = read_txn.open_table(BLOCK_COUNTS) else {
-            return 0;
-        };
-        table.get(ip).ok().flatten().map(|e| e.value()).unwrap_or(0)
+        match self.store.kv_get(NS_BLOCK_COUNTS, ip) {
+            Ok(Some(bytes)) if bytes.len() == 4 => {
+                u32::from_le_bytes(bytes.try_into().unwrap())
+            }
+            Ok(_) => 0,
+            Err(e) => {
+                warn!(error = %e, "get_block_count failed");
+                0
+            }
+        }
     }
 
     pub fn increment_block_count(&self, ip: &str) -> u32 {
         let current = self.get_block_count(ip);
         let new_count = current + 1;
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(BLOCK_COUNTS) {
-                let _ = table.insert(ip, new_count);
-            }
-            let _ = write_txn.commit();
+        let bytes = new_count.to_le_bytes();
+        if let Err(e) = self.store.kv_set(NS_BLOCK_COUNTS, ip, &bytes) {
+            warn!(error = %e, "increment_block_count failed");
         }
         new_count
     }
 
     pub fn clear_block_counts(&self) {
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(BLOCK_COUNTS) {
-                // Drain all entries
-                let keys: Vec<String> = table
-                    .iter()
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .map(|(k, _)| k.value().to_string())
-                    .collect();
-                for key in &keys {
-                    let _ = table.remove(key.as_str());
-                }
-            }
-            let _ = write_txn.commit();
+        if let Err(e) = self.store.kv_clear(NS_BLOCK_COUNTS) {
+            warn!(error = %e, "clear_block_counts failed");
         }
     }
 
     pub fn block_counts_len(&self) -> usize {
-        let Ok(read_txn) = self.db.begin_read() else {
-            return 0;
-        };
-        let Ok(table) = read_txn.open_table(BLOCK_COUNTS) else {
-            return 0;
-        };
-        table.iter().map(|i| i.count()).unwrap_or(0)
+        self.store.kv_count(NS_BLOCK_COUNTS).unwrap_or(0)
     }
 
     // ── XDP Block Times ─────────────────────────────────────────────
 
     pub fn get_xdp_block_time(&self, ip: &str) -> Option<(chrono::DateTime<chrono::Utc>, i64)> {
-        let read_txn = self.db.begin_read().ok()?;
-        let table = read_txn.open_table(XDP_BLOCK_TIMES).ok()?;
-        let entry = table.get(ip).ok()??;
-        let val: serde_json::Value = serde_json::from_slice(entry.value()).ok()?;
-        let blocked_at = val["blocked_at_ms"].as_i64()?;
-        let ttl = val["ttl_secs"].as_i64().unwrap_or(0);
-        Some((chrono::DateTime::from_timestamp_millis(blocked_at)?, ttl))
+        match self.store.kv_get(NS_XDP_BLOCK_TIMES, ip) {
+            Ok(Some(bytes)) => {
+                let val: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                let blocked_at = val["blocked_at_ms"].as_i64()?;
+                let ttl = val["ttl_secs"].as_i64().unwrap_or(0);
+                Some((chrono::DateTime::from_timestamp_millis(blocked_at)?, ttl))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "get_xdp_block_time failed");
+                None
+            }
+        }
     }
 
     pub fn set_xdp_block_time(
@@ -289,120 +238,100 @@ impl StateStore {
             "ttl_secs": ttl_secs,
         });
         let data = serde_json::to_vec(&val).unwrap_or_default();
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(XDP_BLOCK_TIMES) {
-                let _ = table.insert(ip, data.as_slice());
-            }
-            let _ = write_txn.commit();
+        if let Err(e) = self.store.kv_set(NS_XDP_BLOCK_TIMES, ip, &data) {
+            warn!(error = %e, "set_xdp_block_time failed");
         }
     }
 
     pub fn remove_xdp_block_time(&self, ip: &str) {
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(XDP_BLOCK_TIMES) {
-                let _ = table.remove(ip);
-            }
-            let _ = write_txn.commit();
+        if let Err(e) = self.store.kv_delete(NS_XDP_BLOCK_TIMES, ip) {
+            warn!(error = %e, "remove_xdp_block_time failed");
         }
     }
 
     pub fn all_xdp_block_times(&self) -> Vec<(String, chrono::DateTime<chrono::Utc>, i64)> {
-        let mut result = Vec::new();
-        if let Ok(read_txn) = self.db.begin_read() {
-            if let Ok(table) = read_txn.open_table(XDP_BLOCK_TIMES) {
-                if let Ok(iter) = table.iter() {
-                    for entry in iter.flatten() {
-                        let (k, v) = entry;
-                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(v.value()) {
-                            if let (Some(ms), Some(ttl)) =
-                                (val["blocked_at_ms"].as_i64(), val["ttl_secs"].as_i64())
-                            {
-                                if let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) {
-                                    result.push((k.value().to_string(), dt, ttl));
-                                }
-                            }
-                        }
-                    }
-                }
+        match self.store.kv_list(NS_XDP_BLOCK_TIMES) {
+            Ok(entries) => entries
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    let val: serde_json::Value = serde_json::from_slice(&v).ok()?;
+                    let ms = val["blocked_at_ms"].as_i64()?;
+                    let ttl = val["ttl_secs"].as_i64()?;
+                    let dt = chrono::DateTime::from_timestamp_millis(ms)?;
+                    Some((k, dt, ttl))
+                })
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "all_xdp_block_times failed");
+                Vec::new()
             }
         }
-        result
     }
 
     // ── Trust Rules ─────────────────────────────────────────────────
 
     pub fn has_trust_rule(&self, key: &str) -> bool {
-        let Ok(read_txn) = self.db.begin_read() else {
-            return false;
-        };
-        let Ok(table) = read_txn.open_table(TRUST_RULES) else {
-            return false;
-        };
-        table.get(key).ok().flatten().is_some()
+        match self.store.kv_get(NS_TRUST_RULES, key) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                warn!(error = %e, "has_trust_rule failed");
+                false
+            }
+        }
     }
 
     pub fn add_trust_rule(&self, key: &str) {
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(TRUST_RULES) {
-                let _ = table.insert(key, 1u8);
-            }
-            let _ = write_txn.commit();
+        if let Err(e) = self.store.kv_set(NS_TRUST_RULES, key, &[1u8]) {
+            warn!(error = %e, "add_trust_rule failed");
         }
     }
 
     // ── Attacker Profiles ────────────────────────────────────────────
 
     pub fn get_attacker_profile(&self, ip: &str) -> Option<serde_json::Value> {
-        let read_txn = self.db.begin_read().ok()?;
-        let table = read_txn.open_table(ATTACKER_PROFILES).ok()?;
-        let entry = table.get(ip).ok()??;
-        serde_json::from_slice(entry.value()).ok()
+        match self.store.kv_get(NS_ATTACKER_PROFILES, ip) {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "get_attacker_profile failed");
+                None
+            }
+        }
     }
 
     pub fn set_attacker_profile(&self, ip: &str, value: &serde_json::Value) {
         let data = serde_json::to_vec(value).unwrap_or_default();
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(ATTACKER_PROFILES) {
-                let _ = table.insert(ip, data.as_slice());
-            }
-            let _ = write_txn.commit();
+        if let Err(e) = self.store.kv_set(NS_ATTACKER_PROFILES, ip, &data) {
+            warn!(error = %e, "set_attacker_profile failed");
         }
     }
 
     pub fn all_attacker_profiles(&self) -> Vec<(String, serde_json::Value)> {
-        let mut result = Vec::new();
-        if let Ok(read_txn) = self.db.begin_read() {
-            if let Ok(table) = read_txn.open_table(ATTACKER_PROFILES) {
-                if let Ok(iter) = table.iter() {
-                    for entry in iter.flatten() {
-                        let (k, v) = entry;
-                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(v.value()) {
-                            result.push((k.value().to_string(), val));
-                        }
-                    }
-                }
+        match self.store.kv_list(NS_ATTACKER_PROFILES) {
+            Ok(entries) => entries
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    serde_json::from_slice::<serde_json::Value>(&v)
+                        .ok()
+                        .map(|val| (k, val))
+                })
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "all_attacker_profiles failed");
+                Vec::new()
             }
         }
-        result
     }
 
     pub fn remove_attacker_profile(&self, ip: &str) {
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(ATTACKER_PROFILES) {
-                let _ = table.remove(ip);
-            }
-            let _ = write_txn.commit();
+        if let Err(e) = self.store.kv_delete(NS_ATTACKER_PROFILES, ip) {
+            warn!(error = %e, "remove_attacker_profile failed");
         }
     }
 
     pub fn attacker_profiles_len(&self) -> usize {
-        let Ok(read_txn) = self.db.begin_read() else {
-            return 0;
-        };
-        let Ok(table) = read_txn.open_table(ATTACKER_PROFILES) else {
-            return 0;
-        };
-        table.iter().map(|iter| iter.count()).unwrap_or(0)
+        self.store.kv_count(NS_ATTACKER_PROFILES).unwrap_or(0)
     }
 
     /// Remove entries beyond `max` by keeping those with the highest risk_score.
@@ -423,20 +352,17 @@ impl StateStore {
             })
         });
         let to_remove: Vec<String> = all.into_iter().skip(max).map(|(k, _)| k).collect();
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(ATTACKER_PROFILES) {
-                for ip in &to_remove {
-                    let _ = table.remove(ip.as_str());
-                }
+        for ip in &to_remove {
+            if let Err(e) = self.store.kv_delete(NS_ATTACKER_PROFILES, ip) {
+                warn!(error = %e, ip = %ip, "trim_attacker_profiles delete failed");
             }
-            let _ = write_txn.commit();
         }
     }
 
-    /// Compact the database file (reclaim disk space).
+    /// Checkpoint the WAL (replaces redb compact).
     pub fn compact(&mut self) {
-        if let Err(e) = self.db.compact() {
-            warn!(error = %e, "state store compact failed");
+        if let Err(e) = self.store.wal_checkpoint() {
+            warn!(error = %e, "state store WAL checkpoint failed");
         }
     }
 }
@@ -446,6 +372,15 @@ impl StateStore {
 pub enum CooldownTable {
     Decision,
     Notification,
+}
+
+impl CooldownTable {
+    fn namespace(&self) -> &'static str {
+        match self {
+            CooldownTable::Decision => NS_DECISION_COOLDOWNS,
+            CooldownTable::Notification => NS_NOTIFICATION_COOLDOWNS,
+        }
+    }
 }
 
 #[cfg(test)]
