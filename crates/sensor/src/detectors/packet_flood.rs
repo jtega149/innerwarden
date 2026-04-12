@@ -123,11 +123,11 @@ impl PacketFloodDetector {
         let mut incidents = Vec::new();
 
         // Update connection rate baseline for any network-related event.
-        // Skip localhost (127.0.0.0/8, ::1) — local dashboard/agent traffic is not DDoS.
+        // Skip traffic from own IPs — local/loopback/inter-service is not DDoS.
         if is_network_event(event) {
             let src_ip = extract_source_ip(event);
             if let Some(ref ip) = src_ip {
-                if ip.starts_with("127.") || ip == "::1" {
+                if ip.starts_with("127.") || ip == "::1" || super::is_own_ip(ip) {
                     return incidents;
                 }
             }

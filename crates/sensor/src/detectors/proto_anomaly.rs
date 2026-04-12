@@ -110,6 +110,14 @@ impl ProtoAnomalyDetector {
             .unwrap_or_default();
         let now = event.ts;
 
+        // ── Self-traffic guard ──
+        // Traffic between the host's own IPs is infrastructure, not an attack.
+        // Only skip when BOTH src and dst are own IPs (loopback, inter-service).
+        // If only one side is own IP, it's real inbound/outbound traffic.
+        if super::is_own_ip(src_ip) && super::is_own_ip(dst_ip) {
+            return incidents;
+        }
+
         // ── Protocol mismatch detection ──
         // HTTP on non-HTTP port (C2 indicator)
         if app_proto == "http" && !is_http_port(dst_port) {
@@ -124,8 +132,9 @@ impl ProtoAnomalyDetector {
             }
         }
 
-        // SSH on non-standard port
-        if app_proto == "ssh" && dst_port != 22 {
+        // SSH on non-standard port — skip if we're listening on that port
+        // (operator deliberately configured SSH on a custom port)
+        if app_proto == "ssh" && dst_port != 22 && !super::is_own_listening_port(dst_port) {
             if let Some(inc) = self.emit(
                 AnomalyType::SshNonStandardPort,
                 &format!("SSH on port {dst_port}"),

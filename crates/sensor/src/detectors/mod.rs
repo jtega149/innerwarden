@@ -18,6 +18,115 @@ pub fn init_test_external_ips(ips: std::collections::HashSet<String>) {
     let _ = TEST_EXTERNAL_IPS.set(ips);
 }
 
+// ---------------------------------------------------------------------------
+// Host self-awareness: own IPs and listening ports
+// ---------------------------------------------------------------------------
+
+/// The host's own IP addresses (all local interfaces).
+/// Set once at startup from /proc/net/fib_trie.
+static OWN_IPS: std::sync::OnceLock<std::collections::HashSet<String>> =
+    std::sync::OnceLock::new();
+
+/// Ports the host is actively listening on.
+/// Set once at startup from /proc/net/tcp + tcp6.
+static OWN_LISTENING_PORTS: std::sync::OnceLock<std::collections::HashSet<u16>> =
+    std::sync::OnceLock::new();
+
+/// Initialize the host's own IPs from /proc/net/fib_trie.
+/// Call once at sensor startup.
+pub fn init_host_inventory() {
+    let ips = discover_own_ips();
+    let ports = discover_listening_ports();
+    if !ips.is_empty() {
+        tracing::info!(
+            own_ips = ips.len(),
+            listening_ports = ports.len(),
+            "host inventory: self-awareness initialized"
+        );
+    }
+    let _ = OWN_IPS.set(ips);
+    let _ = OWN_LISTENING_PORTS.set(ports);
+}
+
+/// Check if an IP belongs to this host (any local interface).
+pub fn is_own_ip(ip: &str) -> bool {
+    OWN_IPS
+        .get()
+        .is_some_and(|set| set.contains(ip))
+}
+
+/// Check if a port is being listened on by this host.
+#[allow(dead_code)]
+pub fn is_own_listening_port(port: u16) -> bool {
+    OWN_LISTENING_PORTS
+        .get()
+        .is_some_and(|set| set.contains(&port))
+}
+
+/// Discover the host's own IPv4 addresses from /proc/net/fib_trie.
+/// Same logic as agent's cloud_safelist::init_local_interface_ips.
+fn discover_own_ips() -> std::collections::HashSet<String> {
+    let mut ips = std::collections::HashSet::new();
+
+    let Ok(content) = std::fs::read_to_string("/proc/net/fib_trie") else {
+        // Not Linux or /proc not available (macOS, containers without /proc)
+        return ips;
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        // Pattern: "|-- X.X.X.X" followed by "/32 host LOCAL"
+        if let Some(ip_str) = trimmed.strip_prefix("|-- ") {
+            if i + 1 < lines.len() {
+                let next = lines[i + 1].trim();
+                if next.contains("/32 host LOCAL") {
+                    // Skip loopback and link-local — those are already handled by is_internal_ip
+                    if !ip_str.starts_with("127.") && !ip_str.starts_with("169.254.") {
+                        ips.insert(ip_str.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    ips
+}
+
+/// Discover listening TCP ports from /proc/net/tcp and /proc/net/tcp6.
+fn discover_listening_ports() -> std::collections::HashSet<u16> {
+    let mut ports = std::collections::HashSet::new();
+
+    for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            // Format: "  sl  local_address rem_address   st ..."
+            // local_address = hex_ip:hex_port
+            // st = 0A means LISTEN
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let st = parts[3];
+            if st != "0A" {
+                continue; // Not LISTEN state
+            }
+            // Parse port from local_address (second field, after colon)
+            if let Some(port_hex) = parts[1].split(':').nth(1) {
+                if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+                    if port > 0 {
+                        ports.insert(port);
+                    }
+                }
+            }
+        }
+    }
+
+    ports
+}
+
 /// Returns true if the IP is private, loopback, link-local, or documentation range.
 /// Respects [test_external_ips] overrides from the dynamic allowlist.
 pub fn is_internal_ip(ip: &str) -> bool {

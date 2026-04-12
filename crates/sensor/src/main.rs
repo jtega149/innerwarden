@@ -356,6 +356,9 @@ async fn main() -> Result<()> {
     // Initialize test external IPs so is_internal_ip() respects overrides.
     detectors::init_test_external_ips(dynamic_allowlist.test_external_ips.clone());
 
+    // Initialize host self-awareness (own IPs, listening ports).
+    detectors::init_host_inventory();
+
     // Load blocked IPs from agent feedback file.
     let blocked_ips = load_blocked_ips(data_dir);
     if !blocked_ips.is_empty() {
