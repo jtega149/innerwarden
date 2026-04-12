@@ -599,7 +599,20 @@ pub fn generate(data_dir: &Path, output_dir: &Path) -> Result<GeneratedReport> {
     let report = if graph.metrics().node_count > 0 {
         compute_for_date_from_graph(data_dir, None, &graph)
     } else {
-        compute_for_date(data_dir, None)
+        // Graph empty — supplement zero counters from SQLite tables
+        let mut report = compute_for_date(data_dir, None);
+        if let Ok(store) = innerwarden_store::Store::open(data_dir) {
+            if report.detection_summary.total_events == 0 {
+                report.detection_summary.total_events = store.events_count().unwrap_or(0);
+            }
+            if report.detection_summary.total_incidents == 0 {
+                report.detection_summary.total_incidents = store.incidents_count().unwrap_or(0);
+            }
+            if report.agent_ai_summary.total_decisions == 0 {
+                report.agent_ai_summary.total_decisions = store.decisions_count().unwrap_or(0);
+            }
+        }
+        report
     };
 
     let json_path = safe_dated_file(output_dir, "trial-report", &report_date, "json");
