@@ -428,6 +428,8 @@ struct AgentState {
     /// xdp_block_times, trust_rules. Primary source of truth for reads.
     store: state_store::StateStore,
     sqlite_store: Option<Arc<innerwarden_store::Store>>,
+    /// SQLite maintenance scheduler (None when sqlite_store is None).
+    maintenance_scheduler: Option<innerwarden_store::maintenance::MaintenanceScheduler>,
     /// Attacker intelligence profiles: IP → unified profile.
     attacker_profiles: HashMap<String, attacker_intel::AttackerProfile>,
     /// Last attacker intel consolidation timestamp (5-minute interval).
@@ -1250,6 +1252,11 @@ async fn main() -> Result<()> {
         store,
         baseline: baseline::BaselineStore::load(&cli.data_dir, sqlite_store.as_deref()),
         sqlite_store: sqlite_store.clone(),
+        maintenance_scheduler: if sqlite_store.is_some() {
+            Some(innerwarden_store::maintenance::MaintenanceScheduler::new())
+        } else {
+            None
+        },
         attacker_profiles: HashMap::new(), // loaded from redb below
         last_intel_consolidation_at: None,
         correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -1917,6 +1924,13 @@ async fn main() -> Result<()> {
                     let removed = data_retention::cleanup(&cli.data_dir, &cfg.data);
                     if removed > 0 {
                         info!(removed, "data_retention: cleaned up old files");
+                    }
+
+                    // ── SQLite maintenance (time-gated inside tick) ──
+                    if let (Some(ref mut sched), Some(ref sq)) =
+                        (&mut state.maintenance_scheduler, &state.sqlite_store)
+                    {
+                        sched.tick(sq);
                     }
 
                     // ── Memory housekeeping: cap unbounded HashMaps ──
@@ -4050,6 +4064,7 @@ mod tests {
             forensics: forensics::ForensicsCapture::new(data_dir),
             store: state_store::StateStore::open(data_dir).unwrap(),
             sqlite_store: None,
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4337,6 +4352,7 @@ mod tests {
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
             sqlite_store: None,
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4519,6 +4535,7 @@ mod tests {
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
             sqlite_store: None,
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4676,6 +4693,7 @@ mod tests {
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
             sqlite_store: None,
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4845,6 +4863,7 @@ mod tests {
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
             sqlite_store: None,
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4991,6 +5010,7 @@ mod tests {
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
             sqlite_store: None,
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -5149,6 +5169,7 @@ mod tests {
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
             sqlite_store: None,
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),

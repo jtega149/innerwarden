@@ -193,6 +193,177 @@ impl Store {
     }
 }
 
+// ─── MaintenanceScheduler ─────────────────────────────────────────────
+
+/// Time-gated scheduler for periodic SQLite maintenance tasks.
+///
+/// Called every slow-loop tick (~30s) from the agent. Internally gates
+/// tasks into 5-minute, hourly, and daily buckets so the caller does
+/// not need its own timers.
+pub struct MaintenanceScheduler {
+    last_5min: std::time::Instant,
+    last_hourly: std::time::Instant,
+    last_daily: Option<chrono::NaiveDate>,
+}
+
+impl MaintenanceScheduler {
+    pub fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            last_5min: now,
+            last_hourly: now,
+            last_daily: None,
+        }
+    }
+
+    /// Called every slow-loop tick (~30s). Runs time-gated maintenance tasks.
+    pub fn tick(&mut self, store: &Store) {
+        let now = std::time::Instant::now();
+
+        // 5-minute tasks
+        if now.duration_since(self.last_5min).as_secs() >= 300 {
+            self.last_5min = now;
+            self.tick_5min(store);
+        }
+
+        // Hourly tasks
+        if now.duration_since(self.last_hourly).as_secs() >= 3600 {
+            self.last_hourly = now;
+            self.tick_hourly(store);
+        }
+
+        // Daily tasks (first tick of a new calendar day)
+        let today = chrono::Local::now().date_naive();
+        if self.last_daily != Some(today) {
+            self.last_daily = Some(today);
+            self.tick_daily(store);
+        }
+    }
+
+    // ── 5-minute bucket ───────────────────────────────────────────────
+
+    fn tick_5min(&self, store: &Store) {
+        // WAL checkpoint
+        if let Err(e) = store.wal_checkpoint() {
+            warn!("maintenance: wal_checkpoint failed: {e:#}");
+        }
+
+        // KV expired cleanup
+        match store.kv_cleanup_expired() {
+            Ok(n) if n > 0 => info!(deleted = n, "maintenance: kv expired cleanup"),
+            Err(e) => warn!("maintenance: kv_cleanup_expired failed: {e:#}"),
+            _ => {}
+        }
+
+        // WAL size check
+        match store.wal_size_bytes() {
+            Ok(bytes) if bytes > 200 * 1024 * 1024 => {
+                warn!(
+                    bytes,
+                    mb = bytes / (1024 * 1024),
+                    "maintenance: WAL file exceeds 200 MB"
+                );
+            }
+            Err(e) => warn!("maintenance: wal_size_bytes failed: {e:#}"),
+            _ => {}
+        }
+
+        // DB size metric update
+        match store.db_size_bytes() {
+            Ok(bytes) => {
+                if let Err(e) = store.metric_set("db_size_bytes", bytes as i64) {
+                    warn!("maintenance: metric_set db_size_bytes failed: {e:#}");
+                }
+            }
+            Err(e) => warn!("maintenance: db_size_bytes failed: {e:#}"),
+        }
+    }
+
+    // ── Hourly bucket ─────────────────────────────────────────────────
+
+    fn tick_hourly(&self, store: &Store) {
+        // Incremental vacuum (1000 pages)
+        if let Err(e) = store.incremental_vacuum(1000) {
+            warn!("maintenance: incremental_vacuum(1000) failed: {e:#}");
+        }
+
+        // KV trim for bounded namespaces
+        match store.kv_trim("ip_reputations", 10_000) {
+            Ok(n) if n > 0 => info!(deleted = n, "maintenance: trimmed ip_reputations"),
+            Err(e) => warn!("maintenance: kv_trim ip_reputations failed: {e:#}"),
+            _ => {}
+        }
+
+        match store.kv_trim("attacker_profiles", 10_000) {
+            Ok(n) if n > 0 => info!(deleted = n, "maintenance: trimmed attacker_profiles"),
+            Err(e) => warn!("maintenance: kv_trim attacker_profiles failed: {e:#}"),
+            _ => {}
+        }
+    }
+
+    // ── Daily bucket ──────────────────────────────────────────────────
+
+    fn tick_daily(&self, store: &Store) {
+        // Full retention cleanup
+        match store.run_retention(8, 30, 90, 7) {
+            Ok(r) => {
+                if r.events_deleted > 0
+                    || r.incidents_deleted > 0
+                    || r.decisions_deleted > 0
+                    || r.graph_snapshots_deleted > 0
+                {
+                    info!(
+                        events = r.events_deleted,
+                        incidents = r.incidents_deleted,
+                        decisions = r.decisions_deleted,
+                        snapshots = r.graph_snapshots_deleted,
+                        "maintenance: daily retention cleanup"
+                    );
+                }
+            }
+            Err(e) => warn!("maintenance: run_retention failed: {e:#}"),
+        }
+
+        // Hash chain verification
+        match store.verify_hash_chain() {
+            Ok(result) => {
+                if result.intact {
+                    info!(verified = result.verified, "maintenance: hash chain intact");
+                } else {
+                    warn!(
+                        verified = result.verified,
+                        broken_at = ?result.broken_at,
+                        "maintenance: hash chain BROKEN"
+                    );
+                }
+            }
+            Err(e) => warn!("maintenance: verify_hash_chain failed: {e:#}"),
+        }
+
+        // Integrity check
+        match store.integrity_check() {
+            Ok(ref s) if s == "ok" => {}
+            Ok(ref s) => warn!(result = %s, "maintenance: integrity check NOT ok"),
+            Err(e) => warn!("maintenance: integrity_check failed: {e:#}"),
+        }
+
+        // Conditional vacuum if DB > 500 MB
+        match store.db_size_bytes() {
+            Ok(bytes) if bytes > 500 * 1024 * 1024 => {
+                info!(
+                    mb = bytes / (1024 * 1024),
+                    "maintenance: DB > 500 MB, running incremental_vacuum(5000)"
+                );
+                if let Err(e) = store.incremental_vacuum(5000) {
+                    warn!("maintenance: incremental_vacuum(5000) failed: {e:#}");
+                }
+            }
+            Err(e) => warn!("maintenance: db_size_bytes check failed: {e:#}"),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +431,43 @@ mod tests {
         assert_eq!(stats.events_count, 0);
         assert_eq!(stats.incidents_count, 0);
         assert_eq!(stats.schema_version, 1);
+    }
+
+    #[test]
+    fn test_scheduler_new() {
+        let sched = MaintenanceScheduler::new();
+        assert!(sched.last_daily.is_none());
+    }
+
+    #[test]
+    fn test_scheduler_tick_does_not_panic() {
+        let store = Store::open_memory().unwrap();
+        let mut sched = MaintenanceScheduler::new();
+        // First tick should run daily (last_daily is None).
+        // 5-min and hourly gates will not fire yet (just created).
+        sched.tick(&store);
+        assert!(sched.last_daily.is_some());
+    }
+
+    #[test]
+    fn test_scheduler_5min_tasks() {
+        let store = Store::open_memory().unwrap();
+        let sched = MaintenanceScheduler::new();
+        // Directly call tick_5min — should not panic on empty DB
+        sched.tick_5min(&store);
+    }
+
+    #[test]
+    fn test_scheduler_hourly_tasks() {
+        let store = Store::open_memory().unwrap();
+        let sched = MaintenanceScheduler::new();
+        sched.tick_hourly(&store);
+    }
+
+    #[test]
+    fn test_scheduler_daily_tasks() {
+        let store = Store::open_memory().unwrap();
+        let sched = MaintenanceScheduler::new();
+        sched.tick_daily(&store);
     }
 }
