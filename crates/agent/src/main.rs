@@ -741,6 +741,16 @@ async fn main() -> Result<()> {
         Err(e) => { warn!("sqlite store unavailable: {e:#}"); None }
     };
 
+    // One-time migration from legacy files (JSONL + JSON → SQLite)
+    if let Some(ref sq) = sqlite_store {
+        if innerwarden_store::Store::has_legacy_files(&cli.data_dir) {
+            match sq.migrate_from_legacy(&cli.data_dir) {
+                Ok(report) => info!("legacy migration done: {report}"),
+                Err(e) => warn!("legacy migration failed: {e:#}"),
+            }
+        }
+    }
+
     // Shared knowledge graph: try SQLite store first, fall back to file-based dated snapshot.
     let shared_graph = std::sync::Arc::new(std::sync::RwLock::new({
         let from_store = sqlite_store.as_deref()
