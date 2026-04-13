@@ -1,31 +1,40 @@
 use std::path::Path;
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::{correlation_engine, reader, AgentState};
+use crate::{correlation_engine, AgentState};
 
 /// Ingest newly written incidents and update narrative/correlation state.
 pub(crate) fn ingest_new_incidents(
     data_dir: &Path,
-    today: &str,
+    _today: &str,
     state: &mut AgentState,
 ) -> Result<()> {
-    // Also ingest any new incidents incrementally
-    let incidents_path = data_dir.join(format!("incidents-{today}.jsonl"));
-    let new_incidents = reader::read_new_entries::<innerwarden_core::incident::Incident>(
-        &incidents_path,
-        state.narrative_incidents_offset,
-    )
-    .inspect_err(|_| {
-        state.telemetry.observe_error("incident_reader");
-    })?;
-    if !new_incidents.entries.is_empty() {
-        state.narrative_acc.ingest_incidents(&new_incidents.entries);
-        state.narrative_incidents_offset = new_incidents.new_offset;
+    // Read new incidents from SQLite store
+    let new_incidents: Vec<innerwarden_core::incident::Incident> =
+        if let Some(ref sq) = state.sqlite_store {
+            let cursor_key = "narrative_incidents";
+            let cval = sq.get_agent_cursor(cursor_key).unwrap_or(0);
+            match sq.incidents_since(cval, 5000) {
+                Ok(rows) if !rows.is_empty() => {
+                    let max_id = rows.last().unwrap().0;
+                    let entries: Vec<_> = rows.into_iter().map(|(_, inc)| inc).collect();
+                    let _ = sq.set_agent_cursor(cursor_key, max_id);
+                    entries
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            warn!("sqlite_store not available — cannot read narrative incidents");
+            return Ok(());
+        };
+    let _ = data_dir; // silence unused warning
+    if !new_incidents.is_empty() {
+        state.narrative_acc.ingest_incidents(&new_incidents);
 
         // Feed incidents into cross-layer correlation engine
-        for incident in &new_incidents.entries {
+        for incident in &new_incidents {
             let corr_event = correlation_engine::CorrelationEngine::classify_incident(incident);
             state.correlation_engine.observe(corr_event);
         }
@@ -125,7 +134,7 @@ pub(crate) fn ingest_new_incidents(
             }
 
             // Evaluate chain-triggered playbooks
-            for incident in &new_incidents.entries {
+            for incident in &new_incidents {
                 if let Some(exec) = state
                     .playbook_engine
                     .evaluate_chain(&chain.rule_id, incident)

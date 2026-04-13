@@ -254,9 +254,12 @@ pub(crate) fn cmd_configure_2fa(cli: &Cli) -> Result<()> {
             );
 
             println!();
-            println!("  Scan this URI with your authenticator app:");
+            println!("  Scan this QR code with your authenticator app:");
             println!();
-            println!("  {}", uri);
+            // Render QR code as ASCII art in the terminal. The TOTP secret
+            // never touches disk or log files — displayed only as visual
+            // pixels that the operator scans with their phone camera.
+            render_qr_to_terminal(&uri);
             println!();
             print!("  Enter the 6-digit code to verify: ");
             std::io::stdout().flush()?;
@@ -314,6 +317,41 @@ pub(crate) fn cmd_configure_2fa(cli: &Cli) -> Result<()> {
             println!("  Unknown option. Run: innerwarden configure 2fa");
             Ok(())
         }
+    }
+}
+
+/// Render a QR code as Unicode block characters in the terminal.
+/// Uses two rows per line (upper/lower half blocks) for compact display.
+fn render_qr_to_terminal(data: &str) {
+    use qrcode::QrCode;
+    let code = match QrCode::new(data.as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  (QR code generation failed: {e})");
+            return;
+        }
+    };
+    let matrix = code.to_colors();
+    let width = code.width();
+    // Each character represents 2 vertical pixels using half-block chars
+    let rows = width.div_ceil(2);
+    for row in 0..rows {
+        print!("    "); // indent
+        for col in 0..width {
+            let top = matrix[row * 2 * width + col] == qrcode::Color::Dark;
+            let bot = if row * 2 + 1 < width {
+                matrix[(row * 2 + 1) * width + col] == qrcode::Color::Dark
+            } else {
+                false
+            };
+            match (top, bot) {
+                (true, true) => print!("\u{2588}"),  // █ full block
+                (true, false) => print!("\u{2580}"), // ▀ upper half
+                (false, true) => print!("\u{2584}"), // ▄ lower half
+                (false, false) => print!(" "),       //   space
+            }
+        }
+        println!();
     }
 }
 

@@ -129,7 +129,7 @@ function renderStatus(s, collectors) {
       const cmd = on ? disableCmd : enableCmd;
       const label = on ? '⏹ Disable' : '▶ Enable';
       const cls = on ? 'integ-toggle off' : 'integ-toggle on';
-      toggleBtn = '<button class="' + cls + '" onclick="copyCmd(\'' + esc(cmd).replace(/'/g, "\\'") + '\')" title="Copy command">' + label + '</button>';
+      toggleBtn = '<button class="' + cls + '" onclick="copyCmd(\'' + esc(cmd).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + '\')" title="Copy command">' + label + '</button>';
     }
     return '<div class="integ-card ' + (on ? 'active' : 'inactive') + '">' +
       '<div class="integ-icon">' + icon + '</div>' +

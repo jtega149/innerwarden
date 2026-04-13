@@ -420,7 +420,7 @@ async function loadBrain() {
 
       for (const e of recent.entries) {
         const agreeIcon = e.agreed ? '✅' : '⚠️';
-        const iid = esc(e.incident_id).replace(/'/g, "\\'");
+        const iid = esc(e.incident_id).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         const feedbackHtml = e.feedback === true ? '<span style="color:var(--ok)">TP</span>'
           : e.feedback === false ? '<span style="color:var(--danger)">FP</span>'
           : `<button onclick="brainFeedback('${iid}',true)" style="padding:2px 8px;border-radius:4px;border:1px solid var(--ok);background:transparent;color:var(--ok);cursor:pointer;font-size:0.7rem;margin-right:2px;" aria-label="Mark true positive">✓</button><button onclick="brainFeedback('${iid}',false)" style="padding:2px 8px;border-radius:4px;border:1px solid var(--danger);background:transparent;color:var(--danger);cursor:pointer;font-size:0.7rem;" aria-label="Mark false positive">✗</button>`;

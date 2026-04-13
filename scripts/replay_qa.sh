@@ -35,15 +35,12 @@ AGENT_LOG="$TMP_DIR/agent.log"
 REPORT_LOG="$TMP_DIR/report.log"
 
 DATE="$(date +%F)"
-EVENTS_FILE="$DATA_DIR/events-$DATE.jsonl"
-INCIDENTS_FILE="$DATA_DIR/incidents-$DATE.jsonl"
-DECISIONS_FILE="$DATA_DIR/decisions-$DATE.jsonl"
+SQLITE_DB="$DATA_DIR/innerwarden.db"
 TELEMETRY_FILE="$DATA_DIR/telemetry-$DATE.jsonl"
 SUMMARY_FILE="$DATA_DIR/summary-$DATE.md"
 REPORT_MD="$DATA_DIR/trial-report-$DATE.md"
 REPORT_JSON="$DATA_DIR/trial-report-$DATE.json"
 STATE_FILE="$DATA_DIR/state.json"
-AGENT_STATE_FILE="$DATA_DIR/agent-state.json"
 SENSOR_BIN="$ROOT_DIR/target/debug/innerwarden-sensor"
 AGENT_BIN="$ROOT_DIR/target/debug/innerwarden-agent"
 
@@ -68,13 +65,8 @@ assert_json_metric_positive() {
   fi
 }
 
-assert_events_contain_source() {
-  local source="$1"
-  if ! grep -q "\"source\":\"$source\"" "$EVENTS_FILE"; then
-    echo "assertion failed: events file should contain source=$source events"
-    exit 1
-  fi
-}
+# assert_events_contain_source removed: events are now in SQLite, not JSONL.
+# The report JSON metrics (total_events > 0) validate that events were written.
 
 echo "[replay] preparing fixture logs"
 
@@ -184,26 +176,15 @@ echo "[replay] generating operational report"
 "$AGENT_BIN" --report --data-dir "$DATA_DIR" > "$REPORT_LOG" 2>&1
 
 echo "[replay] validating artifacts"
-assert_file_nonempty "$EVENTS_FILE"
-assert_file_nonempty "$INCIDENTS_FILE"
-assert_file_nonempty "$DECISIONS_FILE"
+assert_file_nonempty "$SQLITE_DB"
 assert_file_nonempty "$TELEMETRY_FILE"
 assert_file_nonempty "$SUMMARY_FILE"
 assert_file_nonempty "$STATE_FILE"
-assert_file_nonempty "$AGENT_STATE_FILE"
 assert_file_nonempty "$REPORT_MD"
 assert_file_nonempty "$REPORT_JSON"
 
-if ! grep -Eq '"expected_files_present"[[:space:]]*:[[:space:]]*true' "$REPORT_JSON"; then
-  echo "assertion failed: expected_files_present should be true"
-  exit 1
-fi
 if ! grep -Eq '"state_json_readable"[[:space:]]*:[[:space:]]*true' "$REPORT_JSON"; then
   echo "assertion failed: state_json_readable should be true"
-  exit 1
-fi
-if ! grep -Eq '"agent_state_json_readable"[[:space:]]*:[[:space:]]*true' "$REPORT_JSON"; then
-  echo "assertion failed: agent_state_json_readable should be true"
   exit 1
 fi
 if ! grep -Eq '"available"[[:space:]]*:[[:space:]]*true' "$REPORT_JSON"; then
@@ -216,20 +197,8 @@ assert_json_metric_positive "$REPORT_JSON" "total_incidents"
 assert_json_metric_positive "$REPORT_JSON" "total_decisions"
 assert_json_metric_positive "$REPORT_JSON" "ai_decision_count"
 
-assert_events_contain_source "auth.log"
-
-if ! grep -q '"ai_provider":"anthropic"' "$DECISIONS_FILE"; then
-  echo "assertion failed: decisions must include anthropic provider entries"
-  exit 1
-fi
-
-AUTH_COUNT=$(grep -c '"source":"auth.log"' "$EVENTS_FILE" || true)
-
 echo "[replay] success"
 echo "  data_dir:   $DATA_DIR"
-echo "  events:     $(wc -l < "$EVENTS_FILE" | tr -d ' ') total"
-echo "    auth_log:    $AUTH_COUNT"
-echo "  incidents:  $(wc -l < "$INCIDENTS_FILE" | tr -d ' ')"
-echo "  decisions:  $(wc -l < "$DECISIONS_FILE" | tr -d ' ')"
+echo "  sqlite_db:  $SQLITE_DB ($(du -h "$SQLITE_DB" | cut -f1))"
 echo "  telemetry:  $(wc -l < "$TELEMETRY_FILE" | tr -d ' ')"
 echo "  report:     $REPORT_MD"

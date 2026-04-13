@@ -139,15 +139,87 @@ prompt_yes_no() {
   [[ "${normalized}" == "true" ]]
 }
 
+term_cols() {
+  local cols=""
+  if command -v tput >/dev/null 2>&1; then
+    cols="$(tput cols 2>/dev/null || true)"
+  fi
+  if [[ -z "${cols}" || ! "${cols}" =~ ^[0-9]+$ || "${cols}" -lt 20 ]]; then
+    cols="${COLUMNS:-80}"
+  fi
+  if [[ ! "${cols}" =~ ^[0-9]+$ || "${cols}" -lt 20 ]]; then
+    cols=80
+  fi
+  echo "${cols}"
+}
+
+term_rows() {
+  local rows=""
+  if command -v tput >/dev/null 2>&1; then
+    rows="$(tput lines 2>/dev/null || true)"
+  fi
+  if [[ -z "${rows}" || ! "${rows}" =~ ^[0-9]+$ || "${rows}" -lt 10 ]]; then
+    rows="${LINES:-24}"
+  fi
+  if [[ ! "${rows}" =~ ^[0-9]+$ || "${rows}" -lt 10 ]]; then
+    rows=24
+  fi
+  echo "${rows}"
+}
+
+print_centered_line() {
+  local cols="$1"
+  local line="$2"
+  local width="${#line}"
+  local pad=0
+  if (( cols > width )); then
+    pad=$(( (cols - width) / 2 ))
+  fi
+  printf "%*s%s\n" "${pad}" "" "${line}"
+}
+
+print_install_banner() {
+  local cols rows top_pad i
+  cols="$(term_cols)"
+  rows="$(term_rows)"
+
+  local platform_line
+  platform_line="$(printf "%s %s | kernel %s%s" "${OS_TYPE,,}" "${ARCH}" "${KERNEL}" "${DISTRO:+ | ${DISTRO}}")"
+
+  local banner_lines=(
+"  _____ _   _ _   _ _____ ____  __        ___    ____  ____  _____ _   _ "
+" |_   _| \\ | | \\ | | ____|  _ \\ \\ \\      / / \\  |  _ \\|  _ \\| ____| \\ | |"
+"   | | |  \\| |  \\| |  _| | |_) | \\ \\ /\\ / / _ \\ | |_) | | | |  _| |  \\| |"
+"   | | | |\\  | |\\  | |___|  _ <   \\ V  V / ___ \\|  _ <| |_| | |___| |\\  |"
+"   |_| |_| \\_|_| \\_|_____|_| \\_\\   \\_/\\_/_/   \\_\\_| \\_\\____/|_____|_| \\_|"
+""
+"+---------------------------------------------------------------+"
+"| Your server's immune system installer                         |"
+"+---------------------------------------------------------------+"
+"${platform_line}"
+  )
+
+  if [[ -t 1 ]]; then
+    printf '\033[2J\033[H'
+  fi
+
+  top_pad=1
+  if (( rows > ${#banner_lines[@]} + 2 )); then
+    top_pad=$(( (rows - ${#banner_lines[@]}) / 2 ))
+  fi
+
+  for ((i = 0; i < top_pad; i++)); do
+    echo ""
+  done
+
+  for line in "${banner_lines[@]}"; do
+    print_centered_line "${cols}" "${line}"
+  done
+  echo ""
+}
+
 # ── Banner (only after sudo, so it shows once) ──────────────────────────
-echo ""
-echo "  ┌──────────────────────────────────┐"
-echo "  │  🛡️  InnerWarden                  │"
-echo "  │  Your server's immune system.    │"
-echo "  └──────────────────────────────────┘"
-echo ""
-echo "  ▸ ${OS_TYPE,,} ${ARCH} · kernel ${KERNEL}${DISTRO:+ · $DISTRO}"
-echo ""
+print_install_banner
 
 if [[ "$OS_TYPE" != "Linux" && "$OS_TYPE" != "Darwin" ]]; then
   fail "this installer supports Linux and macOS (Darwin) hosts only"

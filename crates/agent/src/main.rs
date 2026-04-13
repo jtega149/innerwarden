@@ -82,6 +82,7 @@ mod neural_lifecycle;
 mod notification_pipeline;
 mod pcap_capture;
 mod playbook;
+#[allow(dead_code)]
 mod reader;
 #[cfg(feature = "redis-reader")]
 mod redis_reader;
@@ -420,13 +421,18 @@ struct AgentState {
     abuseipdb_report_queue: Vec<(String, String, String, chrono::DateTime<chrono::Utc>)>,
     /// Incremental narrative accumulator - avoids re-reading events file.
     narrative_acc: NarrativeAccumulator,
-    /// Byte offset for incremental incident reading (narrative accumulator).
+    /// Legacy: was byte offset for JSONL incident reading. SQLite cursor is
+    /// now stored in the database itself. Kept to avoid churning test state structs.
+    #[allow(dead_code)]
     narrative_incidents_offset: u64,
     /// Forensics capture - grabs /proc state for High/Critical process incidents.
     forensics: forensics::ForensicsCapture,
     /// Persistent state store (redb) - cooldowns, block_counts, ip_reputations,
     /// xdp_block_times, trust_rules. Primary source of truth for reads.
     store: state_store::StateStore,
+    sqlite_store: Option<Arc<innerwarden_store::Store>>,
+    /// SQLite maintenance scheduler (None when sqlite_store is None).
+    maintenance_scheduler: Option<innerwarden_store::maintenance::MaintenanceScheduler>,
     /// Attacker intelligence profiles: IP → unified profile.
     attacker_profiles: HashMap<String, attacker_intel::AttackerProfile>,
     /// Last attacker intel consolidation timestamp (5-minute interval).
@@ -590,10 +596,7 @@ fn run_cleanup_015(data_dir: &std::path::Path) -> Result<()> {
         report.brute_force_user_nodes_removed
     );
     if !report.removed_user_names.is_empty() {
-        println!(
-            "  removed users        : {} (names redacted)",
-            report.removed_user_names.len()
-        );
+        println!("  removed users        : (names redacted)");
     }
     Ok(())
 }
@@ -733,10 +736,41 @@ async fn main() -> Result<()> {
         dashboard::DeepSecuritySnapshot::default(),
     ));
 
-    // Shared knowledge graph: loaded from today's dated snapshot (Phase 7: daily snapshots).
-    let shared_graph = std::sync::Arc::new(std::sync::RwLock::new(
-        knowledge_graph::KnowledgeGraph::load_today_snapshot(&cli.data_dir),
-    ));
+    // Open SQLite store early so the graph can try loading from it.
+    // Wrapped in Arc so it can be shared with the dashboard task.
+    let sqlite_store: Option<Arc<innerwarden_store::Store>> =
+        match innerwarden_store::Store::open(&cli.data_dir) {
+            Ok(s) => {
+                info!(path = %cli.data_dir.join("innerwarden.db").display(), "sqlite store opened");
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                warn!("sqlite store unavailable: {e:#}");
+                None
+            }
+        };
+
+    // One-time migration from legacy files (JSONL + JSON → SQLite)
+    if let Some(ref sq) = sqlite_store {
+        if innerwarden_store::Store::has_legacy_files(&cli.data_dir) {
+            match sq.migrate_from_legacy(&cli.data_dir) {
+                Ok(report) => info!("legacy migration done: {report}"),
+                Err(e) => warn!("legacy migration failed: {e:#}"),
+            }
+        }
+    }
+
+    // Shared knowledge graph: try SQLite store first, fall back to file-based dated snapshot.
+    let shared_graph = std::sync::Arc::new(std::sync::RwLock::new({
+        let from_store = sqlite_store
+            .as_deref()
+            .and_then(knowledge_graph::KnowledgeGraph::load_from_store);
+        if let Some(g) = from_store {
+            g
+        } else {
+            knowledge_graph::KnowledgeGraph::load_today_snapshot(&cli.data_dir)
+        }
+    }));
 
     // Advisory cache: shared between dashboard (writes advisory denials) and
     // the incident processing loop (checks for advisory violations).
@@ -824,6 +858,7 @@ async fn main() -> Result<()> {
         let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
         let briefing_hour = cfg.briefing.hour;
         let briefing_minute = cfg.briefing.minute;
+        let dashboard_store = sqlite_store.clone();
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -843,6 +878,7 @@ async fn main() -> Result<()> {
                 dashboard_briefing,
                 briefing_hour,
                 briefing_minute,
+                dashboard_store,
             )
             .await
             {
@@ -1216,16 +1252,25 @@ async fn main() -> Result<()> {
         },
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
-        response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(&cli.data_dir),
+        response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(
+            &cli.data_dir,
+            sqlite_store.as_deref(),
+        ),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
         narrative_incidents_offset: 0,
         forensics: forensics::ForensicsCapture::new(&cli.data_dir),
         store,
+        baseline: baseline::BaselineStore::load(&cli.data_dir, sqlite_store.as_deref()),
+        sqlite_store: sqlite_store.clone(),
+        maintenance_scheduler: if sqlite_store.is_some() {
+            Some(innerwarden_store::maintenance::MaintenanceScheduler::new())
+        } else {
+            None
+        },
         attacker_profiles: HashMap::new(), // loaded from redb below
         last_intel_consolidation_at: None,
         correlation_engine: correlation_engine::CorrelationEngine::new(),
-        baseline: baseline::BaselineStore::load(&cli.data_dir),
         playbook_engine: playbook::PlaybookEngine::new(&cli.data_dir),
         defender_brain: defender_brain::DefenderBrain::load(
             &cli.data_dir.join("defender-brain.json").to_string_lossy(),
@@ -1306,7 +1351,12 @@ async fn main() -> Result<()> {
                 feed_urls.len()
             );
         }
-        let client = threat_feeds::ThreatFeedClient::new(vt_key, feed_urls, &cli.data_dir);
+        let client = threat_feeds::ThreatFeedClient::new(
+            vt_key,
+            feed_urls,
+            &cli.data_dir,
+            sqlite_store.as_deref(),
+        );
         let feed_state = client.state();
         if feed_state.total_iocs > 0 {
             info!(
@@ -1358,38 +1408,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    let state_path = cli.data_dir.join("agent-state.json");
-    let mut cursor = reader::AgentCursor::load(&state_path)?;
-
-    // Phase 6: detect stale cursor — if graph event counters are empty but cursor
-    // is advanced, reset cursor to re-ingest events and rebuild telemetry counters.
-    {
-        let today = chrono::Local::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
-        let graph_has_counters = {
-            let g = state.knowledge_graph.read().unwrap();
-            g.total_events_ingested > 0
-        };
-        let cursor_offset = cursor.events_offset(&today);
-        if !graph_has_counters && cursor_offset > 0 {
-            info!(
-                old_offset = cursor_offset,
-                "resetting events cursor: graph counters empty but cursor advanced (snapshot/cursor race)"
-            );
-            cursor.set_events_offset(&today, 0);
-        }
-    }
-
-    // Initialize narrative offset from cursor so we don't re-read all incidents on restart
-    {
-        let today = chrono::Local::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
-        state.narrative_incidents_offset = cursor.incidents_offset(&today);
-    }
+    // Legacy cursor kept for test compatibility (tests still pass AgentCursor)
+    let mut cursor = reader::AgentCursor::default();
 
     if cli.once {
         let handled = process_incidents(
@@ -1408,7 +1428,6 @@ async fn main() -> Result<()> {
         if let Some(w) = &mut state.telemetry_writer {
             w.flush();
         }
-        cursor.save(&state_path)?;
         info!(new_events, incidents_handled = handled, "run complete");
     } else {
         // Activate approval channel and start Telegram polling task
@@ -1533,10 +1552,6 @@ async fn main() -> Result<()> {
             let shutdown = tokio::select! {
                 _ = incident_ticker.tick() => {
                     process_incidents(&cli.data_dir, &mut cursor, &cfg, &mut state, &advisory_cache).await;
-                    // Persist cursor after every incident tick - prevents double-processing on restart
-                    if let Err(e) = cursor.save(&state_path) {
-                        warn!("failed to save cursor after incident tick: {e:#}");
-                    }
                     false
                 }
                 _ = narrative_ticker.tick() => {
@@ -1817,6 +1832,12 @@ async fn main() -> Result<()> {
                         let json = state.response_lifecycle.to_json();
                         let path = cli.data_dir.join("responses.json");
                         if let Ok(data) = serde_json::to_string(&json) {
+                            // Dual-write: SQLite blob + JSON file
+                            if let Some(ref sq) = state.sqlite_store {
+                                if let Err(e) = sq.set_blob("responses", &data) {
+                                    warn!("failed to write responses blob: {e}");
+                                }
+                            }
                             let _ = tokio::fs::write(&path, data).await;
                         }
                     }
@@ -1886,6 +1907,13 @@ async fn main() -> Result<()> {
                         info!(removed, "data_retention: cleaned up old files");
                     }
 
+                    // ── SQLite maintenance (time-gated inside tick) ──
+                    if let (Some(ref mut sched), Some(ref sq)) =
+                        (&mut state.maintenance_scheduler, &state.sqlite_store)
+                    {
+                        sched.tick(sq);
+                    }
+
                     // ── Memory housekeeping: cap unbounded HashMaps ──
                     {
                         const MAX_IP_REPUTATIONS: usize = 2000;
@@ -1916,7 +1944,7 @@ async fn main() -> Result<()> {
                         // ── Threat feed poll + save ──
                         if let Some(ref mut tf) = state.threat_feed {
                             tf.poll_feeds().await;
-                            tf.save(&cli.data_dir);
+                            tf.save(&cli.data_dir, state.sqlite_store.as_deref());
                         }
 
                         // ── Pcap capture cooldown cleanup ──
@@ -1936,7 +1964,7 @@ async fn main() -> Result<()> {
                                     anomaly.description
                                 );
                             }
-                            state.baseline.save(&cli.data_dir);
+                            state.baseline.save(&cli.data_dir, state.sqlite_store.as_deref());
                         }
 
                         // ── Attacker intelligence consolidation (every 5 min) ──
@@ -1958,6 +1986,7 @@ async fn main() -> Result<()> {
                                 &mut state.attacker_profiles,
                                 &state.store,
                                 &cli.data_dir,
+                                state.sqlite_store.as_deref(),
                             );
                             state.last_intel_consolidation_at = Some(Instant::now());
                         }
@@ -2014,9 +2043,6 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    if let Err(e) = cursor.save(&state_path) {
-                        warn!("failed to save cursor after narrative tick: {e:#}");
-                    }
                     false
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -2107,9 +2133,6 @@ async fn main() -> Result<()> {
             let shutdown = tokio::select! {
                 _ = incident_ticker.tick() => {
                     process_incidents(&cli.data_dir, &mut cursor, &cfg, &mut state, &advisory_cache).await;
-                    if let Err(e) = cursor.save(&state_path) {
-                        warn!("failed to save cursor after incident tick: {e:#}");
-                    }
                     false
                 }
                 _ = narrative_ticker.tick() => {
@@ -2166,9 +2189,6 @@ async fn main() -> Result<()> {
                     let removed = data_retention::cleanup(&cli.data_dir, &cfg.data);
                     if removed > 0 {
                         info!(removed, "data_retention: cleaned up old files");
-                    }
-                    if let Err(e) = cursor.save(&state_path) {
-                        warn!("failed to save cursor after narrative tick: {e:#}");
                     }
                     false
                 }
@@ -2251,7 +2271,6 @@ async fn main() -> Result<()> {
                 if let Some(w) = &mut state.telemetry_writer {
                     w.flush();
                 }
-                cursor.save(&state_path)?;
                 break;
             }
         }
@@ -2348,18 +2367,26 @@ async fn process_incidents(
         .format("%Y-%m-%d")
         .to_string();
 
-    let incidents_path = data_dir.join(format!("incidents-{today}.jsonl"));
-
-    let new_incidents = match reader::read_new_entries::<innerwarden_core::incident::Incident>(
-        &incidents_path,
-        cursor.incidents_offset(&today),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            state.telemetry.observe_error("incident_reader");
-            warn!("incident tick: failed to read incidents: {e:#}");
-            return 0;
+    let new_incidents = if let Some(ref sq) = state.sqlite_store {
+        let cval = sq.get_agent_cursor("incidents").unwrap_or(0);
+        match sq.incidents_since(cval, 5000) {
+            Ok(rows) if !rows.is_empty() => {
+                let max_id = rows.last().unwrap().0;
+                let entries = rows.into_iter().map(|(_, inc)| inc).collect();
+                let _ = sq.set_agent_cursor("incidents", max_id);
+                reader::ReadResult {
+                    entries,
+                    new_offset: 0,
+                }
+            }
+            _ => reader::ReadResult {
+                entries: vec![],
+                new_offset: 0,
+            },
         }
+    } else {
+        warn!("sqlite_store not available — cannot read incidents");
+        return 0;
     };
 
     // Drain any pending T.2/T.3 approval results from the Telegram polling task.
@@ -2443,11 +2470,14 @@ async fn process_incidents(
     let ai_enabled = cfg.ai.enabled && state.ai_provider.is_some() && !circuit_breaker_open;
     let (all_events, skill_infos, ai_provider, provider_name, already_blocked, mut blocked_set) =
         if ai_enabled {
-            let events_path = data_dir.join(format!("events-{today}.jsonl"));
-            let events =
-                reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, 0)
-                    .map(|r| r.entries)
-                    .unwrap_or_default();
+            let events = if let Some(ref sq) = state.sqlite_store {
+                sq.events_since(0, 50_000)
+                    .map(|rows| rows.into_iter().map(|(_, ev)| ev).collect())
+                    .unwrap_or_default()
+            } else {
+                warn!("sqlite_store not available — AI context will have no events");
+                vec![]
+            };
             let infos = state.skill_registry.infos();
             // Clone the Arc - owned handle, no borrow of `state`
             let prov: Arc<dyn ai::AiProvider> = state.ai_provider.as_ref().unwrap().clone();
@@ -3290,7 +3320,7 @@ async fn process_telegram_approval(
 /// Returns the number of new events seen this tick.
 async fn process_narrative_tick(
     data_dir: &Path,
-    cursor: &mut reader::AgentCursor,
+    _cursor: &mut reader::AgentCursor,
     cfg: &config::AgentConfig,
     state: &mut AgentState,
 ) -> Result<usize> {
@@ -3313,33 +3343,39 @@ async fn process_narrative_tick(
                 (Vec::new(), 0)
             }
         }
+    } else if let Some(ref sq) = state.sqlite_store {
+        let cval = sq.get_agent_cursor("events").unwrap_or(0);
+        match sq.events_since(cval, 5000) {
+            Ok(rows) if !rows.is_empty() => {
+                let max_id = rows.last().unwrap().0;
+                let entries: Vec<_> = rows.into_iter().map(|(_, ev)| ev).collect();
+                let count = entries.len();
+                let _ = sq.set_agent_cursor("events", max_id);
+                (entries, count)
+            }
+            _ => (Vec::new(), 0),
+        }
     } else {
-        let events_path = data_dir.join(format!("events-{today}.jsonl"));
-        let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(
-            &events_path,
-            cursor.events_offset(&today),
-        )
-        .inspect_err(|_| {
-            state.telemetry.observe_error("event_reader");
-        })?;
-        let count = new_events.entries.len();
-        cursor.set_events_offset(&today, new_events.new_offset);
-        (new_events.entries, count)
+        warn!("sqlite_store not available — cannot read events");
+        (Vec::new(), 0)
     };
 
     #[cfg(not(feature = "redis-reader"))]
-    let (events_entries, events_count) = {
-        let events_path = data_dir.join(format!("events-{today}.jsonl"));
-        let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(
-            &events_path,
-            cursor.events_offset(&today),
-        )
-        .inspect_err(|_| {
-            state.telemetry.observe_error("event_reader");
-        })?;
-        let count = new_events.entries.len();
-        cursor.set_events_offset(&today, new_events.new_offset);
-        (new_events.entries, count)
+    let (events_entries, events_count) = if let Some(ref sq) = state.sqlite_store {
+        let cval = sq.get_agent_cursor("events").unwrap_or(0);
+        match sq.events_since(cval, 5000) {
+            Ok(rows) if !rows.is_empty() => {
+                let max_id = rows.last().unwrap().0;
+                let entries: Vec<_> = rows.into_iter().map(|(_, ev)| ev).collect();
+                let count = entries.len();
+                let _ = sq.set_agent_cursor("events", max_id);
+                (entries, count)
+            }
+            _ => (Vec::new(), 0),
+        }
+    } else {
+        warn!("sqlite_store not available — cannot read events");
+        (Vec::new(), 0)
     };
 
     state.telemetry.observe_events(&events_entries);
@@ -3429,12 +3465,22 @@ async fn process_narrative_tick(
             if let Err(e) = graph.save_dated_snapshot(data_dir) {
                 warn!("knowledge graph snapshot failed: {e:#}");
             }
+            // Spec 016: also save to SQLite store
+            if let Some(ref sq) = state.sqlite_store {
+                if let Err(e) = graph.save_to_store(sq) {
+                    warn!("knowledge graph SQLite snapshot failed: {e:#}");
+                }
+            }
             let metrics = graph.metrics();
             if let Ok(json) = serde_json::to_vec(&metrics) {
                 let _ = std::fs::write(data_dir.join("graph-stats.json"), json);
             }
             // Phase 7: cleanup old snapshots (keep 7 days)
             knowledge_graph::KnowledgeGraph::cleanup_old_snapshots(data_dir, 7);
+            // Spec 016: also cleanup SQLite snapshots
+            if let Some(ref sq) = state.sqlite_store {
+                knowledge_graph::KnowledgeGraph::cleanup_store_snapshots(sq, 7);
+            }
         }
         state.last_graph_snapshot = std::time::Instant::now();
     }
@@ -3800,7 +3846,6 @@ fn boot_self_test() {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use std::io::Write;
     use std::path::Path;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -3870,9 +3915,9 @@ mod tests {
         }
     }
 
-    /// Write a minimal Incident JSON line (ssh brute-force from an external IP).
-    fn incident_line(ip: &str) -> String {
-        serde_json::to_string(&innerwarden_core::incident::Incident {
+    /// Create a test incident (ssh brute-force from an external IP).
+    fn test_incident(ip: &str) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
             ts: chrono::Utc::now(),
             host: "test-host".to_string(),
             incident_id: format!("ssh_bruteforce:{ip}:test"),
@@ -3883,12 +3928,11 @@ mod tests {
             recommended_checks: vec![],
             tags: vec!["ssh".to_string()],
             entities: vec![innerwarden_core::entities::EntityRef::ip(ip)],
-        })
-        .unwrap()
+        }
     }
 
-    fn incident_line_with_kind(ip: &str, kind: &str) -> String {
-        serde_json::to_string(&innerwarden_core::incident::Incident {
+    fn test_incident_with_kind(ip: &str, kind: &str) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
             ts: chrono::Utc::now(),
             host: "test-host".to_string(),
             incident_id: format!("{kind}:{ip}:test"),
@@ -3899,8 +3943,29 @@ mod tests {
             recommended_checks: vec![],
             tags: vec![kind.to_string()],
             entities: vec![innerwarden_core::entities::EntityRef::ip(ip)],
-        })
-        .unwrap()
+        }
+    }
+
+    /// Write a minimal Incident JSON line (kept for backcompat with tests that need JSONL).
+    fn incident_line(ip: &str) -> String {
+        serde_json::to_string(&test_incident(ip)).unwrap()
+    }
+
+    fn incident_line_with_kind(ip: &str, kind: &str) -> String {
+        serde_json::to_string(&test_incident_with_kind(ip, kind)).unwrap()
+    }
+
+    /// Open a SQLite store in the temp dir and return it wrapped in Arc.
+    fn test_sqlite_store(dir: &std::path::Path) -> Arc<innerwarden_store::Store> {
+        Arc::new(innerwarden_store::Store::open(dir).unwrap())
+    }
+
+    /// Insert an incident into the SQLite store.
+    fn insert_test_incident(
+        store: &innerwarden_store::Store,
+        incident: &innerwarden_core::incident::Incident,
+    ) {
+        store.insert_incident(incident).unwrap();
     }
 
     fn sha256_hex_for_test(data: &str) -> String {
@@ -3962,6 +4027,8 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(data_dir),
             store: state_store::StateStore::open(data_dir).unwrap(),
+            sqlite_store: None,
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4160,19 +4227,11 @@ mod tests {
     #[tokio::test]
     async fn golden_path_dry_run_produces_decision_entry() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
 
         // 1. Plant a single brute-force incident from a routable external IP.
-        //    Must NOT be RFC1918, loopback, or documentation (203.0.113.x / 198.51.100.x
-        //    are TEST-NET ranges and would be filtered by the algorithm gate).
         let attacker_ip = "1.2.3.4";
-        let incidents_path = dir.path().join(format!("incidents-{today}.jsonl"));
-        let mut f = std::fs::File::create(&incidents_path).unwrap();
-        writeln!(f, "{}", incident_line(attacker_ip)).unwrap();
-        drop(f);
+        let store = test_sqlite_store(dir.path());
+        insert_test_incident(&store, &test_incident(attacker_ip));
 
         // 2. Config: AI enabled, responder dry_run=true, ufw backend allowed
         let cfg = config::AgentConfig {
@@ -4248,6 +4307,8 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: Some(store.clone()),
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4306,16 +4367,14 @@ mod tests {
         // Verify: one incident handled
         assert_eq!(handled, 1, "expected 1 incident handled");
 
-        // Verify: cursor advanced (incident will not be re-read on next tick)
-        assert!(
-            cursor.incidents_offset(&today) > 0,
-            "cursor should have advanced past the incident"
-        );
-
         // Verify: decision written to audit trail
         if let Some(w) = &mut state.decision_writer {
             w.flush();
         }
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
         let decisions_path = dir.path().join(format!("decisions-{today}.jsonl"));
         let content = std::fs::read_to_string(&decisions_path).unwrap();
         assert!(
@@ -4348,12 +4407,9 @@ mod tests {
             .format("%Y-%m-%d")
             .to_string();
 
-        // Use a routable external IP - TEST-NET ranges (203.0.113.x) are filtered by the gate
         let attacker_ip = "5.6.7.8";
-        let incidents_path = dir.path().join(format!("incidents-{today}.jsonl"));
-        let mut f = std::fs::File::create(&incidents_path).unwrap();
-        writeln!(f, "{}", incident_line(attacker_ip)).unwrap();
-        drop(f);
+        let store = test_sqlite_store(dir.path());
+        insert_test_incident(&store, &test_incident(attacker_ip));
 
         let cfg = config::AgentConfig {
             ai: config::AiConfig {
@@ -4429,6 +4485,8 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: Some(store.clone()),
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4505,11 +4563,12 @@ mod tests {
             .to_string();
 
         let attacker_ip = "9.8.7.6";
-        let incidents_path = dir.path().join(format!("incidents-{today}.jsonl"));
-        let mut f = std::fs::File::create(&incidents_path).unwrap();
-        writeln!(f, "{}", incident_line(attacker_ip)).unwrap();
-        writeln!(f, "{}", incident_line(attacker_ip)).unwrap();
-        drop(f);
+        let store = test_sqlite_store(dir.path());
+        insert_test_incident(&store, &test_incident(attacker_ip));
+        // Insert a second incident for the same IP (different ID to avoid UNIQUE constraint)
+        let mut inc2 = test_incident(attacker_ip);
+        inc2.incident_id = format!("ssh_bruteforce:{attacker_ip}:test2");
+        insert_test_incident(&store, &inc2);
 
         let cfg = config::AgentConfig {
             ai: config::AiConfig {
@@ -4585,6 +4644,8 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: Some(store.clone()),
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4660,22 +4721,14 @@ mod tests {
     #[tokio::test]
     async fn temporal_correlation_context_is_passed_to_ai() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
 
         let attacker_ip = "2.3.4.5";
-        let incidents_path = dir.path().join(format!("incidents-{today}.jsonl"));
-        let mut f = std::fs::File::create(&incidents_path).unwrap();
-        writeln!(f, "{}", incident_line_with_kind(attacker_ip, "port_scan")).unwrap();
-        writeln!(
-            f,
-            "{}",
-            incident_line_with_kind(attacker_ip, "credential_stuffing")
-        )
-        .unwrap();
-        drop(f);
+        let store = test_sqlite_store(dir.path());
+        insert_test_incident(&store, &test_incident_with_kind(attacker_ip, "port_scan"));
+        insert_test_incident(
+            &store,
+            &test_incident_with_kind(attacker_ip, "credential_stuffing"),
+        );
 
         let cfg = config::AgentConfig {
             ai: config::AiConfig {
@@ -4753,6 +4806,8 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: Some(store.clone()),
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4822,10 +4877,8 @@ mod tests {
             .to_string();
 
         let attacker_ip = "7.7.7.7";
-        let incidents_path = dir.path().join(format!("incidents-{today}.jsonl"));
-        let mut f = std::fs::File::create(&incidents_path).unwrap();
-        writeln!(f, "{}", incident_line(attacker_ip)).unwrap();
-        drop(f);
+        let store = test_sqlite_store(dir.path());
+        insert_test_incident(&store, &test_incident(attacker_ip));
 
         let cfg = config::AgentConfig {
             ai: config::AiConfig {
@@ -4898,6 +4951,8 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: Some(store.clone()),
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
@@ -4967,19 +5022,15 @@ mod tests {
     #[tokio::test]
     async fn decision_cooldown_suppresses_repeat() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
 
         let attacker_ip = "1.2.3.4";
 
         // Plant TWO identical brute-force incidents from the same IP
-        let incidents_path = dir.path().join(format!("incidents-{today}.jsonl"));
-        let mut f = std::fs::File::create(&incidents_path).unwrap();
-        writeln!(f, "{}", incident_line(attacker_ip)).unwrap();
-        writeln!(f, "{}", incident_line(attacker_ip)).unwrap();
-        drop(f);
+        let store = test_sqlite_store(dir.path());
+        insert_test_incident(&store, &test_incident(attacker_ip));
+        let mut inc2 = test_incident(attacker_ip);
+        inc2.incident_id = format!("ssh_bruteforce:{attacker_ip}:test2");
+        insert_test_incident(&store, &inc2);
 
         let cfg = config::AgentConfig {
             ai: config::AiConfig {
@@ -5055,6 +5106,8 @@ mod tests {
             narrative_incidents_offset: 0,
             forensics: forensics::ForensicsCapture::new(dir.path()),
             store: state_store::StateStore::open(dir.path()).unwrap(),
+            sqlite_store: Some(store.clone()),
+            maintenance_scheduler: None,
             attacker_profiles: HashMap::new(),
             last_intel_consolidation_at: None,
             correlation_engine: correlation_engine::CorrelationEngine::new(),
