@@ -136,7 +136,8 @@ mod io_uring {
         )| {
             let allowlisted = ["nginx", "caddy", "haproxy", "envoy", "postgres",
                                "mysqld", "mariadbd", "mongod", "redis", "clickhouse",
-                               "scylladb", "io_uring", "tokio", "java", "systemd"];
+                               "scylladb", "io_uring", "tokio", "java", "systemd",
+                               "bun", "deno", "node"];
             if allowlisted.iter().any(|a| comm.starts_with(a)) {
                 return Ok(());
             }
