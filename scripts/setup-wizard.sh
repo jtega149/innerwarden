@@ -100,12 +100,11 @@ selection_has() {
 prompt_required_input() {
   local header="$1"
   local placeholder="$2"
-  local current_value="${3:-}"
-  local value="${current_value}"
+  local value=""
   local trimmed=""
 
   while true; do
-    if ! value="$(gum input --header "${header}" --placeholder "${placeholder}" --value "${value}")"; then
+    if ! value="$(gum input --header "${header}" --placeholder "${placeholder}")"; then
       printf "\nCanceled by user.\n"
       exit 130
     fi
@@ -129,30 +128,32 @@ prompt_required_input() {
 
 EXPERIENCE="Simple"
 PROTECTIONS=""
-SEVERITY=""
+SEVERITY="High + Critical (system default)"
 APPLY_MODE=""
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
+SLACK_WEBHOOK_URL=""
 WEBHOOK_URL=""
 TELEGRAM_SELECTED="false"
+SLACK_SELECTED="false"
 WEBHOOK_SELECTED="false"
 WIZARD_STEP=1
 
 while true; do
-  while (( WIZARD_STEP <= 3 )); do
+  while (( WIZARD_STEP <= 2 )); do
     case "$WIZARD_STEP" in
       1)
         PROTECTIONS_ERROR=""
         while true; do
           render_header
-          style_line "[1/3] Optional Protections" "$FG_MUTED"
-          style_line "Progress: step 1 of 3" "$FG_MUTED"
+          style_line "[1/2] Interaction Channels" "$FG_MUTED"
+          style_line "Progress: step 1 of 2" "$FG_MUTED"
           style_line "Use space to toggle [x]. Enter opens confirmation." "$FG_MUTED"
           style_line "Block-IP stays enabled by default." "$FG_MUTED"
-          style_line "Choose optional channels/features:" "$FG_MUTED"
-          style_line "  - Telegram alerts: sends incidents to Telegram." "$FG_MUTED"
-          style_line "  - Webhook alerts: sends incidents to webhook integrations." "$FG_MUTED"
-          style_line "  - Shell command trail (auditd): records shell command history." "$FG_MUTED"
+          style_line "Choose how you want to interact with InnerWarden:" "$FG_MUTED"
+          style_line "  - Telegram alerts: real-time alerts on your phone." "$FG_MUTED"
+          style_line "  - Slack alerts: notifications in your team channel." "$FG_MUTED"
+          style_line "  - Webhook alerts: integrations (PagerDuty/Opsgenie/custom)." "$FG_MUTED"
           echo ""
           if [[ -n "$PROTECTIONS_ERROR" ]]; then
             style_line "$PROTECTIONS_ERROR" "$FG_WARN"
@@ -168,16 +169,18 @@ while true; do
             --show-help
             --selected-prefix "[x] "
             --unselected-prefix "[ ] "
-            --header "Select optional protections (you can skip)"
+            --header "Select interaction channels (you can skip)"
+          )
+          PROTECTION_OPTIONS=(
+            "Telegram alerts"
+            "Slack alerts"
+            "Webhook alerts"
           )
           if [[ -n "$PROTECTIONS_SELECTED_CSV" ]]; then
             CHOOSE_ARGS+=(--selected="$PROTECTIONS_SELECTED_CSV")
           fi
 
-          PROTECTIONS="$(gum choose "${CHOOSE_ARGS[@]}" \
-            "Telegram alerts" \
-            "Webhook alerts" \
-            "Shell command trail (auditd)")"
+          PROTECTIONS="$(gum choose "${CHOOSE_ARGS[@]}" "${PROTECTION_OPTIONS[@]}")"
 
           if [[ -z "${PROTECTIONS//[$'\n\r\t ']/}" ]]; then
             PROTECTIONS_LIST="  - none (defaults only)"
@@ -186,18 +189,18 @@ while true; do
           fi
 
           render_header
-          style_line "[1/3] Optional Protections" "$FG_MUTED"
-          style_line "Progress: step 1 of 3" "$FG_MUTED"
-          style_line "Selected optional protections:" "$FG_ACCENT"
+          style_line "[1/2] Interaction Channels" "$FG_MUTED"
+          style_line "Progress: step 1 of 2" "$FG_MUTED"
+          style_line "Selected channels:" "$FG_ACCENT"
           printf "%s\n" "$PROTECTIONS_LIST"
           echo ""
 
-          STEP1_ACTION="$(gum choose "Continue" "Edit selections" --header "Confirm protection selections")"
+          STEP1_ACTION="$(gum choose "Continue" "Edit selections" --header "Confirm channel selections")"
           if [[ "$STEP1_ACTION" == "Continue" ]]; then
             if selection_has "Telegram alerts"; then
               TELEGRAM_SELECTED="true"
               render_header
-              style_line "[1/3] Protections" "$FG_MUTED"
+              style_line "[1/2] Channels" "$FG_MUTED"
               style_line "Telegram selected - configure credentials now." "$FG_MUTED"
               TELEGRAM_BOT_TOKEN="$(prompt_required_input \
                 "Telegram bot token (from @BotFather)" \
@@ -229,15 +232,40 @@ while true; do
               TELEGRAM_CHAT_ID=""
             fi
 
+            if selection_has "Slack alerts"; then
+              SLACK_SELECTED="true"
+              render_header
+              style_line "[1/2] Channels" "$FG_MUTED"
+              style_line "Slack selected - configure webhook now." "$FG_MUTED"
+              while true; do
+                SLACK_WEBHOOK_URL="$(prompt_required_input \
+                  "Slack Incoming Webhook URL" \
+                  "Cole aqui a URL completa do Slack" \
+                  "${SLACK_WEBHOOK_URL}")"
+                if [[ "${SLACK_WEBHOOK_URL}" == "__BACK__" ]]; then
+                  PROTECTIONS_ERROR="Slack setup canceled. Review selections and continue."
+                  continue 2
+                fi
+                if [[ "${SLACK_WEBHOOK_URL}" =~ ^https://hooks\.slack\.com/services/ ]]; then
+                  break
+                fi
+                style_line "Slack webhook must start with https://hooks.slack.com/services/." "$FG_WARN"
+                SLACK_WEBHOOK_URL=""
+              done
+            else
+              SLACK_SELECTED="false"
+              SLACK_WEBHOOK_URL=""
+            fi
+
             if selection_has "Webhook alerts"; then
               WEBHOOK_SELECTED="true"
               render_header
-              style_line "[1/3] Protections" "$FG_MUTED"
+              style_line "[1/2] Channels" "$FG_MUTED"
               style_line "Webhook selected - configure endpoint now." "$FG_MUTED"
               while true; do
                 WEBHOOK_URL="$(prompt_required_input \
                   "Webhook URL (required)" \
-                  "https://hooks.example.com/notify" \
+                  "Cole aqui a URL completa do webhook" \
                   "${WEBHOOK_URL}")"
                 if [[ "${WEBHOOK_URL}" == "__BACK__" ]]; then
                   PROTECTIONS_ERROR="Webhook setup canceled. Review selections and continue."
@@ -263,36 +291,13 @@ while true; do
         ;;
       2)
         render_header
-        style_line "[2/3] Alert threshold" "$FG_MUTED"
-        style_line "Progress: step 2 of 3" "$FG_MUTED"
-        style_line "Choose which severities trigger alerts:" "$FG_MUTED"
-        style_line "  - High + Critical: recommended balance (good signal/noise)." "$FG_MUTED"
-        style_line "  - Critical only: lowest noise, only top-priority incidents." "$FG_MUTED"
-        style_line "  - Medium + High + Critical: maximum visibility (more noise)." "$FG_MUTED"
-        style_line "  - Back: return to protections." "$FG_MUTED"
-        echo ""
-        SEVERITY_CHOICE="$(gum choose \
-          "High + Critical" \
-          "Critical only" \
-          "Medium + High + Critical" \
-          "Back" \
-          --header "Choose notification level")"
-
-        if [[ "$SEVERITY_CHOICE" == "Back" ]]; then
-          WIZARD_STEP=1
-        else
-          SEVERITY="$SEVERITY_CHOICE"
-          WIZARD_STEP=3
-        fi
-        ;;
-      3)
-        render_header
-        style_line "[3/3] Apply mode" "$FG_MUTED"
-        style_line "Progress: step 3 of 3" "$FG_MUTED"
+        style_line "[2/2] Apply mode" "$FG_MUTED"
+        style_line "Progress: step 2 of 2" "$FG_MUTED"
+        style_line "Alert threshold is automatic: High + Critical (system default)." "$FG_MUTED"
         style_line "Choose how to finish this setup session:" "$FG_MUTED"
         style_line "  - Review first (recommended): save plan and review before applying." "$FG_MUTED"
         style_line "  - Apply immediately: run setup right after this wizard." "$FG_MUTED"
-        style_line "  - Back: return to alert threshold." "$FG_MUTED"
+        style_line "  - Back: return to channels." "$FG_MUTED"
         echo ""
         APPLY_CHOICE="$(gum choose \
           "Review first (recommended)" \
@@ -301,10 +306,10 @@ while true; do
           --header "How do you want to finish?")"
 
         if [[ "$APPLY_CHOICE" == "Back" ]]; then
-          WIZARD_STEP=2
+          WIZARD_STEP=1
         else
           APPLY_MODE="$APPLY_CHOICE"
-          WIZARD_STEP=4
+          WIZARD_STEP=3
         fi
         ;;
     esac
@@ -317,12 +322,17 @@ while true; do
   style_line "Progress: review" "$FG_MUTED"
   style_line "Experience: $EXPERIENCE (default)" "$FG_MAIN"
   style_line "Block-IP: enabled (default)" "$FG_MAIN"
-  style_line "Protections: ${PROTECTIONS_CSV:-none}" "$FG_MAIN"
+  style_line "Channels: ${PROTECTIONS_CSV:-none}" "$FG_MAIN"
   style_line "Alert threshold: $SEVERITY" "$FG_MAIN"
   if [[ "${TELEGRAM_SELECTED}" == "true" ]]; then
     style_line "Telegram: enabled (credentials collected)" "$FG_MAIN"
   else
     style_line "Telegram: not selected" "$FG_MAIN"
+  fi
+  if [[ "${SLACK_SELECTED}" == "true" ]]; then
+    style_line "Slack: enabled (webhook collected)" "$FG_MAIN"
+  else
+    style_line "Slack: not selected" "$FG_MAIN"
   fi
   if [[ "${WEBHOOK_SELECTED}" == "true" ]]; then
     style_line "Webhook: enabled (endpoint collected)" "$FG_MAIN"
@@ -335,8 +345,7 @@ while true; do
   REVIEW_ACTION="$(gum choose \
     "Save and finish" \
     "Back to apply mode" \
-    "Back to alert threshold" \
-    "Back to protections" \
+    "Back to channels" \
     --header "Confirm setup plan")"
 
   case "$REVIEW_ACTION" in
@@ -344,12 +353,9 @@ while true; do
       break
       ;;
     "Back to apply mode")
-      WIZARD_STEP=3
-      ;;
-    "Back to alert threshold")
       WIZARD_STEP=2
       ;;
-    "Back to protections")
+    "Back to channels")
       WIZARD_STEP=1
       ;;
   esac
@@ -361,6 +367,12 @@ if [[ "${TELEGRAM_SELECTED}" == "true" ]]; then
   TELEGRAM_PLAN_LINE="enabled (credentials collected)"
 else
   TELEGRAM_PLAN_LINE="not selected"
+fi
+
+if [[ "${SLACK_SELECTED}" == "true" ]]; then
+  SLACK_PLAN_LINE="enabled (webhook collected)"
+else
+  SLACK_PLAN_LINE="not selected"
 fi
 
 if [[ "${WEBHOOK_SELECTED}" == "true" ]]; then
@@ -375,9 +387,10 @@ cat > "$PLAN_FILE" <<PLAN
 ## Choices
 - Experience: $EXPERIENCE
 - Block-IP: enabled (default)
-- Protections: ${PROTECTIONS_CSV:-none}
+- Channels: ${PROTECTIONS_CSV:-none}
 - Alert threshold: $SEVERITY
 - Telegram: ${TELEGRAM_PLAN_LINE}
+- Slack: ${SLACK_PLAN_LINE}
 - Webhook: ${WEBHOOK_PLAN_LINE}
 - Mode: $APPLY_MODE
 

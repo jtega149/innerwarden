@@ -31,27 +31,42 @@ pub(crate) async fn handle_advisory_violation(
         "AI agent ignored security advisory"
     );
 
-    // Send Telegram notification about the advisory violation
+    // Send Telegram notification about the advisory violation (gated).
     if let Some(tg) = &state.telegram_client {
-        let msg = format!(
-            "\u{26a0}\u{fe0f} <b>Advisory Ignored</b>\n\n\
-            Your AI agent executed a command that Inner Warden recommended <b>{}</b>.\n\n\
-            <b>Command:</b> <code>{}</code>\n\
-            <b>Risk score:</b> {}/100\n\
-            <b>Signals:</b> {}\n\
-            <b>Advisory ID:</b> <code>{}</code>\n\n\
-            The command was executed despite the warning. Review the audit trail.",
-            advisory.recommendation,
-            advisory
-                .command_preview
-                .replace('<', "&lt;")
-                .replace('>', "&gt;"),
+        let ctx = crate::notification_gate::NotificationContext::for_advisory_ignored(
             advisory.risk_score,
-            advisory.signals.join(", "),
-            advisory.advisory_id,
         );
-        if let Err(e) = tg.send_alert_html(&msg).await {
-            warn!("failed to send advisory ignored alert: {e:#}");
+        let verdict = crate::notification_gate::should_notify(&ctx);
+        match verdict {
+            crate::notification_gate::NotificationVerdict::SendNow => {
+                let msg = format!(
+                    "\u{26a0}\u{fe0f} <b>Advisory Ignored</b>\n\n\
+                    Your AI agent executed a command that Inner Warden recommended <b>{}</b>.\n\n\
+                    <b>Command:</b> <code>{}</code>\n\
+                    <b>Risk score:</b> {}/100\n\
+                    <b>Signals:</b> {}\n\
+                    <b>Advisory ID:</b> <code>{}</code>\n\n\
+                    The command was executed despite the warning. Review the audit trail.",
+                    advisory.recommendation,
+                    advisory
+                        .command_preview
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;"),
+                    advisory.risk_score,
+                    advisory.signals.join(", "),
+                    advisory.advisory_id,
+                );
+                if let Err(e) = tg.send_alert_html(&msg).await {
+                    warn!("failed to send advisory ignored alert: {e:#}");
+                }
+            }
+            crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
+                info!(
+                    advisory_id = %advisory.advisory_id,
+                    "advisory ignored notification deferred to daily briefing"
+                );
+            }
+            crate::notification_gate::NotificationVerdict::Drop => {}
         }
     }
 

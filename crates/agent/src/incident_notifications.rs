@@ -105,8 +105,39 @@ pub(crate) async fn dispatch_incident_notifications(
 
     match action {
         GroupAction::NotifyImmediately => {
-            // First incident in group — dispatch to channels that pass both
-            // severity threshold AND channel notification level filter.
+            // Centralized notification gate: evaluate policy BEFORE any channel dispatch.
+            // Only uncontained active intrusions and confirmed compromises get
+            // immediate notification on ANY channel. Everything else → daily briefing.
+            let gate_ctx = crate::notification_gate::NotificationContext::from_incident(incident);
+            let gate_verdict = crate::notification_gate::should_notify(&gate_ctx);
+
+            let should_send_now = matches!(
+                gate_verdict,
+                crate::notification_gate::NotificationVerdict::SendNow
+            );
+
+            if !should_send_now {
+                // Track for daily briefing + burst summary
+                let detector = incident.incident_id.split(':').next().unwrap_or("unknown");
+                *state
+                    .telegram_deferred
+                    .entry(detector.to_string())
+                    .or_insert(0) += 1;
+
+                // Record contained + check if burst threshold hit
+                if let Some(count) = state.notification_burst_tracker.record_contained() {
+                    if let Some(ref tg) = state.telegram_client {
+                        let msg = crate::notification_gate::format_burst_summary(count);
+                        let tg = tg.clone();
+                        tokio::spawn(async move {
+                            let _ = tg.send_alert_html(&msg).await;
+                        });
+                    }
+                }
+                return;
+            }
+
+            // Gate passed — dispatch to all channels.
 
             // Webhook
             if let Some(min_rank) = thresholds.webhook_min_rank {
@@ -126,52 +157,16 @@ pub(crate) async fn dispatch_incident_notifications(
                 }
             }
 
-            // Telegram T.1 — only immediate threats get individual notifications.
-            // Everything else is deferred to the daily digest.
+            // Telegram T.1 — gate already passed above.
             if let Some(min_rank) = thresholds.telegram_min_rank {
                 let level = cfg.telegram.channel_notifications.notification_level;
                 if incident_rank >= min_rank && passes_channel_filter(level, &incident.severity) {
-                    let is_critical = matches!(
-                        incident.severity,
-                        innerwarden_core::event::Severity::Critical
-                    );
-                    let is_threat = notification_pipeline::is_immediate_threat(incident);
-
-                    // Reset daily budget counter on date change.
-                    let today = chrono::Local::now().date_naive();
-                    if state.telegram_budget_date != Some(today) {
-                        state.telegram_daily_sent = 0;
-                        state.telegram_deferred.clear();
-                        state.telegram_budget_date = Some(today);
-                    }
-
-                    let within_budget = state.telegram_daily_sent < cfg.telegram.daily_budget;
-
-                    if is_threat && within_budget || is_critical {
-                        // Send immediately — real threat or Critical.
-                        if let Some(ref tg) = state.telegram_client {
-                            let mode = guardian_mode(cfg);
-                            let is_simple = cfg.telegram.is_simple_profile();
-                            if let Err(e) = tg.send_incident_alert(incident, mode, is_simple).await
-                            {
-                                warn!(incident_id = %incident.incident_id, "Telegram alert failed: {e:#}");
-                            } else if !is_critical {
-                                state.telegram_daily_sent += 1;
-                            }
+                    if let Some(ref tg) = state.telegram_client {
+                        let mode = guardian_mode(cfg);
+                        let is_simple = cfg.telegram.is_simple_profile();
+                        if let Err(e) = tg.send_incident_alert(incident, mode, is_simple).await {
+                            warn!(incident_id = %incident.incident_id, "Telegram alert failed: {e:#}");
                         }
-                    } else {
-                        // Defer to daily digest — not an immediate threat or budget exhausted.
-                        let detector = incident
-                            .incident_id
-                            .split(':')
-                            .next()
-                            .unwrap_or("unknown")
-                            .to_string();
-                        *state.telegram_deferred.entry(detector).or_insert(0) += 1;
-                        info!(
-                            incident_id = %incident.incident_id,
-                            "notification deferred to digest (not immediate threat)"
-                        );
                     }
                 }
             }

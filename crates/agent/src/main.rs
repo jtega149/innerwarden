@@ -79,6 +79,7 @@ mod narrative_incident_ingest;
     clippy::needless_range_loop
 )]
 mod neural_lifecycle;
+mod notification_gate;
 mod notification_pipeline;
 mod pcap_capture;
 mod playbook;
@@ -348,8 +349,10 @@ struct AgentState {
     last_daily_summary_telegram: Option<chrono::NaiveDate>,
     /// Telegram daily budget: how many immediate notifications sent today.
     /// Resets when the date changes.
+    #[allow(dead_code)]
     telegram_daily_sent: u32,
     /// Date the daily budget counter applies to.
+    #[allow(dead_code)]
     telegram_budget_date: Option<chrono::NaiveDate>,
     /// Incidents deferred from Telegram (not immediate threats) — accumulated
     /// per-detector for the daily digest breakdown.
@@ -508,6 +511,8 @@ struct AgentState {
     /// Redis stream reader for events (None when redis_url is not configured).
     #[cfg(feature = "redis-reader")]
     redis_reader: Option<redis_reader::RedisStreamReader>,
+    /// Notification gate burst tracker — counts contained threats for burst summary.
+    notification_burst_tracker: notification_gate::BurstTracker,
 }
 
 /// Tracks a deferred honeypot-or-block decision waiting for operator input via Telegram.
@@ -1319,6 +1324,7 @@ async fn main() -> Result<()> {
         last_graph_snapshot: std::time::Instant::now(),
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
+        notification_burst_tracker: notification_gate::BurstTracker::new(),
     };
 
     // Seed operator IPs from active SSH sessions (who -i).
@@ -2078,25 +2084,41 @@ async fn main() -> Result<()> {
                         if !result.block_ips.is_empty() || m.staged_count() > 0 {
                             info!(staged = m.staged_count(), new_blocks = result.block_ips.len(), "mesh tick");
                         }
-                        // Notify Telegram about new mesh blocks
+                        // Notify Telegram about new mesh blocks (gated).
                         for (ip, ttl) in &result.block_ips {
                             info!(ip, ttl, "mesh: new block from peer network");
                             state.blocklist.insert(ip.clone());
-                            // Telegram notification
-                            if let Some(ref tg) = state.telegram_client {
-                                let msg = format!(
-                                    "🌐 <b>MESH NETWORK</b>\n\n\
-                                     Peer node detected threat from <code>{ip}</code>\n\
-                                     Action: blocked for {}h (auto-revert)\n\n\
-                                     ⚡ <i>Experimental - collaborative defense network</i>\n\
-                                     <i>Nodes sharing threat intelligence in real time.</i>\n\
-                                     <i>Coming soon: mesh dashboard, trust scores, collective blocklist.</i>",
-                                    ttl / 3600
-                                );
-                                let tg = tg.clone();
-                                tokio::spawn(async move {
-                                    let _ = tg.send_alert_html(&msg).await;
-                                });
+                            // Mesh blocks are always contained -> daily briefing only.
+                            let ctx = notification_gate::NotificationContext::for_mesh_block();
+                            let verdict = notification_gate::should_notify(&ctx);
+                            match verdict {
+                                notification_gate::NotificationVerdict::SendNow => {
+                                    if let Some(ref tg) = state.telegram_client {
+                                        let msg = format!(
+                                            "\u{1f310} <b>MESH NETWORK</b>\n\n\
+                                             Peer node detected threat from <code>{ip}</code>\n\
+                                             Action: blocked for {}h (auto-revert)",
+                                            ttl / 3600
+                                        );
+                                        let tg = tg.clone();
+                                        tokio::spawn(async move {
+                                            let _ = tg.send_alert_html(&msg).await;
+                                        });
+                                    }
+                                }
+                                notification_gate::NotificationVerdict::DailyBriefingOnly => {
+                                    *state.telegram_deferred.entry("mesh".to_string()).or_insert(0) += 1;
+                                    if let Some(count) = state.notification_burst_tracker.record_contained() {
+                                        if let Some(ref tg) = state.telegram_client {
+                                            let msg = notification_gate::format_burst_summary(count);
+                                            let tg = tg.clone();
+                                            tokio::spawn(async move {
+                                                let _ = tg.send_alert_html(&msg).await;
+                                            });
+                                        }
+                                    }
+                                }
+                                notification_gate::NotificationVerdict::Drop => {}
                             }
                         }
                         if !result.unblock_ips.is_empty() {
@@ -2220,21 +2242,9 @@ async fn main() -> Result<()> {
                         for (ip, ttl) in &result.block_ips {
                             info!(ip, ttl, "mesh: new block from peer network");
                             state.blocklist.insert(ip.clone());
-                            if let Some(ref tg) = state.telegram_client {
-                                let msg = format!(
-                                    "🌐 <b>MESH NETWORK</b>\n\n\
-                                     Peer node detected threat from <code>{ip}</code>\n\
-                                     Action: blocked for {}h (auto-revert)\n\n\
-                                     ⚡ <i>Experimental - collaborative defense network</i>\n\
-                                     <i>Nodes sharing threat intelligence in real time.</i>\n\
-                                     <i>Coming soon: mesh dashboard, trust scores, collective blocklist.</i>",
-                                    ttl / 3600
-                                );
-                                let tg = tg.clone();
-                                tokio::spawn(async move {
-                                    let _ = tg.send_alert_html(&msg).await;
-                                });
-                            }
+                            // Mesh blocks are contained -> daily briefing via gate.
+                            *state.telegram_deferred.entry("mesh".to_string()).or_insert(0) += 1;
+                            let _ = state.notification_burst_tracker.record_contained();
                         }
                         m.persist().ok();
                     }
@@ -3573,7 +3583,12 @@ async fn process_narrative_tick(
             &mut state.correlation_engine,
         );
         killchain_inline::write_incidents(data_dir, &kc_incidents);
-        killchain_inline::notify_telegram(&state.telegram_client, &kc_incidents);
+        killchain_inline::notify_telegram(
+            &state.telegram_client,
+            &kc_incidents,
+            &state.notification_burst_tracker,
+            &mut state.telegram_deferred,
+        );
 
         // Periodic stale PID cleanup (every 60s).
         if state.last_killchain_cleanup.elapsed().as_secs() >= 60 {
@@ -3610,7 +3625,12 @@ async fn process_narrative_tick(
         let (_drops, shield_incidents, shield_blocked) =
             shield_inline::process_events(shield, &events_entries, &ip_risks);
         shield_inline::write_incidents(data_dir, &shield_incidents);
-        shield_inline::notify_telegram(&state.telegram_client, &shield_incidents);
+        shield_inline::notify_telegram(
+            &state.telegram_client,
+            &shield_incidents,
+            &state.notification_burst_tracker,
+            &mut state.telegram_deferred,
+        );
         // Sync: register shield blocks in agent blocklist and attacker intel.
         for ip in &shield_blocked {
             state.blocklist.insert(ip.clone());
@@ -4076,6 +4096,7 @@ mod tests {
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
+            notification_burst_tracker: notification_gate::BurstTracker::new(),
         }
     }
 
@@ -4356,6 +4377,7 @@ mod tests {
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
+            notification_burst_tracker: notification_gate::BurstTracker::new(),
         };
 
         // 4. Run the incident tick
@@ -4534,6 +4556,7 @@ mod tests {
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
+            notification_burst_tracker: notification_gate::BurstTracker::new(),
         };
 
         let mut cursor = reader::AgentCursor::default();
@@ -4693,6 +4716,7 @@ mod tests {
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
+            notification_burst_tracker: notification_gate::BurstTracker::new(),
         };
 
         let mut cursor = reader::AgentCursor::default();
@@ -4855,6 +4879,7 @@ mod tests {
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
+            notification_burst_tracker: notification_gate::BurstTracker::new(),
         };
 
         let mut cursor = reader::AgentCursor::default();
@@ -5000,6 +5025,7 @@ mod tests {
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
+            notification_burst_tracker: notification_gate::BurstTracker::new(),
         };
 
         let mut cursor = reader::AgentCursor::default();
@@ -5155,6 +5181,7 @@ mod tests {
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
+            notification_burst_tracker: notification_gate::BurstTracker::new(),
         };
 
         let mut cursor = reader::AgentCursor::default();
