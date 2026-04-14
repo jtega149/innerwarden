@@ -20,34 +20,48 @@ document.addEventListener('visibilitychange', function() {
 function showAlertToast(alert) {
   var alertIp = alert.entity_value || '';
   if (state.hideAllowlisted && alertIp && (isPrivateIp(alertIp) || isIpTrusted(alertIp))) return;
-  if (document.hidden) updateTabBadge(1);
+
   const outcome = alert.outcome || '';
   const isContained = ['blocked','killed','contained','suspended','honeypot'].includes(outcome);
+  const sev = (alert.severity || 'medium').toLowerCase();
+  const isGrave = sev === 'critical' || sev === 'high';
+
+  // Only show toast for uncontained high/critical threats.
+  // Contained threats and low-severity noise stay silent — dashboard updates live.
+  if (isContained || !isGrave) return;
+
+  if (document.hidden) updateTabBadge(1);
+
   const title = alert.title || 'Incident detected';
   const evalue = alert.entity_value || '';
   const etype  = alert.entity_type  || 'ip';
   const toastEl = document.getElementById('toast');
-  if (isContained) {
-    toastEl.innerHTML =
-      `<span style="color:var(--ok);font-weight:700;margin-right:6px">CONTAINED</span>` +
-      `<span>${esc(title)}</span>` +
-      (evalue ? ` <span style="color:var(--muted)">\u2192 ${esc(evalue)}</span>` : '');
-    toastEl.className = 'toast ok visible';
-  } else {
-    const sev = (alert.severity || 'high').toUpperCase();
-    const sevColor = sev === 'CRITICAL' ? '#f43f5e' : '#f97316';
-    toastEl.innerHTML =
-      `<span style="color:${sevColor};font-weight:700;margin-right:6px">${esc(sev)}</span>` +
-      `<span>${esc(title)}</span>` +
-      (evalue
-        ? ` &nbsp;<a href="#" style="color:#78e5ff;text-decoration:none" ` +
-          `onclick="event.preventDefault();loadJourney('${esc(etype)}','${esc(evalue)}')"` +
-          `>\u2192 ${esc(evalue)}</a>`
-        : '');
-    toastEl.className = 'toast err visible';
-  }
+  const sevLabel = sev.toUpperCase();
+  const sevColor = sev === 'critical' ? '#f43f5e' : '#f97316';
+
+  toastEl.innerHTML =
+    `<div style="display:flex;align-items:center;gap:8px;cursor:pointer" ` +
+    `onclick="dismissToast();showView('investigate');` +
+    (evalue ? `handleCardClickByValue('${esc(etype)}','${esc(evalue)}')` : '') + `">` +
+    `<span style="color:${sevColor};font-weight:700">${esc(sevLabel)}</span>` +
+    `<span style="flex:1">${esc(title)}</span>` +
+    (evalue ? `<span style="color:#78e5ff;font-size:0.75rem">${esc(evalue)} \u2192</span>` : '') +
+    `</div>` +
+    `<button onclick="event.stopPropagation();dismissToast()" ` +
+    `style="position:absolute;top:4px;right:8px;background:none;border:none;` +
+    `color:var(--muted);font-size:1.1rem;cursor:pointer;padding:2px 6px">&times;</button>`;
+  toastEl.className = 'toast err visible';
+
   clearTimeout(toastEl._timer);
-  toastEl._timer = setTimeout(() => toastEl.classList.remove('visible'), 8000);
+  toastEl._timer = setTimeout(() => toastEl.classList.remove('visible'), 15000);
+}
+
+function dismissToast() {
+  const toastEl = document.getElementById('toast');
+  if (toastEl) {
+    toastEl.classList.remove('visible');
+    clearTimeout(toastEl._timer);
+  }
 }
 
 // ── Entity search ────────────────────────────────────────────────────
