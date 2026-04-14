@@ -247,9 +247,13 @@ async fn handle_always_on_connection(
         .collect();
 
     // Send Telegram T.5 post-session report.
+    // Skip probe-only sessions (no auth, no commands, ≤2s) — just noise.
+    let duration = elapsed_secs_for_report(started_at);
+    let is_probe_only = commands.is_empty() && credentials.is_empty() && duration <= 2;
     if let Some(ref tg) = telegram_client {
-        let duration = elapsed_secs_for_report(started_at);
-        if let Err(e) = tg
+        if is_probe_only {
+            tracing::debug!(ip = %ip, session = %session_id, "honeypot: skipping Telegram for probe-only session");
+        } else if let Err(e) = tg
             .send_honeypot_session_report(
                 &ip,
                 &session_id,

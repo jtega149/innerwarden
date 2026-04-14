@@ -157,7 +157,7 @@ pub struct PendingConfirmation {
 // ---------------------------------------------------------------------------
 
 /// Maximum automated alert messages per hour (excludes bot command responses).
-const MAX_ALERTS_PER_HOUR: u32 = 30;
+const MAX_ALERTS_PER_HOUR: u32 = 10;
 
 pub struct TelegramClient {
     bot_token: String,

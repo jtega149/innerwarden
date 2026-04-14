@@ -92,12 +92,41 @@ pub(crate) fn notify_telegram(
 ) {
     let Some(tg) = telegram_client else { return };
 
+    // Known service processes that legitimately do socket+dup (web gateways, proxies).
+    const KILLCHAIN_COMM_ALLOWLIST: &[&str] = &[
+        "ruby",
+        "python",
+        "python3",
+        "node",
+        "java",
+        "beam.smp", // runtimes
+        "nginx",
+        "haproxy",
+        "envoy",
+        "caddy", // proxies
+        "postgres",
+        "mysqld",
+        "redis-server", // databases
+        "openclaw",
+        "innerwarden", // our own
+    ];
+
     for inc in incidents {
         let severity = inc
             .get("severity")
             .and_then(|s| s.as_str())
             .unwrap_or("medium");
         if severity != "critical" {
+            continue;
+        }
+
+        // Skip known service processes (socket+dup is normal for them)
+        let comm = inc
+            .get("evidence")
+            .and_then(|e| e.get("comm"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if KILLCHAIN_COMM_ALLOWLIST.iter().any(|a| comm.starts_with(a)) {
             continue;
         }
 

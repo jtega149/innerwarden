@@ -238,10 +238,17 @@ pub(crate) async fn spawn_post_session_tasks(
         false
     };
 
-    // Send Telegram post-session report
+    // Send Telegram post-session report (skip probe-only noise)
+    let is_probe_only = commands.is_empty() && credentials.is_empty();
     if let Some(ref tg) = telegram_client {
         let duration = 300u64; // default; session duration stored in metadata
-        if let Err(e) = tg
+        if is_probe_only {
+            tracing::debug!(
+                ip,
+                session_id,
+                "honeypot: skipping Telegram for probe-only session"
+            );
+        } else if let Err(e) = tg
             .send_honeypot_session_report(
                 ip,
                 session_id,
