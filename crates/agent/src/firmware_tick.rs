@@ -253,29 +253,43 @@ pub(crate) async fn process_firmware_tick(
         "firmware tick: emitted incidents"
     );
 
-    // Telegram notification for firmware incidents.
+    // Telegram notification for firmware incidents (gated).
     if let Some(ref tg) = state.telegram_client {
         for inc in &incidents {
-            let sev = match inc.severity {
-                innerwarden_core::event::Severity::Critical => "🔴 CRITICAL",
-                innerwarden_core::event::Severity::High => "🟠 HIGH",
-                _ => "🟡 MEDIUM",
-            };
-            let msg = format!(
-                "🔧 <b>Firmware Alert</b>\n\n\
-                 {sev}\n\
-                 <b>{}</b>\n\
-                 {}\n\n\
-                 Trust Score: {:.0}%",
-                inc.title,
-                inc.summary,
-                report.trust_score * 100.0,
+            let ctx = crate::notification_gate::NotificationContext::from_firmware_or_hypervisor(
+                inc, "firmware",
             );
-            let tg = tg.clone();
-            let msg_owned = msg;
-            tokio::spawn(async move {
-                let _ = tg.send_alert_html(&msg_owned).await;
-            });
+            let verdict = crate::notification_gate::should_notify(&ctx);
+            match verdict {
+                crate::notification_gate::NotificationVerdict::SendNow => {
+                    let sev = match inc.severity {
+                        innerwarden_core::event::Severity::Critical => "\u{1f534} CRITICAL",
+                        innerwarden_core::event::Severity::High => "\u{1f7e0} HIGH",
+                        _ => "\u{1f7e1} MEDIUM",
+                    };
+                    let msg = format!(
+                        "\u{1f527} <b>Firmware Alert</b>\n\n\
+                         {sev}\n\
+                         <b>{}</b>\n\
+                         {}\n\n\
+                         Trust Score: {:.0}%",
+                        inc.title,
+                        inc.summary,
+                        report.trust_score * 100.0,
+                    );
+                    let tg = tg.clone();
+                    tokio::spawn(async move {
+                        let _ = tg.send_alert_html(&msg).await;
+                    });
+                }
+                crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
+                    *state
+                        .telegram_deferred
+                        .entry("firmware".to_string())
+                        .or_insert(0) += 1;
+                }
+                crate::notification_gate::NotificationVerdict::Drop => {}
+            }
         }
     }
 }

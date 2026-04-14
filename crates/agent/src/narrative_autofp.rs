@@ -73,19 +73,34 @@ pub(crate) async fn maybe_suggest_allowlist_from_fp_reports(
             ]);
 
             if let Some(ref tg) = state.telegram_client {
-                if let Err(e) = tg.send_text_with_keyboard(&text, keyboard).await {
-                    warn!("failed to send auto-FP suggestion: {e:#}");
+                // Auto-FP suggestions go through notification gate.
+                let gate_ctx =
+                    crate::notification_gate::NotificationContext::for_autofp_suggestion();
+                let gate_verdict = crate::notification_gate::should_notify(&gate_ctx);
+                if matches!(
+                    gate_verdict,
+                    crate::notification_gate::NotificationVerdict::SendNow
+                ) {
+                    if let Err(e) = tg.send_text_with_keyboard(&text, keyboard).await {
+                        warn!("failed to send auto-FP suggestion: {e:#}");
+                    } else {
+                        state.store.set_cooldown(
+                            state_store::CooldownTable::Notification,
+                            &cooldown_key,
+                            chrono::Utc::now(),
+                        );
+                        info!(
+                            entity = %entity,
+                            detector = %detector,
+                            count = count,
+                            "auto-FP suggestion sent to Telegram"
+                        );
+                    }
                 } else {
-                    state.store.set_cooldown(
-                        state_store::CooldownTable::Notification,
-                        &cooldown_key,
-                        chrono::Utc::now(),
-                    );
                     info!(
                         entity = %entity,
                         detector = %detector,
-                        count = count,
-                        "auto-FP suggestion sent to Telegram"
+                        "auto-FP suggestion deferred to daily briefing"
                     );
                 }
             }

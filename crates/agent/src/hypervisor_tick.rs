@@ -264,31 +264,47 @@ fn write_incidents(
 }
 
 fn notify_telegram(
-    state: &AgentState,
+    state: &mut AgentState,
     incidents: &[innerwarden_core::incident::Incident],
     trust_score: f64,
 ) {
     if let Some(ref tg) = state.telegram_client {
         for inc in incidents {
-            let sev = match inc.severity {
-                innerwarden_core::event::Severity::Critical => "🔴 CRITICAL",
-                innerwarden_core::event::Severity::High => "🟠 HIGH",
-                _ => "🟡 MEDIUM",
-            };
-            let msg = format!(
-                "🖥️ <b>Hypervisor Alert</b>\n\n\
-                 {sev}\n\
-                 <b>{}</b>\n\
-                 {}\n\n\
-                 Trust Score: {:.0}%",
-                inc.title,
-                inc.summary,
-                trust_score * 100.0,
+            let ctx = crate::notification_gate::NotificationContext::from_firmware_or_hypervisor(
+                inc,
+                "hypervisor",
             );
-            let tg = tg.clone();
-            tokio::spawn(async move {
-                let _ = tg.send_alert_html(&msg).await;
-            });
+            let verdict = crate::notification_gate::should_notify(&ctx);
+            match verdict {
+                crate::notification_gate::NotificationVerdict::SendNow => {
+                    let sev = match inc.severity {
+                        innerwarden_core::event::Severity::Critical => "\u{1f534} CRITICAL",
+                        innerwarden_core::event::Severity::High => "\u{1f7e0} HIGH",
+                        _ => "\u{1f7e1} MEDIUM",
+                    };
+                    let msg = format!(
+                        "\u{1f5a5}\u{fe0f} <b>Hypervisor Alert</b>\n\n\
+                         {sev}\n\
+                         <b>{}</b>\n\
+                         {}\n\n\
+                         Trust Score: {:.0}%",
+                        inc.title,
+                        inc.summary,
+                        trust_score * 100.0,
+                    );
+                    let tg = tg.clone();
+                    tokio::spawn(async move {
+                        let _ = tg.send_alert_html(&msg).await;
+                    });
+                }
+                crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
+                    *state
+                        .telegram_deferred
+                        .entry("hypervisor".to_string())
+                        .or_insert(0) += 1;
+                }
+                crate::notification_gate::NotificationVerdict::Drop => {}
+            }
         }
     }
 }

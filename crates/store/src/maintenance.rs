@@ -304,7 +304,7 @@ impl MaintenanceScheduler {
 
     fn tick_daily(&self, store: &Store) {
         // Full retention cleanup
-        match store.run_retention(8, 30, 90, 7) {
+        match store.run_retention(2, 30, 90, 7) {
             Ok(r) => {
                 if r.events_deleted > 0
                     || r.incidents_deleted > 0

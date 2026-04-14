@@ -40,7 +40,7 @@ struct IpApiResponse {
 }
 
 /// Lightweight geolocation summary attached to `DecisionContext`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GeoInfo {
     pub country: String,
     pub country_code: String,

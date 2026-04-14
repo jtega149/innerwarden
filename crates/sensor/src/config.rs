@@ -11,7 +11,6 @@ pub struct Config {
     #[serde(default)]
     pub detectors: DetectorsConfig,
     #[serde(default)]
-    #[allow(dead_code)] // Fields read at runtime when calibration is wired to detectors
     pub calibration: CalibrationConfig,
 }
 
@@ -600,7 +599,55 @@ fn default_rootkit_timing_min_samples() -> u64 {
 }
 
 fn default_rootkit_timing_z_threshold() -> f64 {
-    4.0
+    // Cloud VMs have network-attached disks with I/O jitter that causes
+    // z-scores of 15-47 regularly. Real rootkits cause z-scores >100
+    // consistently. Auto-detect cloud and use a higher threshold.
+    if is_cloud_vm() {
+        20.0
+    } else {
+        4.0
+    }
+}
+
+/// Detect if running on a cloud VM by reading DMI product_name/sys_vendor.
+/// Used to auto-calibrate timing thresholds that are sensitive to I/O jitter
+/// from network-attached storage.
+fn is_cloud_vm() -> bool {
+    let product_name = std::fs::read_to_string("/sys/class/dmi/id/product_name")
+        .unwrap_or_default()
+        .to_lowercase();
+    let sys_vendor = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+        .unwrap_or_default()
+        .to_lowercase();
+    let combined = format!("{product_name} {sys_vendor}");
+
+    // Match known cloud providers and hypervisors
+    [
+        "oracle",
+        "oci",
+        "amazon",
+        "aws",
+        "ec2",
+        "google",
+        "gce",
+        "microsoft",
+        "azure",
+        "hyper-v",
+        "digitalocean",
+        "hetzner",
+        "linode",
+        "akamai",
+        "vultr",
+        "ovh",
+        "vmware",
+        "virtualbox",
+        "qemu",
+        "kvm",
+        "xen",
+        "bhyve",
+    ]
+    .iter()
+    .any(|sig| combined.contains(sig))
 }
 
 fn default_rootkit_timing_consecutive_threshold() -> usize {
@@ -1173,18 +1220,69 @@ fn default_log_tampering_cooldown_seconds() -> u64 {
 /// expected_outbound = ["api.telegram.org", "api.openai.com", "abuseipdb.com"]
 /// ```
 #[derive(Debug, Deserialize, Default, Clone)]
-#[allow(dead_code)] // Fields reserved for detector wiring in next phase
 pub struct CalibrationConfig {
     /// Services the operator expects to be running. Process names (comm).
     /// Detectors use this to suppress FPs from known infrastructure.
+    /// Reserved for wiring to outbound_anomaly and c2_callback detectors.
     #[serde(default)]
+    #[allow(dead_code)]
     pub expected_services: Vec<String>,
 
     /// Outbound destinations the operator expects. Domains or IPs.
     /// DNS C2 and outbound anomaly detectors use this to avoid flagging
     /// legitimate API calls.
+    /// Reserved for wiring to dns_c2 and outbound_anomaly detectors.
     #[serde(default)]
+    #[allow(dead_code)]
     pub expected_outbound: Vec<String>,
+
+    /// UIDs of trusted operators. Discovery burst and other detectors
+    /// apply higher thresholds for these UIDs. If empty, auto-detected
+    /// from /etc/passwd (uid >= 1000 with login shell).
+    #[serde(default)]
+    pub trusted_uids: Vec<u32>,
+}
+
+impl CalibrationConfig {
+    /// Returns trusted UIDs — either from config or auto-detected from /etc/passwd.
+    /// Auto-detection finds UIDs >= 1000 with login shells (same logic as
+    /// environment_profile.rs in the agent crate).
+    pub fn effective_trusted_uids(&self) -> Vec<u32> {
+        if !self.trusted_uids.is_empty() {
+            return self.trusted_uids.clone();
+        }
+        // Auto-detect: parse /etc/passwd for human UIDs
+        auto_detect_human_uids()
+    }
+}
+
+/// Detect human UIDs from /etc/passwd (uid >= 1000, with login shell).
+/// Returns empty vec on non-Linux or if /etc/passwd is unreadable.
+fn auto_detect_human_uids() -> Vec<u32> {
+    let content = match std::fs::read_to_string("/etc/passwd") {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    let nologin_shells = ["/usr/sbin/nologin", "/bin/false", "/sbin/nologin"];
+
+    content
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() < 7 {
+                return None;
+            }
+            let uid: u32 = parts[2].parse().ok()?;
+            let shell = parts[6];
+
+            if (1000..65534).contains(&uid) && !nologin_shells.iter().any(|s| shell.ends_with(s)) {
+                Some(uid)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 pub fn load(path: &str) -> Result<Config> {

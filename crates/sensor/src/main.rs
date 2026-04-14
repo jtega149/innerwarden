@@ -626,12 +626,15 @@ async fn main() -> Result<()> {
             detectors::sensitive_write::SensitiveWriteDetector::new(&cfg.agent.host_id, 300)
         }),
         discovery_burst: Some({
+            let trusted_uids = cfg.calibration.effective_trusted_uids();
             info!(
                 threshold = 5,
                 window_seconds = 60,
+                trusted_uids = ?trusted_uids,
                 "discovery_burst detector enabled"
             );
             detectors::discovery_burst::DiscoveryBurstDetector::new(&cfg.agent.host_id, 5, 60)
+                .with_trusted_uids(trusted_uids)
         }),
         io_uring_anomaly: Some({
             info!("io_uring_anomaly detector enabled (io_uring evasion detection)");

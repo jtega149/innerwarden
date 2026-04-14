@@ -85,6 +85,11 @@ pub struct DiscoveryBurstDetector {
     alerted: HashMap<String, DateTime<Utc>>,
     cooldown: Duration,
     host: String,
+    /// Trusted operator UIDs (human admins). These get 3x threshold
+    /// instead of firing at the normal rate — operators doing their job
+    /// (deploying, debugging, checking services) routinely run 5+ recon
+    /// commands in 60s. Auto-detected from /etc/passwd if not configured.
+    trusted_uids: Vec<u32>,
 }
 
 impl DiscoveryBurstDetector {
@@ -96,7 +101,16 @@ impl DiscoveryBurstDetector {
             alerted: HashMap::new(),
             cooldown: Duration::seconds(1800), // 30 min — one alert per burst is enough
             host: host.into(),
+            trusted_uids: Vec::new(),
         }
+    }
+
+    /// Set trusted operator UIDs. These get 3x threshold (same as root)
+    /// because operators legitimately run many discovery commands during
+    /// deploys, debugging, and system checks.
+    pub fn with_trusted_uids(mut self, uids: Vec<u32>) -> Self {
+        self.trusted_uids = uids;
+        self
     }
 
     pub fn process(&mut self, event: &Event) -> Option<Incident> {
@@ -179,9 +193,12 @@ impl DiscoveryBurstDetector {
         }
 
         let count = self.windows.get(&key).map(|e| e.len()).unwrap_or(0);
-        // Root (uid=0) legitimately runs many commands during deploys,
-        // package installs, and system administration. Use 3x threshold.
-        let effective_threshold = if uid == 0 {
+        // Root (uid=0) and trusted operator UIDs legitimately run many
+        // commands during deploys, package installs, and system
+        // administration. Use 3x threshold to avoid false positives
+        // while still catching abnormal volumes from compromised accounts.
+        let is_trusted = uid == 0 || self.trusted_uids.contains(&(uid as u32));
+        let effective_threshold = if is_trusted {
             self.threshold * 3
         } else {
             self.threshold

@@ -9,6 +9,10 @@ set -euo pipefail
 # One-liner:
 #   curl -fsSL https://github.com/InnerWarden/innerwarden/releases/latest/download/install.sh | sudo bash
 #
+# Flow test only (no install/no service changes):
+#   bash install.sh --simulate
+#   bash install.sh --simulate --simulate-mode=advanced
+#
 # What this script does:
 # - Downloads (or builds) sensor + agent + ctl binaries
 # - Validates SHA-256 of downloaded binaries
@@ -30,13 +34,20 @@ IW_USER="innerwarden"
 WITH_INTEGRATIONS=0
 CANARY=0
 VERBOSE=0
+SIMULATE=0
+SIMULATE_MODE="basic"
 for arg in "$@"; do
   case "$arg" in
     --with-integrations) WITH_INTEGRATIONS=1 ;;
     --canary) CANARY=1 ;;
     --verbose) VERBOSE=1 ;;
+    --simulate) SIMULATE=1 ;;
+    --simulate-mode=basic) SIMULATE_MODE="basic" ;;
+    --simulate-mode=advanced) SIMULATE_MODE="advanced" ;;
   esac
 done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Detect OS + arch + distro
 OS_TYPE="$(uname -s)"   # Linux | Darwin
@@ -51,19 +62,23 @@ fi
 # Instead of re-execing the entire script with sudo (which kills stdin/tty),
 # we validate sudo once and prefix privileged commands with $SUDO.
 # This keeps the terminal attached so innerwarden setup can prompt the user.
-if [[ "$(id -u)" -ne 0 ]]; then
-  # Check if user has passwordless sudo (common on cloud VMs)
-  if sudo -n true 2>/dev/null; then
-    SUDO="sudo"
-  else
-    echo ""
-    echo "  Root access needed."
-    echo ""
-    sudo -v || { echo "  sudo failed."; exit 1; }
-    SUDO="sudo"
-  fi
-else
+if [[ "${SIMULATE}" -eq 1 ]]; then
   SUDO=""
+else
+  if [[ "$(id -u)" -ne 0 ]]; then
+    # Check if user has passwordless sudo (common on cloud VMs)
+    if sudo -n true 2>/dev/null; then
+      SUDO="sudo"
+    else
+      echo ""
+      echo "  Root access needed."
+      echo ""
+      sudo -v || { echo "  sudo failed."; exit 1; }
+      SUDO="sudo"
+    fi
+  else
+    SUDO=""
+  fi
 fi
 
 BIN_DIR="/usr/local/bin"
@@ -112,7 +127,9 @@ fail() {
 }
 
 normalize_bool() {
-  case "${1,,}" in
+  local normalized
+  normalized="$(printf '%s' "${1}" | tr '[:upper:]' '[:lower:]')"
+  case "${normalized}" in
     1|true|yes|y|on)
       echo "true"
       ;;
@@ -170,7 +187,8 @@ term_rows() {
 print_centered_line() {
   local cols="$1"
   local line="$2"
-  local width="${#line}"
+  local width
+  width="$(printf '%s' "${line}" | wc -m | tr -d ' ')"
   local pad=0
   if (( cols > width )); then
     pad=$(( (cols - width) / 2 ))
@@ -184,18 +202,28 @@ print_install_banner() {
   rows="$(term_rows)"
 
   local platform_line
-  platform_line="$(printf "%s %s | kernel %s%s" "${OS_TYPE,,}" "${ARCH}" "${KERNEL}" "${DISTRO:+ | ${DISTRO}}")"
+  local os_lower
+  os_lower="$(printf '%s' "${OS_TYPE}" | tr '[:upper:]' '[:lower:]')"
+  platform_line="$(printf "%s %s | kernel %s%s" "${os_lower}" "${ARCH}" "${KERNEL}" "${DISTRO:+ | ${DISTRO}}")"
 
   local banner_lines=(
-"  _____ _   _ _   _ _____ ____  __        ___    ____  ____  _____ _   _ "
-" |_   _| \\ | | \\ | | ____|  _ \\ \\ \\      / / \\  |  _ \\|  _ \\| ____| \\ | |"
-"   | | |  \\| |  \\| |  _| | |_) | \\ \\ /\\ / / _ \\ | |_) | | | |  _| |  \\| |"
-"   | | | |\\  | |\\  | |___|  _ <   \\ V  V / ___ \\|  _ <| |_| | |___| |\\  |"
-"   |_| |_| \\_|_| \\_|_____|_| \\_\\   \\_/\\_/_/   \\_\\_| \\_\\____/|_____|_| \\_|"
+"      .-.                       .-."
+"     {{@}}                     {{@}}"
+"      8@8                       8@8"
+"      888      INNER WARDEN     888"
+"      8@8                       8@8"
+"     _    )8(    _             _    )8(    _"
+"      (@)__/8@8\\__(@)           (@)__/8@8\\__(@)"
+"     ~-=):(=-~                 ~-=):(=-~"
+"      |.|                       |.|"
+"      |.|                       |.|"
+"      |.|                       |.|"
+"      \\ /                       \\ /"
+"     ^                         ^"
 ""
-"+---------------------------------------------------------------+"
-"| Your server's immune system installer                         |"
-"+---------------------------------------------------------------+"
+"+-----------------------------------------+"
+"|  Your server's immune system installer  |"
+"+-----------------------------------------+"
 "${platform_line}"
   )
 
@@ -218,11 +246,51 @@ print_install_banner() {
   echo ""
 }
 
+run_simulated_setup_flow() {
+  echo "  [SIMULATION] No files will be written. No services will be changed."
+  echo "  [SIMULATION] Running setup flow in dry-run mode (${SIMULATE_MODE})."
+  echo ""
+
+  run_with_tty_if_available() {
+    if [[ -t 0 ]]; then
+      "$@"
+    elif [[ -e /dev/tty ]] && { : < /dev/tty; } 2>/dev/null; then
+      "$@" < /dev/tty
+    else
+      "$@"
+    fi
+  }
+
+  local wizard_path="${SCRIPT_DIR}/scripts/setup-wizard.sh"
+
+  if [[ -x "${wizard_path}" ]]; then
+    echo "  [SIMULATION] Launching interactive wizard (no root required)..."
+    if run_with_tty_if_available "${wizard_path}"; then
+      return 0
+    fi
+    echo "  [SIMULATION] Wizard unavailable in this shell."
+    echo "  [SIMULATION] Open a normal interactive terminal and run:"
+    echo "    ${wizard_path}"
+    return 0
+  fi
+
+  echo "  [SIMULATION] setup-wizard.sh not found."
+  echo "  [SIMULATION] This mode intentionally avoids root prompts."
+  echo "  [SIMULATION] For CLI dry-run (may request sudo), run manually:"
+  echo "    innerwarden setup --dry-run --mode ${SIMULATE_MODE}"
+  return 0
+}
+
 # ── Banner (only after sudo, so it shows once) ──────────────────────────
 print_install_banner
 
 if [[ "$OS_TYPE" != "Linux" && "$OS_TYPE" != "Darwin" ]]; then
   fail "this installer supports Linux and macOS (Darwin) hosts only"
+fi
+
+if [[ "${SIMULATE}" -eq 1 ]]; then
+  run_simulated_setup_flow
+  exit 0
 fi
 
 if [[ "$OS_TYPE" != "Darwin" ]]; then

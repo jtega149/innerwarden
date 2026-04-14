@@ -246,23 +246,41 @@ async fn handle_always_on_connection(
         .map(|a| (a.username.clone(), a.password.clone()))
         .collect();
 
-    // Send Telegram T.5 post-session report.
+    // Send Telegram T.5 post-session report (gated).
+    // Probe-only sessions -> Drop. All others -> DailyBriefingOnly (honeypot is never SendNow).
+    let duration = elapsed_secs_for_report(started_at);
+    let is_probe_only = commands.is_empty() && credentials.is_empty() && duration <= 2;
     if let Some(ref tg) = telegram_client {
-        let duration = elapsed_secs_for_report(started_at);
-        if let Err(e) = tg
-            .send_honeypot_session_report(
-                &ip,
-                &session_id,
-                duration,
-                &commands,
-                &credentials,
-                &iocs,
-                &verdict,
-                auto_blocked,
-            )
-            .await
-        {
-            warn!("always-on honeypot: failed to send Telegram session report: {e:#}");
+        let gate_ctx = crate::notification_gate::NotificationContext::for_honeypot_session(
+            is_probe_only,
+            auto_blocked,
+        );
+        let gate_verdict = crate::notification_gate::should_notify(&gate_ctx);
+        match gate_verdict {
+            crate::notification_gate::NotificationVerdict::SendNow => {
+                // Honeypot sessions are never SendNow per policy, but handle for completeness.
+                if let Err(e) = tg
+                    .send_honeypot_session_report(
+                        &ip,
+                        &session_id,
+                        duration,
+                        &commands,
+                        &credentials,
+                        &iocs,
+                        &verdict,
+                        auto_blocked,
+                    )
+                    .await
+                {
+                    warn!("always-on honeypot: failed to send Telegram session report: {e:#}");
+                }
+            }
+            crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
+                tracing::debug!(ip = %ip, session = %session_id, "honeypot: session deferred to daily briefing");
+            }
+            crate::notification_gate::NotificationVerdict::Drop => {
+                tracing::debug!(ip = %ip, session = %session_id, "honeypot: probe-only session dropped");
+            }
         }
     }
 
