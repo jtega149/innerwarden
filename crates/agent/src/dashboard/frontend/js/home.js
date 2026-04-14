@@ -10,16 +10,20 @@ var HOME_ORPHAN_WINDOW_MS          = 24 * 60 * 60 * 1000;   // 24h history walk
 
 async function loadHome() {
   try {
-    const [status, overview, incidentList, sensors, responsesData] = await Promise.all([
+    const [status, overview, incidentList, sensors, responsesData, entityData] = await Promise.all([
       loadJson('/api/status'),
       loadJson('/api/overview'),
       loadJson('/api/incidents?limit=100'),
       loadJson('/api/sensors'),
-      loadJson('/api/responses').catch(function() { return {}; })
+      loadJson('/api/responses').catch(function() { return {}; }),
+      loadJson('/api/entities').then(function(r) {
+        return { items: (r.attackers || []).map(function(a) { return Object.assign({}, a, { value: a.ip, group_by: 'ip' }); }) };
+      }).catch(function() { return { items: [] }; })
     ]);
     window._lastOverview = overview;
     window._agentMode = status.mode || 'guard';
     window._lastIncidentList = incidentList.items || [];
+    window._lastEntityItems = entityData.items || [];
 
     // Filtered base matches what Recent Activity will render.
     var items = incidentList.items || [];
@@ -38,7 +42,8 @@ async function loadHome() {
       overview: overview,
       responsesData: responsesData,
       activeHighCriticalList: activeHighCriticalList,
-      allIncidents: items
+      allIncidents: items,
+      entityItems: entityData.items || []
     });
 
     // Soft stale: telemetry a few minutes behind but not yet state 3.
@@ -140,17 +145,15 @@ function computeHomeState(payload) {
 
   // Guard ON or no active threats: AI Protection Active.
   // The operator sees confidence, not alarm.
-  var blockedSet = new Set();
-  (payload.allIncidents || []).forEach(function(inc) {
-    if (inc.outcome === 'blocked' || inc.outcome === 'contained') {
-      (inc.entities || []).forEach(function(e) {
-        var s = typeof e === 'string' ? e : (e.value || '');
-        if (s.startsWith('ip:')) blockedSet.add(s.slice(3));
-      });
-    }
+  // Use entity items (same source as Threats tab) for consistent counts.
+  var entityItems = payload.entityItems || [];
+  var blocked = 0, observing = 0;
+  entityItems.forEach(function(item) {
+    var o = (item.outcome || 'open').toLowerCase();
+    if (o === 'blocked' || o === 'honeypot' || o === 'contained') blocked++;
+    else if (o === 'monitoring' || o === 'open' || o === 'active') observing++;
   });
-  var blocked = blockedSet.size || (overview.ai_responded || 0);
-  var observing = activeList.length;
+  if (blocked === 0) blocked = overview.ai_responded || 0;
   var subParts = [];
   if (blocked > 0) subParts.push(blocked + ' blocked');
   if (observing > 0) subParts.push(observing + ' observing');
@@ -216,16 +219,14 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
   var didEl  = document.getElementById('homeNowDid');
   if (!whatEl || !didEl) return;
 
-  var blockedIpsNow = new Set();
-  (window._lastIncidentList || []).forEach(function(inc) {
-    if (inc.outcome === 'blocked' || inc.outcome === 'contained') {
-      (inc.entities || []).forEach(function(e) {
-        var s = typeof e === 'string' ? e : (e.value || '');
-        if (s.startsWith('ip:')) blockedIpsNow.add(s.slice(3));
-      });
-    }
+  var entityItems = window._lastEntityItems || [];
+  var contained = 0, observingNow = 0;
+  entityItems.forEach(function(item) {
+    var o = (item.outcome || 'open').toLowerCase();
+    if (o === 'blocked' || o === 'honeypot' || o === 'contained') contained++;
+    else if (o === 'monitoring' || o === 'open' || o === 'active') observingNow++;
   });
-  var contained = blockedIpsNow.size > 0 ? blockedIpsNow.size : (overview.ai_responded || 0);
+  if (contained === 0) contained = overview.ai_responded || 0;
   var total = totalEventsScanned || overview.events_count || 0;
 
   // Line 1 — Trust signal: volume scanned
@@ -242,31 +243,27 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
 
   // Line 2 — Outcome summary
   var line2;
-  if (contained === 0 && activeCount === 0) {
+  if (contained === 0 && observingNow === 0) {
     line2 = 'Nothing suspicious found. All systems operating normally.';
-  } else if (contained > 0 && activeCount === 0) {
+  } else if (contained > 0 && observingNow === 0) {
     line2 = 'Blocked ' + contained + ' threat' + (contained > 1 ? 's' : '') + ' automatically. Nothing requires your attention.';
   } else {
-    line2 = 'Blocked ' + contained + ' automatically. Observing ' + activeCount + ' more. No action needed.';
+    line2 = 'Blocked ' + contained + ' automatically. Observing ' + observingNow + ' more. No action needed.';
   }
   didEl.textContent = line2;
 }
 
 // ── KPIs with fixed temporal sub-labels ──────────────────────────────
 function updateHomeKpis(overview, totalEventsScanned) {
-  // Count unique IPs with block decisions (matches Threats tab entity count).
-  // API entities are strings "ip:1.2.3.4", not {type,value} objects.
-  var blockedIps = new Set();
-  (window._lastIncidentList || []).forEach(function(inc) {
-    if (inc.outcome === 'blocked' || inc.outcome === 'contained') {
-      (inc.entities || []).forEach(function(e) {
-        var s = typeof e === 'string' ? e : (e.value || '');
-        if (s.startsWith('ip:')) blockedIps.add(s.slice(3));
-      });
-    }
+  // Count from entity items (same source as Threats tab) for consistency.
+  var entityItems = window._lastEntityItems || [];
+  var blockedCount = 0;
+  entityItems.forEach(function(item) {
+    var o = (item.outcome || 'open').toLowerCase();
+    if (o === 'blocked' || o === 'honeypot' || o === 'contained') blockedCount++;
   });
   var el = document.getElementById('homeKpiThreats');
-  if (el) el.textContent = blockedIps.size > 0 ? blockedIps.size : (overview.ai_responded || 0);
+  if (el) el.textContent = blockedCount > 0 ? blockedCount : (overview.ai_responded || 0);
 
   el = document.getElementById('homeKpiResponded');
   if (el) el.textContent = overview.incidents_count || 0;

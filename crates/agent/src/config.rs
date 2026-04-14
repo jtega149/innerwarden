@@ -1134,6 +1134,7 @@ pub struct TelegramConfig {
     /// Maximum Telegram notifications per day (default: 10).
     /// Only immediate threats count against the budget. Critical severity
     /// always breaks the budget. Everything else goes to the daily digest.
+    #[allow(dead_code)]
     #[serde(default = "default_telegram_daily_budget")]
     pub daily_budget: u32,
 

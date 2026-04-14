@@ -270,9 +270,12 @@ pub(crate) fn write_incidents(data_dir: &Path, incidents: &[serde_json::Value]) 
 }
 
 /// Notify via Telegram for shield escalation events.
+/// Gated through the centralized notification gate.
 pub(crate) fn notify_telegram(
     telegram_client: &Option<std::sync::Arc<crate::telegram::TelegramClient>>,
     incidents: &[serde_json::Value],
+    burst_tracker: &crate::notification_gate::BurstTracker,
+    deferred: &mut std::collections::HashMap<String, u32>,
 ) {
     let Some(tg) = telegram_client else { return };
 
@@ -285,27 +288,48 @@ pub(crate) fn notify_telegram(
             continue;
         }
 
-        let title = inc
-            .get("title")
-            .and_then(|t| t.as_str())
-            .unwrap_or("Shield alert");
-        let summary = inc.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+        // Gate through notification policy.
+        let ctx = crate::notification_gate::NotificationContext::from_shield_json(inc);
+        let verdict = crate::notification_gate::should_notify(&ctx);
 
-        let emoji = if severity == "critical" {
-            "\u{1f534}"
-        } else {
-            "\u{1f7e0}"
-        };
-        let msg = format!(
-            "\u{1f6e1}\u{fe0f} <b>DDoS Shield</b>\n\n\
-             {emoji} {}\n\
-             <b>{title}</b>\n\
-             {summary}",
-            severity.to_uppercase(),
-        );
-        let tg = tg.clone();
-        tokio::spawn(async move {
-            let _ = tg.send_alert_html(&msg).await;
-        });
+        match verdict {
+            crate::notification_gate::NotificationVerdict::SendNow => {
+                let title = inc
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("Shield alert");
+                let summary = inc.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+
+                let emoji = if severity == "critical" {
+                    "\u{1f534}"
+                } else {
+                    "\u{1f7e0}"
+                };
+                let msg = format!(
+                    "\u{1f6e1}\u{fe0f} <b>DDoS Shield</b>\n\n\
+                     {emoji} {}\n\
+                     <b>{title}</b>\n\
+                     {summary}",
+                    severity.to_uppercase(),
+                );
+                let tg = tg.clone();
+                tokio::spawn(async move {
+                    let _ = tg.send_alert_html(&msg).await;
+                });
+            }
+            crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
+                *deferred.entry(ctx.detector.clone()).or_insert(0) += 1;
+                if ctx.is_contained {
+                    if let Some(count) = burst_tracker.record_contained() {
+                        let msg = crate::notification_gate::format_burst_summary(count);
+                        let tg = tg.clone();
+                        tokio::spawn(async move {
+                            let _ = tg.send_alert_html(&msg).await;
+                        });
+                    }
+                }
+            }
+            crate::notification_gate::NotificationVerdict::Drop => {}
+        }
     }
 }

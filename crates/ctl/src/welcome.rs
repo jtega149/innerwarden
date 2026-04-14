@@ -4,13 +4,23 @@ use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 
-/// Wide ASCII logo for larger terminals.
+const INFO_BOX_OFFSET: usize = 4;
+
+/// Compact double-sword logo with brand text between blades.
 const LOGO_WIDE: &[&str] = &[
-    "  _____ _   _ _   _ _____ ____  __        ___    ____  ____  _____ _   _ ",
-    " |_   _| \\ | | \\ | | ____|  _ \\ \\ \\      / / \\  |  _ \\|  _ \\| ____| \\ | |",
-    "   | | |  \\| |  \\| |  _| | |_) | \\ \\ /\\ / / _ \\ | |_) | | | |  _| |  \\| |",
-    "   | | | |\\  | |\\  | |___|  _ <   \\ V  V / ___ \\|  _ <| |_| | |___| |\\  |",
-    "   |_| |_| \\_|_| \\_|_____|_| \\_\\   \\_/\\_/_/   \\_\\_| \\_\\____/|_____|_| \\_|",
+    "      .-.                       .-.",
+    "     {{@}}                     {{@}}",
+    "      8@8                       8@8",
+    "      888      INNER WARDEN     888",
+    "      8@8                       8@8",
+    "     _    )8(    _             _    )8(    _",
+    "      (@)__/8@8\\__(@)           (@)__/8@8\\__(@)",
+    "     ~-=):(=-~                 ~-=):(=-~",
+    "      |.|                       |.|",
+    "      |.|                       |.|",
+    "      |.|                       |.|",
+    "      \\ /                       \\ /",
+    "     ^                         ^",
 ];
 
 fn parse_env_size(key: &str) -> Option<usize> {
@@ -69,7 +79,15 @@ fn box_lines(lines: Vec<String>, cols: usize) -> Vec<String> {
         out.push(format!("| {:<width$} |", line, width = inner_width));
     }
     out.push(border);
-    out
+
+    if cols >= boxed_width + INFO_BOX_OFFSET {
+        let prefix = " ".repeat(INFO_BOX_OFFSET);
+        out.into_iter()
+            .map(|line| format!("{prefix}{line}"))
+            .collect()
+    } else {
+        out
+    }
 }
 
 fn build_screen(cols: usize, ebpf_hooks: u32) -> Vec<String> {

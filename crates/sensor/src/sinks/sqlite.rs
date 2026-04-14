@@ -34,8 +34,15 @@ impl SqliteWriter {
     }
 
     /// Write an event to the events table.
+    ///
+    /// High-volume, low-value event kinds are skipped to prevent unbounded
+    /// database growth. These events are still processed by detectors
+    /// (in-memory) — they just aren't persisted to disk.
     pub fn write_event(&self, event: &Event) {
         if !self.write_events {
+            return;
+        }
+        if is_high_volume_event(&event.kind) {
             return;
         }
         if let Err(e) = self.store.insert_event(event) {
@@ -49,4 +56,24 @@ impl SqliteWriter {
             warn!(incident_id = %incident.incident_id, "sqlite write_incident failed: {e:#}");
         }
     }
+}
+
+/// High-volume event kinds that are useful for in-memory detection but
+/// not worth persisting to SQLite. These fire thousands of times per hour
+/// on active servers and would grow the DB to gigabytes per day.
+///
+/// The detectors still see these events (they run before the sink).
+/// The knowledge graph still ingests them (agent reads from graph, not DB).
+/// Only the raw event audit trail skips them.
+fn is_high_volume_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "tcp_stream.flow"
+            | "tcp_stream.http"
+            | "process.exit"
+            | "process.clone"
+            | "process.fd_redirect"
+            | "network.snapshot_connected"
+            | "network.snapshot_listening"
+    )
 }

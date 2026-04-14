@@ -238,23 +238,43 @@ pub(crate) async fn spawn_post_session_tasks(
         false
     };
 
-    // Send Telegram post-session report
+    // Send Telegram post-session report (gated through notification gate).
+    let is_probe_only = commands.is_empty() && credentials.is_empty();
     if let Some(ref tg) = telegram_client {
         let duration = 300u64; // default; session duration stored in metadata
-        if let Err(e) = tg
-            .send_honeypot_session_report(
-                ip,
-                session_id,
-                duration,
-                &commands,
-                &credentials,
-                &iocs,
-                &verdict,
-                auto_blocked,
-            )
-            .await
-        {
-            tracing::warn!("failed to send honeypot session report via Telegram: {e:#}");
+        let gate_ctx = crate::notification_gate::NotificationContext::for_honeypot_session(
+            is_probe_only,
+            auto_blocked,
+        );
+        let gate_verdict = crate::notification_gate::should_notify(&gate_ctx);
+        match gate_verdict {
+            crate::notification_gate::NotificationVerdict::SendNow => {
+                if let Err(e) = tg
+                    .send_honeypot_session_report(
+                        ip,
+                        session_id,
+                        duration,
+                        &commands,
+                        &credentials,
+                        &iocs,
+                        &verdict,
+                        auto_blocked,
+                    )
+                    .await
+                {
+                    tracing::warn!("failed to send honeypot session report via Telegram: {e:#}");
+                }
+            }
+            crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
+                tracing::debug!(
+                    ip,
+                    session_id,
+                    "honeypot: session deferred to daily briefing"
+                );
+            }
+            crate::notification_gate::NotificationVerdict::Drop => {
+                tracing::debug!(ip, session_id, "honeypot: probe-only session dropped");
+            }
         }
     }
 }
