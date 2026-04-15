@@ -517,7 +517,7 @@ pub async fn serve(
             .context("dashboard server failed")
     } else {
         // ── HTTPS (default) ──────────────────────────────────────────
-        let tls_config = build_tls_config(&data_dir, tls_cert, tls_key)?;
+        let tls_config = build_tls_config(&data_dir, tls_cert, tls_key).await?;
         let addr: std::net::SocketAddr = bind
             .parse()
             .with_context(|| format!("invalid bind address: {bind}"))?;
@@ -534,7 +534,7 @@ pub async fn serve(
 }
 
 /// Build RustlsConfig from cert/key files or auto-generate a self-signed cert.
-fn build_tls_config(
+async fn build_tls_config(
     data_dir: &std::path::Path,
     cert_path: Option<String>,
     key_path: Option<String>,
@@ -556,9 +556,8 @@ fn build_tls_config(
 
         if cert_file.exists() && key_file.exists() {
             info!("loading existing self-signed TLS certificate");
-            let rt = tokio::runtime::Handle::current();
-            let config = rt
-                .block_on(RustlsConfig::from_pem_file(&cert_file, &key_file))
+            let config = RustlsConfig::from_pem_file(&cert_file, &key_file)
+                .await
                 .context("failed to load existing self-signed cert")?;
             return Ok(config);
         }
@@ -609,9 +608,8 @@ fn build_tls_config(
             "self-signed TLS certificate generated (valid 365 days)"
         );
 
-        let rt = tokio::runtime::Handle::current();
-        let config = rt
-            .block_on(RustlsConfig::from_pem_file(&cert_file, &key_file))
+        let config = RustlsConfig::from_pem_file(&cert_file, &key_file)
+            .await
             .context("failed to load generated self-signed cert")?;
         Ok(config)
     }
