@@ -14,6 +14,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/InnerWarden/innerwarden/badge)](https://scorecard.dev/viewer/?uri=github.com/InnerWarden/innerwarden)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12546/badge)](https://www.bestpractices.dev/projects/12546)
+[![codecov](https://codecov.io/gh/InnerWarden/innerwarden/branch/main/graph/badge.svg)](https://codecov.io/gh/InnerWarden/innerwarden)
 [![CI](https://github.com/InnerWarden/innerwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/InnerWarden/innerwarden/actions/workflows/ci.yml)
 [![Security](https://github.com/InnerWarden/innerwarden/actions/workflows/security.yml/badge.svg)](https://github.com/InnerWarden/innerwarden/actions/workflows/security.yml)
 [![Release](https://img.shields.io/github/v/release/InnerWarden/innerwarden?label=release&color=blue)](https://github.com/InnerWarden/innerwarden/releases/latest)
