@@ -2829,9 +2829,18 @@ fn detect_slow_and_low(
 
         // Skip infra processes (same list as data exfil)
         const INFRA: &[&str] = &[
-            "crowdsec", "innerwarden", "tokio-rt-worker", "innerwarden-agent",
-            "innerwarden-senso", "fail2ban", "telegraf", "prometheus",
-            "node_exporter", "apt", "dpkg", "cscli",
+            "crowdsec",
+            "innerwarden",
+            "tokio-rt-worker",
+            "innerwarden-agent",
+            "innerwarden-senso",
+            "fail2ban",
+            "telegraf",
+            "prometheus",
+            "node_exporter",
+            "apt",
+            "dpkg",
+            "cscli",
         ];
         let comm_lower = comm.to_lowercase();
         if INFRA.iter().any(|&c| comm_lower.starts_with(c)) || uid == 998 {
@@ -2842,7 +2851,12 @@ fn detect_slow_and_low(
             if edge.relation != Relation::ConnectedTo || edge.ts < cutoff {
                 continue;
             }
-            if let Some(Node::Ip { addr, is_internal: false, .. }) = graph.get_node(edge.to) {
+            if let Some(Node::Ip {
+                addr,
+                is_internal: false,
+                ..
+            }) = graph.get_node(edge.to)
+            {
                 if crate::cloud_safelist::is_self_traffic_ip(addr) {
                     continue;
                 }
@@ -2880,8 +2894,8 @@ fn detect_slow_and_low(
         if mean < 1.0 {
             continue;
         }
-        let variance = intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
-            / intervals.len() as f64;
+        let variance =
+            intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
         let cv = variance.sqrt() / mean;
 
         // CV < 0.3 = regular beaconing (caught by sensor c2_callback).
@@ -2895,7 +2909,10 @@ fn detect_slow_and_low(
             continue;
         }
 
-        let label = graph.get_node(proc_id).map(|n| n.label()).unwrap_or_default();
+        let label = graph
+            .get_node(proc_id)
+            .map(|n| n.label())
+            .unwrap_or_default();
         let hours = span.num_hours().max(1);
 
         incidents.push(Incident {
@@ -2905,13 +2922,20 @@ fn detect_slow_and_low(
             severity: Severity::High,
             title: format!(
                 "Slow-and-low C2: {} → {} ({} connections over {}h)",
-                label, ip, timestamps.len(), hours
+                label,
+                ip,
+                timestamps.len(),
+                hours
             ),
             summary: format!(
                 "Process {} made {} connections to external IP {} over {} hours with irregular \
                  intervals (CV={:.2}). This pattern evades short-window detectors and suggests \
                  intentional C2 communication.",
-                label, timestamps.len(), ip, hours, cv
+                label,
+                timestamps.len(),
+                ip,
+                hours,
+                cv
             ),
             evidence: serde_json::json!({
                 "source": "knowledge_graph",

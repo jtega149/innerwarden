@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use dialoguer::console::Style;
-use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
+use dialoguer::{theme::ColorfulTheme, MultiSelect, Select};
 
 use crate::commands::agent::{cmd_agent, parse_selection_indices, resolve_dashboard_url};
 use crate::commands::ai::{fetch_models, WIZARD_PROVIDERS};
@@ -29,7 +29,6 @@ struct SetupPreconfigPlan {
     set_telegram_min_severity: bool,
     set_webhook_min_severity: bool,
 }
-
 
 #[derive(Debug, Clone)]
 enum SetupAiKey {
@@ -375,7 +374,12 @@ fn build_setup_ai_plan(
 
 fn prompt_setup_other_ai_plan() -> Result<Option<SetupAiPlan>> {
     let other_providers = [
-        "together", "minimax", "mistral", "xai", "fireworks", "gemini",
+        "together",
+        "minimax",
+        "mistral",
+        "xai",
+        "fireworks",
+        "gemini",
     ];
 
     println!("  Other provider\n");
@@ -868,14 +872,20 @@ fn prompt_notification_channels(
                 .get("TELEGRAM_BOT_TOKEN")
                 .map(|s| mask_secret(s))
                 .unwrap_or_default();
-            println!("    [ok] Telegram  {}", dim.apply_to(format!("token: {token}")));
+            println!(
+                "    [ok] Telegram  {}",
+                dim.apply_to(format!("token: {token}"))
+            );
         }
         if slack_ok {
             let url = env_vars
                 .get("SLACK_WEBHOOK_URL")
                 .map(|s| mask_secret(s))
                 .unwrap_or_default();
-            println!("    [ok] Slack     {}", dim.apply_to(format!("webhook: {url}")));
+            println!(
+                "    [ok] Slack     {}",
+                dim.apply_to(format!("webhook: {url}"))
+            );
         }
         if webhook_ok {
             let url = env_vars
@@ -889,7 +899,10 @@ fn prompt_notification_channels(
                 .get("INNERWARDEN_DASHBOARD_USER")
                 .cloned()
                 .unwrap_or_default();
-            println!("    [ok] Dashboard {}", dim.apply_to(format!("user: {user}")));
+            println!(
+                "    [ok] Dashboard {}",
+                dim.apply_to(format!("user: {user}"))
+            );
         }
         println!();
     }
@@ -964,11 +977,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     } else {
         let plan = prompt_setup_ai_plan()?;
         if let Some(plan) = &plan {
-            println!(
-                "\n  [ok] {} ({})",
-                plan.label,
-                dim.apply_to(&plan.model)
-            );
+            println!("\n  [ok] {} ({})", plan.label, dim.apply_to(&plan.model));
         } else {
             println!("  [--] AI not set yet");
         }
@@ -980,8 +989,8 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
         env_has(&env_vars, "TELEGRAM_BOT_TOKEN") && env_has(&env_vars, "TELEGRAM_CHAT_ID");
     let slack_ok = env_has(&env_vars, "SLACK_WEBHOOK_URL")
         && agent_bool(agent_doc.as_ref(), "slack", "enabled");
-    let webhook_ok = env_has(&env_vars, "WEBHOOK_URL")
-        && agent_bool(agent_doc.as_ref(), "webhook", "enabled");
+    let webhook_ok =
+        env_has(&env_vars, "WEBHOOK_URL") && agent_bool(agent_doc.as_ref(), "webhook", "enabled");
     let dashboard_ok_existing = env_has(&env_vars, "INNERWARDEN_DASHBOARD_USER")
         && env_has(&env_vars, "INNERWARDEN_DASHBOARD_PASSWORD_HASH");
 
@@ -1080,7 +1089,11 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
 
     println!();
     let enable_mesh = if mesh_ok {
-        println!("  [ok] {}  {}", bold.apply_to("Mesh"), dim.apply_to("enabled"));
+        println!(
+            "  [ok] {}  {}",
+            bold.apply_to("Mesh"),
+            dim.apply_to("enabled")
+        );
         true
     } else if setup_mode.is_advanced() {
         let enabled = prompt_yes_no(
@@ -1102,8 +1115,16 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     println!("  {}", bold.apply_to("REVIEW"));
     println!("  {}", dim.apply_to("─".repeat(40)));
     println!("  {:<16} {review_ai}", bold.apply_to("AI"));
-    println!("  {:<16} {}", bold.apply_to("Alerts"), notification_plan.label());
-    println!("  {:<16} {}", bold.apply_to("Protection"), responder_plan.label());
+    println!(
+        "  {:<16} {}",
+        bold.apply_to("Alerts"),
+        notification_plan.label()
+    );
+    println!(
+        "  {:<16} {}",
+        bold.apply_to("Protection"),
+        responder_plan.label()
+    );
     if enable_mesh {
         println!("  {:<16} enabled", bold.apply_to("Mesh"));
     }
@@ -1142,7 +1163,10 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     println!();
 
     if cli.dry_run {
-        println!("  {} Setup preview complete. No changes applied.", dim.apply_to("[dry-run]"));
+        println!(
+            "  {} Setup preview complete. No changes applied.",
+            dim.apply_to("[dry-run]")
+        );
         return Ok(());
     }
 

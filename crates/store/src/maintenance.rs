@@ -328,8 +328,7 @@ impl MaintenanceScheduler {
                 } else {
                     let msg = format!(
                         "HASH CHAIN BROKEN — audit trail tampered. {} verified, broken at: {:?}",
-                        result.verified,
-                        result.broken_at,
+                        result.verified, result.broken_at,
                     );
                     warn!("{msg}");
                     alerts.push(msg);

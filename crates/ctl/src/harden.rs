@@ -1735,8 +1735,8 @@ fn check_auditd() -> CheckResult {
     let cat = "Auditd";
 
     // Check if auditd is installed
-    let auditd_installed = Path::new("/sbin/auditd").exists()
-        || Path::new("/usr/sbin/auditd").exists();
+    let auditd_installed =
+        Path::new("/sbin/auditd").exists() || Path::new("/usr/sbin/auditd").exists();
 
     if !auditd_installed {
         findings.push(Finding {
@@ -1745,7 +1745,11 @@ fn check_auditd() -> CheckResult {
             title: "auditd not installed".into(),
             fix: "Install auditd: apt-get install auditd (Debian/Ubuntu) or yum install audit (RHEL/Rocky)".into(),
         });
-        return CheckResult { category: cat, passed, findings };
+        return CheckResult {
+            category: cat,
+            passed,
+            findings,
+        };
     }
     passed.push("auditd installed".into());
 
@@ -1787,16 +1791,56 @@ fn check_auditd() -> CheckResult {
 
     // Critical ATT&CK rules that enable Sigma detection
     let critical_rules: &[(&str, &str, &str)] = &[
-        ("-S execve", "Execution monitoring (T1059)", "Tracks all process execution — enables 120+ Sigma process_creation rules"),
-        ("-w /etc/passwd", "Identity file monitoring (T1003)", "Detects credential harvesting and user enumeration"),
-        ("-w /etc/shadow", "Credential file monitoring (T1003)", "Detects password hash access"),
-        ("-w /etc/sudoers", "Privilege config monitoring (T1548)", "Detects sudo policy tampering"),
-        ("-w /etc/cron", "Persistence monitoring (T1053)", "Detects crontab-based persistence"),
-        ("-w /etc/ssh", "SSH config monitoring (T1098.004)", "Detects SSH key injection and config tampering"),
-        ("-S connect", "Network connection monitoring (T1071)", "Tracks outbound connections for C2 detection"),
-        ("-S ptrace", "Process injection monitoring (T1055)", "Detects ptrace-based injection and debugging"),
-        ("-w /tmp -p x", "Temp execution monitoring (T1059)", "Detects execution from /tmp (common malware staging)"),
-        ("-S init_module", "Kernel module monitoring (T1547.006)", "Detects rootkit and kernel module loading"),
+        (
+            "-S execve",
+            "Execution monitoring (T1059)",
+            "Tracks all process execution — enables 120+ Sigma process_creation rules",
+        ),
+        (
+            "-w /etc/passwd",
+            "Identity file monitoring (T1003)",
+            "Detects credential harvesting and user enumeration",
+        ),
+        (
+            "-w /etc/shadow",
+            "Credential file monitoring (T1003)",
+            "Detects password hash access",
+        ),
+        (
+            "-w /etc/sudoers",
+            "Privilege config monitoring (T1548)",
+            "Detects sudo policy tampering",
+        ),
+        (
+            "-w /etc/cron",
+            "Persistence monitoring (T1053)",
+            "Detects crontab-based persistence",
+        ),
+        (
+            "-w /etc/ssh",
+            "SSH config monitoring (T1098.004)",
+            "Detects SSH key injection and config tampering",
+        ),
+        (
+            "-S connect",
+            "Network connection monitoring (T1071)",
+            "Tracks outbound connections for C2 detection",
+        ),
+        (
+            "-S ptrace",
+            "Process injection monitoring (T1055)",
+            "Detects ptrace-based injection and debugging",
+        ),
+        (
+            "-w /tmp -p x",
+            "Temp execution monitoring (T1059)",
+            "Detects execution from /tmp (common malware staging)",
+        ),
+        (
+            "-S init_module",
+            "Kernel module monitoring (T1547.006)",
+            "Detects rootkit and kernel module loading",
+        ),
     ];
 
     let mut missing = 0;
@@ -1830,7 +1874,11 @@ fn check_auditd() -> CheckResult {
         });
     }
 
-    CheckResult { category: cat, passed, findings }
+    CheckResult {
+        category: cat,
+        passed,
+        findings,
+    }
 }
 
 // ---------------------------------------------------------------------------

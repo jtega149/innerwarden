@@ -545,7 +545,8 @@ fn build_tls_config(
         // Use operator-provided cert/key
         info!(cert = %cert, key = %key, "loading TLS certificate");
         let rt = tokio::runtime::Handle::current();
-        let config = rt.block_on(RustlsConfig::from_pem_file(&cert, &key))
+        let config = rt
+            .block_on(RustlsConfig::from_pem_file(&cert, &key))
             .with_context(|| format!("failed to load TLS cert={cert} key={key}"))?;
         Ok(config)
     } else {
@@ -556,7 +557,8 @@ fn build_tls_config(
         if cert_file.exists() && key_file.exists() {
             info!("loading existing self-signed TLS certificate");
             let rt = tokio::runtime::Handle::current();
-            let config = rt.block_on(RustlsConfig::from_pem_file(&cert_file, &key_file))
+            let config = rt
+                .block_on(RustlsConfig::from_pem_file(&cert_file, &key_file))
                 .context("failed to load existing self-signed cert")?;
             return Ok(config);
         }
@@ -608,7 +610,8 @@ fn build_tls_config(
         );
 
         let rt = tokio::runtime::Handle::current();
-        let config = rt.block_on(RustlsConfig::from_pem_file(&cert_file, &key_file))
+        let config = rt
+            .block_on(RustlsConfig::from_pem_file(&cert_file, &key_file))
             .context("failed to load generated self-signed cert")?;
         Ok(config)
     }

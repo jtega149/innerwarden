@@ -26,20 +26,40 @@ const C2_ALLOWED_COMMS: &[&str] = &[
 /// Known DNS-over-HTTPS resolver IPs. Non-browser processes connecting to these
 /// on port 443 may be using DoH to evade DNS monitoring.
 const DOH_RESOLVER_IPS: &[&str] = &[
-    "1.1.1.1", "1.0.0.1",             // Cloudflare
-    "8.8.8.8", "8.8.4.4",             // Google
-    "9.9.9.9", "149.112.112.112",     // Quad9
-    "208.67.222.222", "208.67.220.220", // Cisco Umbrella
-    "94.140.14.14", "94.140.15.15",   // AdGuard
-    "185.228.168.168", "185.228.169.168", // CleanBrowsing
+    "1.1.1.1",
+    "1.0.0.1", // Cloudflare
+    "8.8.8.8",
+    "8.8.4.4", // Google
+    "9.9.9.9",
+    "149.112.112.112", // Quad9
+    "208.67.222.222",
+    "208.67.220.220", // Cisco Umbrella
+    "94.140.14.14",
+    "94.140.15.15", // AdGuard
+    "185.228.168.168",
+    "185.228.169.168", // CleanBrowsing
 ];
 
 /// Processes that legitimately use DoH (browsers, VPN clients, system resolvers).
 const DOH_ALLOWED_COMMS: &[&str] = &[
-    "firefox", "chrome", "chromium", "brave", "safari", "edge",
-    "openvpn", "wireguard", "nordvpn", "expressvpn", "protonvpn",
-    "systemd-resolve", "dnsmasq", "unbound", "named", "coredns",
-    "dnscrypt-proxy", "stubby",
+    "firefox",
+    "chrome",
+    "chromium",
+    "brave",
+    "safari",
+    "edge",
+    "openvpn",
+    "wireguard",
+    "nordvpn",
+    "expressvpn",
+    "protonvpn",
+    "systemd-resolve",
+    "dnsmasq",
+    "unbound",
+    "named",
+    "coredns",
+    "dnscrypt-proxy",
+    "stubby",
 ];
 
 /// Detects Command & Control (C2) callback patterns from outbound connections.
