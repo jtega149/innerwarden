@@ -39,5 +39,6 @@ jobs:
       - name: Upload to Codecov
         uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: cobertura.xml
           fail_ci_if_error: false
