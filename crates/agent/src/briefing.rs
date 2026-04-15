@@ -330,3 +330,44 @@ pub fn parse_briefing(llm_response: &str, context_threat_level: &str) -> Briefin
         summary: llm_response.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // parse_briefing preserves threat level and summary text
+    #[test]
+    fn parse_briefing_preserves_fields() {
+        let briefing = parse_briefing("All clear today.", "LOW");
+        assert_eq!(briefing.threat_level, "LOW");
+        assert_eq!(briefing.summary, "All clear today.");
+        assert!(!briefing.date.is_empty());
+    }
+
+    // parse_briefing with elevated threat level
+    #[test]
+    fn parse_briefing_elevated_threat_level() {
+        let briefing = parse_briefing("3 unresolved threats.", "ELEVATED");
+        assert_eq!(briefing.threat_level, "ELEVATED");
+        assert!(briefing.summary.contains("unresolved"));
+    }
+
+    // briefing_prompt injects context into system prompt
+    #[test]
+    fn briefing_prompt_contains_context() {
+        let ctx = "SITUATION STATUS:\n- Operator-relevant incidents today: 5\n";
+        let prompt = briefing_prompt(ctx);
+        assert!(prompt.contains("SITUATION STATUS"));
+        assert!(prompt.contains("InnerWarden"));
+        assert!(prompt.contains("150 words"));
+    }
+
+    // briefing_prompt contains key instructions
+    #[test]
+    fn briefing_prompt_has_critical_rules() {
+        let prompt = briefing_prompt("test context");
+        assert!(prompt.contains("CRITICAL RULES"));
+        assert!(prompt.contains("CONTAINED"));
+        assert!(prompt.contains("NEEDS ATTENTION"));
+    }
+}

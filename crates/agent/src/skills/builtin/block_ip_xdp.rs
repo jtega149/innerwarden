@@ -214,3 +214,79 @@ pub async fn xdp_unblock_ip(ip: &str) -> Result<(), String> {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::{HoneypotRuntimeConfig, SkillContext};
+
+    fn make_ctx(ip: Option<&str>) -> SkillContext {
+        SkillContext {
+            incident: innerwarden_core::incident::Incident {
+                ts: chrono::Utc::now(),
+                host: "h".into(),
+                incident_id: "id".into(),
+                severity: innerwarden_core::event::Severity::High,
+                title: "t".into(),
+                summary: "s".into(),
+                evidence: serde_json::json!({}),
+                recommended_checks: vec![],
+                tags: vec![],
+                entities: vec![],
+            },
+            target_ip: ip.map(str::to_string),
+            target_user: None,
+            target_container: None,
+            duration_secs: None,
+            host: "h".into(),
+            data_dir: std::env::temp_dir(),
+            honeypot: HoneypotRuntimeConfig::default(),
+            ai_provider: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_xdp_ipv4() {
+        let ctx = make_ctx(Some("1.2.3.4"));
+        let result = BlockIpXdp.execute(&ctx, true).await;
+        assert!(result.success);
+        assert!(result.message.contains("DRY RUN"));
+        assert!(result.message.contains("1.2.3.4"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_xdp_ipv6() {
+        let ctx = make_ctx(Some("2001:db8::1"));
+        let result = BlockIpXdp.execute(&ctx, true).await;
+        assert!(result.success);
+        assert!(result.message.contains("DRY RUN"));
+        assert!(result.message.contains("2001:db8::1"));
+    }
+
+    #[tokio::test]
+    async fn invalid_ip_xdp() {
+        let ctx = make_ctx(Some("not-an-ip"));
+        let result = BlockIpXdp.execute(&ctx, true).await;
+        assert!(!result.success);
+        assert!(result.message.contains("invalid IP"));
+    }
+
+    #[tokio::test]
+    async fn no_target_ip_xdp() {
+        let ctx = make_ctx(None);
+        let result = BlockIpXdp.execute(&ctx, true).await;
+        assert!(!result.success);
+        assert!(result.message.contains("no target IP"));
+    }
+
+    #[test]
+    fn skill_metadata_xdp() {
+        assert_eq!(BlockIpXdp.id(), "block-ip-xdp");
+        assert!(BlockIpXdp.name().contains("XDP"));
+        assert_eq!(BlockIpXdp.tier(), SkillTier::Open);
+        // XDP handles many more detectors than other skills
+        assert!(BlockIpXdp.applicable_to().len() > 10);
+        assert!(BlockIpXdp.applicable_to().contains(&"reverse_shell"));
+        assert!(BlockIpXdp.applicable_to().contains(&"ransomware"));
+    }
+}

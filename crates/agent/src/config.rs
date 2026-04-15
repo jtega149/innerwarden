@@ -2658,4 +2658,143 @@ approval_ttl_secs = 300
         };
         assert!(cfg.validate().is_ok());
     }
+
+    // -- AI config tests --
+
+    #[test]
+    fn ai_parsed_min_severity_defaults_to_high() {
+        let cfg = AiConfig::default();
+        assert_eq!(cfg.parsed_min_severity(), Severity::High);
+    }
+
+    #[test]
+    fn ai_parsed_min_severity_accepts_all_levels() {
+        let mut cfg = AiConfig::default();
+        cfg.min_severity = "low".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Low);
+        cfg.min_severity = "medium".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Medium);
+        cfg.min_severity = "critical".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn ai_parsed_min_severity_unknown_defaults_to_high() {
+        let mut cfg = AiConfig::default();
+        cfg.min_severity = "galaxy".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::High);
+    }
+
+    #[test]
+    fn ai_resolved_api_key_prefers_config() {
+        let mut cfg = AiConfig::default();
+        cfg.api_key = "my-key".into();
+        assert_eq!(cfg.resolved_api_key(), "my-key");
+    }
+
+    #[test]
+    fn ai_resolved_api_key_empty_config_falls_to_env() {
+        let cfg = AiConfig::default();
+        // Without env var set, returns empty string
+        let key = cfg.resolved_api_key();
+        // This just checks it doesn't panic; actual value depends on env
+        let _ = key;
+    }
+
+    #[test]
+    fn ai_default_values() {
+        let cfg = AiConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.provider, "openai");
+        assert!(cfg.confidence_threshold > 0.0);
+        assert!(cfg.max_ai_calls_per_tick > 0);
+        assert_eq!(cfg.circuit_breaker_threshold, 0); // disabled by default
+    }
+
+    // -- Telegram additional tests --
+
+    #[test]
+    fn telegram_is_simple_profile_case_insensitive() {
+        let mut cfg = TelegramConfig::default();
+        cfg.user_profile = "Simple".into();
+        assert!(cfg.is_simple_profile());
+        cfg.user_profile = "SIMPLE".into();
+        assert!(cfg.is_simple_profile());
+        cfg.user_profile = "technical".into();
+        assert!(!cfg.is_simple_profile());
+    }
+
+    #[test]
+    fn telegram_parsed_min_severity_all_levels() {
+        let mut cfg = TelegramConfig::default();
+        cfg.min_severity = "low".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Low);
+        cfg.min_severity = "medium".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Medium);
+        cfg.min_severity = "critical".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Critical);
+        cfg.min_severity = "nonsense".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::High); // default fallback
+    }
+
+    // -- Slack config tests --
+
+    #[test]
+    fn slack_parsed_min_severity_defaults_to_high() {
+        let cfg = SlackConfig::default();
+        assert_eq!(cfg.parsed_min_severity(), Severity::High);
+    }
+
+    #[test]
+    fn slack_parsed_min_severity_unknown_defaults_to_high() {
+        let mut cfg = SlackConfig::default();
+        cfg.min_severity = "banana".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::High);
+    }
+
+    // -- Webhook config tests --
+
+    #[test]
+    fn webhook_parsed_min_severity_all_levels() {
+        let mut cfg = WebhookConfig::default();
+        cfg.min_severity = "debug".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Debug);
+        cfg.min_severity = "info".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Info);
+        cfg.min_severity = "low".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Low);
+        cfg.min_severity = "high".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::High);
+        cfg.min_severity = "critical".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::Critical);
+    }
+
+    // -- Responder defaults --
+
+    #[test]
+    fn responder_defaults() {
+        let cfg = ResponderConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.dry_run);
+        assert!(!cfg.allowed_skills.is_empty());
+    }
+
+    // -- Channel notification defaults --
+
+    #[test]
+    fn channel_notification_default_is_actionable() {
+        let cfg = ChannelNotificationConfig::default();
+        assert_eq!(cfg.notification_level, ChannelFilterLevel::Actionable);
+    }
+
+    // -- Briefing config defaults --
+
+    #[test]
+    fn briefing_defaults() {
+        let cfg = BriefingConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.hour, 8);
+        assert_eq!(cfg.minute, 0);
+        assert!(cfg.telegram);
+    }
 }

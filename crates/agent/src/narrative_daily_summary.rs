@@ -190,3 +190,115 @@ fn effective_severity(inc: &Incident, detector: &str) -> Severity {
 
     raw
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_core::event::Severity;
+
+    fn make_incident(
+        detector: &str,
+        severity: Severity,
+        tags: Vec<&str>,
+        evidence: serde_json::Value,
+    ) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "test".into(),
+            incident_id: format!("{}:1.2.3.4:test", detector),
+            severity,
+            title: "Test".into(),
+            summary: "".into(),
+            evidence,
+            recommended_checks: vec![],
+            tags: tags.into_iter().map(|s| s.to_string()).collect(),
+            entities: vec![],
+        }
+    }
+
+    // SSH brute-force on key-only server: anything below Critical → Low
+    #[test]
+    fn effective_severity_ssh_bruteforce_high_becomes_low() {
+        let inc = make_incident(
+            "ssh_bruteforce",
+            Severity::High,
+            vec![],
+            serde_json::json!({}),
+        );
+        assert_eq!(effective_severity(&inc, "ssh_bruteforce"), Severity::Low);
+    }
+
+    // SSH brute-force at Critical stays Critical (attacker got past auth)
+    #[test]
+    fn effective_severity_ssh_bruteforce_critical_stays() {
+        let inc = make_incident(
+            "ssh_bruteforce",
+            Severity::Critical,
+            vec![],
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            effective_severity(&inc, "ssh_bruteforce"),
+            Severity::Critical
+        );
+    }
+
+    // Proto anomaly: High → Medium
+    #[test]
+    fn effective_severity_proto_anomaly_high_to_medium() {
+        let inc = make_incident(
+            "proto_anomaly",
+            Severity::High,
+            vec![],
+            serde_json::json!({}),
+        );
+        assert_eq!(effective_severity(&inc, "proto_anomaly"), Severity::Medium);
+    }
+
+    // Proto anomaly: Medium stays Medium (only High is clamped)
+    #[test]
+    fn effective_severity_proto_anomaly_medium_unchanged() {
+        let inc = make_incident(
+            "proto_anomaly",
+            Severity::Medium,
+            vec![],
+            serde_json::json!({}),
+        );
+        assert_eq!(effective_severity(&inc, "proto_anomaly"), Severity::Medium);
+    }
+
+    // Killchain with unknown pattern: High → Low
+    #[test]
+    fn effective_severity_killchain_unknown_high_to_low() {
+        let evidence = serde_json::json!({"pattern": "unknown"});
+        let inc = make_incident("killchain", Severity::High, vec![], evidence);
+        assert_eq!(effective_severity(&inc, "killchain"), Severity::Low);
+    }
+
+    // Threat intel auto_blocked → Low
+    #[test]
+    fn effective_severity_threat_intel_auto_blocked_to_low() {
+        let inc = make_incident(
+            "threat_intel",
+            Severity::High,
+            vec!["auto_blocked"],
+            serde_json::json!({}),
+        );
+        assert_eq!(effective_severity(&inc, "threat_intel"), Severity::Low);
+    }
+
+    // Correlated anomaly: High → Medium
+    #[test]
+    fn effective_severity_correlated_anomaly_high_to_medium() {
+        let inc = make_incident(
+            "correlated_anomaly",
+            Severity::High,
+            vec![],
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            effective_severity(&inc, "correlated_anomaly"),
+            Severity::Medium
+        );
+    }
+}

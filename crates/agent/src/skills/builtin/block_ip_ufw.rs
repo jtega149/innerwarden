@@ -85,3 +85,59 @@ impl ResponseSkill for BlockIpUfw {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::{HoneypotRuntimeConfig, SkillContext};
+
+    fn make_ctx(ip: Option<&str>) -> SkillContext {
+        SkillContext {
+            incident: innerwarden_core::incident::Incident {
+                ts: chrono::Utc::now(),
+                host: "h".into(),
+                incident_id: "id".into(),
+                severity: innerwarden_core::event::Severity::High,
+                title: "t".into(),
+                summary: "s".into(),
+                evidence: serde_json::json!({}),
+                recommended_checks: vec![],
+                tags: vec![],
+                entities: vec![],
+            },
+            target_ip: ip.map(str::to_string),
+            target_user: None,
+            target_container: None,
+            duration_secs: None,
+            host: "h".into(),
+            data_dir: std::env::temp_dir(),
+            honeypot: HoneypotRuntimeConfig::default(),
+            ai_provider: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_ufw() {
+        let ctx = make_ctx(Some("192.168.1.1"));
+        let result = BlockIpUfw.execute(&ctx, true).await;
+        assert!(result.success);
+        assert!(result.message.contains("DRY RUN"));
+        assert!(result.message.contains("192.168.1.1"));
+    }
+
+    #[tokio::test]
+    async fn no_target_ip_ufw() {
+        let ctx = make_ctx(None);
+        let result = BlockIpUfw.execute(&ctx, true).await;
+        assert!(!result.success);
+        assert!(result.message.contains("no target IP"));
+    }
+
+    #[test]
+    fn skill_metadata_ufw() {
+        assert_eq!(BlockIpUfw.id(), "block-ip-ufw");
+        assert!(BlockIpUfw.name().contains("ufw"));
+        assert_eq!(BlockIpUfw.tier(), SkillTier::Open);
+        assert!(BlockIpUfw.applicable_to().contains(&"credential_stuffing"));
+    }
+}
