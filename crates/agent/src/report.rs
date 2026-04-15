@@ -654,7 +654,7 @@ fn detect_previous_date(data_dir: &Path, analyzed_date: &str) -> Option<String> 
 /// Canonicalize and validate `data_dir` against trusted base directories.
 fn trusted_data_dir(data_dir: &Path) -> Option<PathBuf> {
     let canonical = data_dir.canonicalize().ok()?;
-    let trusted_bases = ["/var/lib", "/usr/local/var/lib", "/tmp"];
+    let trusted_bases = ["/var/lib/innerwarden", "/usr/local/var/lib/innerwarden"];
     for base in trusted_bases {
         if let Ok(base_canonical) = Path::new(base).canonicalize() {
             if canonical.starts_with(&base_canonical) {
