@@ -651,6 +651,20 @@ fn detect_previous_date(data_dir: &Path, analyzed_date: &str) -> Option<String> 
         .max()
 }
 
+/// Canonicalize and validate `data_dir` against trusted base directories.
+fn trusted_data_dir(data_dir: &Path) -> Option<PathBuf> {
+    let canonical = data_dir.canonicalize().ok()?;
+    let trusted_bases = ["/var/lib", "/usr/local/var/lib", "/tmp"];
+    for base in trusted_bases {
+        if let Ok(base_canonical) = Path::new(base).canonicalize() {
+            if canonical.starts_with(&base_canonical) {
+                return Some(canonical);
+            }
+        }
+    }
+    None
+}
+
 fn collect_available_dates(data_dir: &Path) -> Vec<String> {
     let mut dates = BTreeSet::new();
 
@@ -664,14 +678,10 @@ fn collect_available_dates(data_dir: &Path) -> Vec<String> {
     }
 
     // Also check filesystem for JSONL/summary files (legacy fallback)
-    // Canonicalize and verify the path is under a known base to satisfy CodeQL path checks.
-    let data_dir = match data_dir.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return dates.into_iter().collect(),
+    let data_dir = match trusted_data_dir(data_dir) {
+        Some(p) => p,
+        None => return dates.into_iter().collect(),
     };
-    if !data_dir.starts_with("/var/lib") && !data_dir.starts_with("/usr/local/var/lib") && !data_dir.starts_with("/tmp") {
-        return dates.into_iter().collect();
-    }
     let entries = match fs::read_dir(&data_dir) {
         Ok(entries) => entries,
         Err(_) => return dates.into_iter().collect(),
