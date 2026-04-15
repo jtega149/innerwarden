@@ -299,3 +299,54 @@ pub fn build_entry(
         prev_hash: None, // Set by DecisionWriter::write() via hash chaining
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::AiAction;
+
+    #[test]
+    fn test_build_entry_block_ip() {
+        let decision = AiDecision {
+            action: AiAction::BlockIp {
+                ip: "10.0.0.1".to_string(),
+                skill_id: "block-ip-xdp".to_string(),
+            },
+            confidence: 0.95,
+            reason: "malicious".to_string(),
+            auto_execute: true,
+            estimated_threat: "high".to_string(),
+            alternatives: vec![],
+        };
+
+        let entry = build_entry("inc-123", "host-1", "openai", &decision, false, "success");
+
+        assert_eq!(entry.incident_id, "inc-123");
+        assert_eq!(entry.action_type, "block_ip");
+        assert_eq!(entry.target_ip, Some("10.0.0.1".to_string()));
+        assert_eq!(entry.skill_id, Some("block-ip-xdp".to_string()));
+        assert_eq!(entry.execution_result, "success");
+    }
+
+    #[test]
+    fn test_build_entry_suspend_user() {
+        let decision = AiDecision {
+            action: AiAction::SuspendUserSudo {
+                user: "alice".to_string(),
+                duration_secs: 3600,
+            },
+            confidence: 0.8,
+            reason: "sudo fail".to_string(),
+            auto_execute: true,
+            estimated_threat: "medium".to_string(),
+            alternatives: vec![],
+        };
+
+        let entry = build_entry("inc-456", "host-2", "anthropic", &decision, true, "dry ran");
+
+        assert_eq!(entry.action_type, "suspend_user_sudo");
+        assert_eq!(entry.target_user, Some("alice".to_string()));
+        assert_eq!(entry.target_ip, None);
+        assert_eq!(entry.dry_run, true);
+    }
+}

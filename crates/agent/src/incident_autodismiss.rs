@@ -18,7 +18,7 @@ pub(crate) fn try_autodismiss_noise(
 ) -> bool {
     // Only auto-dismiss when the responder is active (Guard mode ON).
     // In Watch/DryRun mode the operator wants to see everything.
-    if !cfg.responder.enabled || cfg.responder.dry_run {
+    if !is_noise_gate_eligible(cfg.responder.enabled, cfg.responder.dry_run) {
         return false;
     }
 
@@ -83,5 +83,22 @@ pub(crate) fn try_autodismiss_noise(
     true
 }
 
+pub(crate) fn is_noise_gate_eligible(responder_enabled: bool, responder_dry_run: bool) -> bool {
+    responder_enabled && !responder_dry_run
+}
+
 // Integration tests for autodismiss live in main.rs test harness where
 // AgentState can be constructed via triage_test_state().
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_noise_gate_eligible() {
+        assert!(is_noise_gate_eligible(true, false));
+        assert!(!is_noise_gate_eligible(false, false));
+        assert!(!is_noise_gate_eligible(true, true));
+        assert!(!is_noise_gate_eligible(false, true));
+    }
+}

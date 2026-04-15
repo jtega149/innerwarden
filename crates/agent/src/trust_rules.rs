@@ -128,3 +128,88 @@ pub(crate) async fn enable_lsm_enforcement() -> Result<(), String> {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_core::event::Severity;
+    use innerwarden_core::incident::Incident;
+
+    fn mock_incident(
+        incident_id: &str,
+        title: &str,
+        summary: &str,
+        severity: Severity,
+    ) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: incident_id.to_string(),
+            severity,
+            title: title.to_string(),
+            summary: summary.to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn test_is_trusted() {
+        let mut rules = HashSet::new();
+        rules.insert("ssh_bruteforce:block_ip".to_string());
+        rules.insert("*:monitor".to_string());
+        rules.insert("port_scan:*".to_string());
+
+        assert!(is_trusted(&rules, "ssh_bruteforce", "block_ip"));
+        assert!(is_trusted(&rules, "any_detector", "monitor"));
+        assert!(is_trusted(&rules, "port_scan", "anything"));
+
+        assert!(!is_trusted(&rules, "ssh_bruteforce", "suspend_user"));
+        assert!(!is_trusted(&rules, "unknown", "block_ip"));
+    }
+
+    #[test]
+    fn test_should_auto_enable_lsm() {
+        // Low severity is always false regardless of detector
+        let inc1 = mock_incident(
+            "suspicious_execution:01",
+            "download",
+            "/tmp/foo",
+            Severity::Medium,
+        );
+        assert!(!should_auto_enable_lsm(&inc1));
+
+        // High severity + execution guard + /tmp
+        let inc2 = mock_incident(
+            "execution_guard:01",
+            "sh",
+            "/tmp/malware run",
+            Severity::High,
+        );
+        assert!(should_auto_enable_lsm(&inc2));
+
+        // High severity + lsm
+        let inc3 = mock_incident("lsm:01", "blocked", "something", Severity::Critical);
+        assert!(should_auto_enable_lsm(&inc3));
+
+        // High severity + container_escape + /dev/shm
+        let inc4 = mock_incident(
+            "container_escape:01",
+            "mount",
+            "mounted /dev/shm",
+            Severity::High,
+        );
+        assert!(should_auto_enable_lsm(&inc4));
+
+        // Unrelated high severity
+        let inc5 = mock_incident(
+            "ssh_bruteforce:01",
+            "brute",
+            "password fail",
+            Severity::High,
+        );
+        assert!(!should_auto_enable_lsm(&inc5));
+    }
+}

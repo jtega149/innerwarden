@@ -38,11 +38,8 @@ pub(crate) async fn execute_simple_action(
             duration_secs,
         } => {
             let skill_id = "suspend-user-sudo";
-            if !cfg.responder.allowed_skills.iter().any(|id| id == skill_id) {
-                return Some((
-                    format!("skipped: skill '{skill_id}' not in allowed_skills"),
-                    false,
-                ));
+            if let Err(msg) = check_skill_allowed(skill_id, &cfg.responder.allowed_skills) {
+                return Some((msg, false));
             }
             if let Some(skill) = state.skill_registry.get(skill_id) {
                 let ctx = skills::SkillContext {
@@ -72,11 +69,8 @@ pub(crate) async fn execute_simple_action(
             duration_secs,
         } => {
             let skill_id = "kill-process";
-            if !cfg.responder.allowed_skills.iter().any(|id| id == skill_id) {
-                return Some((
-                    format!("skipped: skill '{skill_id}' not in allowed_skills"),
-                    false,
-                ));
+            if let Err(msg) = check_skill_allowed(skill_id, &cfg.responder.allowed_skills) {
+                return Some((msg, false));
             }
             if let Some(skill) = state.skill_registry.get(skill_id) {
                 let ctx = skills::SkillContext {
@@ -106,11 +100,8 @@ pub(crate) async fn execute_simple_action(
             action: _,
         } => {
             let skill_id = "block-container";
-            if !cfg.responder.allowed_skills.iter().any(|id| id == skill_id) {
-                return Some((
-                    format!("skipped: skill '{skill_id}' not in allowed_skills"),
-                    false,
-                ));
+            if let Err(msg) = check_skill_allowed(skill_id, &cfg.responder.allowed_skills) {
+                return Some((msg, false));
             }
             if let Some(skill) = state.skill_registry.get(skill_id) {
                 let ctx = skills::SkillContext {
@@ -162,5 +153,36 @@ pub(crate) async fn execute_simple_action(
         }
         ai::AiAction::Ignore { reason } => Some((format!("ignored: {reason}"), false)),
         _ => None,
+    }
+}
+
+pub(crate) fn check_skill_allowed(skill_id: &str, allowed_skills: &[String]) -> Result<(), String> {
+    if allowed_skills.iter().any(|id| id == skill_id) {
+        Ok(())
+    } else {
+        Err(format!("skipped: skill '{skill_id}' not in allowed_skills"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_skill_allowed() {
+        let allowed = vec!["suspend-user-sudo".to_string(), "block-ip".to_string()];
+
+        assert_eq!(check_skill_allowed("suspend-user-sudo", &allowed), Ok(()));
+
+        assert_eq!(
+            check_skill_allowed("kill-process", &allowed),
+            Err("skipped: skill 'kill-process' not in allowed_skills".to_string())
+        );
+
+        let empty: Vec<String> = vec![];
+        assert_eq!(
+            check_skill_allowed("block-container", &empty),
+            Err("skipped: skill 'block-container' not in allowed_skills".to_string())
+        );
     }
 }

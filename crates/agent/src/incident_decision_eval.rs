@@ -116,15 +116,7 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
         let features = build_brain_features(incident, state);
         if let Some(suggestion) = state.defender_brain.suggest(&features) {
             let ai_action_str = format!("{:?}", decision.action);
-            let brain_agrees = {
-                let ba = suggestion.action_name;
-                let aa = &ai_action_str;
-                (ba == "block_ip" && aa.contains("BlockIp"))
-                    || (ba == "kill_process" && aa.contains("KillProcess"))
-                    || (ba == "observe" && (aa.contains("Ignore") || aa.contains("Monitor")))
-                    || (ba == "alert" && aa.contains("Monitor"))
-                    || (ba == "escalate" && aa.contains("Escalate"))
-            };
+            let brain_agrees = is_brain_agreeing_with_ai(suggestion.action_name, &ai_action_str);
 
             info!(
                 incident_id = %incident.incident_id,
@@ -332,4 +324,36 @@ fn build_brain_features(
     };
 
     f
+}
+
+pub(crate) fn is_brain_agreeing_with_ai(brain_action: &str, ai_action_str: &str) -> bool {
+    (brain_action == "block_ip" && ai_action_str.contains("BlockIp"))
+        || (brain_action == "kill_process" && ai_action_str.contains("KillProcess"))
+        || (brain_action == "observe"
+            && (ai_action_str.contains("Ignore") || ai_action_str.contains("Monitor")))
+        || (brain_action == "alert" && ai_action_str.contains("Monitor"))
+        || (brain_action == "escalate" && ai_action_str.contains("Escalate"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_brain_agreeing_with_ai() {
+        assert!(is_brain_agreeing_with_ai("block_ip", "BlockIp(10.0.0.1)"));
+        assert!(!is_brain_agreeing_with_ai("block_ip", "Monitor"));
+
+        assert!(is_brain_agreeing_with_ai("observe", "Ignore"));
+        assert!(is_brain_agreeing_with_ai("observe", "Monitor"));
+
+        assert!(is_brain_agreeing_with_ai("alert", "Monitor"));
+        assert!(!is_brain_agreeing_with_ai("alert", "Ignore"));
+
+        assert!(is_brain_agreeing_with_ai("kill_process", "KillProcess"));
+        assert!(!is_brain_agreeing_with_ai(
+            "kill_process",
+            "SuspendUserSudo"
+        ));
+    }
 }

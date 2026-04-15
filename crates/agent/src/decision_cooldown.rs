@@ -291,3 +291,127 @@ pub(crate) fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiAction, AiDecision};
+    use crate::decisions::DecisionEntry;
+    use innerwarden_core::entities::EntityRef;
+    use innerwarden_core::event::Severity;
+    use innerwarden_core::incident::Incident;
+
+    fn mock_incident(incident_id: &str, entities: Vec<EntityRef>) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: incident_id.to_string(),
+            severity: Severity::High,
+            title: "Test Incident".to_string(),
+            summary: "".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities,
+        }
+    }
+
+    #[test]
+    fn test_notification_cooldown_keys() {
+        let inc = mock_incident(
+            "sshd:bruteforce:123",
+            vec![
+                EntityRef::ip("1.2.3.4"),
+                EntityRef::user("root"),
+                EntityRef::container("c1"),
+            ],
+        );
+        let keys = notification_cooldown_keys(&inc);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"sshd:ip:1.2.3.4".to_string()));
+        assert!(keys.contains(&"sshd:user:root".to_string()));
+    }
+
+    #[test]
+    fn test_decision_cooldown_candidates() {
+        let inc = mock_incident(
+            "pam:sudo_fail:456",
+            vec![EntityRef::ip("5.6.7.8"), EntityRef::user("admin")],
+        );
+        let keys = decision_cooldown_candidates(&inc);
+        assert_eq!(keys.len(), 4);
+        assert!(keys.contains(&"block_ip:pam:ip:5.6.7.8".to_string()));
+        assert!(keys.contains(&"monitor:pam:ip:5.6.7.8".to_string()));
+        assert!(keys.contains(&"honeypot:pam:ip:5.6.7.8".to_string()));
+        assert!(keys.contains(&"suspend_user_sudo:pam:user:admin".to_string()));
+    }
+
+    #[test]
+    fn test_decision_cooldown_key_for_decision() {
+        let inc = mock_incident("kernel:oops:789", vec![]);
+        let decision_block = AiDecision {
+            action: AiAction::BlockIp {
+                ip: "9.9.9.9".to_string(),
+                skill_id: "block-ip-xdp".to_string(),
+            },
+            confidence: 0.9,
+            reason: "test".to_string(),
+            auto_execute: true,
+            estimated_threat: "high".to_string(),
+            alternatives: vec![],
+        };
+        let key = decision_cooldown_key_for_decision(&inc, &decision_block);
+        assert_eq!(key, Some("block_ip:kernel:ip:9.9.9.9".to_string()));
+
+        let decision_monitor = AiDecision {
+            action: AiAction::Monitor {
+                ip: "9.9.9.9".to_string(),
+            },
+            confidence: 0.5,
+            reason: "test".to_string(),
+            auto_execute: true,
+            estimated_threat: "medium".to_string(),
+            alternatives: vec![],
+        };
+        let key2 = decision_cooldown_key_for_decision(&inc, &decision_monitor);
+        assert_eq!(key2, Some("monitor:kernel:ip:9.9.9.9".to_string()));
+
+        let decision_ignore = AiDecision {
+            action: AiAction::Ignore {
+                reason: "benign".to_string(),
+            },
+            confidence: 1.0,
+            reason: "test".to_string(),
+            auto_execute: false,
+            estimated_threat: "low".to_string(),
+            alternatives: vec![],
+        };
+        assert_eq!(
+            decision_cooldown_key_for_decision(&inc, &decision_ignore),
+            None
+        );
+    }
+
+    #[test]
+    fn test_decision_cooldown_key_from_entry() {
+        let entry = DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: "nginx:404:000".to_string(),
+            host: "test".to_string(),
+            ai_provider: "test".to_string(),
+            target_ip: Some("10.0.0.1".to_string()),
+            action_type: "block_ip".to_string(),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.9,
+            auto_executed: true,
+            dry_run: false,
+            execution_result: "success".to_string(),
+            reason: "test".to_string(),
+            estimated_threat: "high".to_string(),
+            prev_hash: None,
+        };
+        let key = decision_cooldown_key_from_entry(&entry);
+        assert_eq!(key, Some("block_ip:nginx:ip:10.0.0.1".to_string()));
+    }
+}

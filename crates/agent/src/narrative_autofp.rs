@@ -50,27 +50,7 @@ pub(crate) async fn maybe_suggest_allowlist_from_fp_reports(
                 continue;
             }
 
-            let text = format!(
-                "\u{1f4ca} <b>Auto-learn suggestion</b>\n\n\
-                 <code>{entity}</code> has been reported as false positive \
-                 {count} times for <code>{detector}</code>.\n\n\
-                 Add to allowlist permanently?",
-                entity = telegram::escape_html_pub(entity),
-                detector = telegram::escape_html_pub(detector),
-            );
-            let is_ip = entity.parse::<std::net::IpAddr>().is_ok();
-            let section = if is_ip { "ip" } else { "proc" };
-            let yes_cb = format!("autofp:yes:{section}:{entity}");
-            let no_cb = format!("autofp:no:{entity}");
-            // Truncate callback data to 64 bytes.
-            let yes_cb = telegram::truncate_callback_pub(&yes_cb);
-            let no_cb = telegram::truncate_callback_pub(&no_cb);
-            let keyboard = serde_json::json!([
-                [
-                    { "text": "\u{2705} Yes, allowlist", "callback_data": yes_cb },
-                    { "text": "\u{274c} No, keep monitoring", "callback_data": no_cb }
-                ]
-            ]);
+            let (text, keyboard) = build_autofp_message_and_keyboard(entity, detector, *count);
 
             if let Some(ref tg) = state.telegram_client {
                 // Auto-FP suggestions go through notification gate.
@@ -105,5 +85,68 @@ pub(crate) async fn maybe_suggest_allowlist_from_fp_reports(
                 }
             }
         }
+    }
+}
+
+pub(crate) fn build_autofp_message_and_keyboard(
+    entity: &str,
+    detector: &str,
+    count: u32,
+) -> (String, serde_json::Value) {
+    let text = format!(
+        "\u{1f4ca} <b>Auto-learn suggestion</b>\n\n\
+         <code>{entity}</code> has been reported as false positive \
+         {count} times for <code>{detector}</code>.\n\n\
+         Add to allowlist permanently?",
+        entity = telegram::escape_html_pub(entity),
+        detector = telegram::escape_html_pub(detector),
+    );
+    let is_ip = entity.parse::<std::net::IpAddr>().is_ok();
+    let section = if is_ip { "ip" } else { "proc" };
+    let yes_cb = format!("autofp:yes:{section}:{entity}");
+    let no_cb = format!("autofp:no:{entity}");
+
+    let yes_cb = telegram::truncate_callback_pub(&yes_cb);
+    let no_cb = telegram::truncate_callback_pub(&no_cb);
+
+    let keyboard = serde_json::json!([
+        [
+            { "text": "\u{2705} Yes, allowlist", "callback_data": yes_cb },
+            { "text": "\u{274c} No, keep monitoring", "callback_data": no_cb }
+        ]
+    ]);
+    (text, keyboard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_autofp_message_and_keyboard_for_ip() {
+        let (text, keyboard) = build_autofp_message_and_keyboard("8.8.8.8", "ssh_bruteforce", 3);
+
+        // Assert text mentions both
+        assert!(text.contains("8.8.8.8"));
+        assert!(text.contains("ssh_bruteforce"));
+        assert!(text.contains("3 times"));
+
+        // IP entity means section is "ip"
+        let yes_cb = keyboard[0][0]["callback_data"].as_str().unwrap();
+        assert_eq!(yes_cb, "autofp:yes:ip:8.8.8.8");
+    }
+
+    #[test]
+    fn test_build_autofp_message_and_keyboard_for_proc() {
+        let (text, keyboard) = build_autofp_message_and_keyboard("/bin/bash", "suspicious_exec", 5);
+
+        // Assert text mentions both
+        assert!(text.contains("/bin/bash"));
+        assert!(text.contains("suspicious_exec"));
+        assert!(text.contains("5 times"));
+
+        // Non-IP entity means section is "proc"
+        let yes_cb = keyboard[0][0]["callback_data"].as_str().unwrap();
+        assert_eq!(yes_cb, "autofp:yes:proc:/bin/bash");
     }
 }

@@ -1350,3 +1350,95 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ai_provider_defaults() {
+        let (model, key, url) = ai_provider_defaults("openai");
+        assert_eq!(model, "gpt-4o-mini");
+        assert_eq!(key, Some("OPENAI_API_KEY".to_string()));
+        assert_eq!(url, None);
+
+        let (model, key, url) = ai_provider_defaults("groq");
+        assert_eq!(model, "llama-3.3-70b-versatile");
+        assert_eq!(key, Some("GROQ_API_KEY".to_string()));
+        assert_eq!(url, Some("https://api.groq.com/openai".to_string()));
+
+        let (model, key, url) = ai_provider_defaults("ollama");
+        assert_eq!(model, "llama3.2");
+        assert_eq!(key, None);
+        assert_eq!(url, None);
+
+        let (model, key, _url) = ai_provider_defaults("unknown_provider");
+        assert_eq!(model, "gpt-4o-mini");
+        assert_eq!(key, Some("UNKNOWN_PROVIDER_API_KEY".to_string()));
+    }
+
+    #[test]
+    fn test_count_failed_setup_checks() {
+        let checks = vec![
+            SetupCheck {
+                label: "1".into(),
+                detail: "".into(),
+                ok: true,
+                critical: true,
+            },
+            SetupCheck {
+                label: "2".into(),
+                detail: "".into(),
+                ok: false,
+                critical: true,
+            },
+            SetupCheck {
+                label: "3".into(),
+                detail: "".into(),
+                ok: false,
+                critical: false,
+            },
+        ];
+        assert_eq!(count_failed_setup_checks(&checks), 1);
+    }
+
+    #[test]
+    fn test_setup_verdict() {
+        assert_eq!(setup_verdict(0), "READY");
+        assert_eq!(setup_verdict(1), "READY_WITH_GAPS");
+        assert_eq!(setup_verdict(5), "READY_WITH_GAPS");
+    }
+
+    #[test]
+    fn test_setup_remediation_command() {
+        let mut checks = vec![];
+
+        // 0 critical
+        assert_eq!(setup_remediation_command(&checks, false), None);
+
+        // 1 critical: Agent service
+        checks.push(SetupCheck {
+            label: "Agent service".into(),
+            detail: "".into(),
+            ok: false,
+            critical: true,
+        });
+
+        let linux_cmd = setup_remediation_command(&checks, false).unwrap();
+        assert!(linux_cmd.contains("systemctl restart"));
+
+        let macos_cmd = setup_remediation_command(&checks, true).unwrap();
+        assert!(macos_cmd.contains("launchctl kickstart"));
+
+        // More than 1 critical
+        checks.push(SetupCheck {
+            label: "AI".into(),
+            detail: "".into(),
+            ok: false,
+            critical: true,
+        });
+
+        let complex_cmd = setup_remediation_command(&checks, false).unwrap();
+        assert_eq!(complex_cmd, "innerwarden setup --mode advanced");
+    }
+}
