@@ -200,6 +200,9 @@ pub async fn serve(
     briefing_hour: u8,
     briefing_minute: u8,
     sqlite_store: Option<Arc<innerwarden_store::Store>>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    insecure_no_tls: bool,
 ) -> Result<()> {
     if auth.is_none() {
         warn!(
@@ -469,7 +472,7 @@ pub async fn serve(
         .layer(rate_limit_layer);
 
     // D6: spawn file watcher and heartbeat tasks
-    tokio::spawn(watch_for_new_entries(data_dir, event_tx.clone()));
+    tokio::spawn(watch_for_new_entries(data_dir.clone(), event_tx.clone()));
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
@@ -499,17 +502,116 @@ pub async fn serve(
         }
     });
 
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .with_context(|| format!("failed to bind dashboard listener on {bind}"))?;
+    if insecure_no_tls {
+        // ── Plain HTTP (explicitly opted out of TLS) ─────────────────
+        warn!(
+            bind = %bind,
+            "dashboard serving over PLAIN HTTP — credentials and data are NOT encrypted. \
+             Use --tls-cert/--tls-key or remove --insecure-no-tls for production."
+        );
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .with_context(|| format!("failed to bind dashboard listener on {bind}"))?;
+        axum::serve(listener, app)
+            .await
+            .context("dashboard server failed")
+    } else {
+        // ── HTTPS (default) ──────────────────────────────────────────
+        let tls_config = build_tls_config(&data_dir, tls_cert, tls_key)?;
+        let addr: std::net::SocketAddr = bind
+            .parse()
+            .with_context(|| format!("invalid bind address: {bind}"))?;
 
-    info!(
-        bind = %bind,
-        "dashboard read-only mode started"
-    );
-    axum::serve(listener, app)
-        .await
-        .context("dashboard server failed")
+        info!(
+            bind = %bind,
+            "dashboard HTTPS started"
+        );
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(app.into_make_service())
+            .await
+            .context("dashboard HTTPS server failed")
+    }
+}
+
+/// Build RustlsConfig from cert/key files or auto-generate a self-signed cert.
+fn build_tls_config(
+    data_dir: &std::path::Path,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    use axum_server::tls_rustls::RustlsConfig;
+
+    if let (Some(cert), Some(key)) = (cert_path, key_path) {
+        // Use operator-provided cert/key
+        info!(cert = %cert, key = %key, "loading TLS certificate");
+        let rt = tokio::runtime::Handle::current();
+        let config = rt.block_on(RustlsConfig::from_pem_file(&cert, &key))
+            .with_context(|| format!("failed to load TLS cert={cert} key={key}"))?;
+        Ok(config)
+    } else {
+        // Auto-generate self-signed certificate
+        let cert_file = data_dir.join("dashboard-cert.pem");
+        let key_file = data_dir.join("dashboard-key.pem");
+
+        if cert_file.exists() && key_file.exists() {
+            info!("loading existing self-signed TLS certificate");
+            let rt = tokio::runtime::Handle::current();
+            let config = rt.block_on(RustlsConfig::from_pem_file(&cert_file, &key_file))
+                .context("failed to load existing self-signed cert")?;
+            return Ok(config);
+        }
+
+        info!("generating self-signed TLS certificate for dashboard");
+        let mut params = rcgen::CertificateParams::new(vec![
+            "localhost".to_string(),
+            "innerwarden".to_string(),
+        ])?;
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("InnerWarden Dashboard".to_string()),
+        );
+        params.distinguished_name.push(
+            rcgen::DnType::OrganizationName,
+            rcgen::DnValue::Utf8String("InnerWarden".to_string()),
+        );
+        // Valid for 365 days
+        params.not_after = rcgen::date_time_ymd(2027, 4, 15);
+        // Add SANs for common access patterns
+        params.subject_alt_names = vec![
+            rcgen::SanType::DnsName("localhost".try_into()?),
+            rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
+            rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))),
+        ];
+
+        let key_pair = rcgen::KeyPair::generate()?;
+        let cert = params.self_signed(&key_pair)?;
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        std::fs::write(&cert_file, &cert_pem)
+            .with_context(|| format!("failed to write {}", cert_file.display()))?;
+        std::fs::write(&key_file, &key_pem)
+            .with_context(|| format!("failed to write {}", key_file.display()))?;
+
+        // Restrict key file permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&cert_file, std::fs::Permissions::from_mode(0o644));
+        }
+
+        info!(
+            cert = %cert_file.display(),
+            key = %key_file.display(),
+            "self-signed TLS certificate generated (valid 365 days)"
+        );
+
+        let rt = tokio::runtime::Handle::current();
+        let config = rt.block_on(RustlsConfig::from_pem_file(&cert_file, &key_file))
+            .context("failed to load generated self-signed cert")?;
+        Ok(config)
+    }
 }
 
 // ---------------------------------------------------------------------------

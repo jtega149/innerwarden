@@ -158,6 +158,20 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:8787")]
     dashboard_bind: String,
 
+    /// Path to TLS certificate file (PEM). If not set, dashboard auto-generates
+    /// a self-signed cert and serves on HTTPS.
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// Path to TLS private key file (PEM). Required if --tls-cert is set.
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    /// Disable TLS and serve dashboard over plain HTTP (NOT recommended for
+    /// production). Default: HTTPS with auto-generated self-signed cert.
+    #[arg(long)]
+    insecure_no_tls: bool,
+
     /// Utility: generate Argon2 password hash for dashboard auth and exit.
     #[arg(long)]
     dashboard_generate_password_hash: bool,
@@ -864,6 +878,9 @@ async fn main() -> Result<()> {
         let briefing_hour = cfg.briefing.hour;
         let briefing_minute = cfg.briefing.minute;
         let dashboard_store = sqlite_store.clone();
+        let tls_cert = cli.tls_cert.clone();
+        let tls_key = cli.tls_key.clone();
+        let insecure_no_tls = cli.insecure_no_tls;
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -884,6 +901,9 @@ async fn main() -> Result<()> {
                 briefing_hour,
                 briefing_minute,
                 dashboard_store,
+                tls_cert,
+                tls_key,
+                insecure_no_tls,
             )
             .await
             {
