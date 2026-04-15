@@ -135,7 +135,7 @@ pub(crate) async fn try_handle_auto_rule(
     let auto_decision = ai::AiDecision {
         action: ai::AiAction::BlockIp {
             ip: ip.to_string(),
-            skill_id,
+            skill_id: skill_id.clone(),
         },
         confidence: 0.95,
         auto_execute: true,
@@ -161,7 +161,7 @@ pub(crate) async fn try_handle_auto_rule(
         action_type: "block_ip".to_string(),
         target_ip: Some(ip.to_string()),
         target_user: None,
-        skill_id: None,
+        skill_id: Some(skill_id.clone()),
         confidence: 0.95,
         auto_executed: true,
         dry_run: cfg.responder.dry_run,
@@ -235,24 +235,38 @@ pub(crate) async fn try_handle_auto_rule(
         }
     }
 
-    true
+    // Only mark as handled if execution was not skipped (or dry-run logged it)
+    !execution_result.starts_with("skipped")
 }
 
-/// Check if an IP is RFC 1918 / loopback / link-local.
+/// Check if an IP is RFC 1918 / loopback / link-local / ULA.
 fn is_internal_ip(ip: &str) -> bool {
-    ip.starts_with("10.")
-        || ip.starts_with("172.16.")
-        || ip.starts_with("172.17.")
-        || ip.starts_with("172.18.")
-        || ip.starts_with("172.19.")
-        || ip.starts_with("172.2")
-        || ip.starts_with("172.30.")
-        || ip.starts_with("172.31.")
-        || ip.starts_with("192.168.")
-        || ip.starts_with("127.")
-        || ip == "::1"
-        || ip.starts_with("fe80:")
-        || ip.starts_with("fd")
+    use std::net::IpAddr;
+    let Ok(addr) = ip.parse::<IpAddr>() else {
+        return false;
+    };
+    match addr {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 10.0.0.0/8
+            octets[0] == 10
+            // 172.16.0.0/12
+            || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+            // 192.168.0.0/16
+            || (octets[0] == 192 && octets[1] == 168)
+            // 127.0.0.0/8 (loopback)
+            || octets[0] == 127
+            // 169.254.0.0/16 (link-local)
+            || (octets[0] == 169 && octets[1] == 254)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+            // fe80::/10 (link-local)
+            || (v6.segments()[0] & 0xffc0) == 0xfe80
+            // fc00::/7 (ULA)
+            || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
 }
 
 #[cfg(test)]
@@ -261,14 +275,27 @@ mod tests {
 
     #[test]
     fn internal_ip_detection() {
+        // RFC 1918
         assert!(is_internal_ip("10.0.0.1"));
         assert!(is_internal_ip("192.168.1.1"));
         assert!(is_internal_ip("172.16.0.1"));
+        assert!(is_internal_ip("172.31.255.255"));
+        // Loopback
         assert!(is_internal_ip("127.0.0.1"));
         assert!(is_internal_ip("::1"));
+        // Link-local
+        assert!(is_internal_ip("169.254.1.1"));
         assert!(is_internal_ip("fe80::1"));
+        // ULA
+        assert!(is_internal_ip("fd00::1"));
+        assert!(is_internal_ip("fc00::1"));
+        // Public — must NOT match
         assert!(!is_internal_ip("8.8.8.8"));
         assert!(!is_internal_ip("185.220.101.1"));
+        assert!(!is_internal_ip("172.15.0.1")); // just below 172.16/12
+        assert!(!is_internal_ip("172.32.0.1")); // just above 172.31
+                                                // Invalid
+        assert!(!is_internal_ip("not-an-ip"));
     }
 
     #[test]
