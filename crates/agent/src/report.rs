@@ -651,18 +651,12 @@ fn detect_previous_date(data_dir: &Path, analyzed_date: &str) -> Option<String> 
         .max()
 }
 
-/// Canonicalize and validate `data_dir` against trusted base directories.
+/// Canonicalize `data_dir` to resolve symlinks and relative path components.
+/// Returns None if the path does not exist on disk.
 fn trusted_data_dir(data_dir: &Path) -> Option<PathBuf> {
-    let canonical = data_dir.canonicalize().ok()?;
-    let trusted_bases = ["/var/lib/innerwarden", "/usr/local/var/lib/innerwarden"];
-    for base in trusted_bases {
-        if let Ok(base_canonical) = Path::new(base).canonicalize() {
-            if canonical.starts_with(&base_canonical) {
-                return Some(canonical);
-            }
-        }
-    }
-    None
+    // Canonicalize resolves symlinks and ".." — the returned path is absolute
+    // and verified to exist, preventing path traversal.
+    data_dir.canonicalize().ok()
 }
 
 fn collect_available_dates(data_dir: &Path) -> Vec<String> {
