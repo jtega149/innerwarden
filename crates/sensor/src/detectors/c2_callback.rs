@@ -23,6 +23,45 @@ const C2_ALLOWED_COMMS: &[&str] = &[
     "puma",         // Ruby web server
 ];
 
+/// Known DNS-over-HTTPS resolver IPs. Non-browser processes connecting to these
+/// on port 443 may be using DoH to evade DNS monitoring.
+const DOH_RESOLVER_IPS: &[&str] = &[
+    "1.1.1.1",
+    "1.0.0.1", // Cloudflare
+    "8.8.8.8",
+    "8.8.4.4", // Google
+    "9.9.9.9",
+    "149.112.112.112", // Quad9
+    "208.67.222.222",
+    "208.67.220.220", // Cisco Umbrella
+    "94.140.14.14",
+    "94.140.15.15", // AdGuard
+    "185.228.168.168",
+    "185.228.169.168", // CleanBrowsing
+];
+
+/// Processes that legitimately use DoH (browsers, VPN clients, system resolvers).
+const DOH_ALLOWED_COMMS: &[&str] = &[
+    "firefox",
+    "chrome",
+    "chromium",
+    "brave",
+    "safari",
+    "edge",
+    "openvpn",
+    "wireguard",
+    "nordvpn",
+    "expressvpn",
+    "protonvpn",
+    "systemd-resolve",
+    "dnsmasq",
+    "unbound",
+    "named",
+    "coredns",
+    "dnscrypt-proxy",
+    "stubby",
+];
+
 /// Detects Command & Control (C2) callback patterns from outbound connections.
 ///
 /// Patterns detected:
@@ -30,6 +69,7 @@ const C2_ALLOWED_COMMS: &[&str] = &[
 /// 2. Beaconing - periodic connections to the same IP at regular intervals
 /// 3. Unusual processes making outbound connections (sh, bash, python, perl, nc)
 /// 4. Burst of connections to many different IPs in short time (data exfil)
+/// 5. DNS-over-HTTPS evasion (non-browser process connecting to DoH resolvers)
 pub struct C2CallbackDetector {
     window: Duration,
     /// Per-IP ring of connection timestamps (for beaconing detection)
@@ -243,6 +283,30 @@ impl C2CallbackDetector {
                 summary: format!(
                     "Possible data exfiltration: {comm} connected to {unique_dests} unique IPs in {} seconds",
                     self.window.num_seconds()
+                ),
+            }));
+        }
+
+        // ── Check 5: DNS-over-HTTPS evasion ─────────────────────────────
+        // Non-browser process connecting to known DoH resolver on port 443.
+        // Attackers use DoH to hide C2 DNS queries from network monitoring.
+        if dst_port == 443
+            && DOH_RESOLVER_IPS.contains(&dst_ip.as_str())
+            && !DOH_ALLOWED_COMMS.iter().any(|c| comm_base.starts_with(c))
+        {
+            self.alerted.insert(alert_key, now);
+            return Some(self.build_incident(IncidentParams {
+                dst_ip: &dst_ip,
+                dst_port,
+                comm: &comm,
+                pid,
+                ts: now,
+                pattern: "doh_evasion",
+                severity: Severity::Medium,
+                summary: format!(
+                    "DNS-over-HTTPS evasion: {comm} (pid={pid}) connected to DoH resolver \
+                     {dst_ip}:443. Non-browser processes using DoH may be hiding C2 DNS queries \
+                     from network monitoring."
                 ),
             }));
         }

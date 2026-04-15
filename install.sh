@@ -251,33 +251,13 @@ run_simulated_setup_flow() {
   echo "  [SIMULATION] Running setup flow in dry-run mode (${SIMULATE_MODE})."
   echo ""
 
-  run_with_tty_if_available() {
-    if [[ -t 0 ]]; then
-      "$@"
-    elif [[ -e /dev/tty ]] && { : < /dev/tty; } 2>/dev/null; then
-      "$@" < /dev/tty
-    else
-      "$@"
-    fi
-  }
-
-  local wizard_path="${SCRIPT_DIR}/scripts/setup-wizard.sh"
-
-  if [[ -x "${wizard_path}" ]]; then
-    echo "  [SIMULATION] Launching interactive wizard (no root required)..."
-    if run_with_tty_if_available "${wizard_path}"; then
-      return 0
-    fi
-    echo "  [SIMULATION] Wizard unavailable in this shell."
-    echo "  [SIMULATION] Open a normal interactive terminal and run:"
-    echo "    ${wizard_path}"
-    return 0
+  if command -v innerwarden >/dev/null 2>&1; then
+    innerwarden setup --dry-run --mode "${SIMULATE_MODE}"
+  else
+    echo "  [SIMULATION] innerwarden binary not found."
+    echo "  [SIMULATION] Run the installer without --simulate first, then:"
+    echo "    innerwarden setup --dry-run --mode ${SIMULATE_MODE}"
   fi
-
-  echo "  [SIMULATION] setup-wizard.sh not found."
-  echo "  [SIMULATION] This mode intentionally avoids root prompts."
-  echo "  [SIMULATION] For CLI dry-run (may request sudo), run manually:"
-  echo "    innerwarden setup --dry-run --mode ${SIMULATE_MODE}"
   return 0
 }
 
@@ -361,13 +341,8 @@ fi
 ENABLE_EXEC_AUDIT="${INNERWARDEN_ENABLE_EXEC_AUDIT:-}"
 ENABLE_EXEC_AUDIT_TTY="${INNERWARDEN_ENABLE_EXEC_AUDIT_TTY:-}"
 
-if [[ -t 0 && -z "${ENABLE_EXEC_AUDIT}" ]]; then
-  echo
-  echo "Privacy notice:"
-  echo "  Shell auditing can capture executed commands and, if enabled, terminal input."
-  echo "  This may include sensitive or personal data."
-  echo "  Enable only with explicit legal authorization from the host owner."
-  if prompt_yes_no "Enable shell command audit trail (auditd EXECVE)?" "no"; then
+if [[ -z "${ENABLE_EXEC_AUDIT}" ]]; then
+  if [[ "${OS_TYPE}" == "Linux" ]]; then
     ENABLE_EXEC_AUDIT="true"
   else
     ENABLE_EXEC_AUDIT="false"
@@ -377,13 +352,6 @@ fi
 ENABLE_EXEC_AUDIT="$(normalize_bool "${ENABLE_EXEC_AUDIT:-false}")"
 
 if [[ "${ENABLE_EXEC_AUDIT}" == "true" ]]; then
-  if [[ -t 0 && -z "${ENABLE_EXEC_AUDIT_TTY}" ]]; then
-    if prompt_yes_no "Also ingest auditd TTY input records when available? (higher privacy impact)" "no"; then
-      ENABLE_EXEC_AUDIT_TTY="true"
-    else
-      ENABLE_EXEC_AUDIT_TTY="false"
-    fi
-  fi
   ENABLE_EXEC_AUDIT_TTY="$(normalize_bool "${ENABLE_EXEC_AUDIT_TTY:-false}")"
 else
   ENABLE_EXEC_AUDIT_TTY="false"

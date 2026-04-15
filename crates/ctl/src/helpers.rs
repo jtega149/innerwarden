@@ -82,6 +82,15 @@ pub(crate) fn load_env_file(path: &Path) -> HashMap<String, String> {
     map
 }
 
+/// Mask a secret for display: "123456789:ABC" → "123***ABC".
+pub(crate) fn mask_secret(s: &str) -> String {
+    if s.len() <= 6 {
+        "***".to_string()
+    } else {
+        format!("{}***{}", &s[..3], &s[s.len() - 3..])
+    }
+}
+
 /// Send a plain Telegram message (MarkdownV2).
 pub(crate) fn send_telegram_message_md(token: &str, chat_id: &str, text: &str) -> Result<()> {
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");

@@ -157,7 +157,7 @@ async function showProfileDetail(ip) {
 let currentIntelTab = 'profiles';
 function switchIntelTab(tab) {
   currentIntelTab = tab;
-  const tabs = ['Profiles','Campaigns','Chains','Baseline','Playbooks','Brain'];
+  const tabs = ['Profiles','Campaigns','Chains','Baseline','Playbooks','Brain','Mitre'];
   tabs.forEach(t => {
     const btn = document.getElementById('intelTab'+t);
     if (btn) { const active = t.toLowerCase() === tab; btn.style.background = active ? 'var(--accent)' : 'var(--card-bg)'; btn.style.color = active ? '#fff' : 'var(--text)'; btn.style.borderColor = active ? 'var(--accent)' : 'var(--border)'; }
@@ -167,6 +167,7 @@ function switchIntelTab(tab) {
   else if (tab === 'baseline') loadBaseline();
   else if (tab === 'playbooks') loadPlaybooks();
   else if (tab === 'brain') loadBrain();
+  else if (tab === 'mitre') loadMitreCoverage();
   else loadIntel();
 }
 
@@ -452,5 +453,77 @@ async function brainFeedback(incidentId, correct) {
     });
     loadBrain(); // Refresh
   } catch(e) { console.error('Brain feedback failed:', e); }
+}
+
+async function loadMitreCoverage() {
+  const content = document.getElementById('intelContent');
+  const status = document.getElementById('intelViewStatus');
+  if (status) status.textContent = 'Loading MITRE coverage…';
+  try {
+    const data = await loadJson('/api/mitre/coverage');
+    const pct = data.coverage_pct || 0;
+    const pctColor = pct >= 70 ? 'var(--ok)' : pct >= 40 ? 'var(--warn)' : 'var(--danger)';
+
+    let html = `<div class="kpi-grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:16px;">
+      <div class="kpi-card"><div class="kpi-value" style="color:${pctColor}">${pct}%</div><div class="kpi-label">Coverage</div></div>
+      <div class="kpi-card"><div class="kpi-value">${data.active_techniques}/${data.total_techniques}</div><div class="kpi-label">Techniques</div></div>
+      <div class="kpi-card"><div class="kpi-value">${data.enabled_detectors || data.active_detectors}</div><div class="kpi-label">Enabled Detectors</div></div>
+      <div class="kpi-card"><div class="kpi-value">${data.fired_today || 0}</div><div class="kpi-label">Fired Today</div></div>
+      <div class="kpi-card"><div class="kpi-value"><a href="/api/mitre/navigator" style="color:var(--accent);text-decoration:none;">Export</a></div><div class="kpi-label">Navigator JSON</div></div>
+    </div>`;
+
+    html += '<div style="font-size:0.75rem;color:var(--dim);margin-bottom:12px;">Green = detector enabled and covering this technique. Coverage shows what your server CAN detect with its current configuration.</div>';
+
+    // Tactic breakdown
+    if (data.tactics && data.tactics.length) {
+      for (const tactic of data.tactics) {
+        const tPct = tactic.total > 0 ? Math.round(tactic.covered / tactic.total * 100) : 0;
+        const tColor = tPct >= 70 ? 'var(--ok)' : tPct >= 40 ? 'var(--warn)' : 'var(--danger)';
+        const barWidth = Math.max(tPct, 2);
+
+        html += `<div style="margin-bottom:12px;border:1px solid var(--border);border-radius:6px;padding:10px;">`;
+        html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">`;
+        html += `<strong style="font-size:0.85rem;">${esc(tactic.tactic)}</strong>`;
+        html += `<span style="font-size:0.8rem;color:${tColor}">${tactic.covered}/${tactic.total} techniques</span>`;
+        html += `</div>`;
+        html += `<div style="background:var(--border);border-radius:3px;height:6px;margin-bottom:8px;">`;
+        html += `<div style="background:${tColor};height:6px;border-radius:3px;width:${barWidth}%;transition:width 0.3s;"></div></div>`;
+
+        // Technique pills
+        html += '<div style="display:flex;flex-wrap:wrap;gap:4px;">';
+        for (const tech of tactic.techniques) {
+          const bg = tech.active ? 'rgba(0,200,0,0.15)' : 'rgba(128,128,128,0.1)';
+          const fg = tech.active ? 'var(--ok)' : 'var(--dim)';
+          const border = tech.active ? 'rgba(0,200,0,0.3)' : 'var(--border)';
+          const status = tech.active ? 'Enabled' : 'Disabled';
+          const detList = tech.detectors.join(', ');
+          html += `<span title="${esc(tech.technique_name)} (${esc(tech.technique_id)})\nStatus: ${status}\nDetectors: ${esc(detList)}" style="font-size:0.7rem;padding:2px 6px;border-radius:3px;background:${bg};color:${fg};border:1px solid ${border};cursor:help;">${esc(tech.technique_id)}</span>`;
+        }
+        html += '</div></div>';
+      }
+    }
+
+    // Recommendations or success message
+    if (data.recommendations && data.recommendations.length) {
+      html += '<div style="margin-top:16px;border:1px solid var(--warn);border-radius:6px;padding:12px;">';
+      html += '<strong style="font-size:0.85rem;">Recommendations to improve coverage</strong>';
+      html += '<div style="margin-top:8px;">';
+      for (const rec of data.recommendations) {
+        html += `<div style="padding:4px 0;font-size:0.8rem;border-bottom:1px solid var(--border);">`;
+        html += `<span style="color:var(--warn);margin-right:6px;">+${rec.techniques_gained}</span>`;
+        html += `<strong>${esc(rec.action)}</strong>`;
+        html += `<span style="color:var(--dim);margin-left:8px;">${esc(rec.impact)}</span>`;
+        html += `</div>`;
+      }
+      html += '</div></div>';
+    } else if (pct >= 90) {
+      html += '<div style="margin-top:16px;border:1px solid var(--ok);border-radius:6px;padding:12px;text-align:center;">';
+      html += '<strong style="color:var(--ok);">All detectors enabled — maximum coverage achieved</strong>';
+      html += '</div>';
+    }
+
+    content.innerHTML = html;
+    if (status) status.textContent = `${pct}% coverage`;
+  } catch(e) { content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`; }
 }
 

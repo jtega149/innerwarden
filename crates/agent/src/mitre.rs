@@ -383,6 +383,186 @@ pub fn generate_navigator_layer() -> serde_json::Value {
     })
 }
 
+/// Per-tactic coverage entry for the dashboard MITRE Coverage view.
+#[derive(Debug, Serialize)]
+pub struct TacticCoverage {
+    pub tactic: &'static str,
+    pub techniques: Vec<TechniqueCoverage>,
+    pub covered: usize,
+    pub total: usize,
+}
+
+/// Per-technique coverage entry.
+#[derive(Debug, Serialize)]
+pub struct TechniqueCoverage {
+    pub technique_id: &'static str,
+    pub technique_name: &'static str,
+    pub detectors: Vec<&'static str>,
+    pub active: bool,
+}
+
+/// Recommendation to improve coverage.
+#[derive(Debug, Serialize)]
+pub struct CoverageRecommendation {
+    pub action: String,
+    pub impact: String,
+    pub techniques_gained: usize,
+}
+
+/// Generate detailed per-tactic coverage using the set of active detectors.
+///
+/// `active_detectors` should be the set of detector names that have actually
+/// fired today (from the knowledge graph) or are enabled in config.
+pub fn coverage_by_tactic(
+    active_detectors: &std::collections::HashSet<String>,
+) -> (Vec<TacticCoverage>, Vec<CoverageRecommendation>) {
+    use std::collections::BTreeMap;
+
+    let all_detectors = &[
+        "ssh_bruteforce",
+        "credential_stuffing",
+        "distributed_ssh",
+        "credential_harvest",
+        "suspicious_login",
+        "port_scan",
+        "web_scan",
+        "user_agent_scanner",
+        "search_abuse",
+        "crypto_miner",
+        "outbound_anomaly",
+        "ransomware",
+        "execution_guard",
+        "reverse_shell",
+        "process_tree",
+        "docker_anomaly",
+        "fileless",
+        "integrity_alert",
+        "log_tampering",
+        "rootkit",
+        "process_injection",
+        "web_shell",
+        "ssh_key_injection",
+        "kernel_module_load",
+        "crontab_persistence",
+        "systemd_persistence",
+        "user_creation",
+        "container_escape",
+        "privesc",
+        "sudo_abuse",
+        "c2_callback",
+        "dns_tunneling",
+        "data_exfiltration",
+        "lateral_movement",
+        "sensitive_write",
+        "at_job_persist",
+        "file_permission_mod",
+        "hidden_artifact",
+        "remote_access_tool",
+        "service_stop",
+        "system_shutdown",
+        "network_sniffing",
+        "masquerading",
+        "data_archive",
+        "proxy_tunnel",
+        "data_exfil_ebpf",
+    ];
+
+    // Build: tactic -> technique_id -> (technique_name, [detectors], any_active)
+    type TechniqueInfo<'a> = (&'a str, Vec<&'a str>, bool);
+    let mut tactic_map: BTreeMap<&str, BTreeMap<&str, TechniqueInfo<'_>>> = BTreeMap::new();
+
+    for &det in all_detectors {
+        let det_active = active_detectors.contains(det);
+        for mapping in map_detector_all(det) {
+            let entry = tactic_map
+                .entry(mapping.tactic)
+                .or_default()
+                .entry(mapping.technique_id)
+                .or_insert((mapping.technique_name, Vec::new(), false));
+            entry.1.push(det);
+            if det_active {
+                entry.2 = true;
+            }
+        }
+    }
+
+    // Desired tactic order (ATT&CK kill chain)
+    let tactic_order = [
+        "Reconnaissance",
+        "Initial Access",
+        "Execution",
+        "Persistence",
+        "Privilege Escalation",
+        "Defense Evasion",
+        "Credential Access",
+        "Lateral Movement",
+        "Collection",
+        "Command and Control",
+        "Exfiltration",
+        "Impact",
+    ];
+
+    let mut tactics = Vec::new();
+    for &tactic in &tactic_order {
+        if let Some(techs) = tactic_map.get(tactic) {
+            let mut techniques: Vec<TechniqueCoverage> = techs
+                .iter()
+                .map(|(&tid, (name, dets, active))| TechniqueCoverage {
+                    technique_id: tid,
+                    technique_name: name,
+                    detectors: dets.clone(),
+                    active: *active,
+                })
+                .collect();
+            techniques.sort_by_key(|t| t.technique_id);
+            let covered = techniques.iter().filter(|t| t.active).count();
+            tactics.push(TacticCoverage {
+                tactic,
+                covered,
+                total: techniques.len(),
+                techniques,
+            });
+        }
+    }
+
+    // Generate recommendations for inactive detectors
+    let mut recs = Vec::new();
+    let inactive_detectors: Vec<&&str> = all_detectors
+        .iter()
+        .filter(|d| !active_detectors.contains(**d))
+        .collect();
+
+    // Group inactive detectors by the techniques they'd add
+    for &det in &inactive_detectors {
+        let mappings = map_detector_all(det);
+        if !mappings.is_empty() {
+            let friendly = det.replace('_', " ");
+            let tactics_covered: Vec<&str> = mappings.iter().map(|m| m.tactic).collect();
+            let unique_tactics: std::collections::BTreeSet<&str> =
+                tactics_covered.into_iter().collect();
+            recs.push(CoverageRecommendation {
+                action: format!("Enable the {} detector", friendly),
+                impact: format!(
+                    "Covers {} in {}",
+                    mappings
+                        .iter()
+                        .map(|m| m.technique_id)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    unique_tactics.into_iter().collect::<Vec<_>>().join(", "),
+                ),
+                techniques_gained: mappings.len(),
+            });
+        }
+    }
+
+    // Sort recommendations by impact (most techniques first)
+    recs.sort_by(|a, b| b.techniques_gained.cmp(&a.techniques_gained));
+    recs.truncate(10); // Top 10 recommendations
+
+    (tactics, recs)
+}
+
 /// Extract the detector name from an incident_id.
 ///
 /// The convention is `detector_name:rest`, so we split on the first `:`.

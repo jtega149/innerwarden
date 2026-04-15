@@ -23,7 +23,7 @@ mod welcome;
 
 use capability::{ActivationOptions, CapabilityRegistry};
 pub(crate) use helpers::{
-    hostname, load_env_file, looks_like_ip, prompt, prompt_with_hint, require_sudo,
+    hostname, load_env_file, looks_like_ip, mask_secret, prompt, prompt_with_hint, require_sudo,
     resolve_data_dir, restart_agent, send_telegram_message_md, write_env_key,
 };
 use innerwarden_core::audit::{append_admin_action, current_operator, AdminActionEntry};

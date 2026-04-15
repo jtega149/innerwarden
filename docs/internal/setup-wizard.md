@@ -1,57 +1,47 @@
-# Setup Wizard Workflow
+# Setup Wizard
 
-Use this to plan and approve setup changes step by step without adding build dependencies.
+The interactive setup wizard is built into the `innerwarden` CLI binary.
 
 ## Run
 
 ```bash
-./scripts/setup-wizard.sh
-```
+# First-time setup (requires root)
+sudo innerwarden setup
 
-Theme/contrast options:
+# Re-run to update channels or settings
+sudo innerwarden setup
 
-```bash
-# Auto (default): tries to detect dark/light terminal
-IW_WIZARD_THEME=auto ./scripts/setup-wizard.sh
+# Advanced mode (more options, manual confirmations)
+sudo innerwarden setup --mode advanced
 
-# Force light/dark contrast palette
-IW_WIZARD_THEME=light ./scripts/setup-wizard.sh
-IW_WIZARD_THEME=dark  ./scripts/setup-wizard.sh
-
-# Disable colors completely (accessibility / maximum compatibility)
-NO_COLOR=1 ./scripts/setup-wizard.sh
+# Dry-run preview (no root required, no files changed)
+innerwarden setup --dry-run
 ```
 
 ## What it does
 
-- Runs an interactive 4-step wizard via `gum`.
-- Captures choices (experience, protections, alert threshold, apply mode).
-- Saves a session plan under `docs/internal/setup/plan-YYYYmmdd-HHMMSS.md`.
-- Applies only if you explicitly choose **Apply immediately** and confirm.
-- Uses adaptive colors for black and white terminals, with manual override.
+- Runs an interactive 4-step wizard in the terminal.
+- Step 1: Experience profile (simple / technical).
+- Step 2: AI provider (Ollama, OpenAI, Anthropic, etc.).
+- Step 3: Notification channels (Telegram, Slack, Webhook, Dashboard — multi-select).
+- Step 4: Protection mode (watch only / auto-protect).
+- Detects existing configuration and offers keep/update per channel.
+- Applies changes atomically to `agent.toml` and `agent.env`.
+- Runs health checks and reports READY or READY_WITH_GAPS.
 
 ## Flow
 
 ```mermaid
 flowchart TD
-    A[Start setup-wizard] --> B[Choose experience]
-    B --> C[Select protections]
-    C --> D[Select alert threshold]
-    D --> E[Choose apply mode]
-    E --> F[Review summary]
-    F --> G[Write plan file]
-    G --> H{Apply immediately?}
-    H -- No --> I[Done]
-    H -- Yes --> J{innerwarden in PATH?}
-    J -- No --> K[Stop with guidance]
-    J -- Yes --> L[Confirm run]
-    L -- Yes --> M[Run innerwarden setup]
-    L -- No --> I
+    A[innerwarden setup] --> B[Pre-configuration scan]
+    B --> C["[1/4] Experience"]
+    C --> D["[2/4] AI provider"]
+    D --> E["[3/4] Notification channels"]
+    E --> F["[4/4] Protection mode"]
+    F --> G[Review summary]
+    G --> H{Apply?}
+    H -- No --> I[Cancelled]
+    H -- Yes --> J[Write configs + restart services]
+    J --> K[Channel guided setup]
+    K --> L[Health checks + verdict]
 ```
-
-## Approval checklist
-
-- Confirm protections selected are expected for this environment.
-- Confirm alert threshold matches desired noise level.
-- Confirm apply mode is intentional.
-- Confirm rollback owner and contact window.

@@ -179,6 +179,9 @@ pub fn run_all_with_calibration(
     // Phase 3C: correlation rules as graph paths
     incidents.extend(detect_correlation_chains(graph, state, host, now));
 
+    // Slow-and-low: 24h lookback for persistent low-rate C2 patterns
+    incidents.extend(detect_slow_and_low(graph, state, host, now));
+
     // Record detections for sensor dedup
     for inc in &incidents {
         let detector = inc.incident_id.split(':').next().unwrap_or("");
@@ -864,10 +867,37 @@ fn detect_data_exfil_calibrated(
                 continue;
             }
 
-            let pid = match graph.get_node(proc_id) {
-                Some(Node::Process { pid, .. }) => *pid,
+            let (pid, comm, uid) = match graph.get_node(proc_id) {
+                Some(Node::Process { pid, comm, uid, .. }) => (*pid, comm.clone(), *uid),
                 _ => continue,
             };
+
+            // Infrastructure processes that legitimately read sensitive files
+            // and connect to external IPs are NOT data exfiltration.
+            // Filter by process name — not IP — so new IPs are covered.
+            const INFRA_COMMS: &[&str] = &[
+                "crowdsec",          // CrowdSec threat intel
+                "innerwarden",       // InnerWarden agent
+                "tokio-rt-worker",   // InnerWarden agent runtime threads
+                "innerwarden-agent", // Agent binary name
+                "innerwarden-senso", // Sensor binary name (truncated to 16 chars)
+                "fail2ban",          // Fail2ban
+                "telegraf",          // Telegraf monitoring
+                "prometheus",        // Prometheus
+                "node_exporter",     // Node exporter
+                "apt",               // Package manager
+                "dpkg",              // Package manager
+                "unattended-upgr",   // Unattended upgrades
+                "cscli",             // CrowdSec CLI
+            ];
+            let comm_lower = comm.to_lowercase();
+            if INFRA_COMMS.iter().any(|&c| comm_lower.starts_with(c)) {
+                continue;
+            }
+            // Also skip InnerWarden UID (typically 998)
+            if uid == 998 {
+                continue;
+            }
 
             let key = format!("graph_exfil:{}:{}", pid, dst_ip);
             if !state.check_and_set(&key, now, 300) {
@@ -2768,6 +2798,164 @@ fn detect_cgroup_abuse(
             entities: vec![],
         });
     }
+    incidents
+}
+
+// ── Slow-and-low detector ──────────────────────────────────────────────
+// Detects persistent low-rate C2 communication over 24h+.
+// Complements the sensor's beaconing detector (5min window) by catching
+// attackers who spread connections over hours/days with irregular intervals.
+
+fn detect_slow_and_low(
+    graph: &KnowledgeGraph,
+    state: &mut GraphDetectorState,
+    host: &str,
+    now: DateTime<Utc>,
+) -> Vec<Incident> {
+    let mut incidents = Vec::new();
+    let cutoff = now - Duration::hours(6); // 6h lookback (graph retains ~6h of edges)
+    let min_connections = 4;
+    let min_span_hours = 2;
+
+    // Group: (process_id, external IP) → edge timestamps
+    let mut patterns: std::collections::HashMap<(NodeId, String), Vec<DateTime<Utc>>> =
+        std::collections::HashMap::new();
+
+    for &proc_id in &graph.active_nodes_since(cutoff) {
+        let (comm, uid) = match graph.get_node(proc_id) {
+            Some(Node::Process { comm, uid, .. }) => (comm.clone(), *uid),
+            _ => continue,
+        };
+
+        // Skip infra processes (same list as data exfil)
+        const INFRA: &[&str] = &[
+            "crowdsec",
+            "innerwarden",
+            "tokio-rt-worker",
+            "innerwarden-agent",
+            "innerwarden-senso",
+            "fail2ban",
+            "telegraf",
+            "prometheus",
+            "node_exporter",
+            "apt",
+            "dpkg",
+            "cscli",
+        ];
+        let comm_lower = comm.to_lowercase();
+        if INFRA.iter().any(|&c| comm_lower.starts_with(c)) || uid == 998 {
+            continue;
+        }
+
+        for edge in graph.outgoing_edges(proc_id) {
+            if edge.relation != Relation::ConnectedTo || edge.ts < cutoff {
+                continue;
+            }
+            if let Some(Node::Ip {
+                addr,
+                is_internal: false,
+                ..
+            }) = graph.get_node(edge.to)
+            {
+                if crate::cloud_safelist::is_self_traffic_ip(addr) {
+                    continue;
+                }
+                patterns
+                    .entry((proc_id, addr.clone()))
+                    .or_default()
+                    .push(edge.ts);
+            }
+        }
+    }
+
+    for ((proc_id, ip), mut timestamps) in patterns {
+        if timestamps.len() < min_connections {
+            continue;
+        }
+        timestamps.sort();
+
+        let first = timestamps.first().copied().unwrap();
+        let last = timestamps.last().copied().unwrap();
+        let span = last - first;
+        if span < Duration::hours(min_span_hours) {
+            continue;
+        }
+
+        // Check irregularity: coefficient of variation of intervals
+        let intervals: Vec<f64> = timestamps
+            .windows(2)
+            .map(|w| (w[1] - w[0]).num_seconds() as f64)
+            .collect();
+        if intervals.is_empty() {
+            continue;
+        }
+
+        let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
+        if mean < 1.0 {
+            continue;
+        }
+        let variance =
+            intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
+        let cv = variance.sqrt() / mean;
+
+        // CV < 0.3 = regular beaconing (caught by sensor c2_callback).
+        // CV >= 0.3 = irregular slow-and-low.
+        if cv < 0.3 {
+            continue;
+        }
+
+        let key = format!("graph_slow_low:{}:{}", proc_id, ip);
+        if !state.check_and_set(&key, now, 3600) {
+            continue;
+        }
+
+        let label = graph
+            .get_node(proc_id)
+            .map(|n| n.label())
+            .unwrap_or_default();
+        let hours = span.num_hours().max(1);
+
+        incidents.push(Incident {
+            ts: now,
+            host: host.to_string(),
+            incident_id: format!("graph_slow_low:{}:{}:{}", proc_id, ip, now.timestamp()),
+            severity: Severity::High,
+            title: format!(
+                "Slow-and-low C2: {} → {} ({} connections over {}h)",
+                label,
+                ip,
+                timestamps.len(),
+                hours
+            ),
+            summary: format!(
+                "Process {} made {} connections to external IP {} over {} hours with irregular \
+                 intervals (CV={:.2}). This pattern evades short-window detectors and suggests \
+                 intentional C2 communication.",
+                label,
+                timestamps.len(),
+                ip,
+                hours,
+                cv
+            ),
+            evidence: serde_json::json!({
+                "source": "knowledge_graph",
+                "detector": "graph_slow_low",
+                "process": label,
+                "ip": ip,
+                "connections": timestamps.len(),
+                "span_hours": hours,
+                "coefficient_of_variation": cv,
+            }),
+            recommended_checks: vec![
+                format!("Investigate {} for C2 implant or backdoor", label),
+                format!("Check {} on AbuseIPDB/VirusTotal", ip),
+                "Review process ancestry for initial compromise".to_string(),
+            ],
+            tags: vec!["T1071".to_string(), "slow_and_low".to_string()],
+            entities: vec![EntityRef::ip(&ip)],
+        });
+    }
+
     incidents
 }
 

@@ -4,6 +4,8 @@ ignore = [
     "RUSTSEC-2023-0071",
     # notify crate unmaintained - used only by DNA daemon binary, not the library
     "RUSTSEC-2024-0384",
+    # rustls-pemfile unmaintained - transitive dep via axum-server, no upgrade path yet
+    "RUSTSEC-2025-0134",
 ]
 
 [licenses]

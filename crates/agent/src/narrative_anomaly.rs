@@ -77,7 +77,7 @@ pub(crate) fn process_anomalies(
                     "correlated_anomaly:baseline_neural:{}",
                     now.format("%Y-%m-%dT%H:%MZ")
                 ),
-                severity: innerwarden_core::event::Severity::High,
+                severity: innerwarden_core::event::Severity::Medium,
                 title: "AI + Statistical convergence — both models flagged unusual activity"
                     .to_string(),
                 summary: format!(

@@ -356,10 +356,10 @@ const IMMEDIATE_THREAT_DETECTORS: &[&str] = &[
     "dns_tunneling_ebpf",
     "crontab_persistence",
     "systemd_persistence",
-    // AI detections — correlated anomaly (baseline+neural agree) is always
-    // immediate.  Pure neural_anomaly only pings at Critical (score > 0.9),
-    // which already passes the gate via the severity check.
-    "correlated_anomaly",
+    // AI detections — correlated anomaly (baseline+neural agree) is advisory.
+    // Demoted from immediate to daily-briefing-only: Medium severity, no
+    // actionable context for operator. Pure neural_anomaly only pings at
+    // Critical (score > 0.9), which passes the gate via the severity check.
 ];
 
 /// Returns `true` when this incident represents an active threat that warrants

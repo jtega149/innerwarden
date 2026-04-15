@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::Timelike as _;
+use innerwarden_core::event::Severity;
+use innerwarden_core::incident::Incident;
 use tracing::{info, warn};
 
 use crate::{bot_helpers, config, narrative, telegram, AgentState};
@@ -74,7 +76,12 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                             let mut detector_counts: HashMap<String, u32> = HashMap::new();
                             for inc in &state.narrative_acc.incidents {
                                 incidents_today += 1;
-                                match inc.severity {
+                                let det = telegram::extract_detector_pub(&inc.incident_id);
+                                // Effective severity: downgrade contained/noise
+                                // detectors so the health score reflects real risk,
+                                // not internet noise that was already handled.
+                                let effective = effective_severity(inc, det);
+                                match effective {
                                     innerwarden_core::event::Severity::Critical => {
                                         critical_count += 1;
                                     }
@@ -83,7 +90,6 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                                     }
                                     _ => {}
                                 }
-                                let det = telegram::extract_detector_pub(&inc.incident_id);
                                 *detector_counts.entry(det.to_string()).or_insert(0) += 1;
                             }
                             let blocks_today =
@@ -127,4 +133,60 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
             }
         }
     }
+}
+
+/// Compute effective severity for health score purposes.
+///
+/// Raw detector severity reflects what the detector saw, not the actual risk
+/// to the server. Internet noise (scanners, bots) that was already contained
+/// or that has zero chance of success should not tank the health score.
+fn effective_severity(inc: &Incident, detector: &str) -> Severity {
+    let raw = inc.severity.clone();
+
+    // SSH brute-force on a key-only server cannot succeed. The harden/scan
+    // module confirms PasswordAuthentication=no, so anything below Critical
+    // (which would mean the attacker got past auth) is Low-impact noise.
+    if detector == "ssh_bruteforce" && !matches!(raw, Severity::Critical) {
+        return Severity::Low;
+    }
+
+    // Proto anomaly scanners: malformed SSH, HTTP on wrong port from external
+    // scanners — these fail at protocol level. Already Low in the sensor for
+    // SshVersionAnomaly, but ProtocolMismatch is High. For health score
+    // purposes, external scanner traffic that triggered no further chain is
+    // Medium at most.
+    if detector == "proto_anomaly" && matches!(raw, Severity::High) {
+        return Severity::Medium;
+    }
+
+    // Kill chain unknown: pattern not matched = incomplete sequence. Not a
+    // confirmed attack chain. Medium is more accurate than the default.
+    if detector == "killchain" {
+        if let Some(pattern) = inc
+            .evidence
+            .get("pattern")
+            .or_else(|| inc.evidence.get(0).and_then(|e| e.get("pattern")))
+            .and_then(|p| p.as_str())
+        {
+            if pattern == "unknown" && matches!(raw, Severity::High | Severity::Medium) {
+                return Severity::Low;
+            }
+        }
+    }
+
+    // Correlated anomaly is advisory (baseline+neural convergence).
+    // Now Medium in the emitter but guard against older incidents.
+    if detector == "correlated_anomaly" && matches!(raw, Severity::High) {
+        return Severity::Medium;
+    }
+
+    // Threat intel hits that were auto-blocked are successes, not threats.
+    if detector == "threat_intel" {
+        if let Some(tags) = inc.tags.as_slice().iter().find(|t| *t == "auto_blocked") {
+            let _ = tags;
+            return Severity::Low;
+        }
+    }
+
+    raw
 }
