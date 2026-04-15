@@ -18,14 +18,6 @@ pub(crate) async fn try_handle_obvious_incident(
     state: &mut AgentState,
 ) -> bool {
     let detector = incident_detector(&incident.incident_id);
-    let is_obvious_detector = matches!(
-        detector,
-        "ssh_bruteforce" | "credential_stuffing" | "packet_flood" | "port_scan" | "threat_intel"
-    );
-    let is_high_or_critical = matches!(
-        incident.severity,
-        innerwarden_core::event::Severity::High | innerwarden_core::event::Severity::Critical
-    );
     let primary_ip = incident
         .entities
         .iter()
@@ -41,7 +33,7 @@ pub(crate) async fn try_handle_obvious_incident(
                 .is_some_and(|r| r.total_incidents > 1)
     });
 
-    if !(is_obvious_detector && is_high_or_critical && ip_seen_before && cfg.responder.enabled) {
+    if !is_obvious_attack(detector, &incident.severity, ip_seen_before, cfg.responder.enabled) {
         return false;
     }
 
@@ -165,4 +157,45 @@ pub(crate) async fn try_handle_obvious_incident(
     }
 
     true
+}
+
+pub(crate) fn is_obvious_attack(
+    detector: &str,
+    severity: &innerwarden_core::event::Severity,
+    ip_seen_before: bool,
+    responder_enabled: bool,
+) -> bool {
+    let is_obvious_detector = matches!(
+        detector,
+        "ssh_bruteforce" | "credential_stuffing" | "packet_flood" | "port_scan" | "threat_intel"
+    );
+    let is_high_or_critical = matches!(
+        severity,
+        innerwarden_core::event::Severity::High | innerwarden_core::event::Severity::Critical
+    );
+    is_obvious_detector && is_high_or_critical && ip_seen_before && responder_enabled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_core::event::Severity;
+
+    #[test]
+    fn test_is_obvious_attack() {
+        // 1. Obvious condition
+        assert!(is_obvious_attack("ssh_bruteforce", &Severity::High, true, true));
+
+        // 2. Not an obvious detector
+        assert!(!is_obvious_attack("strange_logs", &Severity::High, true, true));
+
+        // 3. Not high severity
+        assert!(!is_obvious_attack("ssh_bruteforce", &Severity::Medium, true, true));
+
+        // 4. IP not seen before
+        assert!(!is_obvious_attack("ssh_bruteforce", &Severity::High, false, true));
+
+        // 5. Responder disabled
+        assert!(!is_obvious_attack("ssh_bruteforce", &Severity::High, true, false));
+    }
 }

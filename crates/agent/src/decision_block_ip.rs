@@ -18,43 +18,24 @@ pub(crate) async fn execute_block_ip_decision(
     cfg: &config::AgentConfig,
     state: &mut AgentState,
 ) -> (String, bool) {
-    // Safeguard: reject empty IPs.
-    if ip.is_empty() {
-        warn!("block decision has empty IP - skipping");
-        return ("skipped: block decision has empty IP".to_string(), false);
+// Safeguard: pure eligibility checks (empty IP, operator session, rate limit).
+    if let Err(reason) = check_block_eligibility(
+        ip,
+        &state.operator_ips,
+        state.recent_blocks.len(),
+        crate::MAX_BLOCKS_PER_MINUTE,
+    ) {
+        if reason.starts_with("skipped:") {
+            info!(ip, "{}", reason);
+        } else {
+            warn!(ip, "{}", reason);
+        }
+        return (reason, false);
     }
-
-    // Safeguard: never block operator IPs (active SSH sessions from trusted_users).
-    if state.operator_ips.contains_key(ip) {
-        info!(
-            ip,
-            "operator IP protected — skipping block (active trusted session)"
-        );
-        return (
-            format!("skipped: {ip} is an active operator session"),
-            false,
-        );
-    }
-
-    // Safeguard: rate limit.
-    // Prevent false-positive cascades - max N blocks per minute.
+    
+    // Register the current block in rate limit tracking.
     let now_utc = chrono::Utc::now();
-    let one_minute_ago = now_utc - chrono::Duration::seconds(60);
-    state.recent_blocks.retain(|ts| *ts > one_minute_ago);
-    if state.recent_blocks.len() >= crate::MAX_BLOCKS_PER_MINUTE {
-        warn!(
-            ip,
-            blocks_last_minute = state.recent_blocks.len(),
-            "rate limit: too many blocks in last minute, skipping"
-        );
-        return (
-            format!(
-                "rate-limited: {ip} (>{} blocks/min)",
-                crate::MAX_BLOCKS_PER_MINUTE
-            ),
-            false,
-        );
-    }
+    state.recent_blocks.retain(|ts| *ts > now_utc - chrono::Duration::seconds(60));
     state.recent_blocks.push_back(now_utc);
 
     // Adaptive TTL: use local IP reputation to escalate block duration.
@@ -243,5 +224,60 @@ pub(crate) async fn execute_block_ip_decision(
         (format!("Blocked {ip} via {layers}"), cf_pushed)
     } else {
         (format!("skipped: no block skill available for {ip}"), false)
+    }
+}
+
+pub(crate) fn check_block_eligibility(
+    ip: &str,
+    operator_ips: &std::collections::HashMap<String, std::time::Instant>,
+    recent_blocks_len: usize,
+    max_blocks_per_min: usize,
+) -> Result<(), String> {
+    if ip.is_empty() {
+        return Err("skipped: block decision has empty IP".to_string());
+    }
+    if operator_ips.contains_key(ip) {
+        return Err(format!("skipped: {ip} is an active operator session"));
+    }
+    if recent_blocks_len >= max_blocks_per_min {
+        return Err(format!("rate-limited: {ip} (>{max_blocks_per_min} blocks/min)"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    #[test]
+    fn test_check_block_eligibility() {
+        let mut operator_ips = HashMap::new();
+        operator_ips.insert("10.0.0.5".to_string(), Instant::now());
+
+        // 1. empty ip
+        assert_eq!(
+            check_block_eligibility("", &operator_ips, 0, 20),
+            Err("skipped: block decision has empty IP".to_string())
+        );
+
+        // 2. operator ip
+        assert_eq!(
+            check_block_eligibility("10.0.0.5", &operator_ips, 0, 20),
+            Err("skipped: 10.0.0.5 is an active operator session".to_string())
+        );
+
+        // 3. rate limited
+        assert_eq!(
+            check_block_eligibility("1.2.3.4", &operator_ips, 20, 20),
+            Err("rate-limited: 1.2.3.4 (>20 blocks/min)".to_string())
+        );
+
+        // 4. normal
+        assert_eq!(
+            check_block_eligibility("8.8.8.8", &operator_ips, 5, 20),
+            Ok(())
+        );
     }
 }
