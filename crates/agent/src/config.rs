@@ -2706,7 +2706,10 @@ approval_ttl_secs = 300
         let cfg = AiConfig::default();
         assert!(!cfg.enabled);
         assert_eq!(cfg.provider, "openai");
-        assert!(cfg.confidence_threshold > 0.0);
+        assert!(
+            (cfg.confidence_threshold - 0.85).abs() < f32::EPSILON,
+            "default threshold should be 0.85"
+        );
         assert!(cfg.max_ai_calls_per_tick > 0);
         assert_eq!(cfg.circuit_breaker_threshold, 0); // disabled by default
     }

@@ -561,6 +561,7 @@ fn find_multi_technique_ips(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge_graph::{graph::KnowledgeGraph, types::*};
 
     #[test]
     fn extract_detector_from_incident_id() {
@@ -573,10 +574,270 @@ mod tests {
     }
 
     #[test]
-    fn find_multi_technique_returns_empty_on_empty_graph() {
-        let graph = crate::knowledge_graph::graph::KnowledgeGraph::new();
+    fn find_multi_technique_empty_graph() {
+        let graph = KnowledgeGraph::new();
         let result =
             find_multi_technique_ips(&graph, chrono::Utc::now() - chrono::Duration::hours(1));
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn find_multi_technique_single_detector_not_returned() {
+        // One IP with one detector → should NOT appear in results.
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+
+        let ip_id = graph.ensure_ip("1.2.3.4", now);
+        let inc_id = graph.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:1.2.3.4:001".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "High".into(),
+            title: "SSH brute force".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc_id, ip_id, Relation::TriggeredBy, now));
+
+        let result = find_multi_technique_ips(&graph, now - chrono::Duration::hours(1));
+        assert!(result.is_empty(), "single detector should not be returned");
+    }
+
+    #[test]
+    fn find_multi_technique_two_detectors_returned() {
+        // One IP with two distinct detectors → should appear.
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+
+        let ip_id = graph.ensure_ip("5.6.7.8", now);
+
+        let inc1 = graph.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:5.6.7.8:001".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "High".into(),
+            title: "SSH brute force".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc1, ip_id, Relation::TriggeredBy, now));
+
+        let inc2 = graph.add_node(Node::Incident {
+            incident_id: "port_scan:5.6.7.8:002".into(),
+            detector: "port_scan".into(),
+            severity: "Medium".into(),
+            title: "Port scan".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc2, ip_id, Relation::TriggeredBy, now));
+
+        let result = find_multi_technique_ips(&graph, now - chrono::Duration::hours(1));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "5.6.7.8");
+        assert_eq!(result[0].1.len(), 2);
+        assert!(result[0].1.contains(&"port_scan".to_string()));
+        assert!(result[0].1.contains(&"ssh_bruteforce".to_string()));
+    }
+
+    #[test]
+    fn find_multi_technique_old_incidents_excluded() {
+        // Incidents older than cutoff should not count.
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(2);
+
+        let ip_id = graph.ensure_ip("9.9.9.9", now);
+
+        let inc1 = graph.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:9.9.9.9:001".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "High".into(),
+            title: "".into(),
+            summary: "".into(),
+            ts: old, // OLD
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc1, ip_id, Relation::TriggeredBy, old));
+
+        let inc2 = graph.add_node(Node::Incident {
+            incident_id: "port_scan:9.9.9.9:002".into(),
+            detector: "port_scan".into(),
+            severity: "Medium".into(),
+            title: "".into(),
+            summary: "".into(),
+            ts: now, // RECENT
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc2, ip_id, Relation::TriggeredBy, now));
+
+        // Cutoff 1 hour ago — only the port_scan is recent, ssh_bruteforce is 2h old.
+        let result = find_multi_technique_ips(&graph, now - chrono::Duration::hours(1));
+        assert!(
+            result.is_empty(),
+            "old incident should be excluded by cutoff"
+        );
+    }
+
+    #[test]
+    fn find_multi_technique_multiple_ips() {
+        // Two IPs, only one with 2+ detectors.
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+
+        // IP A: 2 detectors
+        let ip_a = graph.ensure_ip("1.1.1.1", now);
+        let inc_a1 = graph.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:1.1.1.1:001".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "High".into(),
+            title: "".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc_a1, ip_a, Relation::TriggeredBy, now));
+        let inc_a2 = graph.add_node(Node::Incident {
+            incident_id: "web_scan:1.1.1.1:002".into(),
+            detector: "web_scan".into(),
+            severity: "Medium".into(),
+            title: "".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc_a2, ip_a, Relation::TriggeredBy, now));
+
+        // IP B: 1 detector only
+        let ip_b = graph.ensure_ip("2.2.2.2", now);
+        let inc_b1 = graph.add_node(Node::Incident {
+            incident_id: "port_scan:2.2.2.2:003".into(),
+            detector: "port_scan".into(),
+            severity: "Low".into(),
+            title: "".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc_b1, ip_b, Relation::TriggeredBy, now));
+
+        let result = find_multi_technique_ips(&graph, now - chrono::Duration::hours(1));
+        assert_eq!(result.len(), 1, "only IP A should appear");
+        assert_eq!(result[0].0, "1.1.1.1");
+    }
+
+    #[test]
+    fn find_multi_technique_same_detector_twice_not_counted() {
+        // Same detector firing twice should NOT count as multi-technique.
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+
+        let ip_id = graph.ensure_ip("3.3.3.3", now);
+        for i in 0..3 {
+            let inc = graph.add_node(Node::Incident {
+                incident_id: format!("ssh_bruteforce:3.3.3.3:00{i}"),
+                detector: "ssh_bruteforce".into(),
+                severity: "High".into(),
+                title: "".into(),
+                summary: "".into(),
+                ts: now,
+                mitre_ids: vec![],
+                decision: None,
+                confidence: None,
+                decision_reason: None,
+                decision_target: None,
+                auto_executed: false,
+                is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
+                research_only: false,
+            });
+            graph.add_edge(Edge::new(inc, ip_id, Relation::TriggeredBy, now));
+        }
+
+        let result = find_multi_technique_ips(&graph, now - chrono::Duration::hours(1));
+        assert!(result.is_empty(), "same detector 3x is not multi-technique");
     }
 }
