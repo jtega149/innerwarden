@@ -864,10 +864,37 @@ fn detect_data_exfil_calibrated(
                 continue;
             }
 
-            let pid = match graph.get_node(proc_id) {
-                Some(Node::Process { pid, .. }) => *pid,
+            let (pid, comm, uid) = match graph.get_node(proc_id) {
+                Some(Node::Process { pid, comm, uid, .. }) => (*pid, comm.clone(), *uid),
                 _ => continue,
             };
+
+            // Infrastructure processes that legitimately read sensitive files
+            // and connect to external IPs are NOT data exfiltration.
+            // Filter by process name — not IP — so new IPs are covered.
+            const INFRA_COMMS: &[&str] = &[
+                "crowdsec",          // CrowdSec threat intel
+                "innerwarden",       // InnerWarden agent
+                "tokio-rt-worker",   // InnerWarden agent runtime threads
+                "innerwarden-agent", // Agent binary name
+                "innerwarden-senso", // Sensor binary name (truncated to 16 chars)
+                "fail2ban",          // Fail2ban
+                "telegraf",          // Telegraf monitoring
+                "prometheus",        // Prometheus
+                "node_exporter",     // Node exporter
+                "apt",               // Package manager
+                "dpkg",              // Package manager
+                "unattended-upgr",   // Unattended upgrades
+                "cscli",             // CrowdSec CLI
+            ];
+            let comm_lower = comm.to_lowercase();
+            if INFRA_COMMS.iter().any(|&c| comm_lower.starts_with(c)) {
+                continue;
+            }
+            // Also skip InnerWarden UID (typically 998)
+            if uid == 998 {
+                continue;
+            }
 
             let key = format!("graph_exfil:{}:{}", pid, dst_ip);
             if !state.check_and_set(&key, now, 300) {
