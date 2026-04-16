@@ -369,10 +369,20 @@ This spec replaces the `trusted_processes` approach (hardcoded process lists) an
 | PID tree walk | ❌ (not our child) | ❌ (not our child) | ❌ | ❌ |
 | **Behaviour score** | ✅ (systemd parent, DNS resolves) | ✅ (package managed) | ✅ (operator active, dpkg binary) | ✅ (AI verifies context) |
 
+## Product tier
+
+**Spec 021 is 100% FREE (innerwarden repo, Apache-2.0).**
+
+The behavioural checks and AI batch verification are observation — they determine if something is normal or suspicious. They don't enforce or block. Enforcement (blocking unknown binaries, freezing processes) is paid (spec 020 Phase A/B/E in active-defence repo).
+
+Spec 021 is the foundation that spec 020 builds on:
+- Free: score 0-100 → auto-dismiss or escalate to AI triage
+- Paid: score feeds into enforcement decisions (low score + enforce mode → block at LSM)
+
 ## Interaction with other specs
 
 - **Spec 018 (Autonomous Response)**: Phases A-D done. Spec 021 adds Fase 3 between Fase 2 and Fase 4.
-- **Spec 020 (Zero Trust MDR)**: Phase A (execution identity) uses the same binary hash checks. Phase C (trust scoring) shares the score concept. Spec 021 can be a stepping stone — implement the score engine first, then spec 020 builds the enforcement layer on top.
+- **Spec 020 (Zero Trust MDR)**: Spec 021 behavioural checks feed into Phase C (trust scoring). Phase A (execution gate, paid) reuses the binary identity checks from spec 021. The score engine is free; enforcement is paid.
 - **Spec 015 (Signal Quality)**: spec 021 reduces noise in the graph by dismissing FPs before they become incident nodes.
 
 ## Success criteria
