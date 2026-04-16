@@ -1,3 +1,9 @@
+// Clippy 1.95 promotes `unnecessary_sort_by` to a default-deny lint, but
+// the existing codebase uses the explicit `sort_by(|a,b| b.x.cmp(&a.x))`
+// pattern for reverse-sort leaderboards in status/scan output. The
+// `sort_by_key(|x| Reverse(...))` alternative is less readable here.
+#![allow(clippy::unnecessary_sort_by)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

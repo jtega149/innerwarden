@@ -347,13 +347,12 @@ impl Handler for HoneypotSshHandler {
                     let prompt = format!("{}@{}:~# ", user, hostname);
                     let _ = session.data(channel_id, Bytes::from(prompt.into_bytes()));
                 }
-                0x7f | 0x08 => {
+                0x7f | 0x08
                     // Backspace / DEL.
-                    if !input_buf.is_empty() {
+                    if !input_buf.is_empty() => {
                         input_buf.pop();
                         let _ = session.data(channel_id, Bytes::from(b"\x08 \x08".to_vec()));
                     }
-                }
                 0x03 => {
                     // Ctrl+C.
                     input_buf.clear();

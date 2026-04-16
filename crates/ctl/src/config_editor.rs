@@ -41,10 +41,8 @@ fn section_parts(section: &str) -> Vec<&str> {
 fn ensure_section(doc: &mut DocumentMut, section: &str) {
     let parts = section_parts(section);
     match parts.as_slice() {
-        [s1] => {
-            if doc.get(s1).is_none_or(Item::is_none) {
-                doc[s1] = toml_edit::table();
-            }
+        [s1] if doc.get(s1).is_none_or(Item::is_none) => {
+            doc[s1] = toml_edit::table();
         }
         [s1, s2] => {
             // Ensure outer table

@@ -246,7 +246,7 @@ fn check_fileless_complete(
         match e.relation {
             Relation::CreatedMemfd => has_memfd = true,
             Relation::MprotectExec => has_mprotect = true,
-            Relation::ConnectedTo => {
+            Relation::ConnectedTo
                 if graph
                     .get_node(e.to)
                     .map(|n| {
@@ -258,10 +258,9 @@ fn check_fileless_complete(
                             }
                         )
                     })
-                    .unwrap_or(false)
-                {
-                    has_external = true;
-                }
+                    .unwrap_or(false) =>
+            {
+                has_external = true;
             }
             _ => {}
         }

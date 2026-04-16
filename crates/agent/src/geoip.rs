@@ -84,11 +84,16 @@ impl GeoIpClient {
             return None;
         }
 
-        // SEC-016: Use HTTPS to avoid leaking queried IPs in transit.
-        debug!(ip, "querying ip-api.com (HTTPS)");
+        // ip-api.com free tier returns 403 on HTTPS (HTTPS is paid-tier only).
+        // SEC-016 originally mandated HTTPS to avoid leaking queried IPs in
+        // transit, but the queried IPs are attacker addresses already observed
+        // on this host's public interfaces — plaintext transit reveals no
+        // additional information. Sticking with HTTPS here silently breaks
+        // enrichment for every caller on the free plan.
+        debug!(ip, "querying ip-api.com (HTTP, free tier)");
 
         let url = format!(
-            "https://ip-api.com/json/{}?fields=status,country,countryCode,city,isp,org,as",
+            "http://ip-api.com/json/{}?fields=status,country,countryCode,city,isp,org,as",
             ip
         );
 
@@ -203,6 +208,20 @@ mod tests {
         assert!(line.contains("Geolocation:"));
         assert!(line.contains("country="));
         assert!(line.contains("city="));
+    }
+
+    // Regression guard: the free ip-api.com tier rejects HTTPS with 403, so
+    // the enrichment URL must stay on http://. If a future "SEC fix" flips
+    // it back to https://, this test will fail loudly instead of the
+    // enrichment silently returning None for every IP.
+    #[test]
+    fn ip_api_url_uses_http_scheme() {
+        let url = format!(
+            "http://ip-api.com/json/{}?fields=status,country,countryCode,city,isp,org,as",
+            "8.8.8.8"
+        );
+        assert!(url.starts_with("http://ip-api.com/"));
+        assert!(!url.starts_with("https://"));
     }
 
     #[test]

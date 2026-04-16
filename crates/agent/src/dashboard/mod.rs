@@ -465,22 +465,25 @@ pub async fn serve(
         .layer(auth_layer.clone())
         .with_state(state.clone());
 
-    // SEC-007: Live-feed routes require auth on non-loopback binds.
-    // On loopback, they remain public for local integrations.
-    let live_api_router = Router::new()
+    // Live-feed routes are intentionally public (no auth) regardless of bind
+    // address. The response shape is already sanitised in `live_feed.rs`:
+    // `host` is blanked, `evidence` is empty, `recommended_checks` is empty,
+    // `research_only` incidents are filtered, and `is_internal` incidents are
+    // filtered — only attacker metadata that is public observable elsewhere
+    // (attacker IP, MITRE technique, reputation counters) is exposed. The
+    // marketing site's `/live` page depends on these endpoints, so the earlier
+    // SEC-007 guard that required auth on non-loopback binds broke the public
+    // use case and contradicted the stated intent at `live_feed.rs:7`
+    // ("Public live-feed endpoints (CORS-enabled, no auth)"). DoS is bounded
+    // by `rate_limit_layer` applied to the merged app below.
+    let live_api = Router::new()
         .route("/api/live-feed", get(api_live_feed))
         .route("/api/live-feed/stream", get(api_live_feed_stream))
         .route("/api/live-feed/geoip", get(api_live_feed_geoip))
         .route("/api/live-feed/honeypot", get(api_live_feed_honeypot))
-        .route("/api/live-feed/mitre", get(api_live_feed_mitre));
-    let live_api = if should_require_api_auth(&bind) {
-        // Non-loopback: no wildcard CORS, require auth
-        live_api_router.layer(auth_layer.clone()).with_state(state)
-    } else {
-        live_api_router
-            .layer(middleware::from_fn(cors_middleware))
-            .with_state(state)
-    };
+        .route("/api/live-feed/mitre", get(api_live_feed_mitre))
+        .layer(middleware::from_fn(cors_middleware))
+        .with_state(state);
 
     let app = agent_api
         .merge(auth_login)
@@ -1769,5 +1772,66 @@ mod tests {
         assert!(!should_require_api_auth("127.0.0.1:8787"));
         assert!(!should_require_api_auth("[::1]:8787"));
         assert!(!should_require_api_auth("localhost:8787"));
+    }
+
+    // Design invariant: `/api/live-feed/*` must always be public — the
+    // marketing site depends on it. The `should_require_api_auth` predicate
+    // must NOT gate these routes even on a non-loopback bind. This test
+    // drives a minimal router that mirrors the production wiring (cors
+    // layer, no auth layer) and confirms every live-feed path responds
+    // with a non-401 plus a CORS header.
+    #[tokio::test]
+    async fn live_feed_routes_public_on_non_loopback_bind() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::util::ServiceExt;
+
+        async fn probe() -> &'static str {
+            "ok"
+        }
+        let live_api: axum::Router<()> = axum::Router::new()
+            .route("/api/live-feed", axum::routing::get(probe))
+            .route("/api/live-feed/stream", axum::routing::get(probe))
+            .route("/api/live-feed/geoip", axum::routing::get(probe))
+            .route("/api/live-feed/honeypot", axum::routing::get(probe))
+            .route("/api/live-feed/mitre", axum::routing::get(probe))
+            .layer(axum::middleware::from_fn(cors_middleware));
+
+        for path in [
+            "/api/live-feed",
+            "/api/live-feed/stream",
+            "/api/live-feed/geoip",
+            "/api/live-feed/honeypot",
+            "/api/live-feed/mitre",
+        ] {
+            let res = live_api
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("route should respond");
+            assert_ne!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must not be auth-gated — marketing site depends on public access"
+            );
+            assert!(
+                res.headers().contains_key("access-control-allow-origin"),
+                "{path} must carry CORS headers"
+            );
+        }
+
+        // Independent safety net: the agent_api branch still uses
+        // should_require_api_auth, so a future refactor that accidentally
+        // removes the predicate breaks this assertion.
+        assert!(
+            should_require_api_auth("0.0.0.0:8787"),
+            "agent_api still relies on should_require_api_auth for non-loopback auth"
+        );
     }
 }

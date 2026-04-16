@@ -90,7 +90,7 @@ pub fn build_clusters(incidents: &[Incident], window_seconds: u64) -> Vec<Incide
 
     let window = Duration::seconds(window_seconds as i64);
     let mut ordered: Vec<&Incident> = incidents.iter().collect();
-    ordered.sort_by(|a, b| a.ts.cmp(&b.ts));
+    ordered.sort_by_key(|a| a.ts);
 
     let mut working: Vec<WorkingCluster> = Vec::new();
 

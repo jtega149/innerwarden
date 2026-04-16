@@ -7,6 +7,22 @@ use innerwarden_killchain::tracker::PidTracker;
 
 use crate::correlation_engine;
 
+/// `comm` values whose events the kill chain tracker must ignore. These are
+/// the platform's own thread names — the agent, sensor, and watchdog. Without
+/// this list, routine agent activity (outbound threat-feed fetches +
+/// credential file reads) trivially matches DATA_EXFIL against the agent
+/// itself.
+///
+/// Linux `comm` is truncated to 15 characters (`TASK_COMM_LEN = 16` including
+/// NUL), so the binary names below are already in their truncated form as
+/// they appear in kernel events.
+pub const KILLCHAIN_SELF_EXCLUDED_COMMS: &[&str] = &[
+    "tokio-rt-worker", // tokio async runtime worker pool (15 chars)
+    "innerwarden-age", // innerwarden-agent (truncated)
+    "innerwarden-sen", // innerwarden-sensor (truncated)
+    "innerwarden-wat", // innerwarden-watchdog (truncated)
+];
+
 /// Process a batch of sensor events through the kill chain tracker.
 /// Returns incidents (JSON values) for any detected chains.
 /// Also feeds the correlation engine with kill chain events.
@@ -59,8 +75,16 @@ pub(crate) fn process_events(
     all_incidents
 }
 
-/// Write kill chain incidents to the daily JSONL file.
-pub(crate) fn write_incidents(data_dir: &Path, incidents: &[serde_json::Value]) {
+/// Write kill chain incidents to the daily JSONL file **and** the unified
+/// SQLite store (when available). The JSONL path is retained for legacy
+/// consumers; SQLite is the source of truth for dashboard queries, attacker
+/// intel, and monthly reports, so missing sqlite writes make kill chain
+/// detections invisible to the rest of the agent.
+pub(crate) fn write_incidents(
+    data_dir: &Path,
+    sqlite_store: Option<&innerwarden_store::Store>,
+    incidents: &[serde_json::Value],
+) {
     if incidents.is_empty() {
         return;
     }
@@ -82,6 +106,27 @@ pub(crate) fn write_incidents(data_dir: &Path, incidents: &[serde_json::Value]) 
             info!(count = incidents.len(), "killchain: emitted incidents");
         }
         Err(e) => warn!(error = %e, "killchain: failed to write incidents"),
+    }
+
+    if let Some(store) = sqlite_store {
+        let mut persisted = 0usize;
+        for inc in incidents {
+            match serde_json::from_value::<innerwarden_core::incident::Incident>(inc.clone()) {
+                Ok(parsed) => {
+                    if let Err(e) = store.insert_incident(&parsed) {
+                        warn!(error = %e, "killchain: sqlite insert_incident failed");
+                    } else {
+                        persisted += 1;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "killchain: incident JSON did not match Incident schema");
+                }
+            }
+        }
+        if persisted > 0 {
+            info!(persisted, "killchain: incidents persisted to sqlite");
+        }
     }
 }
 
@@ -248,6 +293,165 @@ mod tests {
         let json = event_to_tracker_json(&event);
         assert_eq!(json["kind"], "file.read");
         assert!(json["details"].is_object());
+    }
+
+    // Self-exclusion: the platform's own thread names are all present and
+    // each fits in Linux's 15-char comm limit.
+    #[test]
+    fn self_excluded_comms_cover_platform_threads_and_respect_comm_len() {
+        const COMM_LEN: usize = 15;
+        for name in KILLCHAIN_SELF_EXCLUDED_COMMS {
+            assert!(
+                name.len() <= COMM_LEN,
+                "'{name}' exceeds {COMM_LEN}-char comm limit — kernel would truncate it and the match would never fire"
+            );
+        }
+        assert!(KILLCHAIN_SELF_EXCLUDED_COMMS.contains(&"tokio-rt-worker"));
+        assert!(KILLCHAIN_SELF_EXCLUDED_COMMS.contains(&"innerwarden-age"));
+        assert!(KILLCHAIN_SELF_EXCLUDED_COMMS.contains(&"innerwarden-sen"));
+        assert!(KILLCHAIN_SELF_EXCLUDED_COMMS.contains(&"innerwarden-wat"));
+    }
+
+    // Wiring: a tracker built with the self-exclusion list ignores events
+    // attributed to the agent's tokio worker pool.
+    #[test]
+    fn tracker_configured_with_self_exclusions_drops_tokio_rt_worker() {
+        let mut tracker =
+            PidTracker::new().with_excluded_comms(KILLCHAIN_SELF_EXCLUDED_COMMS.iter().copied());
+
+        let connect = serde_json::json!({
+            "kind": "network.outbound_connect",
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "host": "h",
+            "details": {
+                "pid": 1234,
+                "uid": 0,
+                "comm": "tokio-rt-worker",
+                "dst_ip": "1.1.1.1",
+                "dst_port": 443
+            }
+        });
+        let read = serde_json::json!({
+            "kind": "file.read_access",
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "host": "h",
+            "details": {
+                "pid": 1234,
+                "uid": 0,
+                "comm": "tokio-rt-worker",
+                "filename": "/root/.ssh/id_rsa"
+            }
+        });
+
+        assert!(tracker.process_event(&connect).is_empty());
+        assert!(tracker.process_event(&read).is_empty());
+        assert_eq!(tracker.stats(), (0, 0, 0));
+    }
+
+    // write_incidents must persist a conforming incident to the sqlite store
+    // when one is provided, *and* to the JSONL file (unchanged legacy path).
+    #[test]
+    fn write_incidents_persists_to_sqlite_when_store_provided() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(tmp.path()).expect("open sqlite");
+
+        let incident = serde_json::json!({
+            "ts": "2026-04-16T15:52:02.428033127+00:00",
+            "host": "testhost",
+            "incident_id": "kill_chain:detected:DATA_EXFIL:999:2026-04-16T15:52Z",
+            "severity": "critical",
+            "title": "Kill chain detected: DATA_EXFIL (PID 999, attacker)",
+            "summary": "PID 999 (attacker) completed DATA_EXFIL pattern.",
+            "evidence": [{"pattern": "DATA_EXFIL"}],
+            "recommended_checks": [],
+            "tags": ["kill_chain", "detected", "data_exfil"],
+            "entities": []
+        });
+
+        write_incidents(tmp.path(), Some(&store), &[incident]);
+
+        assert_eq!(store.incidents_count().unwrap(), 1);
+        let found = store
+            .get_incident("kill_chain:detected:DATA_EXFIL:999:2026-04-16T15:52Z")
+            .unwrap();
+        assert!(found.is_some(), "incident must be queryable by incident_id");
+
+        let jsonl = std::fs::read_to_string(tmp.path().join(format!(
+            "incidents-{}.jsonl",
+            chrono::Local::now().date_naive().format("%Y-%m-%d")
+        )))
+        .expect("jsonl written");
+        assert!(jsonl.contains("DATA_EXFIL"));
+    }
+
+    // write_incidents without a store must still write JSONL and not panic.
+    #[test]
+    fn write_incidents_without_store_still_writes_jsonl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let incident = serde_json::json!({
+            "ts": "2026-04-16T15:52:02.428033127+00:00",
+            "host": "testhost",
+            "incident_id": "kill_chain:detected:REVERSE_SHELL:42:2026-04-16T15:52Z",
+            "severity": "critical",
+            "title": "t",
+            "summary": "s",
+            "evidence": [],
+            "recommended_checks": [],
+            "tags": [],
+            "entities": []
+        });
+        write_incidents(tmp.path(), None, &[incident]);
+        let jsonl = std::fs::read_to_string(tmp.path().join(format!(
+            "incidents-{}.jsonl",
+            chrono::Local::now().date_naive().format("%Y-%m-%d")
+        )))
+        .expect("jsonl written");
+        assert!(jsonl.contains("REVERSE_SHELL"));
+    }
+
+    // A malformed incident (missing required fields) must not corrupt sqlite
+    // and must be skipped with a warning — the rest of the batch still writes.
+    #[test]
+    fn write_incidents_skips_malformed_and_persists_valid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(tmp.path()).expect("open sqlite");
+
+        let bad = serde_json::json!({"not_an_incident": true});
+        let good = serde_json::json!({
+            "ts": "2026-04-16T15:52:02.428033127+00:00",
+            "host": "h",
+            "incident_id": "kill_chain:detected:DATA_EXFIL:1:2026-04-16T15:52Z",
+            "severity": "critical",
+            "title": "t",
+            "summary": "s",
+            "evidence": [],
+            "recommended_checks": [],
+            "tags": [],
+            "entities": []
+        });
+
+        write_incidents(tmp.path(), Some(&store), &[bad, good]);
+
+        assert_eq!(store.incidents_count().unwrap(), 1);
+    }
+
+    // An empty incident slice must be a cheap no-op — no JSONL file created,
+    // no sqlite write attempted.
+    #[test]
+    fn write_incidents_empty_is_noop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(tmp.path()).expect("open sqlite");
+        write_incidents(tmp.path(), Some(&store), &[]);
+        assert_eq!(store.incidents_count().unwrap(), 0);
+
+        let expected_jsonl = tmp.path().join(format!(
+            "incidents-{}.jsonl",
+            chrono::Local::now().date_naive().format("%Y-%m-%d")
+        ));
+        assert!(
+            !expected_jsonl.exists(),
+            "no JSONL file should be created for empty input"
+        );
     }
 
     // KILLCHAIN_COMM_ALLOWLIST prevents notification for known service processes

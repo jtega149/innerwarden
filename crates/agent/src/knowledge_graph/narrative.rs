@@ -48,10 +48,8 @@ impl KnowledgeGraph {
                         };
                         detail.push_str(&format!(" ({}={})", key, val_str));
                     }
-                    "success" => {
-                        if val == &serde_json::Value::Bool(false) {
-                            detail.push_str(" (FAILED)");
-                        }
+                    "success" if val == &serde_json::Value::Bool(false) => {
+                        detail.push_str(" (FAILED)");
                     }
                     _ => {}
                 }

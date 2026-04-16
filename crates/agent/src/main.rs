@@ -1,3 +1,10 @@
+// Clippy 1.95 promotes `unnecessary_sort_by` to a default-deny lint, but
+// `sort_by_key(|x| Reverse(...))` is less readable than the explicit
+// `sort_by(|a, b| b.x.cmp(&a.x))` pattern used throughout the agent for
+// reverse-sort leaderboards (threat report, attacker intel, MITRE heatmap).
+// Keep the existing style workspace-wide for this crate.
+#![allow(clippy::unnecessary_sort_by)]
+
 // Use jemalloc on Linux - the default glibc allocator fragments memory and
 // never returns it to the OS, causing apparent "leaks" under sustained load.
 // jemalloc aggressively returns unused pages via madvise(MADV_DONTNEED).
@@ -253,19 +260,17 @@ impl NarrativeAccumulator {
             *self.events_by_kind.entry(ev.kind.clone()).or_insert(0) += 1;
             for entity in &ev.entities {
                 match entity.r#type {
-                    innerwarden_core::entities::EntityType::Ip => {
-                        if self.ip_counts.contains_key(&entity.value)
-                            || self.ip_counts.len() < Self::MAX_ENTITY_ENTRIES
-                        {
-                            *self.ip_counts.entry(entity.value.clone()).or_insert(0) += 1;
-                        }
+                    innerwarden_core::entities::EntityType::Ip
+                        if (self.ip_counts.contains_key(&entity.value)
+                            || self.ip_counts.len() < Self::MAX_ENTITY_ENTRIES) =>
+                    {
+                        *self.ip_counts.entry(entity.value.clone()).or_insert(0) += 1;
                     }
-                    innerwarden_core::entities::EntityType::User => {
-                        if self.user_counts.contains_key(&entity.value)
-                            || self.user_counts.len() < Self::MAX_ENTITY_ENTRIES
-                        {
-                            *self.user_counts.entry(entity.value.clone()).or_insert(0) += 1;
-                        }
+                    innerwarden_core::entities::EntityType::User
+                        if (self.user_counts.contains_key(&entity.value)
+                            || self.user_counts.len() < Self::MAX_ENTITY_ENTRIES) =>
+                    {
+                        *self.user_counts.entry(entity.value.clone()).or_insert(0) += 1;
                     }
                     _ => {}
                 }
@@ -1318,7 +1323,12 @@ async fn main() -> Result<()> {
         hypervisor_environment: None,
         killchain_tracker: innerwarden_killchain::tracker::PidTracker::new()
             .with_timeout(cfg.killchain.session_timeout_secs)
-            .with_pre_chain_threshold(cfg.killchain.pre_chain_threshold),
+            .with_pre_chain_threshold(cfg.killchain.pre_chain_threshold)
+            .with_excluded_comms(
+                killchain_inline::KILLCHAIN_SELF_EXCLUDED_COMMS
+                    .iter()
+                    .copied(),
+            ),
         last_killchain_cleanup: std::time::Instant::now(),
         dna_state: dna_inline::DnaState::new(
             &cli.data_dir.join("dna"),
@@ -3139,6 +3149,12 @@ pub(crate) fn honeypot_runtime(cfg: &config::AgentConfig) -> skills::HoneypotRun
     let mode = cfg.honeypot.mode.trim().to_ascii_lowercase();
     let normalized_mode = match mode.as_str() {
         "demo" | "listener" => mode,
+        // `always_on` keeps a permanent listener running from startup (handled
+        // separately in `main`). When a skill-level honeypot action is
+        // requested, it should behave like `listener` — a real listener, not
+        // the demo text response — since that is the semantic the operator
+        // opted into by enabling always-on mode.
+        "always_on" => "listener".to_string(),
         other => {
             warn!(mode = other, "unknown honeypot mode; falling back to demo");
             "demo".to_string()
@@ -3688,7 +3704,7 @@ async fn process_narrative_tick(
             &kc_events,
             &mut state.correlation_engine,
         );
-        killchain_inline::write_incidents(data_dir, &kc_incidents);
+        killchain_inline::write_incidents(data_dir, state.sqlite_store.as_deref(), &kc_incidents);
         killchain_inline::notify_telegram(
             &state.telegram_client,
             &kc_incidents,
@@ -5455,6 +5471,40 @@ mod tests {
             cfg3.honeypot.mode != "always_on",
             "listener should not match always_on"
         );
+    }
+
+    // `honeypot_runtime` must accept `always_on` without warning and map it
+    // to `listener`, since the skill-level honeypot should behave as a real
+    // listener when the operator has opted into always-on mode.
+    #[test]
+    fn honeypot_runtime_accepts_always_on_as_listener() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "always_on".to_string();
+        let runtime = honeypot_runtime(&cfg);
+        assert_eq!(runtime.mode, "listener");
+    }
+
+    #[test]
+    fn honeypot_runtime_preserves_demo_and_listener() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "demo".to_string();
+        assert_eq!(honeypot_runtime(&cfg).mode, "demo");
+        cfg.honeypot.mode = "listener".to_string();
+        assert_eq!(honeypot_runtime(&cfg).mode, "listener");
+    }
+
+    #[test]
+    fn honeypot_runtime_case_insensitive() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "  ALWAYS_ON  ".to_string();
+        assert_eq!(honeypot_runtime(&cfg).mode, "listener");
+    }
+
+    #[test]
+    fn honeypot_runtime_unknown_mode_falls_back_to_demo() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "totally-made-up".to_string();
+        assert_eq!(honeypot_runtime(&cfg).mode, "demo");
     }
 
     // ── Memory safety: NarrativeAccumulator tests ────────────────────
