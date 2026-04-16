@@ -471,6 +471,16 @@ impl ResponseLifecycle {
                 if ip.is_empty() || tracked_targets.contains(ip) {
                     continue;
                 }
+                // Drop malformed targets — a historical decision row with an
+                // invalid IP must not be rehydrated, otherwise it immediately
+                // becomes a zombie Active entry that can never be reverted.
+                if !crate::decision_block_ip::is_valid_block_target(ip) {
+                    tracing::warn!(
+                        target = %ip,
+                        "skipping invalid target while hydrating from decisions JSONL"
+                    );
+                    continue;
+                }
                 // Check if already in active set (may have been added from snapshot)
                 if lifecycle.active.iter().any(|r| r.target == ip) {
                     continue;
@@ -1482,6 +1492,53 @@ mod tests {
         assert!(targets.contains(&"1.2.3.4"));
         assert!(targets.contains(&"136.216.0.0/16"));
         assert!(!targets.contains(&"129.950.5.0"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Secondary hydration path (`decisions-<date>.jsonl`) must also drop
+    // invalid targets. Without this, a historical decision row for an
+    // invalid IP rehydrates as a zombie Active entry on every restart.
+    #[test]
+    fn test_decisions_jsonl_hydration_drops_invalid_targets() {
+        let tmp = std::env::temp_dir().join(format!(
+            "innerwarden-test-dec-invalid-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Empty snapshot so we exercise only the JSONL path.
+        std::fs::write(
+            tmp.join("responses.json"),
+            r#"{"active":[],"history":[],"totals":{}}"#,
+        )
+        .unwrap();
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let now_rfc = chrono::Utc::now().to_rfc3339();
+        // Three rows: one valid, one octet-out-of-range, one valid CIDR.
+        let jsonl = format!(
+            r#"{{"ts":"{now_rfc}","action_type":"block_ip","target_ip":"1.2.3.4","incident_id":"inc-good","skill_id":"block-ip-ufw"}}
+{{"ts":"{now_rfc}","action_type":"block_ip","target_ip":"129.950.5.0","incident_id":"inc-bad","skill_id":"block-ip-ufw"}}
+{{"ts":"{now_rfc}","action_type":"block_ip","target_ip":"136.216.0.0/16","incident_id":"inc-cidr","skill_id":"block-ip-ufw"}}
+"#
+        );
+        std::fs::write(tmp.join(format!("decisions-{today}.jsonl")), jsonl).unwrap();
+
+        let lc = ResponseLifecycle::load_snapshot(&tmp, None);
+        let targets: Vec<&str> = lc.list_active().iter().map(|r| r.target.as_str()).collect();
+        assert_eq!(
+            targets.len(),
+            2,
+            "exactly one JSONL row should have been pruned; got: {:?}",
+            targets
+        );
+        assert!(targets.contains(&"1.2.3.4"));
+        assert!(targets.contains(&"136.216.0.0/16"));
+        assert!(!targets.contains(&"129.950.5.0"));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
