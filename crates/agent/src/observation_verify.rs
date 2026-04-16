@@ -452,11 +452,13 @@ pub struct ObservationConfig {
     /// Maximum score to auto-escalate without AI (default: 40).
     #[serde(default = "default_escalate_threshold")]
     pub auto_escalate_threshold: u8,
-    /// Use AI for ambiguous items (default: true).
+    /// Use AI for ambiguous items (default: true). Used by Phase C.
     #[serde(default = "default_true")]
+    #[allow(dead_code)] // Phase C reads this
     pub ai_verification: bool,
-    /// Maximum items per AI batch call (default: 10).
+    /// Maximum items per AI batch call (default: 10). Used by Phase C.
     #[serde(default = "default_ai_batch_size")]
+    #[allow(dead_code)] // Phase C reads this
     pub ai_batch_size: usize,
     /// Maintenance windows (HH:MM-HH:MM format). Items during these get +10 context.
     #[serde(default)]
