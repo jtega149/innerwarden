@@ -403,6 +403,24 @@ function renderStatus(s, collectors) {
   html += '<div class="report-section"><div class="report-section-title">Data Directory</div>' +
     '<div style="font-family:\'JetBrains Mono\',monospace;font-size:0.78rem;color:var(--muted);padding:4px 0">' + esc(s.data_dir || '-') + '</div></div>';
 
+  // ── Section 5: Knowledge Graph stats ──────────────────────────────────
+  const gs = s.graph || {};
+  if (gs.node_count) {
+    const gmem = gs.memory_bytes ? (gs.memory_bytes / 1024 / 1024).toFixed(1) + ' MB' : '?';
+    const byType = gs.nodes_by_type || {};
+    html += '<div class="report-section"><div class="report-section-title">Knowledge Graph</div>' +
+      '<div style="display:flex;gap:16px;flex-wrap:wrap;padding:4px 0;font-size:0.78rem;">' +
+      '<span>Nodes: <b>' + (gs.node_count||0) + '</b></span>' +
+      '<span>Edges: <b>' + (gs.edge_count||0) + '</b></span>' +
+      '<span>Memory: <b>' + gmem + '</b></span>' +
+      '<span>Incidents: <b>' + (gs.incident_nodes||0) + '</b></span>' +
+      '<span>Threat Intel: <b>' + (gs.threat_intel_nodes||0) + '</b></span>' +
+      '</div>' +
+      '<div style="font-size:0.72rem;color:var(--muted);padding:2px 0">' +
+      Object.entries(byType).map(function(e) { return e[0] + ':' + e[1]; }).join(' · ') +
+      '</div></div>';
+  }
+
   return html;
 }
 

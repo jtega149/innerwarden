@@ -184,6 +184,23 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
         }
     }
 
+    // Graph stats for Health tab (replaces removed Graph tab).
+    let graph_stats = {
+        let graph = state.knowledge_graph.read().unwrap();
+        let mut by_type: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for (_, n) in graph.nodes().iter() {
+            *by_type.entry(format!("{:?}", n.node_type())).or_insert(0) += 1;
+        }
+        serde_json::json!({
+            "node_count": graph.node_count(),
+            "edge_count": graph.edges_slice().len(),
+            "memory_bytes": graph.memory_estimate,
+            "incident_nodes": by_type.get("Incident").copied().unwrap_or(0),
+            "threat_intel_nodes": graph.threat_intel_nodes.len(),
+            "nodes_by_type": by_type
+        })
+    };
+
     Json(serde_json::json!({
         "date": today,
         "data_dir": data_dir.display().to_string(),
@@ -234,6 +251,7 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
             "total_pre_chain": kc_total_pre_chain,
             "patterns": kc_patterns
         },
+        "graph": graph_stats,
         "version": env!("CARGO_PKG_VERSION")
     }))
 }
