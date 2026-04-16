@@ -620,6 +620,17 @@ pub(crate) fn cmd_module_search(query: Option<&str>) -> Result<()> {
 // Module install / uninstall / publish
 // ---------------------------------------------------------------------------
 
+/// SEC-008: Validate module source rejects insecure HTTP transport.
+fn validate_module_source(source: &str) -> Result<()> {
+    if source.starts_with("http://") {
+        anyhow::bail!(
+            "insecure HTTP transport is not allowed for module installation.\n\
+             Use https:// or a local file path instead."
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_module_install(
     cli: &Cli,
     source: &str,
@@ -632,12 +643,7 @@ pub(crate) fn cmd_module_install(
     use module_package::*;
 
     // SEC-008: Reject insecure HTTP transport for module installation.
-    if source.starts_with("http://") {
-        anyhow::bail!(
-            "insecure HTTP transport is not allowed for module installation.\n\
-             Use https:// or a local file path instead."
-        );
-    }
+    validate_module_source(source)?;
     let is_url = source.starts_with("https://");
     let is_path =
         source.starts_with('/') || source.starts_with('.') || std::path::Path::new(source).exists();
@@ -1169,5 +1175,25 @@ mod tests {
         };
         let (passed, _) = run_module_preflight(&pf);
         assert!(!passed);
+    }
+
+    // SEC-008: Module source validation.
+    #[test]
+    fn validate_module_source_rejects_http() {
+        let r = validate_module_source("http://evil.com/module.tar.gz");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("insecure HTTP"));
+    }
+
+    #[test]
+    fn validate_module_source_allows_https() {
+        assert!(validate_module_source("https://registry.innerwarden.com/mod.tar.gz").is_ok());
+    }
+
+    #[test]
+    fn validate_module_source_allows_local_path() {
+        assert!(validate_module_source("/opt/modules/my-module.tar.gz").is_ok());
+        assert!(validate_module_source("./my-module.tar.gz").is_ok());
+        assert!(validate_module_source("my-module").is_ok());
     }
 }

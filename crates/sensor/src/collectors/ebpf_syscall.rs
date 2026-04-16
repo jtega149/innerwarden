@@ -55,6 +55,12 @@ pub fn is_ebpf_available() -> bool {
     }
 
     // eBPF bytecode exists: embedded builds always have it, otherwise check disk.
+    has_ebpf_bytecode()
+}
+
+/// Check if eBPF bytecode is available (embedded or on disk).
+/// Separated from `is_ebpf_available()` for testability on non-Linux.
+fn has_ebpf_bytecode() -> bool {
     #[cfg(feature = "ebpf-embedded")]
     {
         true
@@ -2758,5 +2764,20 @@ mod tests {
     #[test]
     fn ebpf_obj_paths_are_absolute() {
         assert!(EBPF_OBJ_PATH.starts_with('/'));
+    }
+
+    #[test]
+    fn has_ebpf_bytecode_returns_bool() {
+        // Without the ebpf-embedded feature, checks disk paths which don't
+        // exist in dev/CI — returns false. With embedded, returns true.
+        // Either way, the function must not panic.
+        let result = has_ebpf_bytecode();
+        if cfg!(feature = "ebpf-embedded") {
+            assert!(result);
+        } else {
+            // On dev machines the bytecode files typically don't exist
+            // (they're only built with `cargo +nightly build --target bpfel-unknown-none`)
+            let _ = result; // just verify it doesn't panic
+        }
     }
 }
