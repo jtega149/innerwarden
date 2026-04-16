@@ -454,6 +454,55 @@ impl IpAccumulator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Presentation logic mappers
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub(crate) fn classify_phase(event_kind: &str) -> &'static str {
+    let lower = event_kind.to_ascii_lowercase();
+    if lower.contains("port_scan") || lower.contains("recon") {
+        "reconnaissance"
+    } else if lower.contains("login_success")
+        || lower.contains("_accepted")
+        || lower.contains("auth_success")
+    {
+        "access_success"
+    } else if lower.contains("sudo") || lower.contains("privilege") {
+        "privilege_abuse"
+    } else if lower.contains("persist") {
+        "persistence"
+    } else if lower.contains("exec") || lower.contains("shell") {
+        "execution"
+    } else {
+        "initial_access_attempt"
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn severity_color(severity: &str) -> &'static str {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => "#ff4444",
+        "high" => "#ff8800",
+        "medium" => "#ffbb33",
+        "low" => "#00C851",
+        "info" => "#33b5e5",
+        _ => "#888888",
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn status_determination(outcome: &str) -> &'static str {
+    match outcome.to_ascii_lowercase().as_str() {
+        "blocked" | "killed" => "contained",
+        "monitoring" | "monitored" => "observing",
+        "honeypot" | "diverted" => "contained",
+        "active" | "open" => "needs_attention",
+        "dismissed" | "ignored" => "observing",
+        _ => "needs_attention",
+    }
+}
+
 pub(crate) fn severity_order(s: &str) -> u8 {
     match s {
         "critical" => 5,
@@ -462,5 +511,53 @@ pub(crate) fn severity_order(s: &str) -> u8 {
         "low" => 2,
         "info" => 1,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_phase() {
+        // Assert valid mapped logic matching specification goals
+        assert_eq!(classify_phase("nmap_port_scan"), "reconnaissance");
+        assert_eq!(classify_phase("recon_probe"), "reconnaissance");
+        assert_eq!(classify_phase("ssh_login_success"), "access_success");
+        assert_eq!(classify_phase("pubkey_accepted"), "access_success");
+        assert_eq!(classify_phase("sudo_failure"), "privilege_abuse");
+        assert_eq!(classify_phase("kernel_module_persist"), "persistence");
+        assert_eq!(classify_phase("reverse_shell"), "execution");
+        assert_eq!(classify_phase("ssh_brute_force"), "initial_access_attempt");
+        assert_eq!(classify_phase("unknown_event"), "initial_access_attempt");
+    }
+
+    #[test]
+    fn test_severity_color_mapper() {
+        assert_eq!(severity_color("critical"), "#ff4444");
+        assert_eq!(severity_color("CRITICAL"), "#ff4444");
+        assert_eq!(severity_color("INFO"), "#33b5e5");
+        assert_eq!(severity_color("unknown"), "#888888");
+    }
+
+    #[test]
+    fn test_status_determination_logic() {
+        assert_eq!(status_determination("blocked"), "contained");
+        assert_eq!(status_determination("killed"), "contained");
+        assert_eq!(status_determination("honeypot"), "contained");
+        assert_eq!(status_determination("monitoring"), "observing");
+        assert_eq!(status_determination("dismissed"), "observing");
+        assert_eq!(status_determination("active"), "needs_attention");
+        assert_eq!(status_determination("unknown"), "needs_attention");
+    }
+
+    #[test]
+    fn test_severity_order() {
+        assert_eq!(severity_order("critical"), 5);
+        assert_eq!(severity_order("high"), 4);
+        assert_eq!(severity_order("medium"), 3);
+        assert_eq!(severity_order("low"), 2);
+        assert_eq!(severity_order("info"), 1);
+        assert_eq!(severity_order("unknown"), 0);
     }
 }

@@ -376,3 +376,139 @@ pub(super) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
 
     result
 }
+
+// ---------------------------------------------------------------------------
+// Formatting & Escaping Helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn escape_html(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len() + 10);
+    for c in input.chars() {
+        match c {
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            '/' => escaped.push_str("&#x2F;"),
+            // Null bytes or non-printable chars can be wiped
+            '\0' => escaped.push_str(""),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+pub(crate) fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        return format!("{:.1} GB", bytes as f64 / 1_073_741_824.0);
+    }
+    if bytes >= 1_048_576 {
+        return format!("{:.1} MB", bytes as f64 / 1_048_576.0);
+    }
+    if bytes >= 1024 {
+        return format!("{:.1} KB", bytes as f64 / 1024.0);
+    }
+    format!("{} B", bytes)
+}
+
+pub(crate) fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{}s", secs);
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{}m {}s", mins, secs % 60);
+    }
+    format!("{}h {}m", mins / 60, mins % 60)
+}
+
+pub(crate) fn truncate_ip(ip: &str) -> String {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() == 4 {
+        format!("{}.{}.x.x", parts[0], parts[1])
+    } else {
+        // Fallback or IPv6
+        let chars: Vec<char> = ip.chars().collect();
+        if chars.len() > 10 {
+            let truncated: String = chars[0..8].iter().collect();
+            format!("{}...", truncated)
+        } else {
+            ip.to_string()
+        }
+    }
+}
+
+pub(crate) fn format_percentage(value: f64) -> String {
+    format!("{:.1}%", value)
+}
+
+pub(crate) fn format_timestamp(ts: chrono::DateTime<chrono::Utc>) -> String {
+    ts.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_html_prevents_xss() {
+        // Basic script injection
+        let payload_1 = "<script>alert('xss')</script>";
+        let esc_1 = escape_html(payload_1);
+        assert_eq!(
+            esc_1,
+            "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;&#x2F;script&gt;"
+        );
+
+        // Quotes bounding evasion
+        let payload_2 = "\" onmouseover=\"alert(1)\"";
+        let esc_2 = escape_html(payload_2);
+        assert_eq!(esc_2, "&quot; onmouseover=&quot;alert(1)&quot;");
+
+        // Null bytes
+        let payload_3 = "test\0test";
+        let esc_3 = escape_html(payload_3);
+        assert_eq!(esc_3, "testtest");
+
+        // Ampersand double-escape injection verification
+        let payload_4 = "a & b &amp; c";
+        let esc_4 = escape_html(payload_4);
+        assert_eq!(esc_4, "a &amp; b &amp;amp; c");
+    }
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(500), "500 B");
+        assert_eq!(format_size(1500), "1.5 KB");
+        assert_eq!(format_size(1_500_000), "1.4 MB");
+        assert_eq!(format_size(2_500_000_000), "2.3 GB");
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(125), "2m 5s");
+        assert_eq!(format_duration(3600), "1h 0m");
+        assert_eq!(format_duration(3665), "1h 1m");
+    }
+
+    #[test]
+    fn test_truncate_ip() {
+        assert_eq!(truncate_ip("192.168.1.5"), "192.168.x.x");
+        assert_eq!(truncate_ip("10.0.0.1"), "10.0.x.x");
+        // IPv6 truncates to length
+        assert_eq!(
+            truncate_ip("2001:0db8:85a3:0000:0000:8a2e:0370:7334"),
+            "2001:0db..."
+        );
+        // Short domains
+        assert_eq!(truncate_ip("localhost"), "localhost");
+    }
+
+    #[test]
+    fn test_format_percentage() {
+        assert_eq!(format_percentage(85.45), "85.5%");
+        assert_eq!(format_percentage(100.0), "100.0%");
+    }
+}
