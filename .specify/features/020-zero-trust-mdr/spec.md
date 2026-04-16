@@ -2,7 +2,7 @@
 
 **Created**: 2026-04-15
 **Updated**: 2026-04-16
-**Status**: DRAFT
+**Status**: FREE PHASES COMPLETE (C, D, F-partial done 2026-04-16). Paid phases (A, B, E, F-full) in active-defence repo.
 **Priority**: P0 (product differentiator)
 **Depends on**: Spec 018 (Phases A-D done), Spec 021
 

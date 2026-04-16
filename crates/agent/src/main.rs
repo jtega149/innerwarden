@@ -112,6 +112,8 @@ mod trust_scoring;
 mod two_factor;
 mod web_push;
 mod webhook;
+#[allow(dead_code)]
+mod zero_trust;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};

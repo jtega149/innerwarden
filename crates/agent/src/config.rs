@@ -103,6 +103,10 @@ pub struct AgentConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub soc_checks: crate::soc_checks::SocChecksConfig,
+    /// Zero trust enforcement modes — learning | notify | enforce (spec 020 Phase F).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub zero_trust: crate::zero_trust::ZeroTrustConfig,
     /// Detectors that run graph-only (sensor version suppressed).
     /// After parallel validation, add detector names here to disable the sensor version.
     /// Example: ["threat_intel", "lateral_movement", "persistence"]
