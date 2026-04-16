@@ -112,6 +112,9 @@ ADR: `docs/internal/adr/0001-project-taxonomy.md`
 | 014 | Graph Full Connectivity | **COMPLETE** (Phases A-D + leftover). 8 → 18 active relations. tcp_stream/eBPF/memory/cgroup/incident-PID all ingested. Bug fixes: missing `--features ebpf` flag, filename/path field mismatch, 200MB JSONL cap dropping events. Edges 12K → 33K, Process nodes 411 → 4470. |
 | 016 | Unified SQLite Store | **COMPLETE** (v0.11.0). Single `innerwarden.db` replaces 15 storage artifacts. 8 phases + cleanup. redb removed, JSONL removed, 14 maintenance tasks, legacy migration. |
 | 017 | Dashboard Operator UX | **Draft** P1. Two personas (primary operator + technical fallback). 15 FRs covering state consistency, non-alarmist tone, mobile legibility, stale-data indicators. Spec validated, no plan yet. |
+| 019 | Test Coverage Gaps (Batches 2–7) | **In progress** (Gemini-owned). Batch 1 landed in PR #110. Batches 2–7 outstanding: agent + ctl pure-logic extraction. Target 42.85% → 50%. |
+| 022 | Dashboard Test Coverage | **Draft** P0. 6 batches covering 16 dashboard files (9,709 lines, 24 tests total). HTML escaping, auth, investigation journeys, sensors status bugs, actions validation. Target 0% → 30%+ on dashboard. |
+| 023 | Coverage Closeout (project-wide) | **Draft** P1. 11 batches, 56 files, ~335 tests across ctl/sensor/agent/hypervisor/smm/shield. Picks up what 019 and 022 don't cover. Target 45% → 65% (stretch 70%). Coordination rules + lint traps documented. |
 
 ## Divida tecnica
 
