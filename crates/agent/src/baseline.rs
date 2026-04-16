@@ -198,8 +198,10 @@ impl BaselineStore {
             }
         }
 
-        // Track user login hours
-        if event.kind.contains("login") || event.kind.contains("accepted") {
+        // Track user login hours — only SUCCESSFUL logins.
+        // Failed logins (brute-force) must NOT pollute the baseline,
+        // otherwise attacker usernames appear as "normal" login patterns.
+        if event.kind == "ssh.login_success" || event.kind.contains("accepted") {
             for entity in &event.entities {
                 if entity.r#type == EntityType::User {
                     let profile = self

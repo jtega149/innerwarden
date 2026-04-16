@@ -92,6 +92,21 @@ pub struct AgentConfig {
     #[serde(default)]
     #[allow(dead_code)] // parsed for future signing-verification integration
     pub config_signing: ConfigSigningConfig,
+    /// Observation verification — behavioural scoring for OBSERVING items (spec 021).
+    #[serde(default)]
+    pub observation: crate::observation_verify::ObservationConfig,
+    /// Trust scoring engine — continuous entity trust scores (spec 020 Phase C).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub trust_scoring: crate::trust_scoring::TrustScoringConfig,
+    /// SOC daily checks — system health checks at configurable hour (spec 020 Phase D).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub soc_checks: crate::soc_checks::SocChecksConfig,
+    /// Zero trust enforcement modes — learning | notify | enforce (spec 020 Phase F).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub zero_trust: crate::zero_trust::ZeroTrustConfig,
     /// Detectors that run graph-only (sensor version suppressed).
     /// After parallel validation, add detector names here to disable the sensor version.
     /// Example: ["threat_intel", "lateral_movement", "persistence"]
@@ -1045,6 +1060,43 @@ pub struct ResponderConfig {
     /// Respects dry_run and allowlist.
     #[serde(default = "default_true")]
     pub auto_rules_enabled: bool,
+
+    /// Process names (comm) excluded from correlation-engine data exfil detection.
+    /// Events from these processes are still logged but do not feed into attack
+    /// chain correlation. Prevents false positives from agent's own API calls,
+    /// monitoring tools, and package managers.
+    ///
+    /// Default includes InnerWarden's own processes. Add system daemons and
+    /// monitoring tools that make legitimate outbound connections.
+    #[serde(default = "default_trusted_processes")]
+    pub trusted_processes: Vec<String>,
+}
+
+fn default_trusted_processes() -> Vec<String> {
+    vec![
+        // InnerWarden ecosystem (binary names + tokio thread names)
+        "innerwarden-age".into(),
+        "innerwarden-sen".into(),
+        "innerwarden-wat".into(),
+        "openclaw-gatewa".into(),
+        // NOTE: "tokio-rt-worker" is too broad (any Rust app with Tokio).
+        // Instead, filter by PID tree at runtime. See main.rs trusted_pids.
+        // System services
+        "crowdsec".into(),
+        "apt".into(),
+        "dpkg".into(),
+        "dnf".into(),
+        "yum".into(),
+        "snap".into(),
+        "snapd".into(),
+        "certbot".into(),
+        "unattended-upgr".into(),
+        // Monitoring
+        "prometheus".into(),
+        "grafana".into(),
+        "node_exporter".into(),
+        "telegraf".into(),
+    ]
 }
 
 impl Default for ResponderConfig {
@@ -1055,6 +1107,7 @@ impl Default for ResponderConfig {
             block_backend: default_block_backend(),
             allowed_skills: default_allowed_skills(),
             auto_rules_enabled: true,
+            trusted_processes: default_trusted_processes(),
         }
     }
 }
@@ -1646,7 +1699,7 @@ fn default_context_events() -> usize {
 }
 
 fn default_confidence_threshold() -> f32 {
-    0.8
+    0.85
 }
 
 fn default_incident_poll_secs() -> u64 {
@@ -2706,7 +2759,10 @@ approval_ttl_secs = 300
         let cfg = AiConfig::default();
         assert!(!cfg.enabled);
         assert_eq!(cfg.provider, "openai");
-        assert!(cfg.confidence_threshold > 0.0);
+        assert!(
+            (cfg.confidence_threshold - 0.85).abs() < f32::EPSILON,
+            "default threshold should be 0.85"
+        );
         assert!(cfg.max_ai_calls_per_tick > 0);
         assert_eq!(cfg.circuit_breaker_threshold, 0); // disabled by default
     }

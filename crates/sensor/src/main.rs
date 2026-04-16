@@ -269,7 +269,9 @@ async fn main() -> Result<()> {
             window_seconds = d.window_seconds,
             "sudo_abuse detector enabled"
         );
-        SudoAbuseDetector::new(&cfg.agent.host_id, d.threshold, d.window_seconds)
+        let mut det = SudoAbuseDetector::new(&cfg.agent.host_id, d.threshold, d.window_seconds);
+        det.set_trusted_users(cfg.allowlist.trusted_users.clone());
+        det
     });
     let search_abuse_detector = cfg.detectors.search_abuse.enabled.then(|| {
         let d = &cfg.detectors.search_abuse;

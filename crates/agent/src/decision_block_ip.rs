@@ -239,6 +239,10 @@ pub(crate) fn check_block_eligibility(
     if ip.is_empty() {
         return Err("skipped: block decision has empty IP".to_string());
     }
+    // Reject IPs that won't parse — prevents ufw/iptables "Bad source address" errors.
+    if ip.parse::<std::net::IpAddr>().is_err() {
+        return Err(format!("skipped: {ip} is not a valid IP address"));
+    }
     if operator_ips.contains_key(ip) {
         return Err(format!("skipped: {ip} is an active operator session"));
     }
@@ -282,6 +286,24 @@ mod tests {
         // 4. normal
         assert_eq!(
             check_block_eligibility("8.8.8.8", &operator_ips, 5, 20),
+            Ok(())
+        );
+
+        // 5. invalid IP (octet > 255) — must reject
+        assert_eq!(
+            check_block_eligibility("129.950.5.0", &operator_ips, 0, 20),
+            Err("skipped: 129.950.5.0 is not a valid IP address".to_string())
+        );
+
+        // 6. garbage string — must reject
+        assert_eq!(
+            check_block_eligibility("not-an-ip", &operator_ips, 0, 20),
+            Err("skipped: not-an-ip is not a valid IP address".to_string())
+        );
+
+        // 7. valid IPv6
+        assert_eq!(
+            check_block_eligibility("2001:db8::1", &operator_ips, 0, 20),
             Ok(())
         );
     }

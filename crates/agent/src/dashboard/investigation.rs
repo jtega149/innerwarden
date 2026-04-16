@@ -2060,3 +2060,343 @@ pub(super) fn render_markdown_snapshot(snapshot: &InvestigationExport) -> String
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(-10), "0s"); // fallback handling
+        assert_eq!(format_duration(125), "2m 5s");
+        assert_eq!(format_duration(120), "2m");
+        assert_eq!(format_duration(3600), "1h");
+        assert_eq!(format_duration(3665), "1h 1m");
+    }
+
+    #[test]
+    fn test_derive_verdict_blocked() {
+        let ts = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        let entries = vec![
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "nmap_port_scan"}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "incident".to_string(),
+                data: serde_json::json!({"incident_id": "port_scan:1"}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "decision".to_string(),
+                data: serde_json::json!({"action_type": "block_ip"}),
+            },
+        ];
+
+        let verdict = derive_verdict(&entries, "blocked");
+        assert_eq!(verdict.entry_vector, "port_scan");
+        assert_eq!(verdict.access_status, "no_evidence_of_success");
+        assert_eq!(verdict.containment_status, "blocked");
+        assert_eq!(verdict.confidence, "high"); // has event + incident + decision
+    }
+
+    #[test]
+    fn test_derive_chapters() {
+        let ts = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        let entries = vec![
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "login_attempt", "details": {"user": "admin"}}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "login_attempt", "details": {"user": "root"}}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "incident".to_string(),
+                data: serde_json::json!({"incident_id": "ssh_bruteforce:1"}),
+            },
+        ];
+
+        let chapters = derive_chapters(&entries);
+        assert_eq!(chapters.len(), 2);
+
+        let ch1 = &chapters[0];
+        assert_eq!(ch1.stage, "initial_access_attempt");
+        assert_eq!(ch1.entry_count, 2);
+        assert!(
+            ch1.evidence_highlights.contains(&"admin".to_string())
+                || ch1.evidence_highlights.contains(&"root".to_string())
+        );
+
+        let ch2 = &chapters[1];
+        assert_eq!(ch2.stage, "response");
+        assert_eq!(ch2.entry_count, 1);
+    }
+
+    #[test]
+    fn test_build_journey_summary_with_hints() {
+        // Build summary with no entries
+        let summary = build_journey_summary(
+            &[],
+            "unknown",
+            PivotKind::Ip,
+            "10.0.0.1",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(summary.total_entries, 0);
+        assert!(summary.hints[0].contains("No timeline entries"));
+    }
+    #[test]
+    fn test_severity_rank() {
+        assert_eq!(severity_rank("critical"), 5);
+        assert_eq!(severity_rank("HIGH"), 4);
+        assert_eq!(severity_rank("Medium"), 3);
+        assert_eq!(severity_rank("low"), 2);
+        assert_eq!(severity_rank("info"), 1);
+        assert_eq!(severity_rank("unknown"), 0);
+    }
+
+    #[test]
+    fn test_classify_phase_attack_matrix() {
+        // Covers ATT&CK-like event kind mapping used by journey timeline phases.
+        let cases = [
+            ("initial_access", "initial_access_attempt"),
+            ("execution", "execution"),
+            ("persistence", "persistence"),
+            ("privilege_escalation", "privilege_abuse"),
+            ("defense_evasion", "initial_access_attempt"),
+            ("credential_access", "initial_access_attempt"),
+            ("lateral_movement", "initial_access_attempt"),
+            ("exfiltration", "initial_access_attempt"),
+            ("impact", "initial_access_attempt"),
+            ("honeypot_interaction", "initial_access_attempt"),
+            ("response", "initial_access_attempt"),
+            ("containment", "initial_access_attempt"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(classify_phase(kind), expected);
+        }
+    }
+
+    #[test]
+    fn test_describe_chapter_bruteforce_burst_title() {
+        // Verifies that a large burst is collapsed into a concise brute-force title.
+        let ts = Utc::now();
+        let entries: Vec<JourneyEntry> = (0..50)
+            .map(|_| JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "ssh_login_failed", "details": {"username": "root"}}),
+            })
+            .collect();
+        let (title, _, _) = describe_chapter("initial_access_attempt", &entries);
+        assert_eq!(title, "Brute-force burst (50 attempts)");
+    }
+
+    #[test]
+    fn test_journey_entries_sorted_most_recent_first() {
+        // Ensures timeline rendering can show newest events first when requested.
+        let older = Utc::now() - chrono::Duration::minutes(5);
+        let newer = Utc::now();
+        let mut entries = vec![
+            JourneyEntry {
+                ts: older,
+                kind: "event".to_string(),
+                data: serde_json::json!({}),
+            },
+            JourneyEntry {
+                ts: newer,
+                kind: "incident".to_string(),
+                data: serde_json::json!({}),
+            },
+        ];
+        entries.sort_by(|a, b| b.ts.cmp(&a.ts));
+        assert!(entries[0].ts >= entries[1].ts);
+    }
+
+    #[test]
+    fn test_journey_summary_incident_counts_edge_values() {
+        // Validates 0/1/100 incident count scenarios in the summary builder.
+        let ts = Utc::now();
+        let summary_zero = build_journey_summary(
+            &[],
+            "unknown",
+            PivotKind::Ip,
+            "1.2.3.4",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(summary_zero.incidents_count, 0);
+
+        let one = vec![JourneyEntry {
+            ts,
+            kind: "incident".to_string(),
+            data: serde_json::json!({"incident_id": "one:1"}),
+        }];
+        let summary_one = build_journey_summary(
+            &one,
+            "active",
+            PivotKind::Ip,
+            "1.2.3.4",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(summary_one.incidents_count, 1);
+
+        let many: Vec<JourneyEntry> = (0..100)
+            .map(|idx| JourneyEntry {
+                ts,
+                kind: "incident".to_string(),
+                data: serde_json::json!({"incident_id": format!("bulk:{idx}")}),
+            })
+            .collect();
+        let summary_many = build_journey_summary(
+            &many,
+            "active",
+            PivotKind::Ip,
+            "1.2.3.4",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(summary_many.incidents_count, 100);
+    }
+
+    #[test]
+    fn test_journey_summary_ip_with_only_honeypot_sessions() {
+        // Confirms honeypot-only timelines are counted without requiring incidents.
+        let ts = Utc::now();
+        let entries = vec![JourneyEntry {
+            ts,
+            kind: "honeypot_ssh".to_string(),
+            data: serde_json::json!({"peer_ip": "4.3.2.1"}),
+        }];
+        let summary = build_journey_summary(
+            &entries,
+            "honeypot",
+            PivotKind::Ip,
+            "4.3.2.1",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(summary.honeypot_count, 1);
+        assert_eq!(summary.incidents_count, 0);
+    }
+
+    #[test]
+    fn test_journey_summary_decision_without_incident() {
+        // Ensures decision-only timelines are represented even when no incident is present.
+        let ts = Utc::now();
+        let entries = vec![JourneyEntry {
+            ts,
+            kind: "decision".to_string(),
+            data: serde_json::json!({"action_type": "monitor"}),
+        }];
+        let summary = build_journey_summary(
+            &entries,
+            "monitoring",
+            PivotKind::Ip,
+            "9.9.9.9",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(summary.decisions_count, 1);
+        assert_eq!(summary.incidents_count, 0);
+    }
+
+    #[test]
+    fn test_journey_window_first_and_last_seen() {
+        // Verifies the investigation window is computed from first to last seen entry.
+        let first = Utc::now() - chrono::Duration::minutes(10);
+        let last = Utc::now();
+        let entries = vec![
+            JourneyEntry {
+                ts: first,
+                kind: "event".to_string(),
+                data: serde_json::json!({}),
+            },
+            JourneyEntry {
+                ts: last,
+                kind: "decision".to_string(),
+                data: serde_json::json!({"action_type": "block_ip"}),
+            },
+        ];
+        let first_seen = entries.first().map(|e| e.ts);
+        let last_seen = entries.last().map(|e| e.ts);
+        assert_eq!(first_seen, Some(first));
+        assert_eq!(last_seen, Some(last));
+        assert_eq!((last - first).num_minutes(), 10);
+    }
+
+    #[test]
+    fn test_describe_chapter_response_summary_pluralization() {
+        // Keeps response chapter summary stable for multiple incidents.
+        let ts = Utc::now();
+        let entries = vec![
+            JourneyEntry {
+                ts,
+                kind: "incident".to_string(),
+                data: serde_json::json!({"title": "Incident A"}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "incident".to_string(),
+                data: serde_json::json!({"title": "Incident B"}),
+            },
+        ];
+        let (_, summary, _) = describe_chapter("response", &entries);
+        assert_eq!(summary, "2 detector incident(s) raised");
+    }
+
+    #[test]
+    fn test_build_pivot_shortcuts_no_duplicates() {
+        // Guarantees shortcut list remains deduplicated when subject repeats in related sets.
+        let mut related_ips = BTreeSet::new();
+        related_ips.insert("1.2.3.4".to_string());
+        let mut related_users = BTreeSet::new();
+        related_users.insert("alice".to_string());
+        let mut related_detectors = BTreeSet::new();
+        related_detectors.insert("ssh_bruteforce".to_string());
+        let shortcuts = build_pivot_shortcuts(
+            PivotKind::Ip,
+            "1.2.3.4",
+            &related_ips,
+            &related_users,
+            &related_detectors,
+        );
+        let unique = shortcuts.iter().collect::<BTreeSet<_>>();
+        assert_eq!(shortcuts.len(), unique.len());
+    }
+
+    #[test]
+    fn test_describe_chapter_honeypot_highlights_extract_credentials() {
+        // Checks credential highlights extraction from honeypot auth attempts.
+        let ts = Utc::now();
+        let entries = vec![JourneyEntry {
+            ts,
+            kind: "honeypot_ssh".to_string(),
+            data: serde_json::json!({
+                "auth_attempts": [
+                    {"username": "root", "password": "toor"}
+                ]
+            }),
+        }];
+        let (_, _, highlights) = describe_chapter("honeypot_interaction", &entries);
+        assert_eq!(highlights, vec!["root/toor".to_string()]);
+    }
+}

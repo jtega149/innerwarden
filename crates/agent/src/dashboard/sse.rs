@@ -63,24 +63,7 @@ pub(super) async fn watch_for_new_entries(data_dir: PathBuf, tx: EventTx) {
                     for line in buf.lines() {
                         if let Ok(inc) = serde_json::from_str::<Incident>(line) {
                             if matches!(inc.severity, Severity::High | Severity::Critical) {
-                                // Pick first ip entity, fall back to first entity of any kind.
-                                let entity = inc
-                                    .entities
-                                    .iter()
-                                    .find(|e| e.r#type == EntityType::Ip)
-                                    .or_else(|| inc.entities.first());
-                                let (etype, evalue) = entity
-                                    .map(|e| {
-                                        let t = match e.r#type {
-                                            EntityType::Ip => "ip",
-                                            EntityType::User => "user",
-                                            EntityType::Container => "container",
-                                            EntityType::Path => "path",
-                                            EntityType::Service => "service",
-                                        };
-                                        (t, e.value.as_str())
-                                    })
-                                    .unwrap_or(("ip", "unknown"));
+                                let (etype, evalue) = extract_alert_entity(&inc);
 
                                 let payload = serde_json::json!({
                                     "severity":     format!("{:?}", inc.severity).to_lowercase(),
@@ -149,3 +132,91 @@ pub(super) async fn api_events_stream(
 
 // ---------------------------------------------------------------------------
 // Route handlers
+
+pub(super) fn extract_alert_entity(
+    inc: &innerwarden_core::incident::Incident,
+) -> (&'static str, String) {
+    // Pick first ip entity, fall back to first entity of any kind.
+    let entity = inc
+        .entities
+        .iter()
+        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+        .or_else(|| inc.entities.first());
+
+    entity
+        .map(|e| {
+            let t = match e.r#type {
+                innerwarden_core::entities::EntityType::Ip => "ip",
+                innerwarden_core::entities::EntityType::User => "user",
+                innerwarden_core::entities::EntityType::Container => "container",
+                innerwarden_core::entities::EntityType::Path => "path",
+                innerwarden_core::entities::EntityType::Service => "service",
+            };
+            (t, e.value.clone())
+        })
+        .unwrap_or(("ip", "unknown".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use innerwarden_core::entities::{EntityRef, EntityType};
+    use innerwarden_core::incident::Incident;
+
+    #[test]
+    fn test_extract_alert_entity() {
+        // Picks best entity representation for alert payload rendering.
+        let root_inc = Incident {
+            ts: Utc::now(),
+            host: "test".to_string(),
+            incident_id: "test1".to_string(),
+            severity: innerwarden_core::event::Severity::High,
+            title: "Test".to_string(),
+            summary: "Test".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef {
+                r#type: EntityType::User,
+                value: "root".to_string(),
+            }],
+        };
+
+        let (etype, eval) = extract_alert_entity(&root_inc);
+        assert_eq!(etype, "user");
+        assert_eq!(eval, "root");
+
+        let ip_inc = Incident {
+            entities: vec![
+                EntityRef {
+                    r#type: EntityType::User,
+                    value: "root".to_string(),
+                },
+                EntityRef {
+                    r#type: EntityType::Ip,
+                    value: "1.2.3.4".to_string(),
+                },
+            ],
+            ..root_inc
+        };
+
+        let (etype, eval) = extract_alert_entity(&ip_inc);
+        assert_eq!(etype, "ip"); // should prefer ip over user
+        assert_eq!(eval, "1.2.3.4");
+
+        let empty_inc = Incident {
+            entities: vec![],
+            ..ip_inc
+        };
+        let (etype, eval) = extract_alert_entity(&empty_inc);
+        assert_eq!(etype, "ip");
+        assert_eq!(eval, "unknown");
+    }
+
+    #[test]
+    fn test_sse_connection_count_starts_at_zero() {
+        // The global SSE connection counter should be initialized to zero.
+        assert_eq!(SSE_CONNECTIONS.load(Ordering::Relaxed), 0);
+    }
+}

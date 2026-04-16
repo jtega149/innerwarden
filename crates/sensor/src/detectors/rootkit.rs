@@ -498,7 +498,12 @@ impl RootkitDetector {
         "cargo",
         "rustc",
         "cc1",
+        "cc1plus",
+        "as",
         "ld",
+        "ld.lld",
+        "build-script-", // cargo build scripts (build-script-build, build-script-main, etc.)
+        "proc-macro-srv", // Rust proc macro server
         "sh",
         "bash",
         "git",
@@ -508,8 +513,14 @@ impl RootkitDetector {
         "dpkg",
         "pip",
         "python3",
+        "make",
+        "cmake",
+        "ninja",
         "innerwarden-age",
         "innerwarden-sen",
+        "innerwarden-wat",
+        "crowdsec",
+        "unifiedmonitori", // Oracle Cloud agent
     ];
 
     /// Check if any tracked PIDs are hidden from /proc.

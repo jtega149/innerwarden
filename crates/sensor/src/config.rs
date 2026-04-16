@@ -12,6 +12,15 @@ pub struct Config {
     pub detectors: DetectorsConfig,
     #[serde(default)]
     pub calibration: CalibrationConfig,
+    #[serde(default)]
+    pub allowlist: AllowlistConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct AllowlistConfig {
+    /// Users excluded from sudo abuse detection.
+    #[serde(default)]
+    pub trusted_users: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

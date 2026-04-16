@@ -179,7 +179,7 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
 /// Build 72-dim feature vector for the defender brain from incident + agent state.
 /// Enriched with IP reputation, attacker profile, correlation, baseline — gives
 /// the brain enough context to distinguish real attacks from FPs.
-fn build_brain_features(
+pub(crate) fn build_brain_features(
     incident: &innerwarden_core::incident::Incident,
     state: &AgentState,
 ) -> [f32; 72] {
@@ -324,6 +324,88 @@ fn build_brain_features(
     };
 
     f
+}
+
+/// Log a deterministic (Layer 1/2) decision to the brain so it learns from
+/// high-quality ground-truth labels. Called by auto-rules and correlation-response.
+///
+/// The `ai_action` string is formatted the same way as AI decisions so the
+/// brain's `retrain_from_log` treats them identically.
+pub(crate) fn log_deterministic_decision_to_brain(
+    incident: &innerwarden_core::incident::Incident,
+    action_str: &str,
+    confidence: f32,
+    provider_label: &str,
+    data_dir: &std::path::Path,
+    state: &mut AgentState,
+) {
+    if !state.defender_brain.is_loaded() {
+        return;
+    }
+
+    let features = build_brain_features(incident, state);
+    let suggestion = state.defender_brain.suggest(&features);
+
+    let (brain_action, brain_confidence, brain_value, brain_top3, brain_agrees) =
+        if let Some(ref s) = suggestion {
+            (
+                s.action_name,
+                s.confidence,
+                s.value,
+                s.top_actions.clone(),
+                is_brain_agreeing_with_ai(s.action_name, action_str),
+            )
+        } else {
+            ("unknown", 0.0, 0.0, vec![], false)
+        };
+
+    let det = incident.incident_id.split(':').next().unwrap_or("unknown");
+    let log_entry = defender_brain::BrainLogEntry {
+        ts: chrono::Utc::now(),
+        incident_id: incident.incident_id.clone(),
+        detector: det.to_string(),
+        severity: format!("{:?}", incident.severity),
+        brain_action,
+        brain_confidence,
+        brain_value,
+        brain_top3,
+        ai_action: action_str.to_string(),
+        ai_confidence: confidence,
+        agreed: brain_agrees,
+        feedback: None,
+        features: features.to_vec(),
+    };
+
+    // Persist to brain-log.json (same format as Layer 3 entries).
+    let log_path = data_dir.join("brain-log.json");
+    let mut entries: Vec<serde_json::Value> = std::fs::read_to_string(&log_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if let Ok(v) = serde_json::to_value(&log_entry) {
+        entries.push(v);
+        if entries.len() > 10000 {
+            entries.drain(0..entries.len() - 10000);
+        }
+        if let Err(e) = std::fs::write(
+            &log_path,
+            serde_json::to_string(&entries).unwrap_or_default(),
+        ) {
+            warn!("failed to write brain-log.json: {e}");
+        }
+    }
+
+    // Track agreement stats.
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    state.brain_stats.record(brain_agrees, &today);
+    state.brain_history.record(log_entry);
+
+    info!(
+        incident_id = %incident.incident_id,
+        provider = provider_label,
+        brain_agrees,
+        "brain: logged deterministic decision for training"
+    );
 }
 
 pub(crate) fn is_brain_agreeing_with_ai(brain_action: &str, ai_action_str: &str) -> bool {

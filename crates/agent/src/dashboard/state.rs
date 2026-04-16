@@ -245,3 +245,45 @@ pub(crate) fn generate_session_token() -> String {
     // Format as hex without external crate
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dashboard_action_config_defaults() {
+        let cfg = DashboardActionConfig::default();
+        // Validation of primary security defaults
+        assert!(!cfg.enabled, "actions should be disabled by default");
+        assert!(cfg.dry_run, "dry run should be enabled by default");
+        assert_eq!(cfg.block_backend, "ufw", "ufw should be default backend");
+        assert_eq!(cfg.allowed_skills, vec!["block-ip-ufw".to_string()]);
+        assert_eq!(cfg.retention_incidents_days, 30);
+    }
+
+    #[test]
+    fn test_sse_connection_guards() {
+        // Reset counter
+        SSE_CONNECTIONS.store(0, Ordering::Relaxed);
+
+        let mut guards = Vec::new();
+        // Simulate clients connecting
+        for _ in 0..5 {
+            SSE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+            guards.push(SseGuard);
+        }
+        assert_eq!(SSE_CONNECTIONS.load(Ordering::Relaxed), 5);
+
+        // Simulate clients dropping
+        drop(guards);
+        assert_eq!(SSE_CONNECTIONS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_deep_security_snapshot_defaults() {
+        let snapshot = DeepSecuritySnapshot::default();
+        assert!(snapshot.firmware_trust_score.is_none());
+        assert_eq!(snapshot.killchain_pids_tracked, 0);
+        assert_eq!(snapshot.dna_fingerprints, 0);
+    }
+}

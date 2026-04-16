@@ -9,6 +9,8 @@ pub struct SudoAbuseDetector {
     windows: HashMap<String, VecDeque<SudoEventSample>>,
     alerted: HashMap<String, DateTime<Utc>>,
     host: String,
+    /// Users excluded from sudo abuse detection (system operators).
+    trusted_users: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -26,7 +28,13 @@ impl SudoAbuseDetector {
             windows: HashMap::new(),
             alerted: HashMap::new(),
             host: host.into(),
+            trusted_users: Vec::new(),
         }
+    }
+
+    /// Set trusted users that are excluded from sudo abuse detection.
+    pub fn set_trusted_users(&mut self, users: Vec<String>) {
+        self.trusted_users = users;
     }
 
     /// Detect suspicious sudo activity bursts from a single user.
@@ -42,6 +50,11 @@ impl SudoAbuseDetector {
 
         let user = event.details["user"].as_str()?.trim();
         if user.is_empty() {
+            return None;
+        }
+
+        // Skip trusted system operators — their sudo is expected.
+        if self.trusted_users.iter().any(|tu| tu == user) {
             return None;
         }
 

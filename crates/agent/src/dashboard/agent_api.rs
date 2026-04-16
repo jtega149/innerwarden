@@ -2,28 +2,14 @@
 
 use super::*;
 
-/// Read sensor config.toml to find detectors with `enabled = false`.
-/// Returns a set of detector names that are explicitly disabled.
-/// Falls back to empty set if config can't be read or parsed.
-fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static str> {
+// ---------------------------------------------------------------------------
+
+pub(super) fn parse_disabled_detectors(content: &str) -> std::collections::HashSet<&'static str> {
     let mut disabled = std::collections::HashSet::new();
-
-    // Try common config paths
-    let paths = [
-        "/etc/innerwarden/config.toml",
-        "/etc/innerwarden/sensor.toml",
-    ];
-
-    let content = paths
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
-
     if content.is_empty() {
         return disabled;
     }
 
-    // Parse TOML and check [detectors.X] enabled = false
     let table: toml::Table = match content.parse() {
         Ok(t) => t,
         Err(_) => return disabled,
@@ -34,7 +20,6 @@ fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static s
         None => return disabled,
     };
 
-    // Map config names to detector names (they match 1:1)
     let all_names: &[&str] = &[
         "ssh_bruteforce",
         "credential_stuffing",
@@ -88,6 +73,23 @@ fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static s
     disabled
 }
 
+/// Read sensor config.toml to find detectors with `enabled = false`.
+/// Returns a set of detector names that are explicitly disabled.
+/// Falls back to empty set if config can't be read or parsed.
+fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static str> {
+    let paths = [
+        "/etc/innerwarden/config.toml",
+        "/etc/innerwarden/sensor.toml",
+    ];
+
+    let content = paths
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+
+    parse_disabled_detectors(&content)
+}
+
 // ---------------------------------------------------------------------------
 // Agent API - security context for AI agents (OpenClaw, n8n, etc.)
 // ---------------------------------------------------------------------------
@@ -105,7 +107,6 @@ pub(super) async fn api_agent_security_context(
     let total_incidents = incident_nodes.len();
     let mut high_or_critical = 0usize;
     let mut blocks_today = 0usize;
-    let mut ai_actions = 0usize;
     let mut detector_counts = std::collections::HashMap::<String, usize>::new();
 
     for &id in &incident_nodes {
@@ -124,9 +125,6 @@ pub(super) async fn api_agent_security_context(
             *detector_counts.entry(detector.clone()).or_default() += 1;
 
             if let Some(dec) = decision {
-                if dec != "ignore" && dec != "request_confirmation" {
-                    ai_actions += 1;
-                }
                 if dec == "block_ip" && *auto_executed {
                     blocks_today += 1;
                 }
@@ -138,15 +136,7 @@ pub(super) async fn api_agent_security_context(
     top.sort_by(|a, b| b.1.cmp(&a.1));
     let top_threats: Vec<String> = top.iter().take(5).map(|(k, _)| k.clone()).collect();
 
-    let threat_level = if ai_actions >= 10 {
-        "critical"
-    } else if ai_actions >= 5 {
-        "high"
-    } else if ai_actions >= 1 {
-        "medium"
-    } else {
-        "low"
-    };
+    let threat_level = security_context_level(total_incidents);
 
     let recommendation = match threat_level {
         "critical" => "server under active attack - avoid risky operations",
@@ -218,13 +208,7 @@ pub(super) async fn api_agent_check_ip(
         }
     }
 
-    let recommendation = if blocked {
-        "avoid"
-    } else if incident_count > 0 {
-        "caution"
-    } else {
-        "no threat data"
-    };
+    let recommendation = check_ip_recommendation(blocked, incident_count);
 
     Json(serde_json::json!({
         "ip": ip,
@@ -235,6 +219,26 @@ pub(super) async fn api_agent_check_ip(
         "detectors": detectors.into_iter().collect::<Vec<_>>(),
         "recommendation": recommendation,
     }))
+}
+
+pub(super) fn security_context_level(total_incidents: usize) -> &'static str {
+    if total_incidents == 0 {
+        "calm"
+    } else if total_incidents <= 5 {
+        "elevated"
+    } else {
+        "high"
+    }
+}
+
+pub(super) fn check_ip_recommendation(blocked: bool, incident_count: usize) -> &'static str {
+    if blocked {
+        "avoid"
+    } else if incident_count > 0 {
+        "caution"
+    } else {
+        "no threat data"
+    }
 }
 
 /// Request body for check-command
@@ -729,4 +733,54 @@ pub(super) async fn api_mitre_coverage(
         ))
         .unwrap()
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_disabled_detectors() {
+        // Parses explicit detector toggles and returns only disabled ones.
+        let toml_data = r#"
+[detectors.crypto_miner]
+enabled = false
+[detectors.ssh_bruteforce]
+enabled = true
+[detectors.ransomware]
+enabled = false
+        "#;
+
+        let disabled = parse_disabled_detectors(toml_data);
+        assert_eq!(disabled.len(), 2);
+        assert!(disabled.contains("crypto_miner"));
+        assert!(disabled.contains("ransomware"));
+        assert!(!disabled.contains("ssh_bruteforce"));
+    }
+
+    #[test]
+    fn test_security_context_calm_with_zero_incidents() {
+        // Zero incidents should map to calm context.
+        assert_eq!(security_context_level(0), "calm");
+    }
+
+    #[test]
+    fn test_security_context_elevated_with_small_volume() {
+        // A small incident window should map to elevated.
+        assert_eq!(security_context_level(1), "elevated");
+        assert_eq!(security_context_level(5), "elevated");
+    }
+
+    #[test]
+    fn test_security_context_high_with_large_volume() {
+        // Six or more incidents should map to high.
+        assert_eq!(security_context_level(6), "high");
+    }
+
+    #[test]
+    fn test_check_ip_blocked_sets_avoid_recommendation() {
+        // Blocked IPs must return avoid recommendation and blocked=true semantics.
+        assert_eq!(check_ip_recommendation(true, 0), "avoid");
+        assert_eq!(check_ip_recommendation(true, 10), "avoid");
+    }
 }

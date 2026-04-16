@@ -201,6 +201,17 @@ pub(crate) async fn try_handle_auto_rule(
         rep.record_block();
     }
 
+    // Feed decision to defender brain for training (Phase D).
+    // Layer 1 decisions are high-quality ground truth: deterministic, correct by definition.
+    crate::incident_decision_eval::log_deterministic_decision_to_brain(
+        incident,
+        &format!("{:?}", auto_decision.action),
+        0.95,
+        &format!("auto-rule:{detector}"),
+        data_dir,
+        state,
+    );
+
     // Set cooldown
     state.store.set_cooldown(
         crate::state_store::CooldownTable::Decision,
@@ -237,6 +248,11 @@ pub(crate) async fn try_handle_auto_rule(
 
     // Only mark as handled if execution was not skipped (or dry-run logged it)
     !execution_result.starts_with("skipped")
+}
+
+/// Check if an IP is RFC 1918 / loopback / link-local / ULA (public wrapper).
+pub(crate) fn is_internal_ip_pub(ip: &str) -> bool {
+    is_internal_ip(ip)
 }
 
 /// Check if an IP is RFC 1918 / loopback / link-local / ULA.

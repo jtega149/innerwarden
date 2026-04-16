@@ -228,13 +228,15 @@ impl ProtoAnomalyDetector {
                 }
             }
 
-            // Slow connection (slow loris detection)
+            // Slow connection (slow loris detection).
+            // Skip internal source IPs — health checks and monitoring make
+            // long-lived low-traffic connections that are not attacks.
             let duration_ms = event
                 .details
                 .get("duration_ms")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            if duration_ms > 30_000 && client_bytes < 500 {
+            if duration_ms > 30_000 && client_bytes < 500 && !super::is_own_ip(src_ip) {
                 if let Some(inc) = self.emit(
                     AnomalyType::SlowConnection,
                     "Slow HTTP connection (possible slowloris)",

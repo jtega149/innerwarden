@@ -20,6 +20,7 @@ mod cloudflare;
 mod config;
 mod correlation;
 mod correlation_engine;
+mod correlation_response;
 mod crowdsec;
 mod dashboard;
 mod data_retention;
@@ -73,6 +74,7 @@ mod narrative_anomaly;
 mod narrative_autofp;
 mod narrative_daily_summary;
 mod narrative_incident_ingest;
+mod narrative_observation_verify;
 #[allow(
     dead_code,
     unused_imports,
@@ -82,6 +84,7 @@ mod narrative_incident_ingest;
 mod neural_lifecycle;
 mod notification_gate;
 mod notification_pipeline;
+mod observation_verify;
 mod pcap_capture;
 mod playbook;
 #[allow(dead_code)]
@@ -94,6 +97,8 @@ mod scoring;
 mod shield_inline;
 mod skills;
 mod slack;
+#[allow(dead_code)]
+mod soc_checks;
 mod state_store;
 mod telegram;
 mod telemetry;
@@ -102,9 +107,13 @@ mod threat_feeds;
 mod threat_report;
 mod trust_rules;
 #[allow(dead_code)]
+mod trust_scoring;
+#[allow(dead_code)]
 mod two_factor;
 mod web_push;
 mod webhook;
+#[allow(dead_code)]
+mod zero_trust;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1173,16 +1182,15 @@ async fn main() -> Result<()> {
         } else {
             None
         },
-        decision_writer: if cfg.ai.enabled {
-            match decisions::DecisionWriter::new(&cli.data_dir) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    warn!("failed to create decision writer: {e:#}");
-                    None
-                }
+        // Decision writer is always created — Layer 1/2 decisions are written
+        // even without AI. Previously gated on cfg.ai.enabled which caused
+        // zero audit trail when AI was disabled or during agent restarts.
+        decision_writer: match decisions::DecisionWriter::new(&cli.data_dir) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                warn!("failed to create decision writer: {e:#}");
+                None
             }
-        } else {
-            None
         },
         last_narrative_at: load_last_narrative_instant(&cli.data_dir),
         last_daily_summary_telegram: None,
@@ -3586,8 +3594,40 @@ async fn process_narrative_tick(
         }
     }
 
-    // Feed events into cross-layer correlation engine and baseline learning
+    // Feed events into cross-layer correlation engine and baseline learning.
+    // Events from trusted processes are excluded — they make legitimate
+    // outbound connections that would false-positive on data-exfil chains.
+    //
+    // Two filters:
+    // 1. PID-based: exclude our own process tree (agent, sensor, watchdog children).
+    //    Catches tokio-rt-worker threads that eBPF reports with the thread comm.
+    // 2. Comm-based: exclude known system services (crowdsec, apt, certbot, etc.)
+    let trusted_procs = &cfg.responder.trusted_processes;
+    let own_pid = std::process::id();
     for ev in &events_entries {
+        let ev_comm = ev
+            .details
+            .get("comm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let ev_pid = ev.details.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+        // Filter 1: own process tree (agent + its threads).
+        // eBPF reports thread comm ("tokio-rt-worker") not binary name.
+        // Check if event PID belongs to us by reading /proc/PID/status PPid.
+        let is_own_tree = ev_pid > 0 && is_pid_in_own_tree(ev_pid, own_pid);
+
+        // Filter 2: trusted process comm names from config.
+        let is_trusted_comm = !ev_comm.is_empty()
+            && trusted_procs
+                .iter()
+                .any(|tp| ev_comm.starts_with(tp.as_str()));
+
+        if is_own_tree || is_trusted_comm {
+            // Still feed to baseline (we want to learn their normal patterns)
+            let _ = state.baseline.observe_event(ev);
+            continue;
+        }
         let corr_event = correlation_engine::CorrelationEngine::classify_event(ev);
         let ev_entities = corr_event.entities.clone();
         state.correlation_engine.observe(corr_event);
@@ -3625,10 +3665,27 @@ async fn process_narrative_tick(
     }
 
     // Feed eBPF events through kill chain tracker (inline pattern detection).
+    // Filter out trusted processes to prevent false kill chain matches.
     if cfg.killchain.enabled {
+        let kc_events: Vec<_> = events_entries
+            .iter()
+            .filter(|ev| {
+                let comm = ev
+                    .details
+                    .get("comm")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let pid = ev.details.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let own_tree = pid > 0 && is_pid_in_own_tree(pid, own_pid);
+                let trusted = !comm.is_empty()
+                    && trusted_procs.iter().any(|tp| comm.starts_with(tp.as_str()));
+                !own_tree && !trusted
+            })
+            .cloned()
+            .collect();
         let kc_incidents = killchain_inline::process_events(
             &mut state.killchain_tracker,
-            &events_entries,
+            &kc_events,
             &mut state.correlation_engine,
         );
         killchain_inline::write_incidents(data_dir, &kc_incidents);
@@ -3708,9 +3765,19 @@ async fn process_narrative_tick(
         }
     }
 
+    // Layer 2: Correlation-driven escalation (spec 018 Phase B).
+    // Drains completed attack chains and checks repeat offenders / multi-technique.
+    correlation_response::process_correlation_escalations(data_dir, cfg, state).await;
+
     narrative_anomaly::process_anomalies(data_dir, &today, &events_entries, state);
 
     narrative_incident_ingest::ingest_new_incidents(data_dir, &today, state)?;
+
+    // Spec 021 — Observation verification (Fase 3).
+    // Score undecided incidents and auto-dismiss/escalate clear-cut cases.
+    // Ambiguous items go to AI batch verification.
+    let ambiguous_items = narrative_observation_verify::verify_observing_incidents(cfg, state);
+    narrative_observation_verify::ai_verify_ambiguous(ambiguous_items, cfg, state).await;
 
     narrative_daily_summary::maybe_write_daily_summary_and_digest(
         data_dir,
@@ -3910,6 +3977,50 @@ fn boot_self_test() {
     }
 
     info!("boot self-test: passed");
+}
+
+// ---------------------------------------------------------------------------
+/// Check if a PID belongs to our own process tree by walking PPid up to 3 levels.
+/// Used to filter eBPF events from agent/sensor threads out of correlation detection.
+/// Reads /proc/PID/status which is cheap (procfs, no disk I/O).
+fn is_pid_in_own_tree(pid: u32, own_pid: u32) -> bool {
+    if pid == own_pid {
+        return true;
+    }
+    // Check /proc/PID/status for Tgid (thread group leader) and PPid.
+    // Tokio threads report PPid=1 (init) but Tgid=agent_pid.
+    let status_path = format!("/proc/{pid}/status");
+    let Ok(content) = std::fs::read_to_string(&status_path) else {
+        return false;
+    };
+    // Tgid = thread group ID. For threads, this is the main process PID.
+    let tgid = content
+        .lines()
+        .find(|l| l.starts_with("Tgid:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u32>().ok());
+    if tgid == Some(own_pid) {
+        return true;
+    }
+    // Walk PPid chain (max 3 hops) for child processes (not threads).
+    let mut current = pid;
+    for _ in 0..3 {
+        let path = format!("/proc/{current}/status");
+        let Ok(c) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        let ppid = c
+            .lines()
+            .find(|l| l.starts_with("PPid:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u32>().ok());
+        match ppid {
+            Some(p) if p == own_pid => return true,
+            Some(0) | Some(1) | None => return false,
+            Some(p) => current = p,
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -4322,6 +4433,7 @@ mod tests {
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["block-ip-ufw".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };
@@ -4502,6 +4614,7 @@ mod tests {
                 // Only ufw is allowed; AI picks iptables - should fall back silently
                 allowed_skills: vec!["block-ip-ufw".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };
@@ -4662,6 +4775,7 @@ mod tests {
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["block-ip-ufw".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };
@@ -4975,6 +5089,7 @@ mod tests {
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["honeypot".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };
@@ -5129,6 +5244,7 @@ mod tests {
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["block-ip-ufw".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };

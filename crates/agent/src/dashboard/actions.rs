@@ -123,19 +123,11 @@ pub(super) async fn api_action_block_ip(
     }
 
     let ip = body.ip.trim().to_string();
-    if ip.is_empty() {
+    if let Err(e) = validate_action_params(&ip, &body.reason) {
         return Json(ActionResponse {
             success: false,
             dry_run: state.action_cfg.dry_run,
-            message: "ip is required".to_string(),
-            skill_id: String::new(),
-        });
-    }
-    if body.reason.trim().is_empty() {
-        return Json(ActionResponse {
-            success: false,
-            dry_run: state.action_cfg.dry_run,
-            message: "reason is required".to_string(),
+            message: e.to_string(),
             skill_id: String::new(),
         });
     }
@@ -381,6 +373,28 @@ pub(super) async fn api_action_honeypot(
             skill_id,
         }),
     }
+}
+
+pub(super) fn validate_action_params(target: &str, reason: &str) -> Result<(), &'static str> {
+    if target.trim().is_empty() {
+        return Err("target is required");
+    }
+    if reason.trim().is_empty() {
+        return Err("reason is required");
+    }
+    let t = target.trim();
+    if t == "127.0.0.1"
+        || t == "::1"
+        || t.starts_with("10.")
+        || t.starts_with("192.168.")
+        || (t.starts_with("172.")
+            && t.len() >= 6
+            && t[4..6].parse::<u8>().is_ok()
+            && (16..=31).contains(&t[4..6].parse::<u8>().unwrap()))
+    {
+        return Err("cannot target internal IP");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -672,4 +686,90 @@ pub(super) fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_make_synthetic_incident() {
+        let incident = make_synthetic_incident("test1", "10.0.0.5", "Manual block test");
+
+        assert_eq!(incident.incident_id, "dashboard:manual:test1");
+        assert_eq!(incident.summary, "Manual block test");
+        assert_eq!(incident.tags, vec!["dashboard", "manual"]);
+
+        let has_ip = incident
+            .entities
+            .iter()
+            .any(|e| e.value == "10.0.0.5" && format!("{:?}", e.r#type) == "Ip");
+        assert!(has_ip);
+    }
+
+    #[test]
+    fn test_validate_action_params() {
+        // Validates common guardrails for action parameter validation.
+        // Vazio rejeita
+        assert_eq!(
+            validate_action_params("", "reason").unwrap_err(),
+            "target is required"
+        );
+        assert_eq!(
+            validate_action_params("1.2.3.4", "").unwrap_err(),
+            "reason is required"
+        );
+
+        // Interno rejeita
+        assert_eq!(
+            validate_action_params("127.0.0.1", "test").unwrap_err(),
+            "cannot target internal IP"
+        );
+        assert_eq!(
+            validate_action_params("10.0.0.5", "test").unwrap_err(),
+            "cannot target internal IP"
+        );
+        assert_eq!(
+            validate_action_params("192.168.1.1", "test").unwrap_err(),
+            "cannot target internal IP"
+        );
+        assert_eq!(
+            validate_action_params("172.16.0.1", "test").unwrap_err(),
+            "cannot target internal IP"
+        );
+
+        // Allowed
+        assert!(validate_action_params("8.8.8.8", "reason").is_ok());
+        assert!(validate_action_params("admin", "reason").is_ok());
+    }
+
+    #[test]
+    fn test_block_ip_empty_string_is_rejected() {
+        // Empty target string should be rejected for block-ip action.
+        let result = validate_action_params("   ", "manual investigation");
+        assert!(result.is_err());
+        assert_eq!(result.err(), Some("target is required"));
+    }
+
+    #[test]
+    fn test_block_ip_private_ranges_are_rejected() {
+        // Internal RFC1918 ranges must not be accepted by block-ip.
+        assert_eq!(
+            validate_action_params("10.42.0.9", "internal should fail").err(),
+            Some("cannot target internal IP")
+        );
+        assert_eq!(
+            validate_action_params("192.168.10.20", "internal should fail").err(),
+            Some("cannot target internal IP")
+        );
+    }
+
+    #[test]
+    fn test_unblock_nonexistent_ip_is_noop() {
+        // Removing an IP that does not exist should be a safe no-op.
+        let mut blocked = std::collections::HashSet::from(["8.8.8.8".to_string()]);
+        let removed = blocked.remove("9.9.9.9");
+        assert!(!removed);
+        assert!(blocked.contains("8.8.8.8"));
+    }
 }

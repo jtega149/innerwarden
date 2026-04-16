@@ -22,22 +22,7 @@ pub(super) async fn api_attacker_profiles(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let mut filtered: Vec<serde_json::Value> = profiles
-        .into_iter()
-        .filter(|p| p["risk_score"].as_u64().unwrap_or(0) >= min_risk as u64)
-        .collect();
-
-    match sort {
-        "last_seen" => {
-            filtered.sort_by(|a, b| b["last_seen"].as_str().cmp(&a["last_seen"].as_str()))
-        }
-        "incidents" => filtered.sort_by(|a, b| {
-            b["total_incidents"]
-                .as_u64()
-                .cmp(&a["total_incidents"].as_u64())
-        }),
-        _ => filtered.sort_by(|a, b| b["risk_score"].as_u64().cmp(&a["risk_score"].as_u64())),
-    }
+    let filtered = sort_attacker_profiles(profiles, min_risk, sort);
 
     let total = filtered.len();
     let page: Vec<serde_json::Value> = filtered.into_iter().skip(offset).take(limit).collect();
@@ -56,6 +41,30 @@ pub(super) struct AttackerProfilesQuery {
     offset: Option<usize>,
     sort: Option<String>,
     min_risk: Option<u8>,
+}
+
+pub(super) fn sort_attacker_profiles(
+    profiles: Vec<serde_json::Value>,
+    min_risk: u8,
+    sort_key: &str,
+) -> Vec<serde_json::Value> {
+    let mut filtered: Vec<serde_json::Value> = profiles
+        .into_iter()
+        .filter(|p| p["risk_score"].as_u64().unwrap_or(0) >= min_risk as u64)
+        .collect();
+
+    match sort_key {
+        "last_seen" => {
+            filtered.sort_by(|a, b| b["last_seen"].as_str().cmp(&a["last_seen"].as_str()))
+        }
+        "incidents" => filtered.sort_by(|a, b| {
+            b["total_incidents"]
+                .as_u64()
+                .cmp(&a["total_incidents"].as_u64())
+        }),
+        _ => filtered.sort_by(|a, b| b["risk_score"].as_u64().cmp(&a["risk_score"].as_u64())),
+    }
+    filtered
 }
 
 /// `GET /api/attacker-profiles/:ip` - single attacker profile detail.
@@ -95,7 +104,7 @@ pub(super) async fn api_threat_report(
     });
 
     // Validate month format to prevent path traversal via crafted month param
-    if !month.chars().all(|c| c.is_ascii_digit() || c == '-') || month.len() > 7 {
+    if !is_valid_month(&month) {
         return Json(serde_json::json!({"error": "invalid month format"}));
     }
     let filename = format!("monthly-report-{month}.json");
@@ -183,22 +192,51 @@ pub(super) async fn api_graph_view(State(state): State<DashboardState>) -> Json<
         return Json(serde_json::json!({"nodes": [], "edges": []}));
     }
 
-    // Top 50 non-Incident nodes by degree. Strict cap to prevent browser crash.
-    let mut scored: Vec<(NodeId, usize)> = graph
+    // Build a useful subgraph: incidents + their connected entities (IPs, processes, users).
+    // This shows the "attack story" rather than a blob of unrelated infrastructure.
+    let mut keep: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+
+    // 1. Add all recent incidents (max 20).
+    let mut incidents: Vec<(NodeId, chrono::DateTime<chrono::Utc>)> = graph
         .nodes()
         .iter()
-        .filter(|(_, n)| n.node_type() != NodeType::Incident)
-        .map(|(&id, _)| {
-            let out = graph.outgoing.get(&id).map(|v| v.len()).unwrap_or(0);
-            let inc = graph.incoming.get(&id).map(|v| v.len()).unwrap_or(0);
-            (id, out + inc)
+        .filter_map(|(&id, n)| match n {
+            Node::Incident { ts, .. } => Some((id, *ts)),
+            _ => None,
         })
-        .filter(|(_, degree)| *degree >= 2)
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
-    scored.truncate(50);
-    let node_ids: Vec<NodeId> = scored.into_iter().map(|(id, _)| id).collect();
-    let keep: std::collections::HashSet<NodeId> = node_ids.iter().copied().collect();
+    incidents.sort_by(|a, b| b.1.cmp(&a.1));
+    incidents.truncate(20);
+    for (id, _) in &incidents {
+        keep.insert(*id);
+        // Add nodes connected to each incident (IP, process, user).
+        for edge in graph.all_edges(*id) {
+            keep.insert(edge.from);
+            keep.insert(edge.to);
+        }
+    }
+
+    // 2. Fill remaining slots with high-degree infrastructure nodes (IPs, processes).
+    if keep.len() < 80 {
+        let mut scored: Vec<(NodeId, usize)> = graph
+            .nodes()
+            .iter()
+            .filter(|(id, n)| !keep.contains(id) && n.node_type() != NodeType::Incident)
+            .map(|(&id, _)| {
+                let out = graph.outgoing.get(&id).map(|v| v.len()).unwrap_or(0);
+                let inc = graph.incoming.get(&id).map(|v| v.len()).unwrap_or(0);
+                (id, out + inc)
+            })
+            .filter(|(_, degree)| *degree >= 3)
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        for (id, _) in scored.into_iter().take(80 - keep.len()) {
+            keep.insert(id);
+        }
+    }
+
+    // Cap at 100 nodes to prevent browser crash.
+    let node_ids: Vec<NodeId> = keep.iter().copied().collect();
 
     let cy_nodes: Vec<serde_json::Value> = node_ids
         .iter()
@@ -540,4 +578,78 @@ pub(super) async fn api_graph_threats(
         .collect();
 
     Json(serde_json::json!({ "total": items.len(), "hits": items }))
+}
+
+pub(super) fn is_valid_month(month: &str) -> bool {
+    month.chars().all(|c| c.is_ascii_digit() || c == '-') && month.len() <= 7 && !month.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sort_attacker_profiles() {
+        let profiles = vec![
+            serde_json::json!({"ip": "1.1.1.1", "risk_score": 10, "total_incidents": 5, "last_seen": "2023-01-01"}),
+            serde_json::json!({"ip": "2.2.2.2", "risk_score": 90, "total_incidents": 20, "last_seen": "2023-02-01"}),
+            serde_json::json!({"ip": "3.3.3.3", "risk_score": 50, "total_incidents": 10, "last_seen": "2023-03-01"}),
+        ];
+
+        // test minimum risk filtering
+        let filtered = sort_attacker_profiles(profiles.clone(), 50, "risk_score");
+        assert_eq!(filtered.len(), 2);
+
+        // test sort by risk score
+        assert_eq!(filtered[0]["ip"], "2.2.2.2");
+
+        // test sort by incidents
+        let by_incidents = sort_attacker_profiles(profiles.clone(), 0, "incidents");
+        assert_eq!(by_incidents[0]["ip"], "2.2.2.2");
+        assert_eq!(by_incidents[1]["ip"], "3.3.3.3");
+
+        // test sort by last_seen
+        let by_last_seen = sort_attacker_profiles(profiles, 0, "last_seen");
+        assert_eq!(by_last_seen[0]["ip"], "3.3.3.3");
+    }
+
+    #[test]
+    fn test_is_valid_month_format() {
+        assert!(is_valid_month("2023-01"));
+        assert!(!is_valid_month("2023-01-01")); // too long
+        assert!(!is_valid_month("2023/01"));
+        assert!(!is_valid_month("../2023"));
+        assert!(!is_valid_month(""));
+    }
+
+    #[test]
+    fn test_sort_attacker_profiles_missing_fields() {
+        // Missing score fields default safely and still sort/filter deterministically.
+        let profiles = vec![
+            serde_json::json!({"ip": "1.1.1.1"}), // missing risk_score, defaults to 0
+        ];
+        let by_risk = sort_attacker_profiles(profiles.clone(), 0, "risk_score");
+        assert_eq!(by_risk.len(), 1);
+
+        let filtered = sort_attacker_profiles(profiles, 1, "risk_score");
+        assert_eq!(filtered.len(), 0);
+    }
+
+    #[test]
+    fn test_min_risk_100_filters_everything() {
+        // min_risk=100 should filter all profiles below 100.
+        let profiles = vec![
+            serde_json::json!({"ip": "1.1.1.1", "risk_score": 99}),
+            serde_json::json!({"ip": "2.2.2.2", "risk_score": 10}),
+        ];
+        let filtered = sort_attacker_profiles(profiles, 100, "risk_score");
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_sort_empty_list_does_not_panic() {
+        // Sorting an empty profile list should be stable and panic-free.
+        let filtered = sort_attacker_profiles(Vec::new(), 0, "risk_score");
+        assert!(filtered.is_empty());
+    }
 }

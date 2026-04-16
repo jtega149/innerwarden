@@ -450,3 +450,147 @@ pub(super) async fn api_auth_sessions(State(state): State<DashboardState>) -> im
         "sessions": items,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_basic_auth_valid() {
+        // "admin:secret" in base64 is "YWRtaW46c2VjcmV0"
+        let header = "Basic YWRtaW46c2VjcmV0";
+        let (user, pass) = parse_basic_auth(header).expect("should parse valid auth");
+        assert_eq!(user, "admin");
+        assert_eq!(pass, "secret");
+    }
+
+    #[test]
+    fn test_parse_basic_auth_malformed() {
+        assert!(parse_basic_auth("Bearer YWRtaW46c2VjcmV0").is_none());
+        assert!(parse_basic_auth("Basic").is_none());
+        assert!(parse_basic_auth("Basic ").is_none()); // empty base64
+                                                       // Not base64
+        assert!(parse_basic_auth("Basic !@#$").is_none());
+        // Valid base64 but no colon
+        // "admin" in base64 is "YWRtaW4="
+        assert!(parse_basic_auth("Basic YWRtaW4=").is_none());
+    }
+
+    #[test]
+    fn test_extract_bearer_token() {
+        let req = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer xyz123")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(extract_bearer_token(&req), Some("xyz123"));
+
+        let req2 = Request::builder()
+            .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(extract_bearer_token(&req2), None);
+    }
+
+    #[test]
+    fn test_rate_limiter_blocks_abuse() {
+        let ip = "10.0.0.99";
+        clear_rate_limit(ip);
+        assert!(!is_rate_limited(ip));
+
+        // Attempt up to limit
+        for _ in 0..LOGIN_RATE_LIMIT_MAX_ATTEMPTS - 1 {
+            let blocked = check_and_record_failed_login(ip);
+            assert!(!blocked, "should not be blocked yet");
+        }
+
+        // Final attempt exceeds limit
+        let blocked = check_and_record_failed_login(ip);
+        assert!(blocked, "should be blocked");
+        assert!(is_rate_limited(ip));
+
+        // Auth success resets it
+        clear_rate_limit(ip);
+        assert!(!is_rate_limited(ip));
+    }
+
+    #[test]
+    fn test_extract_client_ip_headers() {
+        let trusted = vec!["127.0.0.1".parse().unwrap()];
+
+        // Forwarded-For proxy IP extraction
+        let mut req = Request::builder().body(Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                "127.0.0.1".parse().unwrap(),
+                8080,
+            )));
+        req.headers_mut()
+            .insert("x-forwarded-for", "1.1.1.1, 2.2.2.2".parse().unwrap());
+        assert_eq!(extract_client_ip(&req, &trusted), "1.1.1.1");
+
+        // Missing headers fallback to socket IP
+        let mut req2 = Request::builder().body(Body::empty()).unwrap();
+        req2.extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                "10.0.0.5".parse().unwrap(),
+                8080,
+            )));
+        assert_eq!(extract_client_ip(&req2, &trusted), "10.0.0.5");
+
+        // Malicious header attempt from untrusted proxy should fallback to socket IP
+        let mut req3 = Request::builder().body(Body::empty()).unwrap();
+        req3.extensions_mut().insert(axum::extract::ConnectInfo(
+            std::net::SocketAddr::new("10.0.0.5".parse().unwrap(), 8080), // 10.0.0.5 not trusted
+        ));
+        req3.headers_mut()
+            .insert("x-forwarded-for", "1.1.1.1".parse().unwrap());
+        assert_eq!(extract_client_ip(&req3, &trusted), "10.0.0.5");
+    }
+
+    #[test]
+    fn test_session_expiry_check() {
+        let ts = Utc::now() - chrono::Duration::minutes(60);
+        let s = Session {
+            username: "admin".into(),
+            created_at: ts,
+            last_activity: Arc::new(AtomicI64::new(ts.timestamp())),
+            client_ip: "1.1.1.1".into(),
+        };
+        // Expired because last activity was 60 mins ago and timeout is 30 mins
+        assert!(s.is_expired(30));
+
+        // Not expired if timeout is 120 mins
+        assert!(!s.is_expired(120));
+    }
+
+    #[test]
+    fn test_session_touch_updates_activity() {
+        let ts = Utc::now() - chrono::Duration::minutes(20);
+        let s = Session {
+            username: "admin".into(),
+            created_at: ts,
+            last_activity: Arc::new(AtomicI64::new(ts.timestamp())),
+            client_ip: "1.1.1.1".into(),
+        };
+        s.touch();
+        // Activity should be updated to now
+        assert!(!s.is_expired(10));
+    }
+
+    #[test]
+    fn test_unauthorized_responses() {
+        let resp = unauthorized_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
+        assert_eq!(
+            resp.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Basic realm=\"innerwarden-dashboard\", charset=\"UTF-8\""
+        );
+    }
+
+    #[test]
+    fn test_rate_limited_response() {
+        let resp = rate_limited_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+}

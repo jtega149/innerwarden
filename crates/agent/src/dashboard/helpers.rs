@@ -376,3 +376,269 @@ pub(super) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
 
     result
 }
+
+// ---------------------------------------------------------------------------
+// Formatting & Escaping Helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn escape_html(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len() + 10);
+    for c in input.chars() {
+        match c {
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            '/' => escaped.push_str("&#x2F;"),
+            // Null bytes or non-printable chars can be wiped
+            '\0' => escaped.push_str(""),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+pub(crate) fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        return format!("{:.1} GB", bytes as f64 / 1_073_741_824.0);
+    }
+    if bytes >= 1_048_576 {
+        return format!("{:.1} MB", bytes as f64 / 1_048_576.0);
+    }
+    if bytes >= 1024 {
+        return format!("{:.1} KB", bytes as f64 / 1024.0);
+    }
+    format!("{} B", bytes)
+}
+
+pub(crate) fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{}s", secs);
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{}m {}s", mins, secs % 60);
+    }
+    format!("{}h {}m", mins / 60, mins % 60)
+}
+
+pub(crate) fn truncate_ip(ip: &str) -> String {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() == 4 {
+        format!("{}.{}.x.x", parts[0], parts[1])
+    } else {
+        // Fallback or IPv6
+        let chars: Vec<char> = ip.chars().collect();
+        if chars.len() > 10 {
+            let truncated: String = chars[0..8].iter().collect();
+            format!("{}...", truncated)
+        } else {
+            ip.to_string()
+        }
+    }
+}
+
+pub(crate) fn format_percentage(value: f64) -> String {
+    format!("{:.1}%", value)
+}
+
+pub(crate) fn format_timestamp(ts: chrono::DateTime<chrono::Utc>) -> String {
+    ts.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_html_prevents_xss() {
+        // Basic script injection
+        let payload_1 = "<script>alert('xss')</script>";
+        let esc_1 = escape_html(payload_1);
+        assert_eq!(
+            esc_1,
+            "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;&#x2F;script&gt;"
+        );
+
+        // Quotes bounding evasion
+        let payload_2 = "\" onmouseover=\"alert(1)\"";
+        let esc_2 = escape_html(payload_2);
+        assert_eq!(esc_2, "&quot; onmouseover=&quot;alert(1)&quot;");
+
+        // Null bytes
+        let payload_3 = "test\0test";
+        let esc_3 = escape_html(payload_3);
+        assert_eq!(esc_3, "testtest");
+
+        // Ampersand double-escape injection verification
+        let payload_4 = "a & b &amp; c";
+        let esc_4 = escape_html(payload_4);
+        assert_eq!(esc_4, "a &amp; b &amp;amp; c");
+    }
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(500), "500 B");
+        assert_eq!(format_size(1500), "1.5 KB");
+        assert_eq!(format_size(1_500_000), "1.4 MB");
+        assert_eq!(format_size(2_500_000_000), "2.3 GB");
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(125), "2m 5s");
+        assert_eq!(format_duration(3600), "1h 0m");
+        assert_eq!(format_duration(3665), "1h 1m");
+    }
+
+    #[test]
+    fn test_truncate_ip() {
+        assert_eq!(truncate_ip("192.168.1.5"), "192.168.x.x");
+        assert_eq!(truncate_ip("10.0.0.1"), "10.0.x.x");
+        // IPv6 truncates to length
+        assert_eq!(
+            truncate_ip("2001:0db8:85a3:0000:0000:8a2e:0370:7334"),
+            "2001:0db..."
+        );
+        // Short domains
+        assert_eq!(truncate_ip("localhost"), "localhost");
+    }
+
+    #[test]
+    fn test_format_percentage() {
+        assert_eq!(format_percentage(85.45), "85.5%");
+        assert_eq!(format_percentage(100.0), "100.0%");
+    }
+
+    #[test]
+    fn test_escape_html_advanced() {
+        assert_eq!(escape_html(""), "", "empty string");
+        assert_eq!(
+            escape_html("🔥 Unicode test"),
+            "🔥 Unicode test",
+            "Unicode untouched"
+        );
+        assert_eq!(
+            escape_html("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;&#x2F;script&gt;"
+        );
+        assert_eq!(escape_html("\"quotes\""), "&quot;quotes&quot;");
+        assert_eq!(escape_html("a & b"), "a &amp; b");
+        assert_eq!(escape_html("null\0byte"), "nullbyte");
+        let long_str = "X".repeat(10_000);
+        assert_eq!(escape_html(&long_str), long_str, "10k characters scaling");
+    }
+
+    #[test]
+    fn test_resolve_date_edge_cases() {
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(resolve_date(None), today);
+        assert_eq!(resolve_date(Some("invalid-date-format")), today);
+        assert_eq!(resolve_date(Some("2024-05")), today); // Incomplete
+        assert_eq!(resolve_date(Some("2024-05-15")), "2024-05-15");
+    }
+
+    #[test]
+    fn test_normalize_limit_bounds() {
+        assert_eq!(normalize_limit(None), 50);
+        assert_eq!(normalize_limit(Some(0)), 1); // clamped min
+        assert_eq!(normalize_limit(Some(1000)), 500); // clamped max
+        assert_eq!(normalize_limit(Some(250)), 250);
+    }
+
+    #[test]
+    fn test_dated_path_generation() {
+        let pb = PathBuf::from("/var/data");
+        // Safe generation
+        assert_eq!(
+            dated_path(&pb, "incidents", "2024-05-15").to_string_lossy(),
+            "/var/data/incidents-2024-05-15.jsonl"
+        );
+        assert_eq!(
+            dated_path(&pb, "incidents", "../etc/passwd").to_string_lossy(),
+            "/var/data/incidents-.jsonl" // Letters and dots removed, leaving only valid chars via filter
+        );
+    }
+
+    #[test]
+    fn test_incident_detector_extraction() {
+        assert_eq!(incident_detector("ssh_brute_force:1234"), "ssh_brute_force");
+        assert_eq!(incident_detector("no_colon_id"), "no_colon_id");
+        assert_eq!(incident_detector(""), "");
+    }
+
+    #[test]
+    fn test_extract_ip_entities_empty() {
+        assert!(extract_ip_entities(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_extract_entity_values_filter() {
+        use innerwarden_core::entities::{EntityRef, EntityType};
+        let entities = vec![
+            EntityRef {
+                r#type: EntityType::Ip,
+                value: "1.2.3.4".into(),
+            },
+            EntityRef {
+                r#type: EntityType::User,
+                value: "root".into(),
+            },
+        ];
+        let ips = extract_entity_values(&entities, EntityType::Ip);
+        assert_eq!(ips, vec!["1.2.3.4"]);
+
+        let users = extract_entity_values(&entities, EntityType::User);
+        assert_eq!(users, vec!["root"]);
+    }
+
+    #[test]
+    fn test_has_intersection() {
+        let mut set = BTreeSet::new();
+        set.insert("alpha".to_string());
+        set.insert("beta".to_string());
+
+        assert!(has_intersection(&["beta".to_string()], &set));
+        assert!(!has_intersection(&["gamma".to_string()], &set));
+        assert!(!has_intersection(&[], &set));
+    }
+
+    #[test]
+    fn test_safe_write_path_traversal() {
+        // Prevents slashes and dots
+        let pb = PathBuf::from("./");
+        assert_eq!(safe_write_data_file(&pb, "../../etc/passwd", "test"), false);
+        assert_eq!(
+            safe_write_data_file(&pb, "/absolute/path.txt", "test"),
+            false
+        );
+    }
+
+    #[test]
+    fn test_determine_outcome_for_ips_hierarchy() {
+        let decisions = vec![];
+        let mut ips = BTreeSet::new();
+        ips.insert("1.2.3.4".to_string());
+
+        // No decisions, no incident => unknown
+        assert_eq!(
+            determine_outcome_for_ips(&decisions, &ips, false),
+            "unknown"
+        );
+        // No decisions, has incident => active
+        assert_eq!(determine_outcome_for_ips(&decisions, &ips, true), "active");
+    }
+
+    #[test]
+    fn test_format_duration_scale() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(59), "59s");
+        assert_eq!(format_duration(61), "1m 1s");
+        assert_eq!(format_duration(3601), "1h 0m");
+    }
+}
