@@ -94,7 +94,6 @@ pub struct AgentConfig {
     pub config_signing: ConfigSigningConfig,
     /// Observation verification — behavioural scoring for OBSERVING items (spec 021).
     #[serde(default)]
-    #[allow(dead_code)] // Phase B will read this
     pub observation: crate::observation_verify::ObservationConfig,
     /// Detectors that run graph-only (sensor version suppressed).
     /// After parallel validation, add detector names here to disable the sensor version.

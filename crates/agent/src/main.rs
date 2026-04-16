@@ -74,6 +74,7 @@ mod narrative_anomaly;
 mod narrative_autofp;
 mod narrative_daily_summary;
 mod narrative_incident_ingest;
+mod narrative_observation_verify;
 #[allow(
     dead_code,
     unused_imports,
@@ -83,7 +84,6 @@ mod narrative_incident_ingest;
 mod neural_lifecycle;
 mod notification_gate;
 mod notification_pipeline;
-#[allow(dead_code)]
 mod observation_verify;
 mod pcap_capture;
 mod playbook;
@@ -3766,6 +3766,11 @@ async fn process_narrative_tick(
     narrative_anomaly::process_anomalies(data_dir, &today, &events_entries, state);
 
     narrative_incident_ingest::ingest_new_incidents(data_dir, &today, state)?;
+
+    // Spec 021 — Observation verification (Fase 3).
+    // Score undecided incidents and auto-dismiss/escalate clear-cut cases.
+    // Ambiguous items are collected for AI batch verification (Phase C).
+    let _ambiguous_items = narrative_observation_verify::verify_observing_incidents(cfg, state);
 
     narrative_daily_summary::maybe_write_daily_summary_and_digest(
         data_dir,
