@@ -273,6 +273,8 @@ function renderEvidenceCard(entry, idx) {
   const metaHtml = lines.length
     ? '<div class="evidence-meta">' + lines.map(l => esc(l)).join('<br>') + '</div>'
     : '';
+  const obsVerifyHtml = (d.reason && d.reason.startsWith('obs-verify'))
+    ? renderObsVerifyScore(d.reason) : '';
   return `
     <div class="evidence-card" id="tl-entry-${idx}">
       <div class="evidence-header">
@@ -282,6 +284,7 @@ function renderEvidenceCard(entry, idx) {
       </div>
       <div class="evidence-title">${esc(entrySummary(entry))}</div>
       ${metaHtml}
+      ${obsVerifyHtml}
       <pre class="evidence-raw" id="raw-${idx}" data-json="${esc(JSON.stringify(entry.data))}"></pre>
     </div>`;
 }
@@ -709,6 +712,67 @@ async function loadJourneyGraph(subjectType, subjectValue) {
   } catch (e) {
     container.innerHTML = '<p style="padding:20px;text-align:center;color:var(--dim);font-size:0.75rem">Graph: ' + esc(e.message) + '</p>';
   }
+}
+
+// ── Observation Verification score display (spec 021 Phase D) ──────────
+
+/** Parse obs-verify reason string and render a visual score badge + breakdown.
+ *  Format: "obs-verify score X/100: reason1, reason2"
+ *  or:     "obs-verify AI: VERDICT — reason"
+ */
+function renderObsVerifyScore(reason) {
+  if (!reason) return '';
+
+  // Parse "obs-verify score X/100: details"
+  var scoreMatch = reason.match(/obs-verify score (\d+)\/100:\s*(.*)/);
+  if (scoreMatch) {
+    var score = parseInt(scoreMatch[1], 10);
+    var details = scoreMatch[2] || '';
+    var checks = details.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+    var color = score >= 70 ? 'var(--ok)' : score < 40 ? 'var(--critical)' : 'var(--accent)';
+    var label = score >= 70 ? 'AUTO-DISMISSED' : score < 40 ? 'ESCALATED' : 'AI VERIFIED';
+
+    var checkIcons = {
+      'package managed binary': true, 'trusted directory': true,
+      'trusted parent chain': true, 'DNS resolves': true,
+      'known binary': true, 'operator context': true,
+      'suspicious binary location': false, 'untrusted parent chain': false,
+      'suspicious network behaviour': false, 'fresh unknown binary': false,
+      'no operator context': false
+    };
+
+    var checksHtml = checks.map(function(c) {
+      var isGood = checkIcons[c] !== undefined ? checkIcons[c] : !c.startsWith('suspicious') && !c.startsWith('untrusted') && !c.startsWith('fresh') && !c.startsWith('no ');
+      var icon = isGood ? '<span style="color:var(--ok)">&#10003;</span>' : '<span style="color:var(--critical)">&#10007;</span>';
+      return icon + ' ' + esc(c);
+    }).join('<br>');
+
+    return '<div class="obs-verify-card">'
+      + '<div class="obs-verify-header">'
+      + '<span class="obs-verify-badge" style="background:' + color + '">' + score + '/100</span>'
+      + '<span class="obs-verify-label">' + label + '</span>'
+      + '</div>'
+      + (checksHtml ? '<div class="obs-verify-checks">' + checksHtml + '</div>' : '')
+      + '</div>';
+  }
+
+  // Parse "obs-verify AI: VERDICT — reason"
+  var aiMatch = reason.match(/obs-verify AI:\s*(NORMAL|SUSPICIOUS)\s*[—-]\s*(.*)/i);
+  if (aiMatch) {
+    var verdict = aiMatch[1].toUpperCase();
+    var aiReason = aiMatch[2] || '';
+    var aiColor = verdict === 'NORMAL' ? 'var(--ok)' : 'var(--critical)';
+    var aiIcon = verdict === 'NORMAL' ? '&#10003;' : '&#10007;';
+    return '<div class="obs-verify-card">'
+      + '<div class="obs-verify-header">'
+      + '<span class="obs-verify-badge" style="background:' + aiColor + '">' + aiIcon + ' AI</span>'
+      + '<span class="obs-verify-label">' + esc(verdict) + '</span>'
+      + '</div>'
+      + '<div class="obs-verify-checks">' + esc(aiReason) + '</div>'
+      + '</div>';
+  }
+
+  return '';
 }
 
 // Detector priority: higher = more important (used to pick primary group)

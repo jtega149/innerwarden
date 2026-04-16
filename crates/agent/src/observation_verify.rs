@@ -1354,4 +1354,64 @@ mod tests {
         // No items listed
         assert!(!msg.contains("1."));
     }
+
+    // ── Dashboard reason format tests (Phase D) ─────────────────────────
+    // The dashboard JS parses "obs-verify score X/100: ..." and
+    // "obs-verify AI: VERDICT — ..." These tests verify the backend
+    // produces the expected format.
+
+    #[test]
+    fn dismiss_reason_format_for_dashboard() {
+        let details = json!({
+            "binary_path": "/usr/bin/curl",
+            "package_managed": true,
+            "ppid_comm": "systemd",
+            "parent_chain": ["systemd"],
+        });
+        let (result, _bd) = behaviour_score(&details, true, false, false, false, 70, 40);
+        if let VerificationResult::Dismiss { score, reason } = result {
+            let formatted = format!("obs-verify score {score}/100: {reason}");
+            // Must start with "obs-verify score" for JS parser
+            assert!(formatted.starts_with("obs-verify score "));
+            // Must contain "/100:"
+            assert!(formatted.contains("/100: "));
+            // Score must be a number
+            assert!(score >= 70);
+        } else {
+            panic!("expected Dismiss");
+        }
+    }
+
+    #[test]
+    fn escalate_reason_format_for_dashboard() {
+        let details = json!({
+            "binary_path": "/tmp/dropper",
+            "dst_port": 4444,
+        });
+        let (result, _bd) = behaviour_score(&details, false, false, false, false, 70, 40);
+        if let VerificationResult::Escalate { score, reason } = result {
+            let formatted = format!("obs-verify score {score}/100: {reason}");
+            assert!(formatted.starts_with("obs-verify score "));
+            assert!(formatted.contains("/100: "));
+            assert!(score < 40);
+        } else {
+            panic!("expected Escalate");
+        }
+    }
+
+    #[test]
+    fn ai_verdict_reason_format_for_dashboard() {
+        // The AI verdict format used in narrative_observation_verify.rs
+        let normal_reason = "obs-verify AI: NORMAL — OpenClaw connecting to Telegram API";
+        let suspicious_reason = "obs-verify AI: SUSPICIOUS — Unknown binary on unusual port";
+        // Must start with "obs-verify AI:" for JS parser
+        assert!(normal_reason.starts_with("obs-verify AI: "));
+        assert!(suspicious_reason.starts_with("obs-verify AI: "));
+        // Must contain verdict keyword
+        assert!(normal_reason.contains("NORMAL"));
+        assert!(suspicious_reason.contains("SUSPICIOUS"));
+        // Must contain em-dash separator
+        assert!(normal_reason.contains("—"));
+        assert!(suspicious_reason.contains("—"));
+    }
 }
