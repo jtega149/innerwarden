@@ -109,3 +109,24 @@ pub(super) async fn api_push_unsubscribe(
         })),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_push_subscribe_body_deserialization() {
+        let json = r#"{
+            "endpoint": "https://push.example.com",
+            "keys": {
+                "p256dh": "dummy_p256dh",
+                "auth": "dummy_auth"
+            }
+        }"#;
+
+        let body: PushSubscribeBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.endpoint, "https://push.example.com");
+        assert_eq!(body.keys.p256dh, "dummy_p256dh");
+        assert_eq!(body.keys.auth, "dummy_auth");
+    }
+}
