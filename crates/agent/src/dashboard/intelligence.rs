@@ -104,7 +104,7 @@ pub(super) async fn api_threat_report(
     });
 
     // Validate month format to prevent path traversal via crafted month param
-    if !month.chars().all(|c| c.is_ascii_digit() || c == '-') || month.len() > 7 {
+    if !is_valid_month(&month) {
         return Json(serde_json::json!({"error": "invalid month format"}));
     }
     let filename = format!("monthly-report-{month}.json");
@@ -580,6 +580,10 @@ pub(super) async fn api_graph_threats(
     Json(serde_json::json!({ "total": items.len(), "hits": items }))
 }
 
+pub(super) fn is_valid_month(month: &str) -> bool {
+    month.chars().all(|c| c.is_ascii_digit() || c == '-') && month.len() <= 7 && !month.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,5 +611,26 @@ mod tests {
         // test sort by last_seen
         let by_last_seen = sort_attacker_profiles(profiles, 0, "last_seen");
         assert_eq!(by_last_seen[0]["ip"], "3.3.3.3");
+    }
+
+    #[test]
+    fn test_is_valid_month_format() {
+        assert!(is_valid_month("2023-01"));
+        assert!(!is_valid_month("2023-01-01")); // too long
+        assert!(!is_valid_month("2023/01"));
+        assert!(!is_valid_month("../2023"));
+        assert!(!is_valid_month(""));
+    }
+
+    #[test]
+    fn test_sort_attacker_profiles_missing_fields() {
+        let profiles = vec![
+            serde_json::json!({"ip": "1.1.1.1"}), // missing risk_score, defaults to 0
+        ];
+        let by_risk = sort_attacker_profiles(profiles.clone(), 0, "risk_score");
+        assert_eq!(by_risk.len(), 1);
+
+        let filtered = sort_attacker_profiles(profiles, 1, "risk_score");
+        assert_eq!(filtered.len(), 0);
     }
 }

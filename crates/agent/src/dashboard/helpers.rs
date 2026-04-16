@@ -511,4 +511,134 @@ mod tests {
         assert_eq!(format_percentage(85.45), "85.5%");
         assert_eq!(format_percentage(100.0), "100.0%");
     }
+
+    #[test]
+    fn test_escape_html_advanced() {
+        assert_eq!(escape_html(""), "", "empty string");
+        assert_eq!(
+            escape_html("🔥 Unicode test"),
+            "🔥 Unicode test",
+            "Unicode untouched"
+        );
+        assert_eq!(
+            escape_html("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;&#x2F;script&gt;"
+        );
+        assert_eq!(escape_html("\"quotes\""), "&quot;quotes&quot;");
+        assert_eq!(escape_html("a & b"), "a &amp; b");
+        assert_eq!(escape_html("null\0byte"), "nullbyte");
+        let long_str = "X".repeat(10_000);
+        assert_eq!(escape_html(&long_str), long_str, "10k characters scaling");
+    }
+
+    #[test]
+    fn test_resolve_date_edge_cases() {
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(resolve_date(None), today);
+        assert_eq!(resolve_date(Some("invalid-date-format")), today);
+        assert_eq!(resolve_date(Some("2024-05")), today); // Incomplete
+        assert_eq!(resolve_date(Some("2024-05-15")), "2024-05-15");
+    }
+
+    #[test]
+    fn test_normalize_limit_bounds() {
+        assert_eq!(normalize_limit(None), 50);
+        assert_eq!(normalize_limit(Some(0)), 1); // clamped min
+        assert_eq!(normalize_limit(Some(1000)), 500); // clamped max
+        assert_eq!(normalize_limit(Some(250)), 250);
+    }
+
+    #[test]
+    fn test_dated_path_generation() {
+        let pb = PathBuf::from("/var/data");
+        // Safe generation
+        assert_eq!(
+            dated_path(&pb, "incidents", "2024-05-15").to_string_lossy(),
+            "/var/data/incidents-2024-05-15.jsonl"
+        );
+        assert_eq!(
+            dated_path(&pb, "incidents", "../etc/passwd").to_string_lossy(),
+            "/var/data/incidents-.jsonl" // Letters and dots removed, leaving only valid chars via filter
+        );
+    }
+
+    #[test]
+    fn test_incident_detector_extraction() {
+        assert_eq!(incident_detector("ssh_brute_force:1234"), "ssh_brute_force");
+        assert_eq!(incident_detector("no_colon_id"), "no_colon_id");
+        assert_eq!(incident_detector(""), "");
+    }
+
+    #[test]
+    fn test_extract_ip_entities_empty() {
+        assert!(extract_ip_entities(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_extract_entity_values_filter() {
+        use innerwarden_core::entities::{EntityRef, EntityType};
+        let entities = vec![
+            EntityRef {
+                r#type: EntityType::Ip,
+                value: "1.2.3.4".into(),
+            },
+            EntityRef {
+                r#type: EntityType::User,
+                value: "root".into(),
+            },
+        ];
+        let ips = extract_entity_values(&entities, EntityType::Ip);
+        assert_eq!(ips, vec!["1.2.3.4"]);
+
+        let users = extract_entity_values(&entities, EntityType::User);
+        assert_eq!(users, vec!["root"]);
+    }
+
+    #[test]
+    fn test_has_intersection() {
+        let mut set = BTreeSet::new();
+        set.insert("alpha".to_string());
+        set.insert("beta".to_string());
+
+        assert!(has_intersection(&["beta".to_string()], &set));
+        assert!(!has_intersection(&["gamma".to_string()], &set));
+        assert!(!has_intersection(&[], &set));
+    }
+
+    #[test]
+    fn test_safe_write_path_traversal() {
+        // Prevents slashes and dots
+        let pb = PathBuf::from("./");
+        assert_eq!(safe_write_data_file(&pb, "../../etc/passwd", "test"), false);
+        assert_eq!(
+            safe_write_data_file(&pb, "/absolute/path.txt", "test"),
+            false
+        );
+    }
+
+    #[test]
+    fn test_determine_outcome_for_ips_hierarchy() {
+        let decisions = vec![];
+        let mut ips = BTreeSet::new();
+        ips.insert("1.2.3.4".to_string());
+
+        // No decisions, no incident => unknown
+        assert_eq!(
+            determine_outcome_for_ips(&decisions, &ips, false),
+            "unknown"
+        );
+        // No decisions, has incident => active
+        assert_eq!(determine_outcome_for_ips(&decisions, &ips, true), "active");
+    }
+
+    #[test]
+    fn test_format_duration_scale() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(59), "59s");
+        assert_eq!(format_duration(61), "1m 1s");
+        assert_eq!(format_duration(3601), "1h 0m");
+    }
 }

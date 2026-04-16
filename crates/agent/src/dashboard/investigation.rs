@@ -2157,4 +2157,13 @@ mod tests {
         assert_eq!(summary.total_entries, 0);
         assert!(summary.hints[0].contains("No timeline entries"));
     }
+    #[test]
+    fn test_severity_rank() {
+        assert_eq!(severity_rank("critical"), 5);
+        assert_eq!(severity_rank("HIGH"), 4);
+        assert_eq!(severity_rank("Medium"), 3);
+        assert_eq!(severity_rank("low"), 2);
+        assert_eq!(severity_rank("info"), 1);
+        assert_eq!(severity_rank("unknown"), 0);
+    }
 }

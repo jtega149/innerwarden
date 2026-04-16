@@ -123,19 +123,11 @@ pub(super) async fn api_action_block_ip(
     }
 
     let ip = body.ip.trim().to_string();
-    if ip.is_empty() {
+    if let Err(e) = validate_action_params(&ip, &body.reason) {
         return Json(ActionResponse {
             success: false,
             dry_run: state.action_cfg.dry_run,
-            message: "ip is required".to_string(),
-            skill_id: String::new(),
-        });
-    }
-    if body.reason.trim().is_empty() {
-        return Json(ActionResponse {
-            success: false,
-            dry_run: state.action_cfg.dry_run,
-            message: "reason is required".to_string(),
+            message: e.to_string(),
             skill_id: String::new(),
         });
     }
@@ -381,6 +373,28 @@ pub(super) async fn api_action_honeypot(
             skill_id,
         }),
     }
+}
+
+pub(super) fn validate_action_params(target: &str, reason: &str) -> Result<(), &'static str> {
+    if target.trim().is_empty() {
+        return Err("target is required");
+    }
+    if reason.trim().is_empty() {
+        return Err("reason is required");
+    }
+    let t = target.trim();
+    if t == "127.0.0.1"
+        || t == "::1"
+        || t.starts_with("10.")
+        || t.starts_with("192.168.")
+        || (t.starts_with("172.")
+            && t.len() >= 6
+            && t[4..6].parse::<u8>().is_ok()
+            && (16..=31).contains(&t[4..6].parse::<u8>().unwrap()))
+    {
+        return Err("cannot target internal IP");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -691,5 +705,40 @@ mod tests {
             .iter()
             .any(|e| e.value == "10.0.0.5" && format!("{:?}", e.r#type) == "Ip");
         assert!(has_ip);
+    }
+
+    #[test]
+    fn test_validate_action_params() {
+        // Vazio rejeita
+        assert_eq!(
+            validate_action_params("", "reason").unwrap_err(),
+            "target is required"
+        );
+        assert_eq!(
+            validate_action_params("1.2.3.4", "").unwrap_err(),
+            "reason is required"
+        );
+
+        // Interno rejeita
+        assert_eq!(
+            validate_action_params("127.0.0.1", "test").unwrap_err(),
+            "cannot target internal IP"
+        );
+        assert_eq!(
+            validate_action_params("10.0.0.5", "test").unwrap_err(),
+            "cannot target internal IP"
+        );
+        assert_eq!(
+            validate_action_params("192.168.1.1", "test").unwrap_err(),
+            "cannot target internal IP"
+        );
+        assert_eq!(
+            validate_action_params("172.16.0.1", "test").unwrap_err(),
+            "cannot target internal IP"
+        );
+
+        // Allowed
+        assert!(validate_action_params("8.8.8.8", "reason").is_ok());
+        assert!(validate_action_params("admin", "reason").is_ok());
     }
 }

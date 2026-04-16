@@ -198,15 +198,7 @@ pub(super) async fn api_incidents(
 
                 // Effective severity: downgrade for handled incidents
                 let sev_lower = severity.to_lowercase();
-                let effective_severity = match outcome {
-                    "blocked" | "killed" | "contained" | "suspended" => match sev_lower.as_str() {
-                        "critical" => "medium".to_string(),
-                        "high" => "low".to_string(),
-                        _ => sev_lower.clone(),
-                    },
-                    "ignored" => "info".to_string(),
-                    _ => sev_lower.clone(), // open, monitored, honeypot: keep original
-                };
+                let effective_severity = effective_severity(outcome, severity);
 
                 Some(IncidentView {
                     ts: *ts,
@@ -706,4 +698,64 @@ pub(super) fn count_file_lines(path: &Path) -> usize {
         .lines()
         .filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
         .count()
+}
+
+pub(super) fn effective_severity(outcome: &str, severity: &str) -> String {
+    let sev_lower = severity.to_lowercase();
+    match outcome {
+        "blocked" | "killed" | "contained" | "suspended" => match sev_lower.as_str() {
+            "critical" => "medium".to_string(),
+            "high" => "low".to_string(),
+            _ => sev_lower,
+        },
+        "ignored" => "info".to_string(),
+        _ => sev_lower, // open, monitored, honeypot: keep original
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn test_effective_severity_downgrade() {
+        // Handled -> downgrade
+        assert_eq!(effective_severity("blocked", "critical"), "medium");
+        assert_eq!(effective_severity("killed", "Critical"), "medium");
+        assert_eq!(effective_severity("contained", "high"), "low");
+        assert_eq!(effective_severity("suspended", "High"), "low");
+
+        // Low stays low
+        assert_eq!(effective_severity("blocked", "low"), "low");
+
+        // Ignored goes to info
+        assert_eq!(effective_severity("ignored", "critical"), "info");
+
+        // Open/monitored/honeypot retain
+        assert_eq!(effective_severity("open", "critical"), "critical");
+        assert_eq!(effective_severity("monitored", "high"), "high");
+        assert_eq!(effective_severity("honeypot", "medium"), "medium");
+        assert_eq!(effective_severity("resolved", "low"), "low");
+    }
+
+    #[test]
+    fn test_is_dashboard_sleeping() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Active 1 second ago
+        let active = AtomicU64::new(now - 1);
+        assert!(!is_dashboard_sleeping(&active));
+
+        // Active 16 minutes ago (past 15m threshold)
+        let sleeping = AtomicU64::new(now - (16 * 60));
+        assert!(is_dashboard_sleeping(&sleeping));
+
+        // Active at 0 (never active or system restart)
+        let never = AtomicU64::new(0);
+        assert!(is_dashboard_sleeping(&never));
+    }
 }

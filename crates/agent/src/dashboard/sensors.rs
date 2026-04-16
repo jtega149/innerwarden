@@ -148,15 +148,7 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
         .ok()
         .and_then(|mtime| mtime.elapsed().ok().map(|d| d.as_secs()));
 
-    let mode = if action_cfg.enabled {
-        if action_cfg.dry_run {
-            "watch"
-        } else {
-            "guard"
-        }
-    } else {
-        "read_only"
-    };
+    let mode = get_protection_mode(action_cfg.enabled, action_cfg.dry_run);
 
     // Count kill chain incidents from knowledge graph (Phase 6A: no JSONL reads).
     // Single pass — avoids u64 underflow from two-pass subtract.
@@ -431,15 +423,35 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
     Json(serde_json::json!({ "collectors": collectors }))
 }
 
+pub(super) fn get_protection_mode(enabled: bool, dry_run: bool) -> &'static str {
+    if enabled {
+        if dry_run {
+            "watch"
+        } else {
+            "guard"
+        }
+    } else {
+        "read_only"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn test_get_protection_mode() {
+        assert_eq!(get_protection_mode(false, false), "read_only");
+        assert_eq!(get_protection_mode(false, true), "read_only");
+        assert_eq!(get_protection_mode(true, true), "watch");
+        assert_eq!(get_protection_mode(true, false), "guard");
+    }
+
+    #[test]
     fn test_sensors_system_status_mapping() {
         // Build mock telemetry config output matching structure expected by frontend
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let events_file = format!("events-{today}.jsonl");
+        let _events_file = format!("events-{today}.jsonl");
 
         let files = serde_json::json!({
             "events": { "exists": false, "size_bytes": 0 },
@@ -449,5 +461,55 @@ mod tests {
         // Assert structure mapping defaults correctly handle missing files fallback
         assert!(!files["events"]["exists"].as_bool().unwrap());
         assert_eq!(files["events"]["size_bytes"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_honeypot_mode_always_on() {
+        let action_cfg = DashboardActionConfig {
+            enabled: true,
+            honeypot_mode: "always_on".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(action_cfg.honeypot_mode, "always_on");
+    }
+
+    #[test]
+    fn test_honeypot_mode_off() {
+        let action_cfg = DashboardActionConfig {
+            enabled: false,
+            honeypot_mode: "off".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(action_cfg.honeypot_mode, "off");
+    }
+
+    #[test]
+    fn test_honeypot_mode_listener() {
+        let action_cfg = DashboardActionConfig {
+            enabled: true,
+            honeypot_mode: "listener".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(action_cfg.honeypot_mode, "listener");
+    }
+
+    #[test]
+    fn test_xdp_integration_state_off() {
+        let action_cfg = DashboardActionConfig {
+            execution_guard_enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(action_cfg.execution_guard_enabled, false);
+    }
+
+    #[test]
+    fn test_kill_chain_tracker_on() {
+        let action_cfg = DashboardActionConfig {
+            enabled: true,
+            execution_guard_enabled: true,
+            ..Default::default()
+        };
+        assert!(action_cfg.enabled);
+        assert!(action_cfg.execution_guard_enabled);
     }
 }

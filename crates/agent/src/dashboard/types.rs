@@ -560,4 +560,92 @@ mod tests {
         assert_eq!(severity_order("info"), 1);
         assert_eq!(severity_order("unknown"), 0);
     }
+
+    #[test]
+    fn test_pivot_kind_parsing() {
+        assert_eq!(PivotKind::parse(Some("user")), PivotKind::User);
+        assert_eq!(PivotKind::parse(Some("USER")), PivotKind::User);
+        assert_eq!(PivotKind::parse(Some("detector")), PivotKind::Detector);
+        assert_eq!(PivotKind::parse(Some("ip")), PivotKind::Ip);
+        assert_eq!(PivotKind::parse(Some("anything_else")), PivotKind::Ip); // default
+        assert_eq!(PivotKind::parse(None), PivotKind::Ip); // default
+    }
+
+    #[test]
+    fn test_pivot_kind_as_str() {
+        assert_eq!(PivotKind::User.as_str(), "user");
+        assert_eq!(PivotKind::Ip.as_str(), "ip");
+        assert_eq!(PivotKind::Detector.as_str(), "detector");
+    }
+
+    #[test]
+    fn test_investigation_filters_from_query() {
+        let filters = InvestigationFilters::from_query(Some("high"), Some(" ssh_bruteforce "));
+        assert_eq!(filters.severity_min, Some(4));
+        assert_eq!(filters.detector, Some("ssh_bruteforce".to_string()));
+
+        let empty = InvestigationFilters::from_query(Some(""), Some(""));
+        assert_eq!(empty.severity_min, None);
+        assert_eq!(empty.detector, None);
+
+        let unknown_severity = InvestigationFilters::from_query(Some("invalid"), None);
+        assert_eq!(unknown_severity.severity_min, None); // Returns 0 which is mapped to None
+    }
+
+    #[test]
+    fn test_ip_accumulator_update_time() {
+        let mut acc = IpAccumulator::default();
+        let early = Utc::now() - chrono::Duration::hours(2);
+        let late = Utc::now() - chrono::Duration::hours(1);
+
+        acc.update_time(late);
+        assert_eq!(acc.first_seen, Some(late));
+        assert_eq!(acc.last_seen, Some(late));
+
+        // Updating with an earlier time shifts first_seen but not last_seen
+        acc.update_time(early);
+        assert_eq!(acc.first_seen, Some(early));
+        assert_eq!(acc.last_seen, Some(late));
+    }
+
+    #[test]
+    fn test_classify_phase_exhaustive() {
+        // Assert every single logical event classification pathway
+        assert_eq!(classify_phase("test_port_scan_active"), "reconnaissance"); // contains port_scan
+        assert_eq!(classify_phase("deep_reconnaissance"), "reconnaissance"); // contains recon
+        assert_eq!(
+            classify_phase("test_login_success_action"),
+            "access_success"
+        ); // contains login_success
+        assert_eq!(classify_phase("password_accepted"), "access_success"); // contains _accepted
+        assert_eq!(classify_phase("user_auth_success"), "access_success"); // contains auth_success
+        assert_eq!(classify_phase("user_sudo_escalation"), "privilege_abuse"); // contains sudo
+        assert_eq!(classify_phase("root_privilege_granted"), "privilege_abuse"); // contains privilege
+        assert_eq!(classify_phase("startup_persistence_added"), "persistence"); // contains persist
+        assert_eq!(classify_phase("test_execution_command"), "execution"); // contains exec
+        assert_eq!(classify_phase("reverse_shell_opened"), "execution"); // contains shell
+        assert_eq!(
+            classify_phase("web_vulnerability_exploit"),
+            "initial_access_attempt"
+        ); // unknown defaults to initial access
+    }
+
+    #[test]
+    fn test_status_determination_exhaustive() {
+        let contained = vec!["blocked", "killed", "honeypot", "diverted"];
+        for status in contained {
+            assert_eq!(status_determination(status), "contained");
+            assert_eq!(status_determination(&status.to_uppercase()), "contained");
+        }
+
+        let observing = vec!["monitoring", "monitored", "dismissed", "ignored"];
+        for status in observing {
+            assert_eq!(status_determination(status), "observing");
+        }
+
+        let needs_attention = vec!["active", "open", "something_else", ""];
+        for status in needs_attention {
+            assert_eq!(status_determination(status), "needs_attention");
+        }
+    }
 }

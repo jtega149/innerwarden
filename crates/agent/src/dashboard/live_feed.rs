@@ -196,46 +196,6 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
         .map(|d| (d.incident_id.clone(), d))
         .collect();
 
-    // Public feed: only show real external attacks (with attacker IP).
-    // Filter out internal detections, system noise, and advisory-only detectors.
-    let is_internal = |inc: &Incident| -> bool {
-        let det = inc.incident_id.split(':').next().unwrap_or("");
-        // Advisory-only detectors (observe, never block)
-        if matches!(
-            det,
-            "neural_anomaly" | "host_drift" | "network_sniffing" | "discovery_burst"
-        ) {
-            return true;
-        }
-        // No external IP = internal noise
-        if !inc.entities.iter().any(|e| e.r#type == EntityType::Ip) {
-            return true;
-        }
-        let t = inc.title.to_lowercase();
-        // Inner Warden processes doing setuid for skills
-        t.contains("(en-agent)")
-            || t.contains("(n-shield)")
-            || t.contains("(en-sensor)")
-            || t.contains("innerwarden")
-            // System daemons that legitimately do setuid
-            || t.contains("(timesyncd)")
-            || t.contains("(systemd")
-            || t.contains("(networkd)")
-            || t.contains("(resolved)")
-            || t.contains("(sshd)")
-            || t.contains("(cron)")
-            || t.contains("(polkitd)")
-            || t.contains("(dbus-daem")
-            || t.contains("(login)")
-            || t.contains("(su)")
-            || t.contains("(sudo)")
-            || t.contains("(pkexec)")
-            || t.contains("(fwupdmgr)")
-            || t.contains("(mandb)")
-            || t.contains("(find)")
-            || t.contains("(install)")
-    };
-
     // Filter real attacks only (exclude internal noise) for consistent stats.
     let real_incidents: Vec<&Incident> = incidents.iter().filter(|i| !is_internal(i)).collect();
 
@@ -651,6 +611,50 @@ pub(super) struct GeoIpResult {
 // It canonicalizes both base and target paths and verifies the target
 // stays within the data directory, preventing path traversal attacks.
 
+// Public feed: only show real external attacks (with attacker IP).
+// Filter out internal detections, system noise, and advisory-only detectors.
+pub(super) fn is_internal(inc: &innerwarden_core::incident::Incident) -> bool {
+    let det = inc.incident_id.split(':').next().unwrap_or("");
+    // Advisory-only detectors (observe, never block)
+    if matches!(
+        det,
+        "neural_anomaly" | "host_drift" | "network_sniffing" | "discovery_burst"
+    ) {
+        return true;
+    }
+    // No external IP = internal noise
+    if !inc
+        .entities
+        .iter()
+        .any(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+    {
+        return true;
+    }
+    let t = inc.title.to_lowercase();
+    // Inner Warden processes doing setuid for skills
+    t.contains("(en-agent)")
+        || t.contains("(n-shield)")
+        || t.contains("(en-sensor)")
+        || t.contains("innerwarden")
+        // System daemons that legitimately do setuid
+        || t.contains("(timesyncd)")
+        || t.contains("(systemd)")
+        || t.contains("(networkd)")
+        || t.contains("(resolved)")
+        || t.contains("(sshd)")
+        || t.contains("(cron)")
+        || t.contains("(polkitd)")
+        || t.contains("(dbus-daem")
+        || t.contains("(login)")
+        || t.contains("(su)")
+        || t.contains("(sudo)")
+        || t.contains("(pkexec)")
+        || t.contains("(fwupdmgr)")
+        || t.contains("(mandb)")
+        || t.contains("(find)")
+        || t.contains("(install)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +723,68 @@ mod tests {
         assert_eq!(val["outcome"], "monitored");
         assert!(val.get("reputation").is_none()); // skip serialization if none
         assert_eq!(val["mitre"]["tactic"], "T0000");
+    }
+
+    #[test]
+    fn test_live_feed_item_serialization_empty() {
+        let item = LiveFeedItem {
+            ts: "2023-01-01T00:00:00Z".to_string(),
+            severity: "low".to_string(),
+            title: "Threat".to_string(),
+            ip: None,
+            action: None,
+            outcome: None,
+            confidence: None,
+            reason: None,
+            reputation: None,
+            mitre: None,
+            detector: None,
+        };
+        let val = serde_json::to_value(&item).unwrap();
+        // Optional fields skipped serialization if none
+        assert!(val.get("outcome").is_none());
+        assert!(val.get("detector").is_none());
+        assert!(val.get("mitre").is_none());
+        assert!(val["action"].is_null());
+    }
+
+    #[test]
+    fn test_is_internal_filter() {
+        use innerwarden_core::entities::EntityRef;
+        // Real IP based threat => external
+        let ext_inc = Incident {
+            ts: Utc::now(),
+            host: String::new(),
+            incident_id: "ssh_bruteforce:123".into(),
+            severity: Severity::High,
+            title: "External threat".into(),
+            summary: "xyz".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("1.2.3.4")],
+        };
+        assert_eq!(is_internal(&ext_inc), false);
+
+        // System daemon title => internal
+        let daemon_inc = Incident {
+            title: "Setuid execution (sudo)".into(),
+            ..ext_inc.clone()
+        };
+        assert_eq!(is_internal(&daemon_inc), true);
+
+        // Advisory detector => internal
+        let adv_inc = Incident {
+            incident_id: "neural_anomaly:123".into(),
+            ..ext_inc.clone()
+        };
+        assert_eq!(is_internal(&adv_inc), true);
+
+        // No IP => internal
+        let no_ip_inc = Incident {
+            entities: vec![EntityRef::user("root")],
+            ..ext_inc.clone()
+        };
+        assert_eq!(is_internal(&no_ip_inc), true);
     }
 }
