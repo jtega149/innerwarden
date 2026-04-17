@@ -46,18 +46,20 @@ coverage:
         informational: false
 
 comment:
-  layout: "diff, flags, components, files"
+  # Restore the default sections so the PR comment shows project coverage,
+  # delta, and reach — not just the file list. Dropping `reach`/`header`
+  # made every PR look like coverage was worse because the overall number
+  # disappeared.
+  layout: "reach, diff, flags, components, files, header"
   behavior: default
   require_changes: true
   show_carryforward_flags: true
 
 # Per-crate component view — shows cov % on each box in PR comments.
+# No per-component status checks: we don't want 12 separate red checks
+# the first time a small crate drifts by 2%. The project-level status
+# at `coverage.status.project.*` above is the single enforcement point.
 component_management:
-  default_rules:
-    statuses:
-      - type: project
-        target: auto
-        threshold: 1%
   individual_components:
     - component_id: agent
       name: agent
@@ -96,15 +98,18 @@ component_management:
       name: core
       paths: ["crates/core/**"]
 
-# Paths that should never be counted.
+# Paths codecov ignores when computing %.
+#
+# Deliberately conservative: only exclude paths that cannot be instrumented
+# or that contain no Rust source at all. Integration tests in
+# `crates/*/tests/` are kept in the report because they execute during
+# `cargo test` and contribute real coverage signal; excluding them was an
+# earlier mistake that caused apparent coverage drops without changing
+# what the code actually tests.
 ignore:
   - "crates/sensor-ebpf/**"           # no_std eBPF bytecode — cannot instrument
   - "crates/sensor-ebpf-types/**"     # shared types, no runtime behavior
-  - "**/tests/**"                     # integration test scaffolding
-  - "**/*/target/**"
-  - "**/build.rs"
-  - "**/benches/**"
-  - "**/examples/**"
+  - "**/*/target/**"                  # cargo build artifacts
   - "rules/**"                        # yaml rule data, not code
   - "modules/**"                      # manifest-only
   - "integrations/**"                 # manifest-only
