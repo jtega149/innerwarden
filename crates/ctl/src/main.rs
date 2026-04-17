@@ -197,6 +197,29 @@ enum Command {
         mode: String,
     },
 
+    /// Replay JSONL event fixtures through detectors and validate output.
+    ///
+    /// Reads event fixtures, runs them through the registered detectors, and
+    /// compares produced incidents against expected.json. Exits non-zero if any
+    /// detector fails its assertion. Custom fixtures let operators validate
+    /// detector behaviour on their own log samples without writing Bash.
+    ///
+    /// Examples:
+    ///   innerwarden replay
+    ///   innerwarden replay --fixture testdata/fixtures/ --expected testdata/expected.json
+    ///   innerwarden replay --fixture /tmp/my-logs/ --expected /tmp/my-expected.json
+    Replay {
+        /// Directory containing .jsonl fixture files. The default path is relative to the
+        /// repo root — run this command from the repository root or pass an absolute path.
+        #[arg(long, default_value = "testdata/fixtures")]
+        fixture: PathBuf,
+
+        /// JSON file describing expected detector output. The default path is relative to the
+        /// repo root — run this command from the repository root or pass an absolute path.
+        #[arg(long, default_value = "testdata/expected.json")]
+        expected: PathBuf,
+    },
+
     /// Check for a newer release and optionally upgrade all binaries.
     ///
     /// Examples:
@@ -2069,6 +2092,10 @@ fn main() -> Result<()> {
         // Top-level commands (not grouped)
         // ===================================================================
         Command::Setup { ref mode } => commands::setup::cmd_setup(&cli, mode),
+        Command::Replay {
+            ref fixture,
+            ref expected,
+        } => commands::replay::cmd_replay(fixture, expected),
         Command::Upgrade {
             check,
             yes,

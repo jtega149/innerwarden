@@ -253,19 +253,17 @@ impl NarrativeAccumulator {
             *self.events_by_kind.entry(ev.kind.clone()).or_insert(0) += 1;
             for entity in &ev.entities {
                 match entity.r#type {
-                    innerwarden_core::entities::EntityType::Ip => {
+                    innerwarden_core::entities::EntityType::Ip
                         if self.ip_counts.contains_key(&entity.value)
-                            || self.ip_counts.len() < Self::MAX_ENTITY_ENTRIES
-                        {
-                            *self.ip_counts.entry(entity.value.clone()).or_insert(0) += 1;
-                        }
+                            || self.ip_counts.len() < Self::MAX_ENTITY_ENTRIES =>
+                    {
+                        *self.ip_counts.entry(entity.value.clone()).or_insert(0) += 1;
                     }
-                    innerwarden_core::entities::EntityType::User => {
+                    innerwarden_core::entities::EntityType::User
                         if self.user_counts.contains_key(&entity.value)
-                            || self.user_counts.len() < Self::MAX_ENTITY_ENTRIES
-                        {
-                            *self.user_counts.entry(entity.value.clone()).or_insert(0) += 1;
-                        }
+                            || self.user_counts.len() < Self::MAX_ENTITY_ENTRIES =>
+                    {
+                        *self.user_counts.entry(entity.value.clone()).or_insert(0) += 1;
                     }
                     _ => {}
                 }
@@ -670,7 +668,7 @@ fn run_backfill_015_research_only(data_dir: &std::path::Path) -> Result<()> {
     if !report.by_detector.is_empty() {
         println!("  by detector    :");
         let mut top: Vec<(&String, &usize)> = report.by_detector.iter().collect();
-        top.sort_by(|a, b| b.1.cmp(a.1));
+        top.sort_by_key(|x| std::cmp::Reverse(*x.1));
         for (det, n) in top.iter().take(15) {
             println!("    {det:<28} {n}");
         }
@@ -2051,7 +2049,7 @@ async fn main() -> Result<()> {
                         if state.attacker_profiles.len() > MAX_ATTACKER_PROFILES {
                             let mut entries: Vec<_> =
                                 state.attacker_profiles.drain().collect();
-                            entries.sort_by(|a, b| b.1.risk_score.cmp(&a.1.risk_score));
+                            entries.sort_by_key(|x| std::cmp::Reverse(x.1.risk_score));
                             entries.truncate(MAX_ATTACKER_PROFILES);
                             state.attacker_profiles = entries.into_iter().collect();
                         }

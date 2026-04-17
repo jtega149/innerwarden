@@ -1363,7 +1363,6 @@ fn print_recommendations(recs: &[ModuleRec], system_findings: &[ScanFinding]) {
     println!("{}", "\u{2501}".repeat(64));
 
     let mut current_tier: Option<&Tier> = None;
-    let mut idx = 1usize;
 
     let available: Vec<_> = recs
         .iter()
@@ -1374,7 +1373,8 @@ fn print_recommendations(recs: &[ModuleRec], system_findings: &[ScanFinding]) {
         .filter(|r| r.tier == Tier::NotAvailable)
         .collect();
 
-    for rec in &available {
+    for (i, rec) in available.iter().enumerate() {
+        let idx = i + 1;
         if current_tier.as_ref().map(|t| t.order()) != Some(rec.tier.order()) {
             println!("\n  {}", rec.tier.label());
             println!();
@@ -1413,7 +1413,6 @@ fn print_recommendations(recs: &[ModuleRec], system_findings: &[ScanFinding]) {
         }
 
         println!();
-        idx += 1;
     }
 
     if !not_available.is_empty() {

@@ -1,0 +1,16 @@
+{
+  "ssh_bruteforce": {
+    "threshold": 5,
+    "window_seconds": 300,
+    "min_incidents": 1,
+    "incident_id_prefix": "ssh_bruteforce:",
+    "severity": "medium"
+  },
+  "credential_stuffing": {
+    "threshold": 3,
+    "window_seconds": 300,
+    "min_incidents": 1,
+    "incident_id_prefix": "credential_stuffing:",
+    "severity": "high"
+  }
+}
