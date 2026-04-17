@@ -1644,7 +1644,7 @@ mod tests {
         Ok((state, handle, port, cert_dir))
     }
 
-    fn build_test_client(port: u16) -> anyhow::Result<TelegramClient> {
+    fn build_test_client(port: u16, cert_dir: &std::path::Path) -> anyhow::Result<TelegramClient> {
         use std::sync::atomic::AtomicU32;
 
         let current_hour: u32 = chrono::Utc::now()
@@ -1653,9 +1653,20 @@ mod tests {
             .parse()
             .unwrap_or(0);
 
+        // Trust ONLY the self-signed cert the mock server generated for
+        // this run. Scoping trust this tightly is what keeps
+        // `danger_accept_invalid_certs` out of the codebase — the
+        // rule rust/disabled-certificate-check that CodeQL flags is a
+        // real security smell even in test code, because a shared
+        // test harness with that flag can leak into prod builds.
+        let cert_pem = std::fs::read(cert_dir.join("mock-cert.pem"))
+            .context("failed to read mock TLS cert for test client")?;
+        let mock_cert =
+            reqwest::Certificate::from_pem(&cert_pem).context("mock TLS cert is not valid PEM")?;
+
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(35))
-            .danger_accept_invalid_certs(true)
+            .add_root_certificate(mock_cert)
             .resolve("api.telegram.org", SocketAddr::from(([127, 0, 0, 1], port)))
             .build()
             .context("failed to build mock-aware reqwest client")?;
@@ -1713,8 +1724,8 @@ mod tests {
         }));
 
         let updates = vec![json!({ "ok": true, "result": callbacks })];
-        let (state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
-        let client = Arc::new(build_test_client(port)?);
+        let (state, server, port, cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port, cert_dir.path())?);
         let (tx, rx) = mpsc::channel::<ApprovalResult>(8);
         let mut task = tokio::spawn(client.run_polling(tx));
 
@@ -1750,8 +1761,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_confirmation_request_uses_mock_response_message_id() -> anyhow::Result<()> {
-        let (state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
-        let client = build_test_client(port)?;
+        let (state, server, port, cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port, cert_dir.path())?;
 
         let id = client
             .send_confirmation_request(
@@ -1786,8 +1797,8 @@ mod tests {
             "ok": false,
             "description": "mock api failure"
         })];
-        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
-        let client = build_test_client(port)?;
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = build_test_client(port, cert_dir.path())?;
 
         let parsed = client.get_updates(0).await?;
         assert!(
@@ -1906,8 +1917,8 @@ mod tests {
             ]
         })];
 
-        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
-        let client = Arc::new(build_test_client(port)?);
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port, cert_dir.path())?);
         let (tx, mut rx) = mpsc::channel::<ApprovalResult>(32);
 
         let mut task = tokio::spawn(client.run_polling(tx));
@@ -1951,8 +1962,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_alert_html_stops_after_hourly_cap_and_sends_warning_once() -> anyhow::Result<()> {
-        let (state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
-        let client = build_test_client(port)?;
+        let (state, server, port, cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port, cert_dir.path())?;
 
         for _ in 0..12usize {
             client.send_alert_html("<b>alert</b>").await?;
@@ -1971,8 +1982,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_abuseipdb_autoblock_includes_dashboard_link() -> anyhow::Result<()> {
-        let (state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
-        let client = build_test_client(port)?;
+        let (state, server, port, cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port, cert_dir.path())?;
 
         client
             .send_abuseipdb_autoblock(
@@ -2011,8 +2022,8 @@ mod tests {
 
     #[tokio::test]
     async fn exercise_client_message_methods_and_allowlist_helpers() -> anyhow::Result<()> {
-        let (state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
-        let client = build_test_client(port)?;
+        let (state, server, port, cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port, cert_dir.path())?;
 
         let incident = make_incident();
         let mut incident_without_ip = make_incident();
@@ -2270,8 +2281,8 @@ mod tests {
             ]
         })];
 
-        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
-        let client = Arc::new(build_test_client(port)?);
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port, cert_dir.path())?);
         let (tx, mut rx) = mpsc::channel::<ApprovalResult>(16);
         let mut task = tokio::spawn(client.run_polling(tx));
 
@@ -2311,8 +2322,8 @@ mod tests {
             "ok": true,
             "result": { "unexpected": "shape" }
         })];
-        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
-        let client = build_test_client(port)?;
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = build_test_client(port, cert_dir.path())?;
 
         let parsed = client.get_updates(0).await?;
         assert!(
@@ -2328,8 +2339,8 @@ mod tests {
     async fn exercise_remaining_client_message_branches() -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
 
-        let (_state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
-        let client = build_test_client(port)?;
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port, cert_dir.path())?;
         let incident = make_incident();
 
         client
@@ -2464,7 +2475,7 @@ mod tests {
             )
             .await?;
 
-        let mut client_no_dashboard = build_test_client(port)?;
+        let mut client_no_dashboard = build_test_client(port, cert_dir.path())?;
         client_no_dashboard.dashboard_url = None;
         client_no_dashboard
             .send_honeypot_session_report(
@@ -2582,8 +2593,8 @@ mod tests {
         }
 
         let updates = vec![json!({ "ok": true, "result": result })];
-        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
-        let client = Arc::new(build_test_client(port)?);
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port, cert_dir.path())?);
         let (tx, mut rx) = mpsc::channel::<ApprovalResult>(64);
         let mut task = tokio::spawn(client.run_polling(tx));
 
@@ -2654,7 +2665,17 @@ mod tests {
 
     #[tokio::test]
     async fn run_polling_covers_get_updates_error_branch() -> anyhow::Result<()> {
-        let client = Arc::new(build_test_client(65001)?);
+        // Port 65001 has nothing listening; this test only exercises the
+        // error branch of get_updates. We still need a cert dir so
+        // build_test_client can construct a reqwest client — generate an
+        // ephemeral self-signed cert solely for that purpose.
+        let cert_dir = tempfile::tempdir()?;
+        let params = rcgen::CertificateParams::new(vec!["api.telegram.org".to_string()])?;
+        let key_pair = rcgen::KeyPair::generate()?;
+        let cert = params.self_signed(&key_pair)?;
+        std::fs::write(cert_dir.path().join("mock-cert.pem"), cert.pem())?;
+
+        let client = Arc::new(build_test_client(65001, cert_dir.path())?);
         let (tx, rx) = mpsc::channel::<ApprovalResult>(1);
         let mut task = tokio::spawn(client.run_polling(tx));
 
@@ -2668,9 +2689,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_text_message_handles_not_ok_telegram_response() -> anyhow::Result<()> {
-        let (_state, server, port, _cert_dir) =
+        let (_state, server, port, cert_dir) =
             start_mock_telegram_server_with_options(vec![], true).await?;
-        let client = build_test_client(port)?;
+        let client = build_test_client(port, cert_dir.path())?;
 
         client.send_text_message("<b>still ok</b>").await?;
 
