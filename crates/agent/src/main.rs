@@ -598,7 +598,7 @@ fn run_cleanup_015(data_dir: &std::path::Path) -> Result<()> {
     // operator can always roll back if the migration does something
     // unexpected. Name it with a timestamp so repeated runs don't clobber.
     let stamp = Local::now().format("%Y%m%dT%H%M%S");
-    let backup_path = snapshot_path.with_extension(format!("json.bak-015-{stamp}"));
+    let backup_path = cleanup_015_backup_path(&snapshot_path, &stamp.to_string());
     fs::copy(&snapshot_path, &backup_path)
         .with_context(|| format!("failed to back up snapshot to {}", backup_path.display()))?;
     println!(
@@ -650,7 +650,7 @@ fn run_backfill_015_research_only(data_dir: &std::path::Path) -> Result<()> {
     }
 
     let stamp = Local::now().format("%Y%m%dT%H%M%S");
-    let backup_path = snapshot_path.with_extension(format!("json.bak-015-researchonly-{stamp}"));
+    let backup_path = backfill_015_research_only_backup_path(&snapshot_path, &stamp.to_string());
     fs::copy(&snapshot_path, &backup_path)
         .with_context(|| format!("failed to back up snapshot to {}", backup_path.display()))?;
     println!(
@@ -2972,16 +2972,7 @@ fn refresh_operator_ips(state: &mut AgentState, allowlist: &config::AllowlistCon
     // Check active sessions via `who -i`
     if let Ok(output) = std::process::Command::new("who").arg("-i").output() {
         let who_out = String::from_utf8_lossy(&output.stdout);
-        for line in who_out.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let (Some(user), Some(ip_raw)) = (parts.first(), parts.last()) {
-                let ip = ip_raw.trim_matches(|c| c == '(' || c == ')');
-                if allowlist.trusted_users.iter().any(|u| u == *user) && !ip.is_empty() && ip != ":"
-                {
-                    active_ips.insert(ip.to_string(), now);
-                }
-            }
-        }
+        active_ips = operator_ips_from_who_output(&who_out, &allowlist.trusted_users, now);
     }
 
     // Log removed sessions
@@ -4010,12 +4001,7 @@ fn is_pid_in_own_tree(pid: u32, own_pid: u32) -> bool {
         return false;
     };
     // Tgid = thread group ID. For threads, this is the main process PID.
-    let tgid = content
-        .lines()
-        .find(|l| l.starts_with("Tgid:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u32>().ok());
-    if tgid == Some(own_pid) {
+    if status_tgid(&content) == Some(own_pid) {
         return true;
     }
     // Walk PPid chain (max 3 hops) for child processes (not threads).
@@ -4025,11 +4011,7 @@ fn is_pid_in_own_tree(pid: u32, own_pid: u32) -> bool {
         let Ok(c) = std::fs::read_to_string(&path) else {
             return false;
         };
-        let ppid = c
-            .lines()
-            .find(|l| l.starts_with("PPid:"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|s| s.parse::<u32>().ok());
+        let ppid = status_ppid(&c);
         match ppid {
             Some(p) if p == own_pid => return true,
             Some(0) | Some(1) | None => return false,
@@ -4037,6 +4019,48 @@ fn is_pid_in_own_tree(pid: u32, own_pid: u32) -> bool {
         }
     }
     false
+}
+
+fn cleanup_015_backup_path(snapshot_path: &Path, stamp: &str) -> PathBuf {
+    snapshot_path.with_extension(format!("json.bak-015-{stamp}"))
+}
+
+fn backfill_015_research_only_backup_path(snapshot_path: &Path, stamp: &str) -> PathBuf {
+    snapshot_path.with_extension(format!("json.bak-015-researchonly-{stamp}"))
+}
+
+fn status_field_u32(content: &str, field: &str) -> Option<u32> {
+    content
+        .lines()
+        .find(|line| line.starts_with(field))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn status_tgid(content: &str) -> Option<u32> {
+    status_field_u32(content, "Tgid:")
+}
+
+fn status_ppid(content: &str) -> Option<u32> {
+    status_field_u32(content, "PPid:")
+}
+
+fn operator_ips_from_who_output(
+    who_output: &str,
+    trusted_users: &[String],
+    now: std::time::Instant,
+) -> HashMap<String, std::time::Instant> {
+    let mut active_ips = HashMap::new();
+    for line in who_output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let (Some(user), Some(ip_raw)) = (parts.first(), parts.last()) {
+            let ip = ip_raw.trim_matches(|c| c == '(' || c == ')');
+            if trusted_users.iter().any(|trusted| trusted == *user) && !ip.is_empty() && ip != ":" {
+                active_ips.insert(ip.to_string(), now);
+            }
+        }
+    }
+    active_ips
 }
 
 // ---------------------------------------------------------------------------
@@ -4047,7 +4071,7 @@ fn is_pid_in_own_tree(pid: u32, own_pid: u32) -> bool {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -5505,6 +5529,82 @@ mod tests {
         let mut cfg = config::AgentConfig::default();
         cfg.honeypot.mode = "totally-made-up".to_string();
         assert_eq!(honeypot_runtime(&cfg).mode, "demo");
+    }
+
+    #[test]
+    fn status_field_u32_parses_expected_proc_status_fields() {
+        // Ensures /proc status parser extracts numeric IDs used by own-process filtering.
+        let sample = "Name:\tagent\nTgid:\t4242\nPPid:\t1\n";
+        assert_eq!(status_field_u32(sample, "Tgid:"), Some(4242));
+        assert_eq!(status_field_u32(sample, "PPid:"), Some(1));
+    }
+
+    #[test]
+    fn status_field_u32_returns_none_for_missing_or_invalid_values() {
+        // Guards parser failure paths so malformed proc status does not cause false matches.
+        let sample = "Name:\tagent\nTgid:\tnot-a-number\n";
+        assert_eq!(status_field_u32(sample, "Tgid:"), None);
+        assert_eq!(status_field_u32(sample, "PPid:"), None);
+    }
+
+    #[test]
+    fn status_helpers_delegate_to_field_parser() {
+        // Verifies convenience wrappers for Tgid/PPid stay aligned with generic parser behavior.
+        let sample = "Tgid:\t9001\nPPid:\t1337\n";
+        assert_eq!(status_tgid(sample), Some(9001));
+        assert_eq!(status_ppid(sample), Some(1337));
+    }
+
+    #[test]
+    fn operator_ips_from_who_output_filters_to_trusted_users() {
+        // Covers who-output parsing so only trusted operator sessions become protected IPs.
+        let trusted = vec!["alice".to_string(), "root".to_string()];
+        let now = std::time::Instant::now();
+        let who = "\
+alice pts/0 2026-04-17 10:00 (203.0.113.8)\n\
+bob pts/1 2026-04-17 10:01 (198.51.100.9)\n\
+root pts/2 2026-04-17 10:02 (2001:db8::7)\n\
+alice pts/3 2026-04-17 10:03 (:)\n";
+        let ips = operator_ips_from_who_output(who, &trusted, now);
+        assert!(ips.contains_key("203.0.113.8"));
+        assert!(ips.contains_key("2001:db8::7"));
+        assert!(!ips.contains_key("198.51.100.9"));
+        assert!(!ips.contains_key(":"));
+    }
+
+    #[test]
+    fn cleanup_backup_paths_include_expected_spec_suffixes() {
+        // Ensures one-shot migration backups remain deterministic and easy to identify.
+        let snapshot = Path::new("/var/lib/innerwarden/graph-2026-04-17.json");
+        assert_eq!(
+            cleanup_015_backup_path(snapshot, "20260417T101500"),
+            PathBuf::from("/var/lib/innerwarden/graph-2026-04-17.json.bak-015-20260417T101500")
+        );
+        assert_eq!(
+            backfill_015_research_only_backup_path(snapshot, "20260417T101500"),
+            PathBuf::from(
+                "/var/lib/innerwarden/graph-2026-04-17.json.bak-015-researchonly-20260417T101500"
+            )
+        );
+    }
+
+    #[test]
+    fn incident_line_serializes_default_test_incident() {
+        // Uses helper output so regression in incident JSON fixture formatting is caught early.
+        let raw = incident_line("1.2.3.4");
+        let parsed: innerwarden_core::incident::Incident =
+            serde_json::from_str(&raw).expect("incident line should be valid JSON");
+        assert_eq!(parsed.incident_id, "ssh_bruteforce:1.2.3.4:test");
+    }
+
+    #[test]
+    fn incident_line_with_kind_serializes_custom_detector_kind() {
+        // Validates custom-kind incident fixture helper used by targeted test scenarios.
+        let raw = incident_line_with_kind("1.2.3.4", "port_scan");
+        let parsed: innerwarden_core::incident::Incident =
+            serde_json::from_str(&raw).expect("incident line should be valid JSON");
+        assert_eq!(parsed.incident_id, "port_scan:1.2.3.4:test");
+        assert!(parsed.tags.contains(&"port_scan".to_string()));
     }
 
     // ── Memory safety: NarrativeAccumulator tests ────────────────────
