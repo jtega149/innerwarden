@@ -54,8 +54,8 @@ pub(crate) fn process_anomalies(
         state.last_baseline_anomaly_ts,
         state.last_autoencoder_anomaly_ts,
     ) {
-        let gap = (baseline_ts - autoencoder_ts).num_seconds().unsigned_abs();
-        if gap <= 60 {
+        let gap = anomaly_gap_seconds(baseline_ts, autoencoder_ts);
+        if anomalies_converged_within_window(baseline_ts, autoencoder_ts, 60) {
             info!(
                 baseline_ts = %baseline_ts,
                 autoencoder_ts = %autoencoder_ts,
@@ -73,10 +73,7 @@ pub(crate) fn process_anomalies(
             let fused_incident = innerwarden_core::incident::Incident {
                 ts: now,
                 host,
-                incident_id: format!(
-                    "correlated_anomaly:baseline_neural:{}",
-                    now.format("%Y-%m-%dT%H:%MZ")
-                ),
+                incident_id: correlated_anomaly_incident_id(now),
                 severity: innerwarden_core::event::Severity::Medium,
                 title: "AI + Statistical convergence — both models flagged unusual activity"
                     .to_string(),
@@ -113,5 +110,76 @@ pub(crate) fn process_anomalies(
             state.last_baseline_anomaly_ts = None;
             state.last_autoencoder_anomaly_ts = None;
         }
+    }
+}
+
+fn anomaly_gap_seconds(
+    baseline_ts: chrono::DateTime<chrono::Utc>,
+    autoencoder_ts: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    (baseline_ts - autoencoder_ts).num_seconds().unsigned_abs()
+}
+
+fn anomalies_converged_within_window(
+    baseline_ts: chrono::DateTime<chrono::Utc>,
+    autoencoder_ts: chrono::DateTime<chrono::Utc>,
+    window_secs: u64,
+) -> bool {
+    anomaly_gap_seconds(baseline_ts, autoencoder_ts) <= window_secs
+}
+
+fn correlated_anomaly_incident_id(now: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "correlated_anomaly:baseline_neural:{}",
+        now.format("%Y-%m-%dT%H:%MZ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn anomaly_gap_seconds_is_absolute_between_timestamps() {
+        // Ensures anomaly gap calculation is order-independent for baseline/autoencoder timestamps.
+        let a = Utc
+            .with_ymd_and_hms(2026, 4, 17, 8, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let b = Utc
+            .with_ymd_and_hms(2026, 4, 17, 7, 59, 0)
+            .single()
+            .expect("valid timestamp");
+        assert_eq!(anomaly_gap_seconds(a, b), 60);
+        assert_eq!(anomaly_gap_seconds(b, a), 60);
+    }
+
+    #[test]
+    fn anomalies_converged_within_window_checks_threshold_boundary() {
+        // Covers convergence gate boundary so fusion only triggers inside the configured window.
+        let now = Utc::now();
+        assert!(anomalies_converged_within_window(
+            now,
+            now - Duration::seconds(60),
+            60
+        ));
+        assert!(!anomalies_converged_within_window(
+            now,
+            now - Duration::seconds(61),
+            60
+        ));
+    }
+
+    #[test]
+    fn correlated_anomaly_incident_id_uses_expected_prefix_and_timestamp() {
+        // Guards incident ID format consumed by downstream dashboards and dedup logic.
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 17, 9, 30, 0)
+            .single()
+            .expect("valid timestamp");
+        let id = correlated_anomaly_incident_id(now);
+        assert!(id.starts_with("correlated_anomaly:baseline_neural:"));
+        assert!(id.ends_with("2026-04-17T09:30Z"));
     }
 }

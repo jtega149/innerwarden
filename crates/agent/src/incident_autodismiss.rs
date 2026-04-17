@@ -22,12 +22,9 @@ pub(crate) fn try_autodismiss_noise(
         return false;
     }
 
-    let detector = incident.incident_id.split(':').next().unwrap_or("");
+    let detector = detector_from_incident_id(&incident.incident_id);
 
-    let reason = format!(
-        "Auto-dismissed: {detector} below AI severity threshold (severity {:?})",
-        incident.severity,
-    );
+    let reason = autodismiss_reason(detector, &incident.severity);
 
     info!(
         incident_id = %incident.incident_id,
@@ -87,18 +84,49 @@ pub(crate) fn is_noise_gate_eligible(responder_enabled: bool, responder_dry_run:
     responder_enabled && !responder_dry_run
 }
 
+fn detector_from_incident_id(incident_id: &str) -> &str {
+    incident_id.split(':').next().unwrap_or("")
+}
+
+fn autodismiss_reason(detector: &str, severity: &innerwarden_core::event::Severity) -> String {
+    format!(
+        "Auto-dismissed: {detector} below AI severity threshold (severity {:?})",
+        severity,
+    )
+}
+
 // Integration tests for autodismiss live in main.rs test harness where
 // AgentState can be constructed via triage_test_state().
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use innerwarden_core::event::Severity;
 
     #[test]
     fn test_is_noise_gate_eligible() {
+        // Ensures the gate is active only in Guard mode (enabled and not dry-run).
         assert!(is_noise_gate_eligible(true, false));
         assert!(!is_noise_gate_eligible(false, false));
         assert!(!is_noise_gate_eligible(true, true));
         assert!(!is_noise_gate_eligible(false, true));
+    }
+
+    #[test]
+    fn detector_from_incident_id_extracts_prefix_before_colon() {
+        // Verifies detector extraction stays consistent for routing and audit reason text.
+        assert_eq!(
+            detector_from_incident_id("ssh_bruteforce:abc"),
+            "ssh_bruteforce"
+        );
+        assert_eq!(detector_from_incident_id("single-token"), "single-token");
+    }
+
+    #[test]
+    fn autodismiss_reason_mentions_detector_and_severity() {
+        // Guards explanatory reason formatting stored in decision audit entries.
+        let reason = autodismiss_reason("suspicious_login", &Severity::Low);
+        assert!(reason.contains("suspicious_login"));
+        assert!(reason.contains("Low"));
     }
 }

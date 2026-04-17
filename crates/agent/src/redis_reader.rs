@@ -216,10 +216,28 @@ mod tests {
 
     #[test]
     fn agent_config_defaults() {
+        // Validates default stream/group values used by the agent bootstrap path.
         let cfg = agent_config("redis://127.0.0.1:6379", None);
         assert_eq!(cfg.events_stream, "innerwarden:events");
         assert_eq!(cfg.incidents_stream, "innerwarden:incidents");
         assert_eq!(cfg.group, "innerwarden-agent");
         assert_eq!(cfg.batch_size, 500);
+    }
+
+    #[test]
+    fn agent_config_keeps_custom_events_stream_when_provided() {
+        // Ensures operator-supplied event stream names override the default.
+        let cfg = agent_config("redis://127.0.0.1:6379", Some("custom:events"));
+        assert_eq!(cfg.events_stream, "custom:events");
+        assert_eq!(cfg.incidents_stream, DEFAULT_INCIDENTS_STREAM);
+    }
+
+    #[test]
+    fn agent_config_sets_expected_reader_identity_fields() {
+        // Guards consumer identity fields so group-based ACK behavior remains stable.
+        let cfg = agent_config("redis://localhost:6379/0", None);
+        assert_eq!(cfg.url, "redis://localhost:6379/0");
+        assert_eq!(cfg.group, "innerwarden-agent");
+        assert_eq!(cfg.consumer, "agent-1");
     }
 }

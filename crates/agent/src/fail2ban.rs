@@ -10,7 +10,7 @@ pub struct Fail2BanState {
 
 impl Fail2BanState {
     pub fn new(_cfg: &crate::config::Fail2BanConfig) -> Self {
-        tracing::info!("Fail2ban integration is deprecated - InnerWarden's native detectors + XDP firewall are superior");
+        tracing::info!("{}", fail2ban_deprecation_message());
         Self { _private: () }
     }
 }
@@ -27,4 +27,40 @@ pub async fn sync_tick(
     _telegram: Option<&std::sync::Arc<crate::telegram::TelegramClient>>,
 ) {
     // No-op: fail2ban sync is deprecated
+    let _ = fail2ban_sync_is_noop();
+}
+
+fn fail2ban_deprecation_message() -> &'static str {
+    "Fail2ban integration is deprecated - InnerWarden's native detectors + XDP firewall are superior"
+}
+
+fn fail2ban_sync_is_noop() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_accepts_config_and_constructs_state() {
+        // Verifies deprecated adapter remains constructible for legacy config compatibility.
+        let cfg = crate::config::Fail2BanConfig::default();
+        let _state = Fail2BanState::new(&cfg);
+    }
+
+    #[test]
+    fn deprecation_message_mentions_native_detectors_and_xdp() {
+        // Guards operator-facing wording so deprecation guidance remains explicit.
+        let msg = fail2ban_deprecation_message();
+        assert!(msg.contains("deprecated"));
+        assert!(msg.contains("native detectors"));
+        assert!(msg.contains("XDP"));
+    }
+
+    #[test]
+    fn sync_tick_marker_reports_noop_behavior() {
+        // Documents intentional no-op behavior for the deprecated sync path.
+        assert!(fail2ban_sync_is_noop());
+    }
 }

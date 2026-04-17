@@ -179,3 +179,78 @@ impl KnowledgeGraph {
         roots.len() as u32
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn count_connected_components_returns_zero_for_empty_graph() {
+        // Covers empty-graph path to avoid regressions in component counting bootstrap behavior.
+        let graph = KnowledgeGraph::new();
+        assert_eq!(graph.count_connected_components(), 0);
+    }
+
+    #[test]
+    fn count_connected_components_splits_disconnected_clusters() {
+        // Ensures union-find correctly reports separate attack clusters as distinct components.
+        let mut graph = KnowledgeGraph::new();
+        let now = Utc::now();
+
+        let p1 = graph.ensure_process(1001, 1, "bash", 0, now);
+        let ip1 = graph.ensure_ip("1.2.3.4", now);
+        graph.add_edge(Edge::new(p1, ip1, Relation::ConnectedTo, now));
+
+        let p2 = graph.ensure_process(2001, 1, "python", 0, now);
+        let ip2 = graph.ensure_ip("5.6.7.8", now);
+        graph.add_edge(Edge::new(p2, ip2, Relation::ConnectedTo, now));
+
+        assert_eq!(graph.count_connected_components(), 2);
+    }
+
+    #[test]
+    fn extract_neural_features_tracks_sensitive_writes_and_active_sessions() {
+        // Verifies feature extraction emits expected counters used by the neural lifecycle model.
+        let mut graph = KnowledgeGraph::new();
+        let now = Utc::now();
+
+        let proc = graph.ensure_process(3001, 1, "curl", 0, now);
+        let sensitive = graph.ensure_file("/etc/shadow");
+        let user = graph.ensure_user("root");
+        let ip = graph.ensure_ip("9.9.9.9", now);
+        let incident = graph.add_node(Node::Incident {
+            incident_id: "inc-1".to_string(),
+            detector: "test".to_string(),
+            severity: "high".to_string(),
+            title: "t".to_string(),
+            summary: "s".to_string(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+
+        graph.add_edge(Edge::new(proc, sensitive, Relation::Wrote, now));
+        let mut login = Edge::new(user, ip, Relation::LoggedInFrom, now - Duration::minutes(1));
+        login
+            .properties
+            .insert("success".to_string(), serde_json::json!(true));
+        graph.add_edge(login);
+        graph.add_edge(Edge::new(proc, incident, Relation::TriggeredBy, now));
+
+        let features = graph.extract_neural_features();
+        assert_eq!(features.writes_to_sensitive, 1);
+        assert_eq!(features.active_sessions, 1);
+        assert_eq!(features.incident_count, 1);
+        assert!(features.total_edges >= 3);
+    }
+}

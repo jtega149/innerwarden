@@ -22,12 +22,8 @@ pub(crate) async fn try_handle_honeypot_routing(
         return false;
     }
 
-    let detector = incident.incident_id.split(':').next().unwrap_or("");
-    let primary_ip = incident
-        .entities
-        .iter()
-        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
-        .map(|e| e.value.clone());
+    let detector = detector_from_incident_id(&incident.incident_id);
+    let primary_ip = primary_ip_from_incident(incident);
     let Some(ip) = primary_ip else {
         return false;
     };
@@ -38,13 +34,12 @@ pub(crate) async fn try_handle_honeypot_routing(
 
     // suspicious_login = brute-force followed by success -> HIGH VALUE.
     // Route to honeypot to observe what they do with access.
-    let should_honeypot = (detector == "suspicious_login" && is_new_attacker)
-        // First-time SSH brute-force with low attempt count.
-        || (detector == "ssh_bruteforce"
-            && is_new_attacker
-            && !allowlist::is_ip_allowlisted(&ip, &cfg.ai.protected_ips)
-            // Only route ~20% of new attackers to honeypot (the rest get blocked).
-            && ip.as_bytes().last().copied().unwrap_or(0) % 5 == 0);
+    let should_honeypot = should_route_to_honeypot(
+        detector,
+        is_new_attacker,
+        allowlist::is_ip_allowlisted(&ip, &cfg.ai.protected_ips),
+        &ip,
+    );
 
     if !should_honeypot {
         return false;
@@ -98,4 +93,120 @@ pub(crate) async fn try_handle_honeypot_routing(
     }
 
     true
+}
+
+fn detector_from_incident_id(incident_id: &str) -> &str {
+    incident_id.split(':').next().unwrap_or("")
+}
+
+fn primary_ip_from_incident(incident: &innerwarden_core::incident::Incident) -> Option<String> {
+    incident
+        .entities
+        .iter()
+        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+        .map(|e| e.value.clone())
+}
+
+fn should_route_to_honeypot(
+    detector: &str,
+    is_new_attacker: bool,
+    is_allowlisted: bool,
+    ip: &str,
+) -> bool {
+    (detector == "suspicious_login" && is_new_attacker)
+        || (detector == "ssh_bruteforce"
+            && is_new_attacker
+            && !is_allowlisted
+            && should_sample_ssh_attacker_for_honeypot(ip))
+}
+
+fn should_sample_ssh_attacker_for_honeypot(ip: &str) -> bool {
+    ip.as_bytes().last().copied().unwrap_or(0) % 5 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_core::{entities::EntityRef, event::Severity, incident::Incident};
+
+    fn sample_incident(incident_id: &str, entities: Vec<EntityRef>) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "host".to_string(),
+            incident_id: incident_id.to_string(),
+            severity: Severity::High,
+            title: "title".to_string(),
+            summary: "summary".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities,
+        }
+    }
+
+    #[test]
+    fn detector_from_incident_id_uses_prefix_before_colon() {
+        // Ensures detector routing stays aligned with incident-id naming convention.
+        assert_eq!(
+            detector_from_incident_id("suspicious_login:2026-04-17"),
+            "suspicious_login"
+        );
+        assert_eq!(
+            detector_from_incident_id("ssh_bruteforce"),
+            "ssh_bruteforce"
+        );
+    }
+
+    #[test]
+    fn primary_ip_from_incident_returns_ip_entity_only() {
+        // Verifies honeypot routing only uses canonical IP entities as routing targets.
+        let incident = sample_incident(
+            "ssh_bruteforce:1",
+            vec![EntityRef::user("alice"), EntityRef::ip("203.0.113.10")],
+        );
+        assert_eq!(
+            primary_ip_from_incident(&incident),
+            Some("203.0.113.10".to_string())
+        );
+    }
+
+    #[test]
+    fn should_route_to_honeypot_prioritizes_new_suspicious_login_attackers() {
+        // Covers high-value suspicious-login branch that always routes new attackers to honeypot.
+        assert!(should_route_to_honeypot(
+            "suspicious_login",
+            true,
+            false,
+            "198.51.100.21"
+        ));
+        assert!(!should_route_to_honeypot(
+            "suspicious_login",
+            false,
+            false,
+            "198.51.100.21"
+        ));
+    }
+
+    #[test]
+    fn should_route_to_honeypot_samples_ssh_attackers_and_respects_allowlist() {
+        // Ensures SSH routing keeps the 20% sampling behavior and never routes allowlisted IPs.
+        assert!(should_route_to_honeypot(
+            "ssh_bruteforce",
+            true,
+            false,
+            "203.0.113.102"
+        ));
+        assert!(!should_route_to_honeypot(
+            "ssh_bruteforce",
+            true,
+            true,
+            "203.0.113.102"
+        ));
+        assert!(!should_route_to_honeypot(
+            "ssh_bruteforce",
+            true,
+            false,
+            "203.0.113.101"
+        ));
+    }
 }
