@@ -596,11 +596,26 @@ mod tests {
     }
 
     #[test]
-    fn high_severity_brute_force_passes() {
+    fn severity_assertion_matches_threshold_crossing_emits_medium() {
+        // The SSH brute-force detector emits exactly one incident per IP per
+        // window: the first event that crosses `threshold` fires an alert,
+        // and the dedup guard (`now - last < window`) suppresses every
+        // subsequent event until the window expires. This means sending
+        // `threshold * 2` events in a single burst still produces
+        // Severity::Medium — the count-at-emit-time is `threshold`, not
+        // `threshold * 2`. The `count >= threshold * 2 -> High` path in
+        // both the real sensor detector and this mirror is only reachable
+        // across dedup windows (first burst + wait + second burst), which
+        // is not something a short fixture exercises.
+        //
+        // The purpose of this test is to confirm the `severity` assertion
+        // in expected.json is actually enforced, not to prove that High is
+        // reachable. 10 events are fed, the detector emits one
+        // `Severity::Medium` incident, and expected.json asserts
+        // `"severity": "medium"` — the run passes.
         let fixture_dir = tempfile::tempdir().unwrap();
         let expected_dir = tempfile::tempdir().unwrap();
 
-        // 10 events (>= threshold*2=10) — brute-force fires with Severity::High.
         let events: String = (1..=10)
             .map(|i| format!(
                 "{{\"ts\":\"2026-01-15T12:00:{:02}Z\",\"host\":\"h\",\"source\":\"auth.log\",\"kind\":\"ssh.login_failed\",\"severity\":\"info\",\"summary\":\"f\",\"details\":{{\"ip\":\"3.3.3.3\",\"user\":\"root\"}},\"tags\":[],\"entities\":[]}}\n",
@@ -612,7 +627,7 @@ mod tests {
         let expected_path = expected_dir.path().join("expected.json");
         std::fs::write(
             &expected_path,
-            r#"{"ssh_bruteforce":{"min_incidents":1,"threshold":5,"window_seconds":300,"severity":"high"}}"#,
+            r#"{"ssh_bruteforce":{"min_incidents":1,"threshold":5,"window_seconds":300,"severity":"medium"}}"#,
         )
         .unwrap();
 
