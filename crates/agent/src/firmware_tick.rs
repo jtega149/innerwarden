@@ -239,7 +239,9 @@ pub(crate) async fn process_firmware_tick(
             let ctx = crate::notification_gate::NotificationContext::from_firmware_or_hypervisor(
                 inc, "firmware",
             );
-            let verdict = crate::notification_gate::should_notify(&ctx);
+            let gate_counter = state.telemetry.gate_suppressed_counter();
+            let verdict =
+                crate::notification_gate::should_notify_with_counter(&ctx, gate_counter.as_ref());
             match verdict {
                 crate::notification_gate::NotificationVerdict::SendNow => {
                     let sev = match inc.severity {

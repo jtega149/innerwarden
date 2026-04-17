@@ -42,6 +42,7 @@ pub(crate) async fn execute_honeypot_decision(
             let post_data_dir = data_dir.to_path_buf();
             let post_ai = state.ai_provider.clone();
             let post_tg = state.telegram_client.clone();
+            let post_gate_counter = state.telemetry.gate_suppressed_counter();
             let post_responder_enabled = cfg.responder.enabled;
             let post_dry_run = cfg.responder.dry_run;
             let post_block_backend = cfg.responder.block_backend.clone();
@@ -54,6 +55,7 @@ pub(crate) async fn execute_honeypot_decision(
                     &post_data_dir,
                     post_ai,
                     post_tg,
+                    post_gate_counter,
                     post_responder_enabled,
                     post_dry_run,
                     &post_block_backend,

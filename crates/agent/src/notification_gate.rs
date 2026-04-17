@@ -309,6 +309,26 @@ impl NotificationContext {
 
 /// Evaluate notification policy. Returns what the caller should do.
 pub(crate) fn should_notify(ctx: &NotificationContext) -> NotificationVerdict {
+    evaluate_verdict(ctx)
+}
+
+/// Evaluate notification policy and increment a monotonic suppression counter
+/// whenever the verdict is not `SendNow`.
+pub(crate) fn should_notify_with_counter(
+    ctx: &NotificationContext,
+    gate_suppressed_total: &AtomicU64,
+) -> NotificationVerdict {
+    let verdict = evaluate_verdict(ctx);
+    if matches!(
+        verdict,
+        NotificationVerdict::DailyBriefingOnly | NotificationVerdict::Drop
+    ) {
+        gate_suppressed_total.fetch_add(1, Ordering::Relaxed);
+    }
+    verdict
+}
+
+fn evaluate_verdict(ctx: &NotificationContext) -> NotificationVerdict {
     // Rule 1: Server compromise (persistence/exfil confirmed) -> always send.
     if ctx.is_compromise {
         return NotificationVerdict::SendNow;
@@ -819,5 +839,32 @@ mod tests {
                 "contract regression: (compromise={compromise}, active={active}, contained={contained}, probe={probe}) expected {want:?} got {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn should_notify_with_counter_increments_only_for_suppressed_verdicts() {
+        let counter = AtomicU64::new(0);
+
+        let send_now = make_ctx("critical", "killchain.data_exfil", false, true, true, false);
+        let deferred = make_ctx("high", "ssh_bruteforce", true, false, false, false);
+        let dropped = make_ctx("low", "honeypot", false, false, false, true);
+
+        assert_eq!(
+            should_notify_with_counter(&send_now, &counter),
+            NotificationVerdict::SendNow
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        assert_eq!(
+            should_notify_with_counter(&deferred, &counter),
+            NotificationVerdict::DailyBriefingOnly
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            should_notify_with_counter(&dropped, &counter),
+            NotificationVerdict::Drop
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
     }
 }

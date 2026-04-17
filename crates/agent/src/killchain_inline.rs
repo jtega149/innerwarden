@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 
 use tracing::{info, warn};
 
@@ -137,6 +138,7 @@ pub(crate) fn notify_telegram(
     incidents: &[serde_json::Value],
     burst_tracker: &crate::notification_gate::BurstTracker,
     deferred: &mut std::collections::HashMap<String, u32>,
+    gate_suppressed_counter: &AtomicU64,
 ) {
     let Some(tg) = telegram_client else { return };
 
@@ -180,7 +182,8 @@ pub(crate) fn notify_telegram(
 
         // Gate through notification policy.
         let ctx = crate::notification_gate::NotificationContext::from_killchain_json(inc);
-        let verdict = crate::notification_gate::should_notify(&ctx);
+        let verdict =
+            crate::notification_gate::should_notify_with_counter(&ctx, gate_suppressed_counter);
 
         match verdict {
             crate::notification_gate::NotificationVerdict::SendNow => {

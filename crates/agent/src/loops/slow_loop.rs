@@ -352,11 +352,13 @@ pub(crate) async fn process_narrative_tick(
             &mut state.correlation_engine,
         );
         killchain_inline::write_incidents(data_dir, state.sqlite_store.as_deref(), &kc_incidents);
+        let gate_counter = state.telemetry.gate_suppressed_counter();
         killchain_inline::notify_telegram(
             &state.telegram_client,
             &kc_incidents,
             &state.notification_burst_tracker,
             &mut state.telegram_deferred,
+            gate_counter.as_ref(),
         );
 
         // Periodic stale PID cleanup (every 60s).
@@ -394,11 +396,13 @@ pub(crate) async fn process_narrative_tick(
         let (_drops, shield_incidents, shield_blocked) =
             shield_inline::process_events(shield, &events_entries, &ip_risks);
         shield_inline::write_incidents(data_dir, &shield_incidents);
+        let gate_counter = state.telemetry.gate_suppressed_counter();
         shield_inline::notify_telegram(
             &state.telegram_client,
             &shield_incidents,
             &state.notification_burst_tracker,
             &mut state.telegram_deferred,
+            gate_counter.as_ref(),
         );
         // Sync: register shield blocks in agent blocklist and attacker intel.
         for ip in &shield_blocked {

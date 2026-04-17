@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use crate::{ai, decisions, ioc, skills, telegram};
@@ -112,6 +113,7 @@ pub(crate) async fn spawn_post_session_tasks(
     data_dir: &Path,
     ai_provider: Option<Arc<dyn ai::AiProvider>>,
     telegram_client: Option<Arc<telegram::TelegramClient>>,
+    gate_suppressed_counter: Arc<AtomicU64>,
     responder_enabled: bool,
     dry_run: bool,
     block_backend: &str,
@@ -272,7 +274,10 @@ pub(crate) async fn spawn_post_session_tasks(
             is_probe_only,
             auto_blocked,
         );
-        let gate_verdict = crate::notification_gate::should_notify(&gate_ctx);
+        let gate_verdict = crate::notification_gate::should_notify_with_counter(
+            &gate_ctx,
+            gate_suppressed_counter.as_ref(),
+        );
         match gate_verdict {
             crate::notification_gate::NotificationVerdict::SendNow => {
                 if let Err(e) = tg

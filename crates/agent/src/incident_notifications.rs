@@ -146,7 +146,11 @@ pub(crate) async fn dispatch_incident_notifications(
             // Only uncontained active intrusions and confirmed compromises get
             // immediate notification on ANY channel. Everything else → daily briefing.
             let gate_ctx = crate::notification_gate::NotificationContext::from_incident(incident);
-            let gate_verdict = crate::notification_gate::should_notify(&gate_ctx);
+            let gate_counter = state.telemetry.gate_suppressed_counter();
+            let gate_verdict = crate::notification_gate::should_notify_with_counter(
+                &gate_ctx,
+                gate_counter.as_ref(),
+            );
 
             let should_send_now = matches!(
                 gate_verdict,

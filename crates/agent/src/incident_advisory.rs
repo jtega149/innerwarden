@@ -36,7 +36,9 @@ pub(crate) async fn handle_advisory_violation(
         let ctx = crate::notification_gate::NotificationContext::for_advisory_ignored(
             advisory.risk_score,
         );
-        let verdict = crate::notification_gate::should_notify(&ctx);
+        let gate_counter = state.telemetry.gate_suppressed_counter();
+        let verdict =
+            crate::notification_gate::should_notify_with_counter(&ctx, gate_counter.as_ref());
         match verdict {
             crate::notification_gate::NotificationVerdict::SendNow => {
                 let msg = format!(

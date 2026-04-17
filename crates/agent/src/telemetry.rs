@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -19,7 +21,9 @@ pub struct TelemetrySnapshot {
     pub events_by_collector: BTreeMap<String, u64>,
     pub incidents_by_detector: BTreeMap<String, u64>,
     pub gate_pass_count: u64,
+    pub gate_suppressed_total: u64,
     pub ai_sent_count: u64,
+    pub telegram_sent_count: u64,
     pub ai_decision_count: u64,
     pub avg_decision_latency_ms: f64,
     pub errors_by_component: BTreeMap<String, u64>,
@@ -33,7 +37,9 @@ pub struct TelemetryState {
     events_by_collector: BTreeMap<String, u64>,
     incidents_by_detector: BTreeMap<String, u64>,
     gate_pass_count: u64,
+    gate_suppressed_total: Arc<AtomicU64>,
     ai_sent_count: u64,
+    telegram_sent_count: Arc<AtomicU64>,
     ai_decision_count: u64,
     decision_latency_sum_ms: u128,
     errors_by_component: BTreeMap<String, u64>,
@@ -43,6 +49,17 @@ pub struct TelemetryState {
 }
 
 impl TelemetryState {
+    pub fn with_external_counters(
+        telegram_sent_count: Arc<AtomicU64>,
+        gate_suppressed_total: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            telegram_sent_count,
+            gate_suppressed_total,
+            ..Self::default()
+        }
+    }
+
     pub fn observe_events(&mut self, events: &[Event]) {
         for event in events {
             *self
@@ -59,6 +76,10 @@ impl TelemetryState {
 
     pub fn observe_gate_pass(&mut self) {
         self.gate_pass_count += 1;
+    }
+
+    pub fn gate_suppressed_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.gate_suppressed_total)
     }
 
     pub fn observe_ai_sent(&mut self) {
@@ -102,7 +123,9 @@ impl TelemetryState {
             events_by_collector: self.events_by_collector.clone(),
             incidents_by_detector: self.incidents_by_detector.clone(),
             gate_pass_count: self.gate_pass_count,
+            gate_suppressed_total: self.gate_suppressed_total.load(Ordering::Relaxed),
             ai_sent_count: self.ai_sent_count,
+            telegram_sent_count: self.telegram_sent_count.load(Ordering::Relaxed),
             ai_decision_count: self.ai_decision_count,
             avg_decision_latency_ms: avg_latency,
             errors_by_component: self.errors_by_component.clone(),
@@ -165,10 +188,7 @@ impl TelemetryWriter {
 }
 
 pub fn read_latest_snapshot(data_dir: &Path, date: &str) -> Option<TelemetrySnapshot> {
-    // Validate date format strictly - reject anything that isn't YYYY-MM-DD
-    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
-    let safe_date = parsed.format("%Y-%m-%d").to_string();
-    let path = data_dir.join(format!("telemetry-{safe_date}.jsonl"));
+    let path = telemetry_path_for_date(data_dir, date)?;
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
 
@@ -200,6 +220,50 @@ pub fn read_latest_snapshot(data_dir: &Path, date: &str) -> Option<TelemetrySnap
     latest
 }
 
+/// Returns the newest telemetry snapshot whose timestamp is <= `not_after`.
+/// This is used to compute trailing-window deltas (for example, "last hour")
+/// from cumulative counters.
+pub fn read_snapshot_at(
+    data_dir: &Path,
+    date: &str,
+    not_after: DateTime<Utc>,
+) -> Option<TelemetrySnapshot> {
+    let path = telemetry_path_for_date(data_dir, date)?;
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+
+    let mut candidate: Option<TelemetrySnapshot> = None;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("failed to read telemetry line: {e}");
+                continue;
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TelemetrySnapshot>(trimmed) {
+            Ok(snapshot) => {
+                if snapshot.ts > not_after {
+                    continue;
+                }
+                match &candidate {
+                    Some(current) if current.ts >= snapshot.ts => {}
+                    _ => candidate = Some(snapshot),
+                }
+            }
+            Err(e) => {
+                warn!("failed to parse telemetry snapshot: {e}");
+            }
+        }
+    }
+
+    candidate
+}
+
 fn action_tag(action: &AiAction) -> &'static str {
     match action {
         AiAction::BlockIp { .. } => "block_ip",
@@ -227,6 +291,13 @@ fn open_or_create(data_dir: &Path, date: &str) -> Result<File> {
         .with_context(|| format!("failed to open {}", path.display()))
 }
 
+fn telemetry_path_for_date(data_dir: &Path, date: &str) -> Option<std::path::PathBuf> {
+    // Validate date format strictly - reject anything that isn't YYYY-MM-DD.
+    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let safe_date = parsed.format("%Y-%m-%d").to_string();
+    Some(data_dir.join(format!("telemetry-{safe_date}.jsonl")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,7 +312,10 @@ mod tests {
 
     #[test]
     fn telemetry_state_tracks_counts_and_latency() {
-        let mut state = TelemetryState::default();
+        let gate_counter = Arc::new(AtomicU64::new(0));
+        let telegram_counter = Arc::new(AtomicU64::new(0));
+        let mut state =
+            TelemetryState::with_external_counters(telegram_counter.clone(), gate_counter.clone());
 
         let ev = Event {
             ts: Utc::now(),
@@ -270,6 +344,8 @@ mod tests {
         };
         state.observe_incident(&inc);
         state.observe_gate_pass();
+        gate_counter.fetch_add(1, Ordering::Relaxed);
+        telegram_counter.fetch_add(1, Ordering::Relaxed);
         state.observe_ai_sent();
         state.observe_ai_decision(
             &ai::AiAction::BlockIp {
@@ -288,7 +364,9 @@ mod tests {
             Some(1)
         );
         assert_eq!(snap.gate_pass_count, 1);
+        assert_eq!(snap.gate_suppressed_total, 1);
         assert_eq!(snap.ai_sent_count, 1);
+        assert_eq!(snap.telegram_sent_count, 1);
         assert_eq!(snap.ai_decision_count, 1);
         assert_eq!(snap.avg_decision_latency_ms, 120.0);
         assert_eq!(snap.dry_run_execution_count, 1);
@@ -310,8 +388,12 @@ mod tests {
 
         let mut writer = TelemetryWriter::new(dir.path()).unwrap();
 
-        let mut state = TelemetryState::default();
+        let gate_counter = Arc::new(AtomicU64::new(0));
+        let telegram_counter = Arc::new(AtomicU64::new(0));
+        let mut state =
+            TelemetryState::with_external_counters(telegram_counter.clone(), gate_counter.clone());
         state.observe_gate_pass();
+        telegram_counter.fetch_add(1, Ordering::Relaxed);
         let first = state.snapshot("incident_tick");
         writer.write(&first).unwrap();
 
@@ -323,5 +405,80 @@ mod tests {
         let latest = read_latest_snapshot(dir.path(), &date).unwrap();
         assert_eq!(latest.ai_sent_count, 1);
         assert_eq!(latest.gate_pass_count, 1);
+        assert_eq!(latest.telegram_sent_count, 1);
+    }
+
+    #[test]
+    fn read_snapshot_at_returns_nearest_snapshot_not_after_threshold() {
+        let dir = TempDir::new().unwrap();
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let path = dir.path().join(format!("telemetry-{date}.jsonl"));
+
+        let now = Utc::now();
+        let older = TelemetrySnapshot {
+            ts: now - chrono::Duration::minutes(75),
+            tick: "old".to_string(),
+            events_by_collector: BTreeMap::new(),
+            incidents_by_detector: BTreeMap::new(),
+            gate_pass_count: 0,
+            gate_suppressed_total: 0,
+            ai_sent_count: 0,
+            telegram_sent_count: 1,
+            ai_decision_count: 0,
+            avg_decision_latency_ms: 0.0,
+            errors_by_component: BTreeMap::new(),
+            decisions_by_action: BTreeMap::new(),
+            dry_run_execution_count: 0,
+            real_execution_count: 0,
+        };
+        let newer = TelemetrySnapshot {
+            ts: now - chrono::Duration::minutes(61),
+            tick: "near".to_string(),
+            events_by_collector: BTreeMap::new(),
+            incidents_by_detector: BTreeMap::new(),
+            gate_pass_count: 0,
+            gate_suppressed_total: 0,
+            ai_sent_count: 0,
+            telegram_sent_count: 2,
+            ai_decision_count: 0,
+            avg_decision_latency_ms: 0.0,
+            errors_by_component: BTreeMap::new(),
+            decisions_by_action: BTreeMap::new(),
+            dry_run_execution_count: 0,
+            real_execution_count: 0,
+        };
+        let too_new = TelemetrySnapshot {
+            ts: now - chrono::Duration::minutes(10),
+            tick: "future".to_string(),
+            events_by_collector: BTreeMap::new(),
+            incidents_by_detector: BTreeMap::new(),
+            gate_pass_count: 0,
+            gate_suppressed_total: 0,
+            ai_sent_count: 0,
+            telegram_sent_count: 99,
+            ai_decision_count: 0,
+            avg_decision_latency_ms: 0.0,
+            errors_by_component: BTreeMap::new(),
+            decisions_by_action: BTreeMap::new(),
+            dry_run_execution_count: 0,
+            real_execution_count: 0,
+        };
+
+        let mut content = String::new();
+        content.push_str(&serde_json::to_string(&older).unwrap());
+        content.push('\n');
+        content.push_str(&serde_json::to_string(&newer).unwrap());
+        content.push('\n');
+        content.push_str(&serde_json::to_string(&too_new).unwrap());
+        content.push('\n');
+        std::fs::write(path, content).unwrap();
+
+        let threshold = now - chrono::Duration::hours(1);
+        let chosen = read_snapshot_at(dir.path(), &date, threshold).unwrap();
+        assert_eq!(chosen.tick, "near");
+        assert_eq!(chosen.telegram_sent_count, 2);
     }
 }

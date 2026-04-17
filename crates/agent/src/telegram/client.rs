@@ -39,6 +39,9 @@ pub struct TelegramClient {
     /// the outbox file becomes the authoritative record for envelope
     /// assertions. Path override via `INNERWARDEN_MOCK_TELEGRAM_PATH`.
     mock_outbox: Option<PathBuf>,
+    /// Cumulative count of successful sendMessage calls in real API mode.
+    /// This is wired to telemetry snapshots for spec-024 drift metrics.
+    telegram_sent_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Returns the mock outbox path iff the process is running in mock telegram
@@ -91,6 +94,7 @@ impl TelegramClient {
                     .unwrap_or(0),
             )),
             mock_outbox,
+            telegram_sent_counter: None,
         })
     }
 
@@ -99,6 +103,10 @@ impl TelegramClient {
     #[allow(dead_code)]
     pub fn is_mock(&self) -> bool {
         self.mock_outbox.is_some()
+    }
+
+    pub fn set_telegram_sent_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        self.telegram_sent_counter = Some(counter);
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -1529,6 +1537,10 @@ impl TelegramClient {
                 .as_str()
                 .unwrap_or("unknown Telegram error");
             warn!(method, url = %sanitize_url(&url), "Telegram API error: {desc}");
+        } else if method == "sendMessage" {
+            if let Some(counter) = &self.telegram_sent_counter {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         Ok(resp)
@@ -1761,6 +1773,7 @@ mod tests {
             alerts_this_hour: Arc::new(AtomicU32::new(0)),
             alert_counter_hour: Arc::new(AtomicU32::new(current_hour)),
             mock_outbox: None,
+            telegram_sent_counter: None,
         })
     }
 
@@ -1865,6 +1878,22 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("Recommended action"));
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_message_increments_counter_in_real_api_mode() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let mut client = build_test_client(port, cert_dir.path())?;
+        let sent_counter = Arc::new(AtomicU64::new(0));
+        client.set_telegram_sent_counter(sent_counter.clone());
+
+        client.send_text_message("counter-check").await?;
+        assert_eq!(sent_counter.load(Ordering::Relaxed), 1);
 
         server.abort();
         Ok(())
@@ -2756,7 +2785,7 @@ mod tests {
 
         let client = Arc::new(build_test_client(65001, cert_dir.path())?);
         let (tx, rx) = mpsc::channel::<ApprovalResult>(1);
-        let mut task = tokio::spawn(client.run_polling(tx));
+        let task = tokio::spawn(client.run_polling(tx));
 
         tokio::time::sleep(Duration::from_millis(250)).await;
         drop(rx);
@@ -2843,13 +2872,17 @@ mod tests {
 
         #[tokio::test(flavor = "current_thread")]
         async fn send_alert_html_writes_jsonl_line_in_mock_mode() -> anyhow::Result<()> {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::sync::Arc;
+
             let tmp = tempfile::tempdir()?;
             let outbox = tmp.path().join("telegram-outbox.jsonl");
             let outbox_str = outbox.to_string_lossy().to_string();
+            let sent_counter = Arc::new(AtomicU64::new(0));
 
             // Build client under env lock, then drop env before awaiting — the
             // client captures the outbox into its own field on construction.
-            let client = {
+            let mut client = {
                 let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 let prev_enabled = std::env::var("INNERWARDEN_MOCK_TELEGRAM").ok();
                 let prev_path = std::env::var("INNERWARDEN_MOCK_TELEGRAM_PATH").ok();
@@ -2868,8 +2901,14 @@ mod tests {
             };
 
             assert!(client.is_mock());
+            client.set_telegram_sent_counter(sent_counter.clone());
             client.send_raw_html("<b>spec-024</b>").await?;
             client.send_text_message("payload").await?;
+            assert_eq!(
+                sent_counter.load(Ordering::Relaxed),
+                0,
+                "mock mode must not affect real-api telemetry counter"
+            );
 
             let contents = std::fs::read_to_string(&outbox)?;
             let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();

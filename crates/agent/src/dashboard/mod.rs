@@ -885,6 +885,8 @@ mod tests {
             decisions_by_action: BTreeMap::new(),
             dry_run_execution_count: 1,
             real_execution_count: 0,
+            gate_suppressed_total: 0,
+            telegram_sent_count: 0,
         };
         std::fs::write(
             &telemetry_path,

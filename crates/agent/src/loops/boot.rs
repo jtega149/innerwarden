@@ -413,6 +413,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         bl
     };
 
+    let telemetry_telegram_sent_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let telemetry_gate_suppressed_counter =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // Build Telegram client (None when disabled or misconfigured)
     let telegram_client: Option<Arc<telegram::TelegramClient>> = if cfg.telegram.enabled {
         let token = cfg.telegram.resolved_bot_token();
@@ -428,6 +432,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             };
             match telegram::TelegramClient::new(token, chat_id, dashboard_url) {
                 Ok(mut c) => {
+                    c.set_telegram_sent_counter(telemetry_telegram_sent_counter.clone());
                     if cfg.telegram.dev_mode {
                         c.dev_mode = true;
                         info!("Telegram dev mode ON — FP review button on every notification");
@@ -585,7 +590,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         skill_registry: skills::SkillRegistry::default_builtin(),
         blocklist: startup_blocklist,
         correlator: correlation::TemporalCorrelator::new(cfg.correlation.window_seconds, 4096),
-        telemetry: telemetry::TelemetryState::default(),
+        telemetry: telemetry::TelemetryState::with_external_counters(
+            telemetry_telegram_sent_counter.clone(),
+            telemetry_gate_suppressed_counter.clone(),
+        ),
         telemetry_writer: if cfg.telemetry.enabled {
             match telemetry::TelemetryWriter::new(&cli.data_dir) {
                 Ok(w) => Some(w),
@@ -974,6 +982,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             let abuseipdb_threshold = cfg.abuseipdb.auto_block_threshold;
             let ai_clone = state.ai_provider.clone();
             let tg_clone = state.telegram_client.clone();
+            let gate_counter = state.telemetry.gate_suppressed_counter();
             let data_dir_clone = cli.data_dir.clone();
             let responder_enabled = cfg.responder.enabled;
             let dry_run = cfg.responder.dry_run;
@@ -989,6 +998,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     filter_bl,
                     ai_clone,
                     tg_clone,
+                    gate_counter,
                     abuseipdb_client,
                     abuseipdb_threshold,
                     data_dir_clone,
@@ -1729,7 +1739,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             state.blocklist.insert(ip.clone());
                             // Mesh blocks are always contained -> daily briefing only.
                             let ctx = notification_gate::NotificationContext::for_mesh_block();
-                            let verdict = notification_gate::should_notify(&ctx);
+                            let gate_counter = state.telemetry.gate_suppressed_counter();
+                            let verdict = notification_gate::should_notify_with_counter(
+                                &ctx,
+                                gate_counter.as_ref(),
+                            );
                             match verdict {
                                 notification_gate::NotificationVerdict::SendNow => {
                                     if let Some(ref tg) = state.telegram_client {
