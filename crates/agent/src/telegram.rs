@@ -1,5 +1,6 @@
 mod burst;
 mod client;
+mod commands;
 mod formatting;
 mod templates;
 
@@ -63,9 +64,10 @@ pub struct PendingConfirmation {
 }
 
 pub use burst::{format_daily_digest_enriched, format_simple_status, PipelineDigestStats};
-pub use client::{
+pub use client::TelegramClient;
+pub use commands::{
     append_to_allowlist, log_allowlist_change, log_false_positive, read_undoable_allowlist_entries,
-    remove_from_allowlist, TelegramClient,
+    remove_from_allowlist,
 };
 pub use formatting::{escape_html_pub, extract_detector_pub, truncate_callback_pub};
 
