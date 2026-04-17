@@ -114,6 +114,33 @@ fn detail_i64(event: &Event, key: &str) -> Option<i64> {
     event.details.get(key).and_then(|v| v.as_i64())
 }
 
+fn sanitized_incident_ip(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|_| trimmed.to_string())
+}
+
+fn sanitized_incident_user(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn sanitized_incident_path(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 impl KnowledgeGraph {
     /// Record event source/kind for sensors tab telemetry.
     /// Stored in a lightweight counter, not on every edge.
@@ -294,13 +321,13 @@ impl KnowledgeGraph {
         for entity in &incident.entities {
             let target = match entity.r#type {
                 innerwarden_core::entities::EntityType::Ip => {
-                    Some(self.ensure_ip(&entity.value, incident.ts))
+                    sanitized_incident_ip(&entity.value).map(|ip| self.ensure_ip(&ip, incident.ts))
                 }
                 innerwarden_core::entities::EntityType::User => {
-                    Some(self.ensure_user(&entity.value))
+                    sanitized_incident_user(&entity.value).map(|user| self.ensure_user(&user))
                 }
                 innerwarden_core::entities::EntityType::Path => {
-                    Some(self.ensure_file(&entity.value))
+                    sanitized_incident_path(&entity.value).map(|path| self.ensure_file(&path))
                 }
                 innerwarden_core::entities::EntityType::Container => {
                     Some(self.ensure_container(&entity.value))
@@ -1700,6 +1727,60 @@ mod tests {
         }
     }
 
+    fn make_incident(incident_id: &str, entities: Vec<EntityRef>) -> Incident {
+        Incident {
+            ts: Utc
+                .with_ymd_and_hms(2026, 4, 9, 14, 0, 0)
+                .single()
+                .expect("fixed timestamp should be valid"),
+            host: "prod-01".to_string(),
+            incident_id: incident_id.to_string(),
+            severity: Severity::High,
+            title: "Incident".to_string(),
+            summary: "summary".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: Vec::new(),
+            tags: Vec::new(),
+            entities,
+        }
+    }
+
+    #[test]
+    fn test_sanitized_incident_ip_accepts_only_real_ip_literals() {
+        // Guard path: incident IP entities must be parsable IP literals to
+        // avoid polluting the graph with attacker-controlled garbage strings.
+        assert_eq!(
+            sanitized_incident_ip(" 203.0.113.12 "),
+            Some("203.0.113.12".to_string())
+        );
+        assert!(sanitized_incident_ip("not-an-ip").is_none());
+        assert!(sanitized_incident_ip("   ").is_none());
+    }
+
+    #[test]
+    fn test_sanitized_incident_user_rejects_blank_values() {
+        // Guard path: usernames are trimmed and blank values are dropped so
+        // we never create empty User nodes from malformed incident payloads.
+        assert_eq!(
+            sanitized_incident_user("  root  "),
+            Some("root".to_string())
+        );
+        assert!(sanitized_incident_user("").is_none());
+        assert!(sanitized_incident_user("   ").is_none());
+    }
+
+    #[test]
+    fn test_sanitized_incident_path_rejects_blank_values() {
+        // Guard path: path entities must contain non-whitespace text; this
+        // keeps File indexes stable and avoids empty-path node pollution.
+        assert_eq!(
+            sanitized_incident_path("  /etc/shadow "),
+            Some("/etc/shadow".to_string())
+        );
+        assert!(sanitized_incident_path("").is_none());
+        assert!(sanitized_incident_path("   ").is_none());
+    }
+
     #[test]
     fn test_ingest_shell_command_exec() {
         let mut g = KnowledgeGraph::new();
@@ -1818,6 +1899,56 @@ mod tests {
         assert!(g.find_by_pid(1234).is_some());
         assert!(g.find_by_ip("45.1.1.1").is_some());
         assert_eq!(g.edge_count(), 1); // ConnectedTo
+    }
+
+    #[test]
+    fn test_ingest_network_bind_listen_creates_listens_on_edge() {
+        // Dispatch path: `network.bind_listen` shares the same ingest path as
+        // `network.listen`, so port topology still gets populated.
+        let mut g = KnowledgeGraph::new();
+        let event = make_event(
+            "network.bind_listen",
+            serde_json::json!({
+                "pid": 4321,
+                "comm": "nginx",
+                "uid": 33,
+                "port": 443,
+                "proto": "tcp"
+            }),
+        );
+        g.ingest(&event);
+
+        let pid = g.find_by_pid(4321).expect("process should be created");
+        let port = g
+            .find_by_port(443, "tcp")
+            .expect("port node should be created");
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.from == pid && e.to == port && e.relation == Relation::ListensOn),
+            "bind_listen must create a ListensOn edge"
+        );
+    }
+
+    #[test]
+    fn test_ingest_unknown_kind_only_updates_telemetry() {
+        // Fallback path: unknown event kinds are intentionally ignored for
+        // topology, but telemetry counters must still track source/kind volume.
+        let mut g = KnowledgeGraph::new();
+        let event = make_event("custom.unknown_kind", serde_json::json!({"x": 1}));
+        g.ingest(&event);
+
+        assert_eq!(g.node_count(), 0, "unknown event should not create nodes");
+        assert_eq!(g.edge_count(), 0, "unknown event should not create edges");
+        assert_eq!(
+            g.total_events_ingested, 1,
+            "telemetry counter should advance"
+        );
+        assert_eq!(
+            g.kind_counts.get("custom.unknown_kind"),
+            Some(&1usize),
+            "kind telemetry should include unknown kinds"
+        );
     }
 
     #[test]
@@ -2006,6 +2137,212 @@ mod tests {
             }
             _ => panic!("expected Incident node"),
         }
+    }
+
+    #[test]
+    fn test_ingest_incident_skips_invalid_entity_payloads() {
+        // Guard path: incident entity sanitization should drop malformed
+        // values so garbage strings do not become persistent graph entities.
+        let mut g = KnowledgeGraph::new();
+        let incident = make_incident(
+            "entity-sanitize:1",
+            vec![
+                EntityRef::ip("198.51.100.9"),
+                EntityRef::ip("not-an-ip"),
+                EntityRef::ip(" "),
+                EntityRef::user("alice"),
+                EntityRef::user("  "),
+                EntityRef::path("/etc/passwd"),
+                EntityRef::path("   "),
+            ],
+        );
+
+        g.ingest_incident(&incident);
+
+        assert!(
+            g.find_by_ip("198.51.100.9").is_some(),
+            "valid IP should still be ingested"
+        );
+        assert!(
+            g.find_by_ip("not-an-ip").is_none(),
+            "invalid IP literal must be discarded"
+        );
+        assert!(
+            g.find_by_user("alice").is_some(),
+            "valid user should still be ingested"
+        );
+        assert!(
+            g.find_by_user("").is_none(),
+            "blank user values must be discarded"
+        );
+        assert!(
+            g.find_by_path("/etc/passwd").is_some(),
+            "valid path should still be ingested"
+        );
+        assert!(
+            g.find_by_path("").is_none(),
+            "blank path values must be discarded"
+        );
+    }
+
+    #[test]
+    fn test_ingest_incident_reuses_nodes_on_repeat_ingest() {
+        // Dedup path: repeated ingestion of the same incident should reuse
+        // Incident/IP/User nodes instead of creating duplicates.
+        let mut g = KnowledgeGraph::new();
+        let incident = make_incident(
+            "repeat-incident:1",
+            vec![EntityRef::ip("203.0.113.7"), EntityRef::user("root")],
+        );
+
+        g.ingest_incident(&incident);
+        g.ingest_incident(&incident);
+
+        assert_eq!(
+            g.nodes_of_type(NodeType::Incident).len(),
+            1,
+            "incident node should be upserted by incident_id"
+        );
+        assert_eq!(
+            g.nodes_of_type(NodeType::Ip).len(),
+            1,
+            "IP nodes should be deduplicated across repeated ingests"
+        );
+        assert_eq!(
+            g.nodes_of_type(NodeType::User).len(),
+            1,
+            "User nodes should be deduplicated across repeated ingests"
+        );
+    }
+
+    #[test]
+    fn test_ingest_incident_evidence_object_links_trigger_process() {
+        // Evidence object path: a single evidence object with pid should
+        // create a Process node and a TriggeredBy edge from Incident.
+        let mut g = KnowledgeGraph::new();
+        let mut incident = make_incident("evidence-object:1", vec![]);
+        incident.evidence = serde_json::json!({
+            "pid": 4242,
+            "comm": "payload",
+            "uid": 0
+        });
+
+        g.ingest_incident(&incident);
+
+        let incident_id = g
+            .find_by_incident("evidence-object:1")
+            .expect("incident node should exist");
+        let process_id = g.find_by_pid(4242).expect("process node should exist");
+        assert!(
+            g.edges.iter().any(|e| e.from == incident_id
+                && e.to == process_id
+                && e.relation == Relation::TriggeredBy),
+            "incident evidence object should connect incident to process"
+        );
+    }
+
+    #[test]
+    fn test_ingest_incident_evidence_array_ignores_zero_pid_entries() {
+        // Guard path: pid=0 evidence items are invalid and should be skipped,
+        // while valid items in the same array still create process links.
+        let mut g = KnowledgeGraph::new();
+        let mut incident = make_incident("evidence-array:1", vec![]);
+        incident.evidence = serde_json::json!([
+            {"pid": 0, "comm": "invalid", "uid": 0},
+            {"pid": 7777, "comm": "valid-proc", "uid": 1000}
+        ]);
+
+        g.ingest_incident(&incident);
+
+        assert!(
+            g.find_by_pid(0).is_none(),
+            "pid=0 entry should not create a process node"
+        );
+        let valid_pid = g.find_by_pid(7777).expect("valid pid should be ingested");
+        let inc = g
+            .find_by_incident("evidence-array:1")
+            .expect("incident node should exist");
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.from == inc && e.to == valid_pid && e.relation == Relation::TriggeredBy),
+            "valid pid evidence should produce a TriggeredBy edge"
+        );
+    }
+
+    #[test]
+    fn test_ingest_incident_ignores_service_entities_for_trigger_edges() {
+        // Mapping rule: service entities are metadata-only and should not
+        // create TriggeredBy edges, while concrete entities still do.
+        let mut g = KnowledgeGraph::new();
+        let incident = make_incident(
+            "service-entity:1",
+            vec![
+                EntityRef::service("crowdsec"),
+                EntityRef::container("container-abc"),
+            ],
+        );
+
+        g.ingest_incident(&incident);
+
+        let incident_id = g
+            .find_by_incident("service-entity:1")
+            .expect("incident node should exist");
+        let container_id = g
+            .find_by_container("container-abc")
+            .expect("container entity should be ingested");
+        assert!(
+            g.edges.iter().any(|e| e.from == incident_id
+                && e.to == container_id
+                && e.relation == Relation::TriggeredBy),
+            "container entities should still produce TriggeredBy edges"
+        );
+        assert_eq!(
+            g.edges.iter().filter(|e| e.from == incident_id).count(),
+            1,
+            "service entities should not create additional TriggeredBy edges"
+        );
+    }
+
+    #[test]
+    fn test_ingest_decision_block_ip_records_edge_metadata() {
+        // Decision mapping: block_ip should connect Ip -> System and preserve
+        // reason/confidence metadata used by operator and audit workflows.
+        let mut g = KnowledgeGraph::new();
+        let incident = make_incident("decision-incident:1", vec![EntityRef::ip("198.51.100.8")]);
+        g.ingest_incident(&incident);
+
+        let decision_ts = Utc
+            .with_ymd_and_hms(2026, 4, 9, 15, 0, 0)
+            .single()
+            .expect("fixed timestamp should be valid");
+        g.ingest_decision(
+            "decision-incident:1",
+            "block_ip",
+            Some("198.51.100.8"),
+            0.91,
+            "auto block",
+            true,
+            decision_ts,
+        );
+
+        let blocked_edge = g
+            .edges
+            .iter()
+            .find(|e| e.relation == Relation::BlockedBy)
+            .expect("block_ip should create a BlockedBy edge");
+        assert_eq!(
+            blocked_edge.properties.get("reason"),
+            Some(&serde_json::Value::from("auto block"))
+        );
+        assert_eq!(
+            blocked_edge.properties.get("incident_id"),
+            Some(&serde_json::Value::from("decision-incident:1"))
+        );
+        assert_eq!(
+            blocked_edge.properties.get("auto_executed"),
+            Some(&serde_json::Value::from(true))
+        );
     }
 
     #[test]
