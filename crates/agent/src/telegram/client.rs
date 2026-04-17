@@ -1718,3 +1718,418 @@ pub fn log_false_positive(
         let _ = writeln!(f, "{}", entry);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Bytes,
+        extract::State,
+        http::{Method, Uri},
+        routing::any,
+        Json, Router,
+    };
+    use innerwarden_core::{entities::EntityRef, event::Severity};
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+
+    #[derive(Clone, Debug)]
+    struct MockRequest {
+        method: String,
+        path: String,
+        body: serde_json::Value,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockTelegramState {
+        requests: Arc<tokio::sync::Mutex<Vec<MockRequest>>>,
+        updates: Arc<tokio::sync::Mutex<VecDeque<serde_json::Value>>>,
+    }
+
+    async fn mock_telegram_handler(
+        State(state): State<MockTelegramState>,
+        method: Method,
+        uri: Uri,
+        body: Bytes,
+    ) -> Json<serde_json::Value> {
+        let body_json =
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+        state.requests.lock().await.push(MockRequest {
+            method: method.to_string(),
+            path: uri.path().to_string(),
+            body: body_json,
+        });
+
+        if uri.path().ends_with("/getUpdates") {
+            let next = state
+                .updates
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| json!({ "ok": true, "result": [] }));
+            Json(next)
+        } else {
+            Json(json!({
+                "ok": true,
+                "result": { "message_id": 777 }
+            }))
+        }
+    }
+
+    async fn start_mock_telegram_server(
+        updates: Vec<serde_json::Value>,
+    ) -> anyhow::Result<(
+        MockTelegramState,
+        tokio::task::JoinHandle<()>,
+        u16,
+        tempfile::TempDir,
+    )> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let state = MockTelegramState {
+            requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            updates: Arc::new(tokio::sync::Mutex::new(VecDeque::from(updates))),
+        };
+
+        let app = Router::new()
+            .route("/*path", any(mock_telegram_handler))
+            .with_state(state.clone());
+
+        let cert_dir = tempfile::tempdir()?;
+        let cert_file = cert_dir.path().join("mock-cert.pem");
+        let key_file = cert_dir.path().join("mock-key.pem");
+        let params = rcgen::CertificateParams::new(vec![
+            "api.telegram.org".to_string(),
+            "localhost".to_string(),
+        ])?;
+        let key_pair = rcgen::KeyPair::generate()?;
+        let cert = params.self_signed(&key_pair)?;
+        std::fs::write(&cert_file, cert.pem())?;
+        std::fs::write(&key_file, key_pair.serialize_pem())?;
+
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_file, &key_file)
+            .await
+            .context("failed to load mock Telegram TLS cert")?;
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = probe.local_addr()?.port();
+        drop(probe);
+
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let handle = tokio::spawn(async move {
+            let _ = axum_server::bind_rustls(addr, tls)
+                .serve(app.into_make_service())
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok((state, handle, port, cert_dir))
+    }
+
+    fn build_test_client(port: u16) -> anyhow::Result<TelegramClient> {
+        use std::sync::atomic::AtomicU32;
+
+        let current_hour: u32 = chrono::Utc::now()
+            .format("%H")
+            .to_string()
+            .parse()
+            .unwrap_or(0);
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(35))
+            .danger_accept_invalid_certs(true)
+            .resolve("api.telegram.org", SocketAddr::from(([127, 0, 0, 1], port)))
+            .build()
+            .context("failed to build mock-aware reqwest client")?;
+
+        Ok(TelegramClient {
+            bot_token: "test-token".to_string(),
+            chat_id: "chat-123".to_string(),
+            dashboard_url: Some("https://dashboard.local".to_string()),
+            dev_mode: false,
+            http,
+            last_send: Arc::new(tokio::sync::Mutex::new(
+                tokio::time::Instant::now() - Duration::from_secs(1),
+            )),
+            alerts_this_hour: Arc::new(AtomicU32::new(0)),
+            alert_counter_hour: Arc::new(AtomicU32::new(current_hour)),
+        })
+    }
+
+    fn make_incident() -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "srv-01".to_string(),
+            incident_id: "ssh_bruteforce:198.51.100.10:2026-04-17T12:00:00Z".to_string(),
+            severity: Severity::High,
+            title: "SSH brute force burst".to_string(),
+            summary: "20 failed attempts in 60s".to_string(),
+            evidence: json!([]),
+            recommended_checks: vec![],
+            tags: vec!["ssh".to_string()],
+            entities: vec![EntityRef::ip("198.51.100.10".to_string())],
+        }
+    }
+
+    #[tokio::test]
+    async fn send_confirmation_request_uses_mock_response_message_id() -> anyhow::Result<()> {
+        let (state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port)?;
+
+        let id = client
+            .send_confirmation_request(
+                &make_incident(),
+                "iptables -A INPUT -s 198.51.100.10 -j DROP",
+                "block-ip",
+                0.92,
+                120,
+            )
+            .await?;
+        assert_eq!(id, 777);
+
+        let requests = state.requests.lock().await.clone();
+        let send_message = requests
+            .iter()
+            .find(|r| r.path.ends_with("/sendMessage"))
+            .expect("sendMessage request should be emitted");
+        assert_eq!(send_message.method, "POST");
+        assert_eq!(send_message.body["chat_id"], "chat-123");
+        assert!(send_message.body["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Recommended action"));
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_updates_returns_empty_when_telegram_not_ok() -> anyhow::Result<()> {
+        let updates = vec![json!({
+            "ok": false,
+            "description": "mock api failure"
+        })];
+        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = build_test_client(port)?;
+
+        let parsed = client.get_updates(0).await?;
+        assert!(
+            parsed.is_empty(),
+            "not-ok response should map to empty updates"
+        );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_polling_routes_callback_prefixes_and_text_commands() -> anyhow::Result<()> {
+        let updates = vec![json!({
+            "ok": true,
+            "result": [
+                {
+                    "update_id": 1,
+                    "callback_query": {
+                        "id": "cb-1",
+                        "from": { "first_name": "Alice" },
+                        "data": "quick:block:1.2.3.4",
+                        "message": { "message_id": 1001, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 2,
+                    "callback_query": {
+                        "id": "cb-2",
+                        "from": { "first_name": "Alice" },
+                        "data": "hpot:monitor:2.2.2.2",
+                        "message": { "message_id": 1002, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 3,
+                    "callback_query": {
+                        "id": "cb-3",
+                        "from": { "first_name": "Alice" },
+                        "data": "allow:proc:sshd",
+                        "message": { "message_id": 1003, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 4,
+                    "callback_query": {
+                        "id": "cb-4",
+                        "from": { "first_name": "Alice" },
+                        "data": "allow:ip:10.0.0.1",
+                        "message": { "message_id": 1004, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 5,
+                    "callback_query": {
+                        "id": "cb-5",
+                        "from": { "first_name": "Alice" },
+                        "data": "fp:incident-123",
+                        "message": { "message_id": 1005, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 6,
+                    "callback_query": {
+                        "id": "cb-6",
+                        "from": { "first_name": "Alice" },
+                        "data": "autofp:yes:proc:sshd",
+                        "message": { "message_id": 1006, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 7,
+                    "callback_query": {
+                        "id": "cb-7",
+                        "from": { "first_name": "Alice" },
+                        "data": "undo:proc:sshd",
+                        "message": { "message_id": 1007, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 8,
+                    "callback_query": {
+                        "id": "cb-8",
+                        "from": { "first_name": "Alice" },
+                        "data": "enable2fa",
+                        "message": { "message_id": 1008, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 9,
+                    "callback_query": {
+                        "id": "cb-9",
+                        "from": { "first_name": "Alice" },
+                        "data": "menu:status",
+                        "message": { "message_id": 1009, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 10,
+                    "callback_query": {
+                        "id": "cb-10",
+                        "from": { "first_name": "Alice" },
+                        "data": "dismiss2fa",
+                        "message": { "message_id": 1010, "chat": { "id": 42 } }
+                    }
+                },
+                {
+                    "update_id": 11,
+                    "message": {
+                        "message_id": 1011,
+                        "text": "/enable ai",
+                        "from": { "first_name": "Alice" },
+                        "chat": { "id": 42 }
+                    }
+                }
+            ]
+        })];
+
+        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port)?);
+        let (tx, mut rx) = mpsc::channel::<ApprovalResult>(32);
+
+        let mut task = tokio::spawn(client.run_polling(tx));
+        let mut incident_ids = Vec::new();
+        for _ in 0..10usize {
+            let result = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .context("timed out waiting for approval result")?
+                .context("approval channel closed early")?;
+            incident_ids.push(result.incident_id);
+        }
+
+        for expected in [
+            "__quick_block__:1.2.3.4",
+            "__hpot__:2.2.2.2",
+            "__allow_proc__:sshd",
+            "__allow_ip__:10.0.0.1",
+            "__fp__:incident-123",
+            "__autofp__:yes:proc:sshd",
+            "__undo__:proc:sshd",
+            "__enable2fa__",
+            "__status__",
+            "__enable__:ai",
+        ] {
+            assert!(
+                incident_ids.iter().any(|id| id == expected),
+                "missing routed callback result: {expected}"
+            );
+        }
+
+        drop(rx);
+        if tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_alert_html_stops_after_hourly_cap_and_sends_warning_once() -> anyhow::Result<()> {
+        let (state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port)?;
+
+        for _ in 0..12usize {
+            client.send_alert_html("<b>alert</b>").await?;
+        }
+
+        let requests = state.requests.lock().await.clone();
+        let send_count = requests
+            .iter()
+            .filter(|r| r.path.ends_with("/sendMessage"))
+            .count();
+        assert_eq!(send_count, 11, "10 alerts + 1 flood warning should be sent");
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_abuseipdb_autoblock_includes_dashboard_link() -> anyhow::Result<()> {
+        let (state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port)?;
+
+        client
+            .send_abuseipdb_autoblock(
+                "203.0.113.55",
+                95,
+                80,
+                120,
+                Some("US"),
+                Some("Example ISP"),
+                "AbuseIPDB threshold exceeded",
+                false,
+                Some("https://dash.local"),
+            )
+            .await?;
+
+        let requests = state.requests.lock().await.clone();
+        let send_message = requests
+            .iter()
+            .find(|r| r.path.ends_with("/sendMessage"))
+            .expect("sendMessage request should be emitted");
+        assert!(send_message.body["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("AbuseIPDB"));
+        assert!(
+            send_message.body["reply_markup"]["inline_keyboard"][0][0]["url"]
+                .as_str()
+                .unwrap_or("")
+                .contains("subject_type=ip"),
+            "dashboard deep-link should include subject_type=ip"
+        );
+
+        server.abort();
+        Ok(())
+    }
+}
