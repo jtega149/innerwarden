@@ -552,4 +552,111 @@ mod tests {
         // Should NOT contain docker/lxc indicators - looks like bare metal
         assert_eq!(out, "0::/");
     }
+
+    #[test]
+    fn uname_and_pwd_variants_are_handled() {
+        assert_eq!(try_handle("uname", "root", "node01"), Some("Linux".into()));
+        assert!(try_handle("uname -a", "root", "node01")
+            .unwrap()
+            .contains("node01"));
+        assert_eq!(
+            try_handle("uname -r", "root", "node01"),
+            Some("5.15.0-91-generic".into())
+        );
+        assert_eq!(
+            try_handle("uname -n", "root", "node01"),
+            Some("node01".into())
+        );
+        assert_eq!(try_handle("pwd", "root", "host"), Some("/root".into()));
+        assert_eq!(
+            try_handle("pwd", "deploy", "host"),
+            Some("/home/deploy".into())
+        );
+    }
+
+    #[test]
+    fn missing_paths_return_realistic_errors() {
+        let missing_cat = try_handle("cat /does/not/exist", "root", "host").unwrap();
+        assert!(missing_cat.contains("No such file or directory"));
+
+        let missing_ls = try_handle("ls /does/not/exist", "root", "host").unwrap();
+        assert!(missing_ls.contains("cannot access"));
+    }
+
+    #[test]
+    fn network_and_process_commands_include_expected_markers() {
+        let net = try_handle("netstat -tulnp", "root", "host").unwrap();
+        assert!(net.contains("LISTEN"));
+        assert!(net.contains("0.0.0.0:22"));
+
+        let ss = try_handle("ss -tulnp", "root", "host").unwrap();
+        assert!(ss.contains("LISTEN"));
+
+        let ps = try_handle("ps", "root", "host").unwrap();
+        assert!(ps.contains("PID"));
+        assert!(ps.contains("bash"));
+
+        let docker = try_handle("docker ps", "root", "host").unwrap();
+        assert!(docker.contains("CONTAINER ID"));
+        assert!(docker.contains("nginx"));
+    }
+
+    #[test]
+    fn env_ip_and_which_cover_edge_paths() {
+        let env = try_handle("env", "deploy", "edge01").unwrap();
+        assert!(env.contains("USER=deploy"));
+        assert!(env.contains("HOSTNAME=edge01"));
+        assert!(env.contains("HOME=/home/deploy"));
+
+        let ip_addr = try_handle("ip a", "root", "host").unwrap();
+        assert!(ip_addr.contains("eth0"));
+        assert!(ip_addr.contains("10.0.0.42"));
+
+        assert!(try_handle("ip route", "root", "host").is_none());
+        assert_eq!(
+            try_handle("which bash", "root", "host"),
+            Some("/usr/bin/bash".into())
+        );
+        assert_eq!(
+            try_handle("which nmap", "root", "host"),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn service_echo_and_fs_mutation_commands_cover_branches() {
+        let svc_status = try_handle("systemctl status ssh", "root", "host").unwrap();
+        assert!(svc_status.contains("Active: active (running)"));
+
+        assert_eq!(
+            try_handle("systemctl restart nginx", "root", "host"),
+            Some(String::new())
+        );
+        assert!(try_handle("systemctl bogus nginx", "root", "host").is_none());
+
+        assert_eq!(
+            try_handle("echo \"quoted value\"", "root", "host"),
+            Some("quoted value".into())
+        );
+        assert_eq!(
+            try_handle("mkdir /tmp/a", "root", "host"),
+            Some(String::new())
+        );
+        assert_eq!(
+            try_handle("touch /tmp/a", "root", "host"),
+            Some(String::new())
+        );
+        assert_eq!(
+            try_handle("mv /tmp/a /tmp/b", "root", "host"),
+            Some(String::new())
+        );
+        assert_eq!(
+            try_handle("cp /tmp/b /tmp/c", "root", "host"),
+            Some(String::new())
+        );
+        assert_eq!(
+            try_handle("chmod +x /tmp/c", "root", "host"),
+            Some(String::new())
+        );
+    }
 }

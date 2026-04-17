@@ -940,6 +940,65 @@ pub(crate) fn write_telegram_triage_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge_graph::types::{Edge, Node, Relation};
+    use crate::knowledge_graph::KnowledgeGraph;
+    use tempfile::TempDir;
+
+    fn seeded_graph() -> std::sync::Arc<std::sync::RwLock<KnowledgeGraph>> {
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let ip_a = graph.ensure_ip("203.0.113.10", now);
+        let ip_b = graph.ensure_ip("198.51.100.7", now);
+
+        let inc_a = graph.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:203.0.113.10:1".to_string(),
+            detector: "ssh_bruteforce".to_string(),
+            severity: "high".to_string(),
+            title: "SSH brute-force".to_string(),
+            summary: "many failed logins".to_string(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("block_ip".to_string()),
+            confidence: Some(0.93),
+            decision_reason: Some("clear abuse".to_string()),
+            decision_target: Some("203.0.113.10".to_string()),
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc_a, ip_a, Relation::TriggeredBy, now));
+
+        let inc_b = graph.add_node(Node::Incident {
+            incident_id: "port_scan:198.51.100.7:2".to_string(),
+            detector: "port_scan".to_string(),
+            severity: "medium".to_string(),
+            title: "Port scan".to_string(),
+            summary: "sequential probes".to_string(),
+            ts: now - chrono::Duration::minutes(5),
+            mitre_ids: vec![],
+            decision: Some("monitor".to_string()),
+            confidence: Some(0.55),
+            decision_reason: Some("observe".to_string()),
+            decision_target: Some("198.51.100.7".to_string()),
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(
+            inc_b,
+            ip_b,
+            Relation::TriggeredBy,
+            now - chrono::Duration::minutes(5),
+        ));
+
+        std::sync::Arc::new(std::sync::RwLock::new(graph))
+    }
 
     // --- parse_telegram_triage_action ---
 
@@ -1037,5 +1096,195 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_2fa_enabled(&cfg));
+    }
+
+    #[test]
+    fn graph_helpers_summarize_incidents_and_decisions() {
+        let kg = seeded_graph();
+        assert_eq!(graph_count(&kg, "incidents"), 2);
+        assert_eq!(graph_count(&kg, "decisions"), 2);
+        assert_eq!(graph_count(&kg, "unknown"), 0);
+
+        let threats = graph_last_incidents(&kg, 5);
+        assert!(threats.contains("Recent threats"));
+        assert!(threats.contains("SSH brute-force"));
+        assert!(threats.contains("<code>203.0.113.10</code>"));
+
+        let decisions = graph_last_decisions(&kg, 5);
+        assert!(decisions.contains("Recent decisions"));
+        assert!(decisions.contains("block_ip"));
+        assert!(decisions.contains("monitor"));
+
+        let raw = graph_last_incidents_raw(&kg, 2);
+        assert!(raw.contains("[high] SSH brute-force"));
+        assert!(raw.contains("[medium] Port scan"));
+    }
+
+    #[test]
+    fn graph_helpers_handle_empty_graph() {
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(KnowledgeGraph::new()));
+        assert_eq!(
+            graph_last_incidents(&kg, 3),
+            "🔇 Clean slate - no intrusion attempts today."
+        );
+        assert_eq!(
+            graph_last_decisions(&kg, 3),
+            "⚖️ No decisions yet today - standing by."
+        );
+        assert!(graph_last_incidents_raw(&kg, 3).is_empty());
+    }
+
+    #[test]
+    fn triage_action_handles_invalid_and_fp_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+
+        let invalid_proc = crate::tests::triage_approval("__allow_proc__:   \"\"   ", "operator");
+        assert!(handle_telegram_triage_action(
+            &invalid_proc,
+            dir.path(),
+            &cfg,
+            &mut state
+        ));
+
+        let invalid_ip = crate::tests::triage_approval("__allow_ip__:not-an-ip", "operator");
+        assert!(handle_telegram_triage_action(
+            &invalid_ip,
+            dir.path(),
+            &cfg,
+            &mut state
+        ));
+
+        let empty_fp = crate::tests::triage_approval("__fp__:", "operator");
+        assert!(handle_telegram_triage_action(
+            &empty_fp,
+            dir.path(),
+            &cfg,
+            &mut state
+        ));
+
+        // Valid FP path updates graph incident metadata.
+        {
+            let mut graph = state.knowledge_graph.write().expect("graph write");
+            graph.add_node(Node::Incident {
+                incident_id: "ssh_bruteforce:203.0.113.44:test".to_string(),
+                detector: "ssh_bruteforce".to_string(),
+                severity: "high".to_string(),
+                title: "SSH brute-force".to_string(),
+                summary: "many attempts".to_string(),
+                ts: chrono::Utc::now(),
+                mitre_ids: vec![],
+                decision: None,
+                confidence: None,
+                decision_reason: None,
+                decision_target: None,
+                auto_executed: false,
+                is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
+                research_only: false,
+            });
+        }
+
+        let fp = crate::tests::triage_approval("__fp__:ssh_bruteforce:203.0.113.44:test", "alice");
+        assert!(handle_telegram_triage_action(
+            &fp,
+            dir.path(),
+            &cfg,
+            &mut state
+        ));
+
+        let graph = state.knowledge_graph.read().expect("graph read");
+        let node_id = graph
+            .find_by_incident("ssh_bruteforce:203.0.113.44:test")
+            .expect("incident node exists");
+        match graph.get_node(node_id) {
+            Some(Node::Incident {
+                false_positive,
+                fp_reporter,
+                ..
+            }) => {
+                assert!(*false_positive);
+                assert_eq!(fp_reporter.as_deref(), Some("alice"));
+            }
+            other => panic!("expected incident node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_2fa_gate_and_totp_cancel_flow() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.security = Some(config::SecurityConfig {
+            two_factor_method: "totp".to_string(),
+            totp_secret: "JBSWY3DPEHPK3PXP".to_string(),
+            ..Default::default()
+        });
+
+        let intercepted = check_2fa_gate(
+            &mut state,
+            &cfg,
+            "operator",
+            two_factor::PendingActionType::AllowlistIp("1.2.3.4".to_string()),
+        );
+        assert!(intercepted);
+        assert!(state.two_factor_state.pending.contains_key("operator"));
+
+        let cancel = crate::tests::triage_approval("/cancel", "operator");
+        assert!(handle_totp_response(&cancel, dir.path(), &cfg, &mut state));
+        assert!(!state.two_factor_state.pending.contains_key("operator"));
+    }
+
+    #[test]
+    fn handle_totp_response_ignores_non_totp_or_missing_pending() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+
+        let plain_text = crate::tests::triage_approval("hello", "operator");
+        assert!(!handle_totp_response(
+            &plain_text,
+            dir.path(),
+            &cfg,
+            &mut state
+        ));
+
+        let six_digits_no_pending = crate::tests::triage_approval("123456", "operator");
+        assert!(!handle_totp_response(
+            &six_digits_no_pending,
+            dir.path(),
+            &cfg,
+            &mut state
+        ));
+    }
+
+    #[test]
+    fn handle_totp_response_wrong_code_keeps_pending_for_retry() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.security = Some(config::SecurityConfig {
+            two_factor_method: "totp".to_string(),
+            totp_secret: "JBSWY3DPEHPK3PXP".to_string(),
+            ..Default::default()
+        });
+
+        check_2fa_gate(
+            &mut state,
+            &cfg,
+            "operator",
+            two_factor::PendingActionType::AllowlistProcess("sshd".to_string()),
+        );
+        assert!(state.two_factor_state.pending.contains_key("operator"));
+
+        let wrong = crate::tests::triage_approval("000000", "operator");
+        assert!(handle_totp_response(&wrong, dir.path(), &cfg, &mut state));
+        assert!(
+            state.two_factor_state.pending.contains_key("operator"),
+            "pending action should be re-stored after wrong code"
+        );
     }
 }

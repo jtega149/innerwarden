@@ -438,6 +438,8 @@ pub(crate) async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     #[test]
     fn parse_urlencoded_basic() {
@@ -599,5 +601,148 @@ mod tests {
         assert!(filtered.iter().any(|(k, _)| k == "User-Agent"));
         assert!(filtered.iter().any(|(k, _)| k == "Authorization"));
         assert!(!filtered.iter().any(|(k, _)| k == "X-Custom"));
+    }
+
+    #[test]
+    fn route_mcp_and_sensitive_paths_are_served() {
+        let mk_capture =
+            |method: &str, path: &str, body: &[u8]| -> (RawRequest, HttpRequestCapture) {
+                let req = RawRequest {
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    headers: vec![("Content-Type".into(), "application/json".into())],
+                    body: body.to_vec(),
+                    keep_alive: true,
+                };
+                let cap = HttpRequestCapture {
+                    ts: String::new(),
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    headers: vec![],
+                    body_preview: None,
+                    form_fields: None,
+                };
+                (req, cap)
+            };
+
+        let (req_tools, mut cap_tools) = mk_capture("GET", "/mcp/tools", b"");
+        let resp_tools_raw = route(&req_tools, &mut cap_tools);
+        let resp_tools = String::from_utf8_lossy(&resp_tools_raw);
+        assert!(resp_tools.contains("application/json"));
+        assert!(resp_tools.contains("secret-manager"));
+
+        let (req_call, mut cap_call) =
+            mk_capture("POST", "/mcp/call", br#"{"tool":"database-query"}"#);
+        let resp_call_raw = route(&req_call, &mut cap_call);
+        let resp_call = String::from_utf8_lossy(&resp_call_raw);
+        assert!(resp_call.contains("application/json"));
+        assert!(resp_call.contains("\"users\""));
+        assert!(cap_call.form_fields.is_some());
+
+        let (req_env, mut cap_env) = mk_capture("GET", "/.env", b"");
+        let resp_env_raw = route(&req_env, &mut cap_env);
+        let resp_env = String::from_utf8_lossy(&resp_env_raw);
+        assert!(resp_env.contains("DB_PASSWORD"));
+
+        let (req_aws, mut cap_aws) = mk_capture("GET", "/.aws/credentials", b"");
+        let resp_aws_raw = route(&req_aws, &mut cap_aws);
+        let resp_aws = String::from_utf8_lossy(&resp_aws_raw);
+        assert!(resp_aws.contains("[default]"));
+        assert!(resp_aws.contains("aws_access_key_id"));
+    }
+
+    #[tokio::test]
+    async fn read_one_request_parses_headers_body_and_connection_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let body = "username=admin";
+            let request = format!(
+                "POST /login HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let req = read_one_request(&mut server_stream, &mut buf, 8, Duration::from_secs(1))
+            .await
+            .expect("request should parse");
+        client.await.unwrap();
+
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/login");
+        assert!(!req.keep_alive);
+        assert_eq!(req.body.len(), 8);
+        assert_eq!(&req.body, b"username");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_captures_multiple_requests_over_keep_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_connection(&mut stream, 4, 2048, 256, Duration::from_secs(1)).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let body = "username=attacker&password=h2";
+        let request = format!(
+            "GET /login HTTP/1.1\r\nHost: honeypot\r\nUser-Agent: scanner\r\nConnection: keep-alive\r\n\r\n\
+             POST /login HTTP/1.1\r\nHost: honeypot\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), client.read(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => response.extend_from_slice(&chunk[..n]),
+                _ => break,
+            }
+        }
+
+        let evidence = server.await.unwrap();
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.contains("200 OK"));
+        assert!(response_text.contains("Sign In"));
+        assert_eq!(evidence.requests.len(), 2);
+        assert_eq!(evidence.requests[0].method, "GET");
+        assert_eq!(evidence.requests[0].path, "/login");
+        assert_eq!(evidence.requests[1].method, "POST");
+        assert_eq!(evidence.requests[1].path, "/login");
+        assert!(evidence.requests[1].form_fields.is_some());
+        assert!(evidence.requests[1]
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("host")));
+    }
+
+    #[tokio::test]
+    async fn read_one_request_rejects_oversized_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![b'a'; 16_385];
+        let req = read_one_request(
+            &mut server_stream,
+            &mut buf,
+            1024,
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(req.is_none());
     }
 }

@@ -142,3 +142,105 @@ pub(crate) fn build_agent_context(
         data_dir = data_dir.display(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::knowledge_graph::types::Node;
+
+    #[test]
+    fn incident_detector_parses_prefix() {
+        assert_eq!(
+            incident_detector("ssh_bruteforce:1.2.3.4:abc"),
+            "ssh_bruteforce"
+        );
+        assert_eq!(incident_detector("singleword"), "singleword");
+    }
+
+    #[test]
+    fn guardian_mode_maps_responder_state() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = false;
+        assert!(matches!(guardian_mode(&cfg), telegram::GuardianMode::Watch));
+
+        cfg.responder.enabled = true;
+        cfg.responder.dry_run = true;
+        assert!(matches!(
+            guardian_mode(&cfg),
+            telegram::GuardianMode::DryRun
+        ));
+
+        cfg.responder.dry_run = false;
+        assert!(matches!(guardian_mode(&cfg), telegram::GuardianMode::Guard));
+    }
+
+    #[test]
+    fn build_agent_context_includes_runtime_snapshot() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.ai.enabled = true;
+        cfg.ai.provider = "openai".to_string();
+        cfg.ai.model = "gpt-5".to_string();
+        cfg.responder.enabled = true;
+        cfg.responder.dry_run = false;
+        cfg.responder.block_backend = "ufw".to_string();
+        cfg.responder.allowed_skills = vec!["block-ip-ufw".to_string(), "honeypot".to_string()];
+        cfg.telegram.enabled = true;
+        cfg.abuseipdb.enabled = true;
+        cfg.geoip.enabled = true;
+        cfg.fail2ban.enabled = true;
+        cfg.slack.enabled = true;
+        cfg.cloudflare.enabled = true;
+
+        let mut graph = knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        graph.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:198.51.100.10:1".to_string(),
+            detector: "ssh_bruteforce".to_string(),
+            severity: "high".to_string(),
+            title: "SSH brute-force".to_string(),
+            summary: "many attempts".to_string(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("block_ip".to_string()),
+            confidence: Some(0.95),
+            decision_reason: Some("clear brute force".to_string()),
+            decision_target: Some("198.51.100.10".to_string()),
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_node(Node::Incident {
+            incident_id: "port_scan:198.51.100.11:2".to_string(),
+            detector: "port_scan".to_string(),
+            severity: "medium".to_string(),
+            title: "Port scan".to_string(),
+            summary: "multiple ports".to_string(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+
+        let context = build_agent_context(&cfg, std::path::Path::new("/tmp/innerwarden"), &kg);
+
+        assert!(context.contains("INNERWARDEN SYSTEM STATE"));
+        assert!(context.contains("Mode: 🟢 GUARD"));
+        assert!(context.contains("intrusion attempts, 1 actions taken"));
+        assert!(context.contains("AI analysis: ENABLED - provider=openai, model=gpt-5"));
+        assert!(context.contains("Telegram bot: ENABLED"));
+        assert!(context.contains("Cloudflare edge blocking: ENABLED"));
+        assert!(context.contains("Allowed skills: block-ip-ufw, honeypot"));
+    }
+}

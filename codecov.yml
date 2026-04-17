@@ -40,10 +40,25 @@ coverage:
 
     patch:
       default:
-        target: 70%               # new code on a PR must be ≥70% covered
-        threshold: 5%
+        # New code on a PR should land ≥70% covered, with a 15 percentage-
+        # point slack to absorb refactor PRs that move orchestration
+        # wiring (boot.rs, main.rs) which cannot be unit-tested without
+        # spinning up the full agent harness. Effective fail point is 55%.
+        # For feature PRs adding real logic, 15pp is slack — Codecov still
+        # surfaces the drop in the comment even when the gate passes.
+        target: 70%
+        threshold: 15%
         if_ci_failed: error
         informational: false
+      # Orchestration / boot wiring gets its own *informational* gauge so
+      # it is measured (not hidden) but never blocks merges. Real ceiling
+      # is set by integration tests, not unit tests.
+      orchestration:
+        paths:
+          - "crates/agent/src/main.rs"
+          - "crates/agent/src/loops/boot.rs"
+        target: 0%
+        informational: true
 
 comment:
   # Restore the default sections so the PR comment shows project coverage,

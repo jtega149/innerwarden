@@ -455,3 +455,134 @@ fn tg_reply(state: &AgentState, text: impl Into<String>) {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn approval(id: &str, chosen_action: &str) -> telegram::ApprovalResult {
+        telegram::ApprovalResult {
+            incident_id: id.to_string(),
+            approved: true,
+            operator_name: "operator".to_string(),
+            always: false,
+            chosen_action: chosen_action.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn quick_block_returns_warning_when_responder_disabled() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+        let handled = handle_telegram_action_callback(
+            &approval("__quick_block__:198.51.100.42", ""),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+        assert!(handled);
+    }
+
+    #[tokio::test]
+    async fn quick_block_uses_skill_and_updates_blocklist_when_allowed() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = true;
+        cfg.responder.dry_run = true;
+        cfg.responder.block_backend = "ufw".to_string();
+        cfg.responder.allowed_skills = vec!["block-ip-ufw".to_string()];
+        let handled = handle_telegram_action_callback(
+            &approval("__quick_block__:203.0.113.45", ""),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+
+        assert!(handled);
+        assert!(state.blocklist.contains("203.0.113.45"));
+    }
+
+    #[tokio::test]
+    async fn honeypot_callback_monitor_path_consumes_pending_choice() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+        state.pending_honeypot_choices.insert(
+            "198.51.100.55".to_string(),
+            crate::PendingHoneypotChoice {
+                ip: "198.51.100.55".to_string(),
+                incident_id: "inc-hpot-1".to_string(),
+                incident: crate::tests::test_incident("198.51.100.55"),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            },
+        );
+
+        let handled = handle_telegram_action_callback(
+            &approval("__hpot__:198.51.100.55", "monitor"),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+
+        assert!(handled);
+        assert!(!state.pending_honeypot_choices.contains_key("198.51.100.55"));
+    }
+
+    #[tokio::test]
+    async fn pending_confirmation_reject_writes_trust_rule_when_always_set() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+        state.pending_confirmations.insert(
+            "inc-approve-1".to_string(),
+            (
+                telegram::PendingConfirmation {
+                    incident_id: "inc-approve-1".to_string(),
+                    telegram_message_id: 10,
+                    action_description: "block ip".to_string(),
+                    created_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+                    detector: "ssh_bruteforce".to_string(),
+                    action_name: "block_ip".to_string(),
+                },
+                crate::ai::AiDecision::ignore("rejected in test"),
+                crate::tests::test_incident("203.0.113.200"),
+            ),
+        );
+        let result = telegram::ApprovalResult {
+            incident_id: "inc-approve-1".to_string(),
+            approved: false,
+            operator_name: "operator".to_string(),
+            always: true,
+            chosen_action: String::new(),
+        };
+
+        let handled = handle_pending_confirmation(&result, dir.path(), &cfg, &mut state).await;
+
+        assert!(handled);
+        assert!(state.trust_rules.contains("ssh_bruteforce:block_ip"));
+    }
+
+    #[tokio::test]
+    async fn pending_confirmation_returns_false_for_unknown_incident() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+        let result = telegram::ApprovalResult {
+            incident_id: "missing".to_string(),
+            approved: true,
+            operator_name: "operator".to_string(),
+            always: false,
+            chosen_action: String::new(),
+        };
+
+        let handled = handle_pending_confirmation(&result, dir.path(), &cfg, &mut state).await;
+        assert!(!handled);
+    }
+}

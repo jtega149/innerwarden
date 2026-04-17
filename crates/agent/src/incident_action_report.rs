@@ -75,3 +75,129 @@ pub(crate) fn maybe_send_post_execution_telegram_report(
             .await;
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn base_decision(action: ai::AiAction) -> ai::AiDecision {
+        ai::AiDecision {
+            action,
+            confidence: 0.91,
+            auto_execute: true,
+            reason: "unit test".to_string(),
+            alternatives: vec![],
+            estimated_threat: "high".to_string(),
+        }
+    }
+
+    fn state_with_telegram(dir: &std::path::Path) -> AgentState {
+        let mut state = crate::tests::triage_test_state(dir);
+        let tg = crate::telegram::TelegramClient::new("token", "chat-id", None)
+            .expect("telegram client");
+        state.telegram_client = Some(Arc::new(tg));
+        state
+    }
+
+    #[tokio::test]
+    async fn skips_when_execution_was_not_performed_or_bot_disabled() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = false;
+        let mut incident = crate::tests::test_incident("203.0.113.30");
+        incident.severity = innerwarden_core::event::Severity::Critical;
+        let decision = base_decision(ai::AiAction::BlockIp {
+            ip: "203.0.113.30".to_string(),
+            skill_id: "block-ip-ufw".to_string(),
+        });
+
+        maybe_send_post_execution_telegram_report(
+            &incident,
+            &decision,
+            "skipped: confidence below threshold",
+            false,
+            &cfg,
+            &state,
+            None,
+            None,
+        );
+
+        cfg.telegram.bot.enabled = true;
+        maybe_send_post_execution_telegram_report(
+            &incident, &decision, "ok", false, &cfg, &state, None, None,
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_non_immediate_threats_even_when_executed() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = state_with_telegram(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+        let incident = crate::tests::test_incident_with_kind("203.0.113.31", "benign_detector");
+        let decision = base_decision(ai::AiAction::Monitor {
+            ip: "203.0.113.31".to_string(),
+        });
+
+        maybe_send_post_execution_telegram_report(
+            &incident, &decision, "ok", false, &cfg, &state, None, None,
+        );
+    }
+
+    #[tokio::test]
+    async fn maps_all_action_variants_into_report_labels_and_targets() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = state_with_telegram(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+        cfg.responder.dry_run = true;
+
+        let mut incident = crate::tests::test_incident("203.0.113.32");
+        incident.severity = innerwarden_core::event::Severity::Critical;
+        incident.incident_id = "kill_chain:203.0.113.32:4242".to_string();
+
+        let actions = vec![
+            ai::AiAction::BlockIp {
+                ip: "203.0.113.32".to_string(),
+                skill_id: "block-ip-ufw".to_string(),
+            },
+            ai::AiAction::Monitor {
+                ip: "203.0.113.32".to_string(),
+            },
+            ai::AiAction::Honeypot {
+                ip: "203.0.113.32".to_string(),
+            },
+            ai::AiAction::SuspendUserSudo {
+                user: "root".to_string(),
+                duration_secs: 300,
+            },
+            ai::AiAction::KillProcess {
+                user: "root".to_string(),
+                duration_secs: 120,
+            },
+            ai::AiAction::BlockContainer {
+                container_id: "abc123".to_string(),
+                action: "pause".to_string(),
+            },
+            ai::AiAction::KillChainResponse {
+                reason: "chain complete".to_string(),
+            },
+            ai::AiAction::Ignore {
+                reason: "false positive".to_string(),
+            },
+            ai::AiAction::RequestConfirmation {
+                summary: "needs approval".to_string(),
+            },
+        ];
+
+        for action in actions {
+            let decision = base_decision(action);
+            maybe_send_post_execution_telegram_report(
+                &incident, &decision, "executed", true, &cfg, &state, None, None,
+            );
+        }
+    }
+}
