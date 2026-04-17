@@ -152,6 +152,7 @@ impl CustomResponses {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_shell_match() {
@@ -204,5 +205,61 @@ shell_commands:
         assert!(custom.try_shell("cat /etc/passwd > /tmp/out").is_some());
         // No match
         assert!(custom.try_shell("cat /etc/shadow").is_none());
+    }
+
+    #[test]
+    fn test_load_dir_merges_yaml_files_and_skips_invalid_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        std::fs::write(
+            path.join("a.yml"),
+            r#"
+shell_commands:
+  "docker ps":
+    output: "A"
+http_routes:
+  "GET /a":
+    body: "ok-a"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("b.yaml"),
+            r#"
+shell_commands:
+  "whoami":
+    output: "root"
+http_routes:
+  "GET /b":
+    content_type: "application/json"
+    body: '{"ok":true}'
+"#,
+        )
+        .unwrap();
+        std::fs::write(path.join("invalid.yml"), "shell_commands: [").unwrap();
+        std::fs::write(path.join("ignore.txt"), "not yaml").unwrap();
+
+        let loaded = CustomResponses::load_dir(path);
+        assert_eq!(loaded.shell_commands.len(), 2);
+        assert_eq!(loaded.http_routes.len(), 2);
+        assert_eq!(loaded.try_shell("docker ps"), Some("A"));
+        assert_eq!(loaded.try_shell("whoami"), Some("root"));
+        assert_eq!(
+            loaded.try_http("GET", "/a").map(|(_, b)| b),
+            Some("ok-a".to_string())
+        );
+        assert_eq!(
+            loaded.try_http("GET", "/b").map(|(ct, _)| ct),
+            Some("application/json".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_dir_missing_path_returns_default() {
+        let missing = std::path::Path::new("/tmp/innerwarden-does-not-exist-custom-responses");
+        let loaded = CustomResponses::load_dir(missing);
+        assert!(loaded.shell_commands.is_empty());
+        assert!(loaded.http_routes.is_empty());
     }
 }

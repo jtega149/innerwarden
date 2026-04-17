@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveDate};
@@ -49,11 +49,9 @@ impl JsonlWriter {
         let today = Local::now().date_naive();
 
         // ── Disk-exhaustion guard ───────────────────────────────────────
-        let path = self
-            .data_dir
-            .join(format!("events-{}.jsonl", today.format("%Y-%m-%d")));
+        let path = events_file_path(&self.data_dir, today);
         if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() >= MAX_EVENTS_FILE_BYTES {
+            if is_events_file_at_capacity(meta.len()) {
                 if self.events_limit_warned != Some(today) {
                     warn!(
                         "events file exceeded 200MB - pausing event writes to prevent disk exhaustion"
@@ -100,9 +98,7 @@ impl JsonlWriter {
 
     fn events_writer(&mut self, today: NaiveDate) -> Result<&mut DatedWriter> {
         if self.events_writer.as_ref().is_none_or(|w| w.date != today) {
-            let path = self
-                .data_dir
-                .join(format!("events-{}.jsonl", today.format("%Y-%m-%d")));
+            let path = events_file_path(&self.data_dir, today);
             self.events_writer = Some(DatedWriter::open(path, today)?);
         }
         Ok(self.events_writer.as_mut().unwrap())
@@ -114,9 +110,7 @@ impl JsonlWriter {
             .as_ref()
             .is_none_or(|w| w.date != today)
         {
-            let path = self
-                .data_dir
-                .join(format!("incidents-{}.jsonl", today.format("%Y-%m-%d")));
+            let path = incidents_file_path(&self.data_dir, today);
             self.incidents_writer = Some(DatedWriter::open(path, today)?);
         }
         Ok(self.incidents_writer.as_mut().unwrap())
@@ -140,5 +134,66 @@ impl DatedWriter {
             writer: BufWriter::new(file),
             date,
         })
+    }
+}
+
+fn events_file_path(data_dir: &Path, today: NaiveDate) -> PathBuf {
+    data_dir.join(format!("events-{}.jsonl", today.format("%Y-%m-%d")))
+}
+
+fn incidents_file_path(data_dir: &Path, today: NaiveDate) -> PathBuf {
+    data_dir.join(format!("incidents-{}.jsonl", today.format("%Y-%m-%d")))
+}
+
+fn is_events_file_at_capacity(current_size: u64) -> bool {
+    current_size >= MAX_EVENTS_FILE_BYTES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("innerwarden-sensor-jsonl-tests-{nanos}"));
+        std::fs::create_dir_all(&path).expect("test temp dir must be creatable");
+        path
+    }
+
+    #[test]
+    fn file_path_helpers_build_date_partitioned_jsonl_names() {
+        // Ensures daily file partition naming stays stable for downstream ingestion jobs.
+        let date = NaiveDate::from_ymd_opt(2026, 4, 17).expect("valid calendar date");
+        let root = Path::new("/var/lib/innerwarden");
+        assert_eq!(
+            events_file_path(root, date),
+            PathBuf::from("/var/lib/innerwarden/events-2026-04-17.jsonl")
+        );
+        assert_eq!(
+            incidents_file_path(root, date),
+            PathBuf::from("/var/lib/innerwarden/incidents-2026-04-17.jsonl")
+        );
+    }
+
+    #[test]
+    fn events_capacity_guard_trips_at_or_above_limit() {
+        // Covers disk-safety boundary that pauses event writes when the daily file is too large.
+        assert!(!is_events_file_at_capacity(MAX_EVENTS_FILE_BYTES - 1));
+        assert!(is_events_file_at_capacity(MAX_EVENTS_FILE_BYTES));
+        assert!(is_events_file_at_capacity(MAX_EVENTS_FILE_BYTES + 1));
+    }
+
+    #[test]
+    fn new_creates_data_dir_and_exposes_it_via_accessor() {
+        // Verifies sink initialization keeps writer rooted in the requested data directory.
+        let data_dir = unique_test_dir().join("nested").join("sink");
+        let writer =
+            JsonlWriter::new(&data_dir, true).expect("writer init should create data directory");
+        assert_eq!(writer.data_dir(), data_dir.as_path());
+        assert!(data_dir.exists());
     }
 }

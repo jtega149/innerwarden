@@ -51,7 +51,7 @@ impl TemporalCorrelator {
             .cloned()
             .collect();
 
-        related.sort_by_key(|x| std::cmp::Reverse(x.ts));
+        related.sort_by(|a, b| b.ts.cmp(&a.ts));
         related.truncate(limit);
         related
     }
@@ -90,7 +90,7 @@ pub fn build_clusters(incidents: &[Incident], window_seconds: u64) -> Vec<Incide
 
     let window = Duration::seconds(window_seconds as i64);
     let mut ordered: Vec<&Incident> = incidents.iter().collect();
-    ordered.sort_by_key(|x| x.ts);
+    ordered.sort_by_key(|a| a.ts);
 
     let mut working: Vec<WorkingCluster> = Vec::new();
 
@@ -145,7 +145,7 @@ pub fn build_clusters(incidents: &[Incident], window_seconds: u64) -> Vec<Incide
         })
         .collect();
 
-    clusters.sort_by_key(|x| std::cmp::Reverse(x.start_ts));
+    clusters.sort_by(|a, b| b.start_ts.cmp(&a.start_ts));
     clusters
 }
 

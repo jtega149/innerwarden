@@ -70,17 +70,9 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
                 continue;
             }
 
-            let in_danger_path = DANGER_PATHS.iter().any(|p| bin.path.starts_with(p));
-
-            let severity = if in_danger_path {
-                Severity::Critical
-            } else if is_new {
-                Severity::High
-            } else {
-                Severity::Medium // hash changed
-            };
-
-            let action = if is_new { "new_suid" } else { "suid_modified" };
+            let in_danger_path = is_in_danger_path(&bin.path);
+            let severity = classify_suid_change_severity(is_new, in_danger_path);
+            let action = suid_action_label(is_new);
 
             let event = Event {
                 ts: now,
@@ -185,6 +177,28 @@ fn compute_sha256(path: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
+fn is_in_danger_path(path: &str) -> bool {
+    DANGER_PATHS.iter().any(|prefix| path.starts_with(prefix))
+}
+
+fn classify_suid_change_severity(is_new: bool, in_danger_path: bool) -> Severity {
+    if in_danger_path {
+        Severity::Critical
+    } else if is_new {
+        Severity::High
+    } else {
+        Severity::Medium
+    }
+}
+
+fn suid_action_label(is_new: bool) -> &'static str {
+    if is_new {
+        "new_suid"
+    } else {
+        "suid_modified"
+    }
+}
+
 #[cfg(unix)]
 fn meta_uid(meta: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
@@ -202,10 +216,42 @@ mod tests {
 
     #[test]
     fn test_danger_paths() {
-        assert!(DANGER_PATHS.iter().any(|p| "/tmp/evil".starts_with(p)));
-        assert!(DANGER_PATHS
-            .iter()
-            .any(|p| "/dev/shm/backdoor".starts_with(p)));
-        assert!(!DANGER_PATHS.iter().any(|p| "/usr/bin/sudo".starts_with(p)));
+        // Ensures path risk classifier catches canonical unsafe writable locations.
+        assert!(is_in_danger_path("/tmp/evil"));
+        assert!(is_in_danger_path("/dev/shm/backdoor"));
+        assert!(!is_in_danger_path("/usr/bin/sudo"));
+    }
+
+    #[test]
+    fn classify_suid_change_severity_prioritizes_danger_paths() {
+        // Verifies dangerous locations are always critical regardless of change type.
+        assert!(matches!(
+            classify_suid_change_severity(true, true),
+            Severity::Critical
+        ));
+        assert!(matches!(
+            classify_suid_change_severity(false, true),
+            Severity::Critical
+        ));
+    }
+
+    #[test]
+    fn classify_suid_change_severity_distinguishes_new_and_modified_binaries() {
+        // Guards normal severity split between new SUID creation and hash-only drift.
+        assert!(matches!(
+            classify_suid_change_severity(true, false),
+            Severity::High
+        ));
+        assert!(matches!(
+            classify_suid_change_severity(false, false),
+            Severity::Medium
+        ));
+    }
+
+    #[test]
+    fn suid_action_label_matches_change_kind() {
+        // Confirms event kind labels remain stable for downstream routing and analytics.
+        assert_eq!(suid_action_label(true), "new_suid");
+        assert_eq!(suid_action_label(false), "suid_modified");
     }
 }

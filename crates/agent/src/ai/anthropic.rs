@@ -383,11 +383,18 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
         )
     };
 
-    let graph_section = ctx
-        .graph_context
-        .as_ref()
-        .map(|gc| format!("\n{gc}\n"))
-        .unwrap_or_default();
+    // Spec 025: prefer the structured JSON subgraph when available.
+    // See the matching block in `openai.rs::build_prompt` for the
+    // measured-accuracy rationale.
+    let graph_section = if let Some(subgraph) = ctx.graph_subgraph.as_ref() {
+        let json = serde_json::to_string_pretty(subgraph).unwrap_or_else(|_| "{}".to_string());
+        format!("\nGRAPH_SUBGRAPH (JSON — cite `nodes[].id` when reasoning):\n{json}\n")
+    } else {
+        ctx.graph_context
+            .as_ref()
+            .map(|gc| format!("\n{gc}\n"))
+            .unwrap_or_default()
+    };
 
     format!(
         r#"Analyze this security incident and decide on a response.
@@ -484,5 +491,76 @@ mod tests {
     fn provider_preserves_explicit_claude_model() {
         let p = AnthropicProvider::new("key".into(), "claude-opus-4-6".into());
         assert_eq!(p.model, "claude-opus-4-6");
+    }
+
+    // ─── Spec 025 — build_prompt graph section (mirror of openai tests) ──
+
+    fn spec025_incident() -> innerwarden_core::incident::Incident {
+        use innerwarden_core::{entities::EntityRef, event::Severity, incident::Incident};
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "test".into(),
+            incident_id: "ssh_bruteforce:1.2.3.4:test".into(),
+            severity: Severity::High,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("1.2.3.4")],
+        }
+    }
+
+    fn spec025_ctx<'a>(
+        incident: &'a innerwarden_core::incident::Incident,
+        graph_context: Option<String>,
+        graph_subgraph: Option<serde_json::Value>,
+    ) -> DecisionContext<'a> {
+        DecisionContext {
+            incident,
+            recent_events: vec![],
+            related_incidents: vec![],
+            already_blocked: vec![],
+            available_skills: vec![],
+            ip_reputation: None,
+            ip_geo: None,
+            graph_context,
+            graph_subgraph,
+        }
+    }
+
+    #[test]
+    fn anthropic_build_prompt_prefers_subgraph() {
+        let inc = spec025_incident();
+        let subgraph = serde_json::json!({
+            "center": 42,
+            "nodes": [{"id": 42, "type": "Ip", "label": "1.2.3.4", "addr": "1.2.3.4"}],
+            "edges": [],
+            "truncated": false,
+            "full_node_count": 1
+        });
+        let ctx = spec025_ctx(&inc, Some("prose fallback".into()), Some(subgraph));
+        let prompt = build_prompt(&ctx);
+        assert!(prompt.contains("GRAPH_SUBGRAPH"));
+        assert!(prompt.contains("\"addr\": \"1.2.3.4\""));
+        assert!(!prompt.contains("prose fallback"));
+    }
+
+    #[test]
+    fn anthropic_build_prompt_falls_back_to_prose() {
+        let inc = spec025_incident();
+        let ctx = spec025_ctx(&inc, Some("ATTACK CONTEXT prose".into()), None);
+        let prompt = build_prompt(&ctx);
+        assert!(!prompt.contains("GRAPH_SUBGRAPH"));
+        assert!(prompt.contains("ATTACK CONTEXT prose"));
+    }
+
+    #[test]
+    fn anthropic_build_prompt_skips_section_when_both_absent() {
+        let inc = spec025_incident();
+        let ctx = spec025_ctx(&inc, None, None);
+        let prompt = build_prompt(&ctx);
+        assert!(!prompt.contains("GRAPH_SUBGRAPH"));
+        assert!(!prompt.contains("ATTACK CONTEXT"));
     }
 }

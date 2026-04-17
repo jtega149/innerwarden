@@ -1373,8 +1373,7 @@ fn print_recommendations(recs: &[ModuleRec], system_findings: &[ScanFinding]) {
         .filter(|r| r.tier == Tier::NotAvailable)
         .collect();
 
-    for (i, rec) in available.iter().enumerate() {
-        let idx = i + 1;
+    for (idx, rec) in (1usize..).zip(available.iter()) {
         if current_tier.as_ref().map(|t| t.order()) != Some(rec.tier.order()) {
             println!("\n  {}", rec.tier.label());
             println!();

@@ -56,7 +56,11 @@ pub(crate) async fn maybe_suggest_allowlist_from_fp_reports(
                 // Auto-FP suggestions go through notification gate.
                 let gate_ctx =
                     crate::notification_gate::NotificationContext::for_autofp_suggestion();
-                let gate_verdict = crate::notification_gate::should_notify(&gate_ctx);
+                let gate_counter = state.telemetry.gate_suppressed_counter();
+                let gate_verdict = crate::notification_gate::should_notify_with_counter(
+                    &gate_ctx,
+                    gate_counter.as_ref(),
+                );
                 if matches!(
                     gate_verdict,
                     crate::notification_gate::NotificationVerdict::SendNow

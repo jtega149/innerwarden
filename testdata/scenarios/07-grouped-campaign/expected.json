@@ -1,0 +1,14 @@
+{
+  "status": "wip",
+  "description": "Spec 005 acceptance — 100 ssh.login_failed events from a single IP in under 20 minutes should produce many incidents but exactly 1 grouped Telegram notification. Current `agent --once` harness skips the slow-loop tick so GroupingEngine.tick is never invoked and the grouped summary never dispatches. Envelope is deliberately permissive until the harness grows continuous-mode (target: incidents 50..120, telegram_msgs 1..1, blocks 1..120).",
+  "last_reviewed": "2026-04-17",
+  "target_envelope_once_harness_supports_slow_loop": {
+    "incidents": { "min": 50, "max": 120 },
+    "telegram_msgs": { "min": 1, "max": 1 },
+    "blocks": { "min": 1, "max": 120 }
+  },
+  "incidents": { "min": 0, "max": 120 },
+  "telegram_msgs": { "min": 0, "max": 1 },
+  "blocks": { "min": 0, "max": 120 },
+  "decisions_auto_executed": { "min": 0, "max": 120 }
+}

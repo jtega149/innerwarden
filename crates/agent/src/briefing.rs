@@ -334,6 +334,7 @@ pub fn parse_briefing(llm_response: &str, context_threat_level: &str) -> Briefin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge_graph::types::{Edge, Node, Relation};
 
     // parse_briefing preserves threat level and summary text
     #[test]
@@ -369,5 +370,123 @@ mod tests {
         assert!(prompt.contains("CRITICAL RULES"));
         assert!(prompt.contains("CONTAINED"));
         assert!(prompt.contains("NEEDS ATTENTION"));
+    }
+
+    fn add_incident(
+        graph: &mut KnowledgeGraph,
+        incident_id: &str,
+        detector: &str,
+        severity: &str,
+        title: &str,
+        ip: &str,
+        decision: Option<&str>,
+        decision_target: Option<&str>,
+        auto_executed: bool,
+        research_only: bool,
+        ts: chrono::DateTime<Utc>,
+    ) {
+        let ip_id = graph.ensure_ip(ip, ts);
+        let inc_id = graph.add_node(Node::Incident {
+            incident_id: incident_id.to_string(),
+            detector: detector.to_string(),
+            severity: severity.to_string(),
+            title: title.to_string(),
+            summary: format!("{title} summary"),
+            ts,
+            mitre_ids: vec![],
+            decision: decision.map(|d| d.to_string()),
+            confidence: Some(0.9),
+            decision_reason: Some("unit test".to_string()),
+            decision_target: decision_target.map(|t| t.to_string()),
+            auto_executed,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only,
+        });
+        graph.add_edge(Edge::new(inc_id, ip_id, Relation::TriggeredBy, ts));
+    }
+
+    #[test]
+    fn build_briefing_context_summarizes_resolved_and_unresolved_activity() {
+        crate::cloud_safelist::init();
+        let now = Utc::now();
+        let mut graph = KnowledgeGraph::new();
+
+        add_incident(
+            &mut graph,
+            "ssh_bruteforce:203.0.113.10:1",
+            "ssh_bruteforce",
+            "high",
+            "SSH brute-force",
+            "203.0.113.10",
+            Some("block_ip"),
+            Some("203.0.113.10"),
+            true,
+            false,
+            now,
+        );
+        add_incident(
+            &mut graph,
+            "port_scan:203.0.113.10:2",
+            "port_scan",
+            "medium",
+            "Port scan",
+            "203.0.113.10",
+            Some("ignore"),
+            None,
+            false,
+            false,
+            now,
+        );
+        add_incident(
+            &mut graph,
+            "ransomware:198.51.100.5:3",
+            "ransomware",
+            "critical",
+            "Ransomware behavior",
+            "198.51.100.5",
+            None,
+            None,
+            false,
+            false,
+            now,
+        );
+        add_incident(
+            &mut graph,
+            "self_traffic:198.18.0.1:4",
+            "self_traffic",
+            "low",
+            "Agent cloud check",
+            "198.18.0.1",
+            None,
+            None,
+            false,
+            true,
+            now,
+        );
+
+        let kg = Arc::new(RwLock::new(graph));
+        let context = build_briefing_context(&kg);
+
+        assert!(context.contains("SECURITY INTELLIGENCE CONTEXT"));
+        assert!(context.contains("ACTIONS ALREADY TAKEN BY AI"));
+        assert!(context.contains("Blocked IP 203.0.113.10"));
+        assert!(context.contains("UNRESOLVED THREATS NEEDING ATTENTION"));
+        assert!(context.contains("[CRITICAL] Ransomware behavior"));
+        assert!(context.contains("TOP ATTACKERS (external IPs only)"));
+        assert!(context.contains("203.0.113.10"));
+        assert!(context.contains("DETECTOR ACTIVITY"));
+        assert!(context.contains("KNOWLEDGE GRAPH"));
+    }
+
+    #[test]
+    fn build_briefing_context_handles_empty_graph() {
+        let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
+        let context = build_briefing_context(&kg);
+        assert!(context.contains("Operator-relevant incidents today: 0"));
+        assert!(context.contains("Human attention needed: NONE"));
+        assert!(context.contains("TOP ATTACKERS (external IPs only):"));
     }
 }

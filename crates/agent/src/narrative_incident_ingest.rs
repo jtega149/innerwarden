@@ -18,8 +18,7 @@ pub(crate) fn ingest_new_incidents(
             let cval = sq.get_agent_cursor(cursor_key).unwrap_or(0);
             match sq.incidents_since(cval, 5000) {
                 Ok(rows) if !rows.is_empty() => {
-                    let max_id = rows.last().unwrap().0;
-                    let entries: Vec<_> = rows.into_iter().map(|(_, inc)| inc).collect();
+                    let (entries, max_id) = split_incident_rows(rows);
                     let _ = sq.set_agent_cursor(cursor_key, max_id);
                     entries
                 }
@@ -30,7 +29,7 @@ pub(crate) fn ingest_new_incidents(
             return Ok(());
         };
     let _ = data_dir; // silence unused warning
-    if !new_incidents.is_empty() {
+    if should_process_new_incidents(new_incidents.len()) {
         state.narrative_acc.ingest_incidents(&new_incidents);
 
         // Feed incidents into cross-layer correlation engine
@@ -163,9 +162,7 @@ pub(crate) fn ingest_new_incidents(
                 }
             }
             // Keep last 100 chains
-            if existing.len() > 100 {
-                existing = existing.split_off(existing.len() - 100);
-            }
+            existing = trim_to_latest(existing, 100);
             let _ = std::fs::write(
                 &chains_path,
                 serde_json::to_string(&existing).unwrap_or_default(),
@@ -183,4 +180,79 @@ pub(crate) fn ingest_new_incidents(
     }
 
     Ok(())
+}
+
+fn split_incident_rows(
+    rows: Vec<(i64, innerwarden_core::incident::Incident)>,
+) -> (Vec<innerwarden_core::incident::Incident>, i64) {
+    let max_id = rows.last().map(|(id, _)| *id).unwrap_or(0);
+    let incidents = rows.into_iter().map(|(_, incident)| incident).collect();
+    (incidents, max_id)
+}
+
+fn should_process_new_incidents(count: usize) -> bool {
+    count > 0
+}
+
+fn trim_to_latest(mut values: Vec<serde_json::Value>, limit: usize) -> Vec<serde_json::Value> {
+    if values.len() > limit {
+        values = values.split_off(values.len() - limit);
+    }
+    values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_core::{event::Severity, incident::Incident};
+
+    fn sample_incident(id: &str) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "host".to_string(),
+            incident_id: id.to_string(),
+            severity: Severity::Medium,
+            title: "title".to_string(),
+            summary: "summary".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn split_incident_rows_returns_incidents_and_latest_cursor_id() {
+        // Ensures SQLite cursor progression tracks the highest processed row id.
+        let rows = vec![
+            (10, sample_incident("i-1")),
+            (12, sample_incident("i-2")),
+            (15, sample_incident("i-3")),
+        ];
+        let (incidents, max_id) = split_incident_rows(rows);
+        assert_eq!(incidents.len(), 3);
+        assert_eq!(max_id, 15);
+    }
+
+    #[test]
+    fn should_process_new_incidents_only_when_count_is_positive() {
+        // Guards ingest short-circuit so empty batches avoid unnecessary processing work.
+        assert!(!should_process_new_incidents(0));
+        assert!(should_process_new_incidents(1));
+    }
+
+    #[test]
+    fn trim_to_latest_keeps_tail_slice_when_over_limit() {
+        // Verifies chain history pruning keeps the most recent entries for dashboard rendering.
+        let values: Vec<serde_json::Value> = (0..5).map(|n| serde_json::json!(n)).collect();
+        let trimmed = trim_to_latest(values, 3);
+        assert_eq!(
+            trimmed,
+            vec![
+                serde_json::json!(2),
+                serde_json::json!(3),
+                serde_json::json!(4)
+            ]
+        );
+    }
 }

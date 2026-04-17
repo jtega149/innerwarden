@@ -1273,6 +1273,10 @@ fn auto_detect_human_uids() -> Vec<u32> {
         Err(_) => return vec![],
     };
 
+    parse_human_uids_from_passwd(&content)
+}
+
+fn parse_human_uids_from_passwd(content: &str) -> Vec<u32> {
     let nologin_shells = ["/usr/sbin/nologin", "/bin/false", "/sbin/nologin"];
 
     content
@@ -1298,4 +1302,41 @@ pub fn load(path: &str) -> Result<Config> {
     let content = std::fs::read_to_string(Path::new(path))
         .with_context(|| format!("failed to read config: {path}"))?;
     toml::from_str(&content).with_context(|| "failed to parse config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_human_uids_from_passwd_filters_system_and_nologin_accounts() {
+        // Ensures UID auto-detection keeps only interactive human accounts.
+        let passwd = "\
+root:x:0:0:root:/root:/bin/bash\n\
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+alice:x:1000:1000:Alice:/home/alice:/bin/bash\n\
+bob:x:1001:1001:Bob:/home/bob:/bin/zsh\n\
+svc:x:1002:1002:Svc:/home/svc:/bin/false\n\
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n";
+        let uids = parse_human_uids_from_passwd(passwd);
+        assert_eq!(uids, vec![1000, 1001]);
+    }
+
+    #[test]
+    fn effective_trusted_uids_prefers_explicit_configuration() {
+        // Covers explicit override path so operator-provided trusted UIDs are never replaced by autodetect.
+        let cfg = CalibrationConfig {
+            trusted_uids: vec![42, 84],
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_trusted_uids(), vec![42, 84]);
+    }
+
+    #[test]
+    fn default_helpers_expose_expected_sensor_defaults() {
+        // Guards key default values used when config omits optional fields.
+        assert_eq!(default_redis_maxlen(), 50_000);
+        assert_eq!(default_poll_seconds(), 60);
+        assert_eq!(default_journald_units(), vec!["sshd", "sudo"]);
+    }
 }

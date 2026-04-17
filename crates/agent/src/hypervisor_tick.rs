@@ -57,18 +57,7 @@ pub(crate) async fn process_hypervisor_tick(
 
     // Detect environment change (stealth hypervisor install / Blue Pill).
     if let Some(ref prev) = prev_env {
-        let changed = match (prev, &report.environment) {
-            (
-                innerwarden_hypervisor::Environment::BareMetal,
-                innerwarden_hypervisor::Environment::VirtualMachine { .. }
-                | innerwarden_hypervisor::Environment::UnknownHypervisor,
-            ) => Some("bare_metal_to_vm"),
-            (
-                innerwarden_hypervisor::Environment::VirtualMachine { .. },
-                innerwarden_hypervisor::Environment::UnknownHypervisor,
-            ) => Some("vm_to_unknown_hypervisor"),
-            _ => None,
-        };
+        let changed = detect_environment_drift(prev, &report.environment);
 
         if let Some(drift_type) = changed {
             let incident_id = format!("hypervisor:env_drift:{drift_type}");
@@ -118,22 +107,23 @@ pub(crate) async fn process_hypervisor_tick(
     // Trust score degradation.
     if report.trust_score < cfg.hypervisor.trust_score_threshold {
         // Cooldown: one incident per 24h.
-        if let Some(last) = state.last_hypervisor_incident_at {
-            let hours_since = (chrono::Utc::now() - last).num_hours();
-            if hours_since < 24 {
-                tracing::debug!(
-                    hours_since,
-                    "hypervisor: trust_degraded cooldown active, skipping"
-                );
-                // Still write env drift incidents above, but skip trust degradation.
-                if incidents.is_empty() {
-                    return;
-                }
-                // Write only drift incidents.
-                write_incidents(data_dir, &today.to_string(), &incidents);
-                notify_telegram(state, &incidents, report.trust_score);
+        if should_skip_hypervisor_cooldown(state.last_hypervisor_incident_at, chrono::Utc::now()) {
+            let hours_since = state
+                .last_hypervisor_incident_at
+                .map(|last| (chrono::Utc::now() - last).num_hours())
+                .unwrap_or_default();
+            tracing::debug!(
+                hours_since,
+                "hypervisor: trust_degraded cooldown active, skipping"
+            );
+            // Still write env drift incidents above, but skip trust degradation.
+            if incidents.is_empty() {
                 return;
             }
+            // Write only drift incidents.
+            write_incidents(data_dir, &today.to_string(), &incidents);
+            notify_telegram(state, &incidents, report.trust_score);
+            return;
         }
 
         let incident_id = format!(
@@ -148,13 +138,7 @@ pub(crate) async fn process_hypervisor_tick(
         {
             tracing::debug!(incident_id, "hypervisor: incident suppressed by user");
         } else {
-            let severity = if report.trust_score < 0.3 {
-                innerwarden_core::event::Severity::Critical
-            } else if report.trust_score < 0.6 {
-                innerwarden_core::event::Severity::High
-            } else {
-                innerwarden_core::event::Severity::Medium
-            };
+            let severity = classify_hypervisor_trust_severity(report.trust_score);
 
             let critical_checks: Vec<String> = report
                 .checks
@@ -274,14 +258,12 @@ fn notify_telegram(
                 inc,
                 "hypervisor",
             );
-            let verdict = crate::notification_gate::should_notify(&ctx);
+            let gate_counter = state.telemetry.gate_suppressed_counter();
+            let verdict =
+                crate::notification_gate::should_notify_with_counter(&ctx, gate_counter.as_ref());
             match verdict {
                 crate::notification_gate::NotificationVerdict::SendNow => {
-                    let sev = match inc.severity {
-                        innerwarden_core::event::Severity::Critical => "\u{1f534} CRITICAL",
-                        innerwarden_core::event::Severity::High => "\u{1f7e0} HIGH",
-                        _ => "\u{1f7e1} MEDIUM",
-                    };
+                    let sev = format_hypervisor_severity(&inc.severity);
                     let msg = format!(
                         "\u{1f5a5}\u{fe0f} <b>Hypervisor Alert</b>\n\n\
                          {sev}\n\
@@ -317,4 +299,136 @@ pub(crate) fn is_virtual_machine(state: &AgentState) -> bool {
         Some(innerwarden_hypervisor::Environment::VirtualMachine { .. })
             | Some(innerwarden_hypervisor::Environment::UnknownHypervisor)
     )
+}
+
+fn detect_environment_drift(
+    previous: &innerwarden_hypervisor::Environment,
+    current: &innerwarden_hypervisor::Environment,
+) -> Option<&'static str> {
+    match (previous, current) {
+        (
+            innerwarden_hypervisor::Environment::BareMetal,
+            innerwarden_hypervisor::Environment::VirtualMachine { .. }
+            | innerwarden_hypervisor::Environment::UnknownHypervisor,
+        ) => Some("bare_metal_to_vm"),
+        (
+            innerwarden_hypervisor::Environment::VirtualMachine { .. },
+            innerwarden_hypervisor::Environment::UnknownHypervisor,
+        ) => Some("vm_to_unknown_hypervisor"),
+        _ => None,
+    }
+}
+
+fn should_skip_hypervisor_cooldown(
+    last_incident_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    last_incident_at
+        .map(|last| (now - last).num_hours() < 24)
+        .unwrap_or(false)
+}
+
+fn classify_hypervisor_trust_severity(score: f64) -> innerwarden_core::event::Severity {
+    if score < 0.3 {
+        innerwarden_core::event::Severity::Critical
+    } else if score < 0.6 {
+        innerwarden_core::event::Severity::High
+    } else {
+        innerwarden_core::event::Severity::Medium
+    }
+}
+
+fn format_hypervisor_severity(severity: &innerwarden_core::event::Severity) -> &'static str {
+    match severity {
+        innerwarden_core::event::Severity::Critical => "\u{1f534} CRITICAL",
+        innerwarden_core::event::Severity::High => "\u{1f7e0} HIGH",
+        _ => "\u{1f7e1} MEDIUM",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use innerwarden_core::event::Severity;
+
+    #[test]
+    fn detect_environment_drift_flags_bare_metal_to_vm_transition() {
+        // Ensures Blue-Pill style environment flips are captured as critical drift events.
+        let drift = detect_environment_drift(
+            &innerwarden_hypervisor::Environment::BareMetal,
+            &innerwarden_hypervisor::Environment::UnknownHypervisor,
+        );
+        assert_eq!(drift, Some("bare_metal_to_vm"));
+    }
+
+    #[test]
+    fn detect_environment_drift_flags_vm_to_unknown_transition() {
+        // Covers downgrade path when known VM metadata disappears into unknown hypervisor state.
+        let drift = detect_environment_drift(
+            &innerwarden_hypervisor::Environment::VirtualMachine {
+                hypervisor: "kvm".to_string(),
+            },
+            &innerwarden_hypervisor::Environment::UnknownHypervisor,
+        );
+        assert_eq!(drift, Some("vm_to_unknown_hypervisor"));
+    }
+
+    #[test]
+    fn detect_environment_drift_ignores_stable_environment() {
+        // Verifies steady-state environments do not emit false-positive drift types.
+        let drift = detect_environment_drift(
+            &innerwarden_hypervisor::Environment::BareMetal,
+            &innerwarden_hypervisor::Environment::BareMetal,
+        );
+        assert_eq!(drift, None);
+    }
+
+    #[test]
+    fn should_skip_hypervisor_cooldown_only_within_24h_window() {
+        // Guards cooldown behavior so repeated trust incidents are suppressed for one day.
+        let now = Utc::now();
+        assert!(should_skip_hypervisor_cooldown(
+            Some(now - Duration::hours(2)),
+            now
+        ));
+        assert!(!should_skip_hypervisor_cooldown(
+            Some(now - Duration::hours(25)),
+            now
+        ));
+    }
+
+    #[test]
+    fn classify_hypervisor_trust_severity_uses_score_bands() {
+        // Ensures trust-score thresholds map to stable severity levels used by alerting.
+        assert!(matches!(
+            classify_hypervisor_trust_severity(0.2),
+            Severity::Critical
+        ));
+        assert!(matches!(
+            classify_hypervisor_trust_severity(0.5),
+            Severity::High
+        ));
+        assert!(matches!(
+            classify_hypervisor_trust_severity(0.8),
+            Severity::Medium
+        ));
+    }
+
+    #[test]
+    fn format_hypervisor_severity_produces_expected_labels() {
+        // Checks Telegram label formatting so severity badges remain operator-friendly.
+        assert_eq!(
+            format_hypervisor_severity(&Severity::Critical),
+            "\u{1f534} CRITICAL"
+        );
+        assert_eq!(
+            format_hypervisor_severity(&Severity::High),
+            "\u{1f7e0} HIGH"
+        );
+        assert_eq!(
+            format_hypervisor_severity(&Severity::Medium),
+            "\u{1f7e1} MEDIUM"
+        );
+    }
 }

@@ -10,11 +10,7 @@ use crate::{config, AgentState};
 pub(crate) fn load_suppressed_ids(data_dir: &Path) -> HashSet<String> {
     let path = data_dir.join("suppressed-incidents.txt");
     match std::fs::read_to_string(&path) {
-        Ok(content) => content
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect(),
+        Ok(content) => parse_suppressed_ids(&content),
         Err(_) => HashSet::new(),
     }
 }
@@ -115,20 +111,10 @@ pub(crate) async fn process_firmware_tick(
 
         // --- VM detection: reduce severity on VMs where firmware is inaccessible ---
         let on_vm = is_virtual_machine(state);
-        let severity = if on_vm {
-            // On VMs, firmware checks are unreliable — downgrade to Info
-            tracing::debug!("firmware: running on VM, downgrading severity to Info");
-            innerwarden_core::event::Severity::Info
-        } else if report.trust_score < 0.3 {
-            innerwarden_core::event::Severity::Critical
-        } else if report.trust_score < 0.6 {
-            innerwarden_core::event::Severity::High
-        } else {
-            innerwarden_core::event::Severity::Medium
-        };
+        let severity = classify_firmware_trust_severity(report.trust_score, on_vm);
 
         // On VMs with Info severity, skip generating an incident entirely
-        if on_vm && severity == innerwarden_core::event::Severity::Info {
+        if should_skip_vm_trust_incident(on_vm, &severity) {
             tracing::debug!(
                 trust_score = format!("{:.0}%", report.trust_score * 100.0),
                 "firmware: VM detected, skipping trust_degraded incident"
@@ -192,13 +178,7 @@ pub(crate) async fn process_firmware_tick(
             ts: chrono::Utc::now(),
             host: host.clone(),
             incident_id: format!("firmware:corr:{}", threat.id),
-            severity: if threat.confidence >= 0.9 {
-                innerwarden_core::event::Severity::Critical
-            } else if threat.confidence >= 0.7 {
-                innerwarden_core::event::Severity::High
-            } else {
-                innerwarden_core::event::Severity::Medium
-            },
+            severity: classify_correlated_threat_severity(threat.confidence),
             title: threat.name.clone(),
             summary: threat.detail.clone(),
             evidence: serde_json::json!({
@@ -259,7 +239,9 @@ pub(crate) async fn process_firmware_tick(
             let ctx = crate::notification_gate::NotificationContext::from_firmware_or_hypervisor(
                 inc, "firmware",
             );
-            let verdict = crate::notification_gate::should_notify(&ctx);
+            let gate_counter = state.telemetry.gate_suppressed_counter();
+            let verdict =
+                crate::notification_gate::should_notify_with_counter(&ctx, gate_counter.as_ref());
             match verdict {
                 crate::notification_gate::NotificationVerdict::SendNow => {
                     let sev = match inc.severity {
@@ -291,5 +273,109 @@ pub(crate) async fn process_firmware_tick(
                 crate::notification_gate::NotificationVerdict::Drop => {}
             }
         }
+    }
+}
+
+fn parse_suppressed_ids(content: &str) -> HashSet<String> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn classify_firmware_trust_severity(score: f64, on_vm: bool) -> innerwarden_core::event::Severity {
+    if on_vm {
+        innerwarden_core::event::Severity::Info
+    } else if score < 0.3 {
+        innerwarden_core::event::Severity::Critical
+    } else if score < 0.6 {
+        innerwarden_core::event::Severity::High
+    } else {
+        innerwarden_core::event::Severity::Medium
+    }
+}
+
+fn should_skip_vm_trust_incident(
+    on_vm: bool,
+    severity: &innerwarden_core::event::Severity,
+) -> bool {
+    on_vm && matches!(severity, innerwarden_core::event::Severity::Info)
+}
+
+fn classify_correlated_threat_severity(confidence: f64) -> innerwarden_core::event::Severity {
+    if confidence >= 0.9 {
+        innerwarden_core::event::Severity::Critical
+    } else if confidence >= 0.7 {
+        innerwarden_core::event::Severity::High
+    } else {
+        innerwarden_core::event::Severity::Medium
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_core::event::Severity;
+
+    #[test]
+    fn parse_suppressed_ids_ignores_comments_and_blanks() {
+        // Ensures suppression file parsing keeps only valid incident-id patterns.
+        let parsed = parse_suppressed_ids("# comment\n\nfirmware:trust_degraded\n  hypervisor  \n");
+        assert!(parsed.contains("firmware:trust_degraded"));
+        assert!(parsed.contains("hypervisor"));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn classify_firmware_trust_severity_downgrades_to_info_on_vm() {
+        // Covers VM branch where firmware telemetry is less reliable and should not escalate.
+        assert!(matches!(
+            classify_firmware_trust_severity(0.1, true),
+            Severity::Info
+        ));
+    }
+
+    #[test]
+    fn classify_firmware_trust_severity_uses_score_bands_on_bare_metal() {
+        // Verifies trust-score thresholds map to stable severity levels off-VM.
+        assert!(matches!(
+            classify_firmware_trust_severity(0.2, false),
+            Severity::Critical
+        ));
+        assert!(matches!(
+            classify_firmware_trust_severity(0.5, false),
+            Severity::High
+        ));
+        assert!(matches!(
+            classify_firmware_trust_severity(0.8, false),
+            Severity::Medium
+        ));
+    }
+
+    #[test]
+    fn should_skip_vm_trust_incident_only_for_vm_info_cases() {
+        // Guards skip logic so only VM + Info combinations suppress trust incidents.
+        assert!(should_skip_vm_trust_incident(true, &Severity::Info));
+        assert!(!should_skip_vm_trust_incident(false, &Severity::Info));
+        assert!(!should_skip_vm_trust_incident(true, &Severity::High));
+    }
+
+    #[test]
+    fn classify_correlated_threat_severity_follows_confidence_thresholds() {
+        // Confirms correlated threat confidence translates to deterministic severity bands.
+        assert!(matches!(
+            classify_correlated_threat_severity(0.95),
+            Severity::Critical
+        ));
+        assert!(matches!(
+            classify_correlated_threat_severity(0.75),
+            Severity::High
+        ));
+        assert!(matches!(
+            classify_correlated_threat_severity(0.50),
+            Severity::Medium
+        ));
     }
 }

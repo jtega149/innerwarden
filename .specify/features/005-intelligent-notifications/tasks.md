@@ -53,7 +53,7 @@
 - [x] T014 [US2] Modify `incident_obvious.rs` to signal `auto_resolved = true` back to pipeline group when obvious gate handles incident (+ abuseipdb + crowdsec gates)
 - [x] T015 [US2] Apply channel filter in `incident_notifications.rs` dispatch — skip notification if group doesn't meet channel's `level`
 - [x] T016 [US2] Ensure backward compat: if `level` not set in config, behave like current code (severity threshold only)
-- [ ] T017 [US2] Add `/api/incident-groups` endpoint to `crates/agent/src/dashboard.rs` — list active groups with live counters and status
+- [x] T017 [US2] Add `/api/incident-groups` endpoint to `crates/agent/src/dashboard.rs` — list active groups with live counters and status
 - [x] T018 [US2] Add tests: filter levels (all/actionable/critical/none), actionable classification, backward compat
 
 **Checkpoint**: 90%+ noise reduction achieved. Dashboard full picture. Telegram actionable only.
@@ -100,11 +100,11 @@
 
 **Independent Test**: Add cron job, verify census logs the change.
 
-- [ ] T031 [US5] Implement `run_census()` in `environment_profile.rs` — diff current state vs stored profile
-- [ ] T032 [US5] Write diffs to `census-YYYY-MM-DD.jsonl` in data_dir
-- [ ] T033 [US5] Generate alerts for suspicious changes: new UID (not from package), new cron
-- [ ] T034 [US5] Schedule census tick in `main.rs` slow loop — every `census_interval_hours` (default 6)
-- [ ] T035 [US5] Add tests: diff detection, alert generation for new UID/cron, no alert for removed service
+- [x] T031 [US5] Implement `run_census()` in `environment_profile.rs` — diff current state vs stored profile
+- [x] T032 [US5] Write diffs to `census-YYYY-MM-DD.jsonl` in data_dir
+- [x] T033 [US5] Generate alerts for suspicious changes: new UID (not from package), new cron
+- [x] T034 [US5] Schedule census tick in `main.rs` slow loop — every `census_interval_hours` (default 6)
+- [x] T035 [US5] Add tests: diff detection, alert generation for new UID/cron, no alert for removed service
 
 **Checkpoint**: Continuous environment calibration operational.
 
@@ -116,11 +116,11 @@
 
 **Independent Test**: Ignore 3 notifications of same type, verify 4th auto-demoted.
 
-- [ ] T036 [US6] Track ignored notifications in `notification_pipeline.rs` — no operator tap within 24h
-- [ ] T037 [US6] Implement auto-demotion: after 3 ignored of same detector+entity_type → demote to INFO
-- [ ] T038 [US6] Persist feedback to `notification-feedback.jsonl` in data_dir
-- [ ] T039 [US6] Load feedback at startup, apply demotions to pipeline
-- [ ] T040 [US6] Add tests: ignore tracking, auto-demotion threshold, persistence round-trip, explicit "Not a threat" demotion
+- [x] T036 [US6] Track ignored notifications in `notification_pipeline.rs` — no operator tap within 24h
+- [x] T037 [US6] Implement auto-demotion: after 3 ignored of same detector+entity_type → demote to INFO
+- [x] T038 [US6] Persist feedback to `notification-feedback.jsonl` in data_dir
+- [x] T039 [US6] Load feedback at startup, apply demotions to pipeline
+- [x] T040 [US6] Add tests: ignore tracking, auto-demotion threshold, persistence round-trip, explicit "Not a threat" demotion
 
 **Checkpoint**: Notification quality improves over time with zero operator effort.
 
@@ -132,12 +132,12 @@
 
 **Independent Test**: Enable `batch_triage`, verify 1 API call per window.
 
-- [ ] T041 [US7] Build batch prompt from all groups at end of window in `notification_pipeline.rs`
-- [ ] T042 [US7] Parse AI response (URGENT / INFO / SUPPRESS per group)
-- [ ] T043 [US7] Apply AI classification to drive Telegram notification for ambiguous groups
-- [ ] T044 [US7] Add config: `batch_triage` (default false), `batch_window_secs` (3600) in `config.rs`
-- [ ] T045 [US7] Implement fallback: if API fails, use per-group level classification
-- [ ] T046 [US7] Add tests: prompt formatting, response parsing, fallback behavior
+- [x] T041 [US7] Build batch prompt from all groups at end of window in `notification_pipeline.rs`
+- [x] T042 [US7] Parse AI response (URGENT / INFO / SUPPRESS per group)
+- [x] T043 [US7] Apply AI classification to drive Telegram notification for ambiguous groups
+- [x] T044 [US7] Add config: `batch_triage` (default false), `batch_window_secs` (3600) in `config.rs`
+- [x] T045 [US7] Implement fallback: if API fails, use per-group level classification
+- [x] T046 [US7] Add tests: prompt formatting, response parsing, fallback behavior
 
 **Checkpoint**: AI cost reduced from N calls/window to 1. Optional feature, zero impact if disabled.
 

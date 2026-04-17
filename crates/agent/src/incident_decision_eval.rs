@@ -420,6 +420,7 @@ pub(crate) fn is_brain_agreeing_with_ai(brain_action: &str, ai_action_str: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_is_brain_agreeing_with_ai() {
@@ -437,5 +438,113 @@ mod tests {
             "kill_process",
             "SuspendUserSudo"
         ));
+    }
+
+    #[test]
+    fn build_brain_features_populates_profile_and_detector_signals() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let ip = "8.8.8.8";
+        state.blocklist.insert(ip.to_string());
+        state.last_baseline_anomaly_ts = Some(chrono::Utc::now());
+        state.last_autoencoder_anomaly_ts = Some(chrono::Utc::now());
+
+        let mut profile = crate::attacker_intel::new_profile(ip, chrono::Utc::now());
+        profile.total_incidents = 12;
+        profile.risk_score = 82;
+        profile
+            .detectors_triggered
+            .insert("neural_anomaly".to_string());
+        profile.visit_dates = vec!["2026-04-16".to_string(), "2026-04-17".to_string()];
+        state.attacker_profiles.insert(ip.to_string(), profile);
+
+        let mut local_rep = crate::ip_reputation::LocalIpReputation::new();
+        local_rep.reputation_score = 77.0;
+        state.ip_reputations.insert(ip.to_string(), local_rep);
+
+        let mut incident = crate::tests::test_incident_with_kind(ip, "neural_anomaly");
+        incident.evidence = serde_json::json!([{"maturity": 0.2}]);
+
+        let features = build_brain_features(&incident, &state);
+
+        // High severity
+        assert_eq!(features[2], 1.0);
+        // Profile + IP-dependent features
+        assert!(features[4] > 0.0);
+        assert!(features[5] > 0.8);
+        assert_eq!(features[8], 1.0);
+        assert!(features[9] > 0.7);
+        assert_eq!(features[10], 0.0);
+        // Detector flags
+        assert_eq!(features[23], 1.0);
+        // Recent anomaly markers
+        assert_eq!(features[25], 1.0);
+        assert_eq!(features[26], 1.0);
+        // Neural anomaly + low maturity => likely FP pattern flag
+        assert_eq!(features[29], 1.0);
+    }
+
+    #[test]
+    fn apply_correlation_boost_and_log_decision_enriches_and_persists_brain_log() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.defender_brain = crate::defender_brain::DefenderBrain::load("embedded");
+        state.latest_anomaly_score = Some(0.93);
+
+        let ip = "9.9.9.9";
+        let mut profile = crate::attacker_intel::new_profile(ip, chrono::Utc::now());
+        profile.risk_score = 90;
+        profile.visit_count = 4;
+        profile.dna.pattern_class = "targeted".to_string();
+        state.attacker_profiles.insert(ip.to_string(), profile);
+
+        let mut previous = crate::tests::test_incident_with_kind(ip, "ssh_bruteforce");
+        previous.ts = chrono::Utc::now() - chrono::Duration::minutes(1);
+        state.correlator.observe(&previous);
+
+        let incident = crate::tests::test_incident_with_kind(ip, "port_scan");
+        let mut cfg = config::AgentConfig::default();
+        cfg.correlation.enabled = true;
+
+        let mut decision = ai::AiDecision {
+            action: ai::AiAction::BlockIp {
+                ip: ip.to_string(),
+                skill_id: "block-ip-ufw".to_string(),
+            },
+            confidence: 0.55,
+            auto_execute: true,
+            reason: "base decision".to_string(),
+            alternatives: vec!["monitor".to_string()],
+            estimated_threat: "high".to_string(),
+        };
+
+        apply_correlation_boost_and_log_decision(
+            &incident,
+            &cfg,
+            &mut state,
+            &mut decision,
+            dir.path(),
+        );
+
+        assert!(decision.confidence > 0.55, "confidence should be boosted");
+        assert!(
+            decision.reason.contains("[correlated:")
+                || decision.reason.contains("[intel: risk")
+                || decision.reason.contains("[neural:"),
+            "reason should include enrichment markers"
+        );
+        assert!(
+            !state.brain_history.recent(1).is_empty(),
+            "brain history should receive a log entry"
+        );
+        assert!(dir.path().join("brain-log.json").exists());
+        assert!(
+            state.brain_stats.total_since_retrain > 0,
+            "brain stats should track agreement counters"
+        );
+        assert!(
+            state.latest_anomaly_score.is_none(),
+            "anomaly score should be consumed by decision evaluation"
+        );
     }
 }

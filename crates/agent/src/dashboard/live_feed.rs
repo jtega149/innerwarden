@@ -434,6 +434,10 @@ pub(super) async fn api_live_feed_geoip(Query(query): Query<GeoIpQuery>) -> Json
     let mut results = Vec::new();
     for ip in ips {
         let ip = ip.trim();
+        // ip-api.com free tier returns 403 on HTTPS; HTTPS requires the paid
+        // plan. The IPs queried here are public attacker addresses already
+        // observed on the server's public interfaces, so plaintext transit
+        // adds no material disclosure. See also `crate::geoip`.
         let url = format!(
             "http://ip-api.com/json/{}?fields=status,lat,lon,country",
             ip

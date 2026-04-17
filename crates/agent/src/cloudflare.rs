@@ -15,7 +15,7 @@
 
 use serde::Deserialize;
 use serde_json::json;
-use tracing::warn;
+use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // API response types
@@ -24,13 +24,29 @@ use tracing::warn;
 #[derive(Debug, Deserialize)]
 struct CloudflareResponse {
     success: bool,
+    #[serde(default)]
     result: Option<CloudflareResult>,
+    #[serde(default)]
+    errors: Vec<CloudflareError>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CloudflareResult {
     id: String,
 }
+
+#[derive(Debug, Deserialize)]
+struct CloudflareError {
+    code: i64,
+    #[allow(dead_code)]
+    message: String,
+}
+
+/// Cloudflare API error code for "an access rule with this configuration
+/// already exists" — the IP is already blocked at the edge, so from the
+/// agent's perspective the push succeeded idempotently.
+/// https://developers.cloudflare.com/fundamentals/api/reference/errors/
+const CF_ERROR_DUPLICATE: i64 = 10009;
 
 // ---------------------------------------------------------------------------
 // CloudflareClient
@@ -123,6 +139,13 @@ impl CloudflareClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body_text = resp.text().await.unwrap_or_default();
+            if classify_non_2xx_as_duplicate(&body_text) {
+                debug!(
+                    ip,
+                    status, "Cloudflare push_block: IP already blocked (duplicate rule)"
+                );
+                return None;
+            }
             warn!(
                 ip,
                 status,
@@ -141,12 +164,31 @@ impl CloudflareClient {
         };
 
         if !cf_resp.success {
+            if cf_resp.errors.iter().any(|e| e.code == CF_ERROR_DUPLICATE) {
+                debug!(
+                    ip,
+                    "Cloudflare push_block: IP already blocked (duplicate rule)"
+                );
+                return None;
+            }
             warn!(ip, "Cloudflare push_block: API returned success=false");
             return None;
         }
 
         cf_resp.result.map(|r| r.id)
     }
+}
+
+/// Returns true when the response body indicates the block rule already
+/// exists for this IP. Used on non-2xx responses, where Cloudflare reports
+/// the duplicate as a `400` with a typed error body.
+fn classify_non_2xx_as_duplicate(body: &str) -> bool {
+    // Cheap path: look for the numeric code without full deserialization, so
+    // malformed or unexpected bodies still hit the regular warn path.
+    if let Ok(parsed) = serde_json::from_str::<CloudflareResponse>(body) {
+        return parsed.errors.iter().any(|e| e.code == CF_ERROR_DUPLICATE);
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -213,5 +255,84 @@ mod tests {
         std::env::remove_var("CLOUDFLARE_API_TOKEN");
         let token = resolve_api_token("");
         assert_eq!(token, "");
+    }
+
+    // ── Duplicate rule (error 10009) classification ─────────────────────────
+
+    #[test]
+    fn classify_duplicate_detects_error_10009() {
+        // Verbatim shape returned by Cloudflare when a firewall access rule
+        // for the same IP already exists.
+        let body = r#"{
+            "result": null,
+            "success": false,
+            "errors": [
+                {"code": 10009, "message": "firewallaccessrules.api.duplicate_of_existing"}
+            ],
+            "messages": []
+        }"#;
+        assert!(classify_non_2xx_as_duplicate(body));
+    }
+
+    #[test]
+    fn classify_duplicate_ignores_other_errors() {
+        let body = r#"{
+            "result": null,
+            "success": false,
+            "errors": [{"code": 10000, "message": "authentication error"}]
+        }"#;
+        assert!(!classify_non_2xx_as_duplicate(body));
+    }
+
+    #[test]
+    fn classify_duplicate_ignores_empty_errors() {
+        assert!(!classify_non_2xx_as_duplicate(
+            r#"{"success": false, "errors": []}"#
+        ));
+    }
+
+    #[test]
+    fn classify_duplicate_ignores_malformed_body() {
+        assert!(!classify_non_2xx_as_duplicate("not json at all"));
+        assert!(!classify_non_2xx_as_duplicate(""));
+    }
+
+    #[test]
+    fn classify_duplicate_picks_matching_code_among_many() {
+        let body = r#"{
+            "success": false,
+            "errors": [
+                {"code": 1001, "message": "other"},
+                {"code": 10009, "message": "dup"}
+            ]
+        }"#;
+        assert!(classify_non_2xx_as_duplicate(body));
+    }
+
+    #[test]
+    fn cloudflare_response_deserializes_with_errors_array() {
+        let body = r#"{
+            "success": false,
+            "errors": [{"code": 10009, "message": "dup"}]
+        }"#;
+        let parsed: CloudflareResponse = serde_json::from_str(body).unwrap();
+        assert!(!parsed.success);
+        assert!(parsed.result.is_none());
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].code, CF_ERROR_DUPLICATE);
+    }
+
+    #[test]
+    fn cloudflare_response_deserializes_success_without_errors_field() {
+        // Successful creation response has no `errors` key at all — default
+        // handling must produce an empty vec so the deserializer succeeds.
+        let body = r#"{
+            "success": true,
+            "result": {"id": "abc123"}
+        }"#;
+        let parsed: CloudflareResponse = serde_json::from_str(body).unwrap();
+        assert!(parsed.success);
+        assert_eq!(parsed.result.unwrap().id, "abc123");
+        assert!(parsed.errors.is_empty());
     }
 }

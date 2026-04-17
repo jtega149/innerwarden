@@ -2546,6 +2546,8 @@ mod tests {
             decisions_by_action,
             dry_run_execution_count: 3,
             real_execution_count: 0,
+            gate_suppressed_total: 0,
+            telegram_sent_count: 0,
         };
         fs::write(
             dir.path().join(format!("telemetry-{date}.jsonl")),

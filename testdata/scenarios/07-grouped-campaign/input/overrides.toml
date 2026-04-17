@@ -1,0 +1,27 @@
+# Spec 024 Phase C — grouped-campaign scenario (spec 005 acceptance).
+#
+# 100 ssh.login_failed events from the same IP inside an 18-minute span.
+# The sensor's ssh_bruteforce detector runs with a 10-second dedup
+# window so each event that follows a gate-crossing gap re-alerts; the
+# result is many individual incidents which the agent's GroupingEngine
+# merges into exactly 1 grouped telegram summary.
+#
+# Harness caveat: `innerwarden-agent --once` does not spin the slow
+# loop, so GroupingEngine::tick is never invoked and the grouped
+# summary is not dispatched during the scenario run. Envelope stays
+# WIP until the harness grows a continuous-mode runner. The fixture
+# and expected.json capture the target behaviour so a future harness
+# revision (or a real production scrape) can tighten the envelope in
+# one edit.
+
+[sensor.agent]
+host_id = "scen-07-grouped-campaign"
+
+[sensor.collectors.auth_log]
+enabled = true
+path = "{{AUTH_LOG}}"
+
+[sensor.detectors.ssh_bruteforce]
+enabled = true
+threshold = 5
+window_seconds = 10

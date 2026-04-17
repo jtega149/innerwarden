@@ -387,6 +387,190 @@ impl KnowledgeGraph {
 
         signals
     }
+
+    // ─── Spec 025 — structured subgraph for LLM prompts ─────────────────
+    //
+    // Returns the same neighbourhood as `attack_narrative`, but as a
+    // compact JSON payload the LLM can reason over directly instead of
+    // re-deriving structure from prose. Measured delta on qwen2.5:3b:
+    // action accuracy 53% → 73%, target hallucination 47% → 7%
+    // (see `.specify/features/025-structured-ai-prompt/spec.md`).
+    //
+    // Output shape:
+    //   { nodes: [ { id, type, label, ...selected_fields } ],
+    //     edges: [ { from, to, rel, ts } ],
+    //     truncated: bool }
+    //
+    // Design notes:
+    // - The node projection drops bulky optional fields (datasets, tags,
+    //   properties) — only the IDs + type + label + the few typed
+    //   attributes that drive decisions (ip addr, pid, comm, severity).
+    // - Cap at 40 nodes to keep the prompt manageable on small local
+    //   models (qwen2.5:1.5b struggles above ~3k tokens). When the BFS
+    //   returns more, we keep the centre + its most connected neighbours
+    //   and emit `truncated: true` so the model knows context is partial.
+    // - Edge timestamps are RFC3339 so the model can reason about ordering
+    //   without having to parse weird formats.
+    pub fn attack_subgraph_json(&self, center: NodeId, depth: usize) -> serde_json::Value {
+        const MAX_NODES: usize = 40;
+
+        let sub = self.neighborhood(center, depth);
+        let full_node_count = sub.nodes.len();
+
+        // Rank nodes by edge count so we keep the most connected ones when
+        // truncating. Always keep the centre.
+        let mut node_ids: Vec<NodeId> = sub.nodes.keys().copied().collect();
+        if full_node_count > MAX_NODES {
+            let mut degree: std::collections::HashMap<NodeId, usize> =
+                std::collections::HashMap::new();
+            for edge in &sub.edges {
+                *degree.entry(edge.from).or_insert(0) += 1;
+                *degree.entry(edge.to).or_insert(0) += 1;
+            }
+            node_ids.sort_by(|a, b| {
+                // Centre always first, then by descending degree.
+                if *a == center {
+                    return std::cmp::Ordering::Less;
+                }
+                if *b == center {
+                    return std::cmp::Ordering::Greater;
+                }
+                degree
+                    .get(b)
+                    .copied()
+                    .unwrap_or(0)
+                    .cmp(&degree.get(a).copied().unwrap_or(0))
+            });
+            node_ids.truncate(MAX_NODES);
+        }
+
+        let kept: std::collections::HashSet<NodeId> = node_ids.iter().copied().collect();
+
+        let node_payload: Vec<serde_json::Value> = node_ids
+            .iter()
+            .filter_map(|id| sub.nodes.get(id).map(|n| project_node(*id, n)))
+            .collect();
+
+        // Only keep edges whose endpoints both survived truncation so the
+        // LLM never references a dangling id.
+        let edge_payload: Vec<serde_json::Value> = sub
+            .edges
+            .iter()
+            .filter(|e| kept.contains(&e.from) && kept.contains(&e.to))
+            .map(|e| {
+                serde_json::json!({
+                    "from": e.from,
+                    "to": e.to,
+                    "rel": format!("{:?}", e.relation),
+                    "ts": e.ts.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "center": center,
+            "nodes": node_payload,
+            "edges": edge_payload,
+            "truncated": full_node_count > MAX_NODES,
+            "full_node_count": full_node_count,
+        })
+    }
+}
+
+/// Project a single `Node` into a compact `{id, type, label, ...}` JSON value
+/// that the LLM can consume without re-deriving structure from prose.
+fn project_node(id: NodeId, node: &Node) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "id": id,
+        "type": format!("{:?}", node.node_type()),
+        "label": node.label(),
+    });
+    let obj = out.as_object_mut().expect("json object");
+    match node {
+        Node::Ip {
+            addr,
+            is_tor,
+            risk_score,
+            datasets,
+            ..
+        } => {
+            obj.insert("addr".into(), serde_json::Value::String(addr.clone()));
+            if *is_tor {
+                obj.insert("is_tor".into(), serde_json::Value::Bool(true));
+            }
+            if *risk_score > 0 {
+                obj.insert("risk_score".into(), serde_json::json!(*risk_score));
+            }
+            if !datasets.is_empty() {
+                obj.insert(
+                    "threat_intel".into(),
+                    serde_json::Value::Array(
+                        datasets
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+        }
+        Node::Process { pid, comm, uid, .. } => {
+            obj.insert("pid".into(), serde_json::json!(*pid));
+            obj.insert("comm".into(), serde_json::Value::String(comm.clone()));
+            obj.insert("uid".into(), serde_json::json!(*uid));
+        }
+        Node::File { path, .. } => {
+            obj.insert("path".into(), serde_json::Value::String(path.clone()));
+        }
+        Node::User { name, uid, .. } => {
+            obj.insert("name".into(), serde_json::Value::String(name.clone()));
+            if let Some(uid) = uid {
+                obj.insert("uid".into(), serde_json::json!(*uid));
+            }
+        }
+        Node::Incident {
+            incident_id,
+            severity,
+            detector,
+            decision,
+            auto_executed,
+            ..
+        } => {
+            obj.insert(
+                "incident_id".into(),
+                serde_json::Value::String(incident_id.clone()),
+            );
+            obj.insert(
+                "severity".into(),
+                serde_json::Value::String(severity.clone()),
+            );
+            obj.insert(
+                "detector".into(),
+                serde_json::Value::String(detector.clone()),
+            );
+            if let Some(dec) = decision {
+                obj.insert("decision".into(), serde_json::Value::String(dec.clone()));
+                obj.insert(
+                    "auto_executed".into(),
+                    serde_json::Value::Bool(*auto_executed),
+                );
+            }
+        }
+        Node::Port {
+            number, protocol, ..
+        } => {
+            obj.insert("port".into(), serde_json::json!(*number));
+            obj.insert(
+                "protocol".into(),
+                serde_json::Value::String(protocol.clone()),
+            );
+        }
+        Node::Domain { name, .. } => {
+            obj.insert("name".into(), serde_json::Value::String(name.clone()));
+        }
+        _ => {}
+    }
+    out
 }
 
 #[cfg(test)]
@@ -459,5 +643,191 @@ mod tests {
         let signal_names: Vec<&str> = signals.iter().map(|(n, _)| n.as_str()).collect();
         assert!(signal_names.contains(&"deep_process_chain"));
         assert!(signal_names.contains(&"persistence_detected"));
+    }
+
+    // ─── Spec 025 — attack_subgraph_json tests ─────────────────────────
+
+    #[test]
+    fn subgraph_empty_center_returns_stable_shape() {
+        let g = KnowledgeGraph::new();
+        // u64::MAX cannot exist — simulate a missing centre.
+        let missing: NodeId = u64::MAX;
+        let out = g.attack_subgraph_json(missing, 3);
+        assert_eq!(out["center"].as_u64(), Some(u64::MAX));
+        assert_eq!(out["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(out["edges"].as_array().unwrap().len(), 0);
+        assert_eq!(out["truncated"].as_bool(), Some(false));
+        assert_eq!(out["full_node_count"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn subgraph_depth_zero_returns_only_center() {
+        let mut g = KnowledgeGraph::new();
+        let proc_id = g.ensure_process(1234, 1, "payload", 0, ts(0));
+        let ip = g.ensure_ip("93.1.1.1", ts(0));
+        g.add_edge(Edge::new(proc_id, ip, Relation::ConnectedTo, ts(1)));
+
+        let out = g.attack_subgraph_json(proc_id, 0);
+        let nodes = out["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["id"].as_u64(), Some(proc_id));
+        assert_eq!(nodes[0]["type"], "Process");
+        // depth=0: no edges followed
+        assert_eq!(out["edges"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn subgraph_projects_known_node_types_with_typed_fields() {
+        let mut g = KnowledgeGraph::new();
+        let proc_id = g.ensure_process(1234, 1, "payload", 100, ts(0));
+        let ip = g.ensure_ip("93.1.1.1", ts(0));
+        let file = g.ensure_file("/etc/cron.d/backdoor");
+
+        g.add_edge(Edge::new(proc_id, ip, Relation::ConnectedTo, ts(1)));
+        g.add_edge(Edge::new(proc_id, file, Relation::Wrote, ts(2)));
+
+        let out = g.attack_subgraph_json(proc_id, 2);
+        let nodes = out["nodes"].as_array().unwrap();
+
+        let proc_node = nodes
+            .iter()
+            .find(|n| n["type"] == "Process")
+            .expect("process node present");
+        assert_eq!(proc_node["pid"].as_u64(), Some(1234));
+        assert_eq!(proc_node["comm"], "payload");
+        assert_eq!(proc_node["uid"].as_u64(), Some(100));
+
+        let ip_node = nodes
+            .iter()
+            .find(|n| n["type"] == "Ip")
+            .expect("ip node present");
+        assert_eq!(ip_node["addr"], "93.1.1.1");
+
+        let file_node = nodes
+            .iter()
+            .find(|n| n["type"] == "File")
+            .expect("file node present");
+        assert_eq!(file_node["path"], "/etc/cron.d/backdoor");
+    }
+
+    #[test]
+    fn subgraph_edges_carry_relation_and_timestamp() {
+        let mut g = KnowledgeGraph::new();
+        let proc_id = g.ensure_process(1234, 1, "payload", 0, ts(0));
+        let ip = g.ensure_ip("93.1.1.1", ts(0));
+        g.add_edge(Edge::new(proc_id, ip, Relation::ConnectedTo, ts(10)));
+
+        let out = g.attack_subgraph_json(proc_id, 2);
+        let edges = out["edges"].as_array().unwrap();
+        assert!(!edges.is_empty());
+        let edge = &edges[0];
+        assert_eq!(edge["rel"], "ConnectedTo");
+        assert!(edge["ts"].as_str().unwrap().starts_with("2023-"));
+    }
+
+    #[test]
+    fn subgraph_ip_threat_intel_fields_present_when_populated() {
+        let mut g = KnowledgeGraph::new();
+        let ip = g.ensure_ip("93.1.1.1", ts(0));
+        // Mutate the node after insertion to set threat-intel state.
+        if let Some(Node::Ip {
+            datasets,
+            is_tor,
+            risk_score,
+            ..
+        }) = g.nodes.get_mut(&ip)
+        {
+            datasets.push("spamhaus_drop".to_string());
+            *is_tor = true;
+            *risk_score = 95;
+        }
+
+        let out = g.attack_subgraph_json(ip, 0);
+        let ip_node = &out["nodes"][0];
+        assert_eq!(ip_node["is_tor"], true);
+        assert_eq!(ip_node["risk_score"], 95);
+        assert_eq!(ip_node["threat_intel"][0], "spamhaus_drop");
+    }
+
+    #[test]
+    fn subgraph_truncates_when_neighbourhood_exceeds_cap() {
+        let mut g = KnowledgeGraph::new();
+        let center = g.ensure_process(1000, 1, "hub", 0, ts(0));
+        // 60 distinct IP nodes all connected to the centre -> triggers the cap.
+        for i in 0..60 {
+            let ip = g.ensure_ip(&format!("10.0.0.{}", i), ts(0));
+            g.add_edge(Edge::new(center, ip, Relation::ConnectedTo, ts(i)));
+        }
+        let out = g.attack_subgraph_json(center, 3);
+        let nodes = out["nodes"].as_array().unwrap();
+        assert_eq!(out["truncated"].as_bool(), Some(true));
+        assert_eq!(nodes.len(), 40);
+        assert_eq!(
+            nodes[0]["id"].as_u64(),
+            Some(center),
+            "centre must survive truncation"
+        );
+        // No dangling edges — every edge endpoint exists in the node list.
+        let kept: std::collections::HashSet<u64> =
+            nodes.iter().map(|n| n["id"].as_u64().unwrap()).collect();
+        for edge in out["edges"].as_array().unwrap() {
+            assert!(kept.contains(&edge["from"].as_u64().unwrap()));
+            assert!(kept.contains(&edge["to"].as_u64().unwrap()));
+        }
+    }
+
+    #[test]
+    fn subgraph_incident_projects_decision_and_severity() {
+        use innerwarden_core::{entities::EntityRef, event::Severity, incident::Incident};
+        let mut g = KnowledgeGraph::new();
+        let incident = Incident {
+            ts: ts(0),
+            host: "test".into(),
+            incident_id: "ssh_bruteforce:93.1.1.1:test".into(),
+            severity: Severity::High,
+            title: "SSH brute force".into(),
+            summary: "many failed logins".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("93.1.1.1")],
+        };
+        g.ingest_incident(&incident);
+        let inc = g.find_by_incident(&incident.incident_id).unwrap();
+        g.ingest_decision(
+            &incident.incident_id,
+            "block_ip",
+            Some("93.1.1.1"),
+            0.95,
+            "auto-rule",
+            true,
+            ts(0),
+        );
+
+        let out = g.attack_subgraph_json(inc, 2);
+        let inc_node = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "Incident")
+            .expect("incident node present");
+        assert_eq!(inc_node["severity"], "High");
+        assert_eq!(inc_node["detector"], "ssh_bruteforce");
+        assert_eq!(inc_node["decision"], "block_ip");
+        assert_eq!(inc_node["auto_executed"], true);
+    }
+
+    #[test]
+    fn subgraph_full_node_count_reflects_pre_truncation_size() {
+        let mut g = KnowledgeGraph::new();
+        let center = g.ensure_process(1000, 1, "hub", 0, ts(0));
+        for i in 0..5 {
+            let ip = g.ensure_ip(&format!("10.0.0.{}", i), ts(0));
+            g.add_edge(Edge::new(center, ip, Relation::ConnectedTo, ts(i)));
+        }
+        let out = g.attack_subgraph_json(center, 3);
+        // 1 centre + 5 IPs = 6
+        assert_eq!(out["full_node_count"].as_u64(), Some(6));
+        assert_eq!(out["truncated"].as_bool(), Some(false));
     }
 }

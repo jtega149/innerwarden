@@ -1044,6 +1044,17 @@ fn tg_reply(state: &AgentState, text: impl Into<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn cmd(id: &str) -> telegram::ApprovalResult {
+        telegram::ApprovalResult {
+            incident_id: id.to_string(),
+            approved: true,
+            operator_name: "operator".to_string(),
+            always: false,
+            chosen_action: String::new(),
+        }
+    }
 
     #[test]
     fn test_strip_ansi() {
@@ -1101,5 +1112,78 @@ mod tests {
         let s = serde_json::to_string(&kb).unwrap();
         assert!(s.contains("menu:status"));
         assert!(!s.contains("enable:ai"));
+    }
+
+    #[tokio::test]
+    async fn handle_common_commands_returns_true() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.blocklist.insert("203.0.113.90".to_string());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+        cfg.telegram.user_profile = "simple".to_string();
+
+        let commands = [
+            "__status__",
+            "__help__",
+            "__threats__",
+            "__decisions__",
+            "__menu__",
+            "__guard__",
+            "__watch__",
+            "__blocked__",
+            "__unknown_cmd__",
+            "__capabilities__",
+            "__start__",
+            "__enable2fa__",
+        ];
+        for id in commands {
+            let handled = handle_telegram_bot_command(&cmd(id), dir.path(), &cfg, &mut state).await;
+            assert!(handled, "command {id} should be handled");
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_toggle_and_callback_commands_returns_true() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+
+        let commands = [
+            "__sensitivity__:quiet",
+            "__profile__:technical",
+            "__doctor__",
+            "__enable__:ai --param provider=openai",
+            "__disable__:ai",
+            "enable:ai",
+            "__undo__:ip:198.51.100.20",
+            "__autofp__:no:curl",
+            "__autofp__:yes:proc:curl",
+        ];
+        for id in commands {
+            let handled = handle_telegram_bot_command(&cmd(id), dir.path(), &cfg, &mut state).await;
+            assert!(handled, "command {id} should be handled");
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_ask_and_unknown_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+
+        let handled_ask = handle_telegram_bot_command(
+            &cmd("__ask__:what happened?"),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+        let handled_no_match =
+            handle_telegram_bot_command(&cmd("not-a-command"), dir.path(), &cfg, &mut state).await;
+        assert!(handled_ask);
+        assert!(!handled_no_match);
     }
 }

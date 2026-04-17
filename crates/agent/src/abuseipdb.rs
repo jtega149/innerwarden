@@ -266,6 +266,8 @@ mod tests {
 
     #[test]
     fn deserializes_check_response() {
+        // Parse path: canonical AbuseIPDB responses should deserialize all
+        // context fields used in enrichment and reporting.
         let json = r#"{
             "data": {
                 "ipAddress": "1.2.3.4",
@@ -294,6 +296,8 @@ mod tests {
 
     #[test]
     fn deserializes_tor_node() {
+        // Tor-path parsing: tor exit-node responses should preserve both
+        // confidence and `isTor` flags.
         let json = r#"{
             "data": {
                 "ipAddress": "10.0.0.1",
@@ -313,6 +317,8 @@ mod tests {
 
     #[test]
     fn context_line_format() {
+        // Formatting path: context summary should include core score/volume
+        // fields and optional geo/provider annotations.
         let rep = IpReputation {
             confidence_score: 75,
             total_reports: 100,
@@ -330,6 +336,7 @@ mod tests {
 
     #[test]
     fn context_line_tor_flag() {
+        // Flag path: Tor reputations should append an explicit marker.
         let rep = IpReputation {
             confidence_score: 100,
             total_reports: 999,
@@ -344,12 +351,14 @@ mod tests {
 
     #[test]
     fn not_configured_when_empty_key() {
+        // Config path: empty API key should mark client as unconfigured.
         let client = AbuseIpDbClient::new(String::new(), 30);
         assert!(!client.is_configured());
     }
 
     #[test]
     fn resolve_api_key_prefers_config() {
+        // Resolution path: explicit config values should override env lookup.
         // When config key is non-empty, use it
         let key = resolve_api_key("mykey123");
         assert_eq!(key, "mykey123");
@@ -357,12 +366,15 @@ mod tests {
 
     #[test]
     fn detector_categories_ssh() {
+        // Category mapping path: SSH-related detectors should map to brute
+        // force and SSH category IDs.
         assert_eq!(detector_to_categories("ssh_bruteforce"), "18,22");
         assert_eq!(detector_to_categories("credential_stuffing"), "18,22");
     }
 
     #[test]
     fn detector_categories_scan() {
+        // Category mapping path: scan detectors should map to scan/web IDs.
         assert_eq!(detector_to_categories("port_scan"), "14");
         assert_eq!(detector_to_categories("web_scan"), "21");
         assert_eq!(detector_to_categories("scanner_ua"), "21");
@@ -370,11 +382,14 @@ mod tests {
 
     #[test]
     fn detector_categories_fallback() {
+        // Fallback path: unknown detectors should map to generic hacking.
         assert_eq!(detector_to_categories("unknown_detector"), "15");
     }
 
     #[test]
     fn report_request_serializes() {
+        // Request-shape path: report payload should serialize with expected
+        // top-level keys for AbuseIPDB submission.
         let req = ReportRequest {
             ip: "1.2.3.4".to_string(),
             categories: "18,22".to_string(),
@@ -383,5 +398,14 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"ip\":\"1.2.3.4\""));
         assert!(json.contains("\"categories\":\"18,22\""));
+    }
+
+    #[test]
+    fn detector_categories_cover_execution_and_search_abuse() {
+        // Mapping path: execution and search-abuse detectors should keep their
+        // expected AbuseIPDB category identifiers.
+        assert_eq!(detector_to_categories("execution_guard"), "15");
+        assert_eq!(detector_to_categories("search_abuse"), "21");
+        assert_eq!(detector_to_categories("sudo_abuse"), "15");
     }
 }

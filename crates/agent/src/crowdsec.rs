@@ -287,33 +287,67 @@ mod tests {
 
     #[test]
     fn parse_stream_response() {
+        // Decode path: stream payloads should deserialize both additions and
+        // removals so sync diffing can operate deterministically.
         let raw = r#"{"new":[{"id":1,"origin":"CAPI","type":"ban","scope":"ip","value":"1.2.3.4","duration":"86399s"}],"deleted":[{"id":2,"origin":"CAPI","type":"ban","scope":"ip","value":"5.6.7.8","duration":"0s"}]}"#;
-        let stream: StreamResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(stream.new.as_ref().unwrap().len(), 1);
-        assert_eq!(stream.new.as_ref().unwrap()[0].value, "1.2.3.4");
-        assert_eq!(stream.deleted.as_ref().unwrap().len(), 1);
-        assert_eq!(stream.deleted.as_ref().unwrap()[0].value, "5.6.7.8");
+        let stream: StreamResponse =
+            serde_json::from_str(raw).expect("stream response should deserialize");
+        assert_eq!(
+            stream
+                .new
+                .as_ref()
+                .expect("new list should be present")
+                .len(),
+            1
+        );
+        assert_eq!(
+            stream.new.as_ref().expect("new list should be present")[0].value,
+            "1.2.3.4"
+        );
+        assert_eq!(
+            stream
+                .deleted
+                .as_ref()
+                .expect("deleted list should be present")
+                .len(),
+            1
+        );
+        assert_eq!(
+            stream
+                .deleted
+                .as_ref()
+                .expect("deleted list should be present")[0]
+                .value,
+            "5.6.7.8"
+        );
     }
 
     #[test]
     fn parse_null_response() {
+        // Edge path: upstream may return literal "null" and callers should
+        // treat it as an empty incremental update.
         let text = "null";
         assert!(text.trim() == "null");
     }
 
     #[test]
     fn parse_empty_stream() {
+        // Empty path: explicit null lists should decode without panics and
+        // represent a no-op sync response.
         let raw = r#"{"new":null,"deleted":null}"#;
-        let stream: StreamResponse = serde_json::from_str(raw).unwrap();
+        let stream: StreamResponse =
+            serde_json::from_str(raw).expect("empty stream should deserialize");
         assert!(stream.new.is_none());
         assert!(stream.deleted.is_none());
     }
 
     #[test]
     fn skips_simulated_decisions() {
+        // Filter path: simulated decisions must never enter the blocklist.
         let raw = r#"{"new":[{"id":1,"origin":"CAPI","type":"ban","scope":"ip","value":"1.2.3.4","duration":"3600s","simulated":true}]}"#;
-        let stream: StreamResponse = serde_json::from_str(raw).unwrap();
-        let new = stream.new.unwrap();
+        let stream: StreamResponse =
+            serde_json::from_str(raw).expect("stream response should deserialize");
+        let new = stream.new.expect("new list should be present");
         // Simulated should be filtered by extract_ips
         let filtered: Vec<String> = new
             .into_iter()
@@ -325,17 +359,50 @@ mod tests {
 
     #[test]
     fn private_ip_is_filtered() {
-        assert!(is_private_or_loopback("192.168.1.1".parse().unwrap()));
-        assert!(is_private_or_loopback("127.0.0.1".parse().unwrap()));
-        assert!(!is_private_or_loopback("1.2.3.4".parse().unwrap()));
+        // Guard path: private/loopback ranges must be ignored during threat
+        // list sync to prevent internal addresses from being blocked.
+        assert!(is_private_or_loopback(
+            "192.168.1.1".parse().expect("valid IPv4 should parse")
+        ));
+        assert!(is_private_or_loopback(
+            "127.0.0.1".parse().expect("valid IPv4 should parse")
+        ));
+        assert!(!is_private_or_loopback(
+            "1.2.3.4".parse().expect("valid IPv4 should parse")
+        ));
     }
 
     #[test]
     fn threat_list_lookup() {
+        // Lookup path: threat list membership checks should behave exactly as
+        // a set with constant-time positive and negative queries.
         let mut list = HashSet::new();
         list.insert("1.2.3.4".to_string());
         list.insert("5.6.7.8".to_string());
         assert!(list.contains("1.2.3.4"));
         assert!(!list.contains("9.9.9.9"));
+    }
+
+    #[test]
+    fn ipv6_loopback_and_unspecified_are_filtered() {
+        // IPv6 path: local-address equivalents should be filtered just like
+        // private IPv4 addresses.
+        assert!(is_private_or_loopback(
+            "::1".parse().expect("valid IPv6 loopback should parse")
+        ));
+        assert!(is_private_or_loopback(
+            "::".parse().expect("valid IPv6 unspecified should parse")
+        ));
+    }
+
+    #[test]
+    fn ipv6_global_address_is_not_filtered() {
+        // Global path: routable IPv6 addresses should remain eligible for
+        // threat-list insertion.
+        assert!(!is_private_or_loopback(
+            "2001:4860:4860::8888"
+                .parse()
+                .expect("valid global IPv6 should parse")
+        ));
     }
 }

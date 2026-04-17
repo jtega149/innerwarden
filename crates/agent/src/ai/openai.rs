@@ -30,6 +30,7 @@ fn uses_new_token_param(model: &str) -> bool {
 }
 
 impl OpenAiProvider {
+    #[allow(dead_code)] // Used when provider = "openai" (matched explicitly in factory)
     pub fn new(api_key: String, model: String) -> Self {
         Self::with_base_url(api_key, model, "https://api.openai.com".to_string())
     }
@@ -309,11 +310,21 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
         .map(|g| format!("\nIP GEOLOCATION:\n{}", g.as_context_line()))
         .unwrap_or_default();
 
-    let graph_section = ctx
-        .graph_context
-        .as_ref()
-        .map(|gc| format!("\n{gc}\n"))
-        .unwrap_or_default();
+    // Spec 025: prefer the structured JSON subgraph when available —
+    // qwen2.5:3b gained +20 pp action accuracy on the ai-grounding
+    // benchmark when the prompt carried `{nodes, edges}` JSON instead of
+    // the prose narrative. Fall back to the prose `graph_context` when
+    // the subgraph field is absent so providers without the new wiring
+    // still work.
+    let graph_section = if let Some(subgraph) = ctx.graph_subgraph.as_ref() {
+        let json = serde_json::to_string_pretty(subgraph).unwrap_or_else(|_| "{}".to_string());
+        format!("\nGRAPH_SUBGRAPH (JSON — cite `nodes[].id` when reasoning):\n{json}\n")
+    } else {
+        ctx.graph_context
+            .as_ref()
+            .map(|gc| format!("\n{gc}\n"))
+            .unwrap_or_default()
+    };
 
     format!(
         r#"Analyze this security incident and decide on a response.
@@ -688,5 +699,87 @@ mod tests {
 
         let d = parse_decision(json).unwrap();
         assert!(matches!(d.action, AiAction::Ignore { .. }));
+    }
+
+    // ─── Spec 025 — build_prompt graph section ─────────────────────────
+
+    fn spec025_incident() -> innerwarden_core::incident::Incident {
+        use innerwarden_core::{entities::EntityRef, event::Severity, incident::Incident};
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "test".into(),
+            incident_id: "ssh_bruteforce:1.2.3.4:test".into(),
+            severity: Severity::High,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("1.2.3.4")],
+        }
+    }
+
+    fn spec025_ctx<'a>(
+        incident: &'a innerwarden_core::incident::Incident,
+        graph_context: Option<String>,
+        graph_subgraph: Option<serde_json::Value>,
+    ) -> DecisionContext<'a> {
+        DecisionContext {
+            incident,
+            recent_events: vec![],
+            related_incidents: vec![],
+            already_blocked: vec![],
+            available_skills: vec![],
+            ip_reputation: None,
+            ip_geo: None,
+            graph_context,
+            graph_subgraph,
+        }
+    }
+
+    #[test]
+    fn build_prompt_prefers_graph_subgraph_when_present() {
+        let inc = spec025_incident();
+        let subgraph = serde_json::json!({
+            "center": 42,
+            "nodes": [{"id": 42, "type": "Ip", "label": "1.2.3.4", "addr": "1.2.3.4"}],
+            "edges": [],
+            "truncated": false,
+            "full_node_count": 1
+        });
+        let prose = "ATTACK CONTEXT (prose fallback)".to_string();
+        let ctx = spec025_ctx(&inc, Some(prose), Some(subgraph));
+        let prompt = build_prompt(&ctx);
+        assert!(
+            prompt.contains("GRAPH_SUBGRAPH"),
+            "prompt must emit GRAPH_SUBGRAPH block"
+        );
+        assert!(
+            prompt.contains("\"addr\": \"1.2.3.4\""),
+            "subgraph JSON must be embedded as text"
+        );
+        assert!(
+            !prompt.contains("ATTACK CONTEXT (prose fallback)"),
+            "prose fallback must not be emitted when subgraph is present"
+        );
+    }
+
+    #[test]
+    fn build_prompt_falls_back_to_prose_when_subgraph_missing() {
+        let inc = spec025_incident();
+        let prose = "ATTACK CONTEXT: timeline + risk indicators".to_string();
+        let ctx = spec025_ctx(&inc, Some(prose), None);
+        let prompt = build_prompt(&ctx);
+        assert!(!prompt.contains("GRAPH_SUBGRAPH"));
+        assert!(prompt.contains("ATTACK CONTEXT: timeline + risk indicators"));
+    }
+
+    #[test]
+    fn build_prompt_no_graph_section_when_both_absent() {
+        let inc = spec025_incident();
+        let ctx = spec025_ctx(&inc, None, None);
+        let prompt = build_prompt(&ctx);
+        assert!(!prompt.contains("GRAPH_SUBGRAPH"));
+        assert!(!prompt.contains("ATTACK CONTEXT"));
     }
 }

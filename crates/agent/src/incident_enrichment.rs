@@ -315,6 +315,7 @@ pub(crate) fn is_ip_eligible_for_external_enrichment(ip: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_is_ip_eligible_for_external_enrichment() {
@@ -338,5 +339,122 @@ mod tests {
         assert!(!is_ip_eligible_for_external_enrichment("not_an_ip"));
         assert!(!is_ip_eligible_for_external_enrichment(""));
         assert!(!is_ip_eligible_for_external_enrichment("256.256.256.256"));
+    }
+
+    #[test]
+    fn enrich_attacker_identity_creates_missing_profile() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let incident = crate::tests::test_incident("203.0.113.55");
+        let geo = geoip::GeoInfo {
+            country: "United Kingdom".to_string(),
+            country_code: "GB".to_string(),
+            city: "London".to_string(),
+            isp: "Example ISP".to_string(),
+            asn: "AS64500 Example".to_string(),
+        };
+        let reputation = abuseipdb::IpReputation {
+            confidence_score: 88,
+            total_reports: 17,
+            distinct_users: 9,
+            country_code: Some("GB".to_string()),
+            isp: Some("Example ISP".to_string()),
+            is_tor: false,
+        };
+
+        enrich_attacker_identity(&incident, &mut state, Some(&geo), Some(&reputation));
+
+        let profile = state
+            .attacker_profiles
+            .get("203.0.113.55")
+            .expect("profile should exist");
+        assert!(profile.geo.is_some());
+        assert_eq!(profile.abuseipdb_score, Some(88));
+    }
+
+    #[tokio::test]
+    async fn backfill_enrichment_uses_cached_geo_and_abuse_entries() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        state.sqlite_store = Some(store.clone());
+        state.abuseipdb = Some(abuseipdb::AbuseIpDbClient::new(String::new(), 30));
+        let ip = "8.8.8.8";
+        state.attacker_profiles.insert(
+            ip.to_string(),
+            attacker_intel::new_profile(ip, chrono::Utc::now()),
+        );
+
+        let cached_geo = geoip::GeoInfo {
+            country: "Brazil".to_string(),
+            country_code: "BR".to_string(),
+            city: "Sao Paulo".to_string(),
+            isp: "Unit Test ISP".to_string(),
+            asn: "AS64510 UnitTest".to_string(),
+        };
+        let cached_abuse = abuseipdb::IpReputation {
+            confidence_score: 64,
+            total_reports: 12,
+            distinct_users: 4,
+            country_code: Some("BR".to_string()),
+            isp: Some("Unit Test ISP".to_string()),
+            is_tor: false,
+        };
+        let geo_json = serde_json::to_string(&cached_geo).expect("geo json");
+        let abuse_json = serde_json::to_string(&cached_abuse).expect("abuse json");
+        store
+            .kv_set_with_expiry(
+                GEOIP_CACHE_NS,
+                ip,
+                geo_json.as_bytes(),
+                Some(&(chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()),
+            )
+            .expect("set geo cache");
+        store
+            .kv_set_with_expiry(
+                ABUSEIPDB_CACHE_NS,
+                ip,
+                abuse_json.as_bytes(),
+                Some(&(chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()),
+            )
+            .expect("set abuse cache");
+
+        backfill_enrichment(&mut state).await;
+
+        let profile = state.attacker_profiles.get(ip).expect("profile updated");
+        assert!(profile.geo.is_some());
+        assert_eq!(profile.abuseipdb_score, Some(64));
+    }
+
+    #[tokio::test]
+    async fn backfill_enrichment_respects_daily_abuseipdb_limit() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let key = format!("abuseipdb_daily_{today}");
+        store
+            .kv_set(
+                ABUSEIPDB_LIMITS_NS,
+                &key,
+                ABUSEIPDB_DAILY_LIMIT.to_string().as_bytes(),
+            )
+            .expect("set daily counter");
+        state.sqlite_store = Some(store);
+        state.abuseipdb = Some(abuseipdb::AbuseIpDbClient::new(String::new(), 30));
+        let ip = "203.0.113.80";
+        state.attacker_profiles.insert(
+            ip.to_string(),
+            attacker_intel::new_profile(ip, chrono::Utc::now()),
+        );
+
+        backfill_enrichment(&mut state).await;
+
+        let profile = state.attacker_profiles.get(ip).expect("profile exists");
+        assert!(profile.geo.is_none());
+        assert!(profile.abuseipdb_score.is_none());
     }
 }

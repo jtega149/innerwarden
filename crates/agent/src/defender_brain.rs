@@ -782,6 +782,7 @@ mod tests {
 
     #[test]
     fn empty_brain_returns_none() {
+        // Baseline path: unloaded brains should refuse to suggest actions.
         let brain = DefenderBrain::new();
         assert!(!brain.is_loaded());
         assert!(brain.suggest(&[0.0; 72]).is_none());
@@ -789,6 +790,8 @@ mod tests {
 
     #[test]
     fn embedded_iwd1_loads_and_suggests() {
+        // Model path: embedded IWD1 weights should parse and produce bounded
+        // confidence/value outputs for a non-trivial feature vector.
         let brain = DefenderBrain::from_iwd1(MODEL_BYTES).expect("IWD1 should parse");
         assert!(brain.loaded);
 
@@ -814,6 +817,8 @@ mod tests {
 
     #[test]
     fn embedded_iwd1_varied_scenarios() {
+        // Scenario path: policy inference should remain stable across quiet,
+        // ransomware and scan-style feature combinations.
         let brain = DefenderBrain::from_iwd1(MODEL_BYTES).expect("IWD1 should parse");
 
         // Scenario 1: quiet (no threats)
@@ -853,6 +858,8 @@ mod tests {
 
     #[test]
     fn load_json_model() {
+        // Compatibility path: JSON-exported brains should still load when
+        // available for local supervised retraining workflows.
         // Try loading the R6 model if available
         let path = "best-def-r6.json";
         if std::path::Path::new(path).exists() {
@@ -870,5 +877,51 @@ mod tests {
             assert!(suggestion.value >= -1.0 && suggestion.value <= 1.0);
             assert!(!suggestion.action_name.is_empty());
         }
+    }
+
+    #[test]
+    fn ai_action_to_index_maps_known_and_unknown_actions() {
+        // Mapping path: AI action labels from brain-log entries should map to
+        // stable policy-space indices used for supervised fine-tuning.
+        assert_eq!(ai_action_to_index("BlockIp"), Some(1));
+        assert_eq!(ai_action_to_index("KillProcess"), Some(2));
+        assert_eq!(ai_action_to_index("SuspendUser"), Some(3));
+        assert_eq!(ai_action_to_index("Honeypot"), Some(4));
+        assert_eq!(ai_action_to_index("Ignore"), Some(0));
+        assert_eq!(ai_action_to_index("Monitor"), Some(7));
+        assert_eq!(ai_action_to_index("Escalate"), Some(9));
+        assert_eq!(ai_action_to_index("UnknownAction"), None);
+    }
+
+    #[test]
+    fn softmax_outputs_probability_distribution() {
+        // Numerical path: softmax should always produce non-negative values
+        // that sum to 1.0 for downstream policy selection.
+        let probs = softmax(&[2.0, 1.0, -3.0]);
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(probs.iter().all(|p| *p >= 0.0));
+        assert!(probs[0] > probs[1]);
+    }
+
+    #[test]
+    fn forward_layers_apply_relu_and_linear_rules() {
+        // Activation path: hidden layers clamp negatives with ReLU while
+        // linear heads preserve signed values.
+        let layer = Layer {
+            weights: vec![vec![1.0, -2.0], vec![-1.0, -1.0]],
+            biases: vec![0.0, 0.5],
+        };
+        let input = vec![1.0, 3.0];
+
+        let relu = forward_relu(&layer, &input);
+        assert_eq!(relu.len(), 2);
+        assert_eq!(relu[0], 0.0);
+        assert_eq!(relu[1], 0.0);
+
+        let linear = forward_linear(&layer, &input);
+        assert_eq!(linear.len(), 2);
+        assert!(linear[0] < 0.0);
+        assert!(linear[1] < 0.0);
     }
 }

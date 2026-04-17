@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use tracing::{debug, info, warn};
@@ -47,6 +48,7 @@ async fn handle_always_on_connection(
     ssh_cfg: Arc<russh::server::Config>,
     ai_provider: Option<Arc<dyn ai::AiProvider>>,
     telegram_client: Option<Arc<telegram::TelegramClient>>,
+    gate_suppressed_counter: Arc<AtomicU64>,
     data_dir: PathBuf,
     interaction: String,
     blocklist_already_has_ip: bool,
@@ -255,7 +257,10 @@ async fn handle_always_on_connection(
             is_probe_only,
             auto_blocked,
         );
-        let gate_verdict = crate::notification_gate::should_notify(&gate_ctx);
+        let gate_verdict = crate::notification_gate::should_notify_with_counter(
+            &gate_ctx,
+            gate_suppressed_counter.as_ref(),
+        );
         match gate_verdict {
             crate::notification_gate::NotificationVerdict::SendNow => {
                 // Honeypot sessions are never SendNow per policy, but handle for completeness.
@@ -317,6 +322,7 @@ pub(crate) async fn run_always_on_honeypot(
     filter_blocklist: Arc<Mutex<HashSet<String>>>,
     ai_provider: Option<Arc<dyn ai::AiProvider>>,
     telegram_client: Option<Arc<telegram::TelegramClient>>,
+    gate_suppressed_counter: Arc<AtomicU64>,
     abuseipdb_client: Option<Arc<abuseipdb::AbuseIpDbClient>>,
     abuseipdb_threshold: u8,
     data_dir: PathBuf,
@@ -409,6 +415,7 @@ pub(crate) async fn run_always_on_honeypot(
                 let ssh_cfg_clone = ssh_cfg.clone();
                 let ai_clone = ai_provider.clone();
                 let tg_clone = telegram_client.clone();
+                let gate_counter = gate_suppressed_counter.clone();
                 let dd = data_dir.clone();
                 let ip_clone = ip.clone();
                 let intr = interaction.clone();
@@ -425,6 +432,7 @@ pub(crate) async fn run_always_on_honeypot(
                         ssh_cfg_clone,
                         ai_clone,
                         tg_clone,
+                        gate_counter,
                         dd,
                         intr,
                         bl_has_ip,
@@ -540,6 +548,8 @@ mod tests {
 
     #[test]
     fn no_autoblock_without_interaction() {
+        // Decision path: probe-only sessions must never auto-block to avoid
+        // poisoning the blocklist with harmless scan noise.
         let allowed = vec!["block-ip-ufw".to_string()];
         assert!(!should_auto_block_after_session(
             true, false, false, "ufw", &allowed
@@ -548,6 +558,8 @@ mod tests {
 
     #[test]
     fn autoblock_with_interaction_and_skill_allowed() {
+        // Happy path: when interaction happened and the backend skill is
+        // enabled, the session should become auto-block eligible.
         let allowed = vec!["block-ip-ufw".to_string()];
         assert!(should_auto_block_after_session(
             true, false, true, "ufw", &allowed
@@ -556,7 +568,36 @@ mod tests {
 
     #[test]
     fn elapsed_report_rounds_subsecond_to_one() {
+        // Reporting path: sub-second sessions still report as 1 second so
+        // operator-facing summaries avoid a confusing "0s" duration.
         let started = std::time::Instant::now() - std::time::Duration::from_millis(250);
         assert_eq!(elapsed_secs_for_report(started), 1);
+    }
+
+    #[test]
+    fn no_autoblock_when_responder_is_disabled() {
+        // Guard path: auto-blocking must stay off when responder mode is
+        // disabled even if an interaction occurred.
+        let allowed = vec!["block-ip-ufw".to_string()];
+        assert!(!should_auto_block_after_session(
+            false, false, true, "ufw", &allowed
+        ));
+    }
+
+    #[test]
+    fn no_autoblock_when_ip_already_blocked() {
+        // Idempotency path: repeated sessions from an already blocked IP
+        // should not trigger another auto-block workflow.
+        let allowed = vec!["block-ip-ufw".to_string()];
+        assert!(!should_auto_block_after_session(
+            true, true, true, "ufw", &allowed
+        ));
+    }
+
+    #[test]
+    fn elapsed_report_keeps_whole_seconds() {
+        // Precision path: whole-second durations must pass through unchanged.
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        assert!(elapsed_secs_for_report(started) >= 3);
     }
 }

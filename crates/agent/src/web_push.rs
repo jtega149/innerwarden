@@ -351,6 +351,8 @@ mod tests {
 
     #[test]
     fn generate_vapid_keys_produces_valid_pair() {
+        // Crypto bootstrap path: generated VAPID keys must match the expected
+        // P-256 shapes used by browser subscription APIs.
         let (pem, public_b64) = generate_vapid_keys().expect("key generation failed");
         assert!(
             pem.contains("PRIVATE KEY"),
@@ -366,14 +368,17 @@ mod tests {
 
     #[test]
     fn load_subscriptions_returns_empty_for_missing_file() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // Fallback path: missing subscription storage should decode as an
+        // empty list for first-run deployments.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
         let subs = load_subscriptions(dir.path());
         assert!(subs.is_empty());
     }
 
     #[test]
     fn save_and_load_subscriptions() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // Persistence path: saved subscriptions must roundtrip through JSON.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
         let sub = WebPushSubscription {
             endpoint: "https://example.com/push/test".to_string(),
             keys: WebPushKeys {
@@ -381,7 +386,8 @@ mod tests {
                 auth: "test_auth".to_string(),
             },
         };
-        save_subscriptions(dir.path(), std::slice::from_ref(&sub)).unwrap();
+        save_subscriptions(dir.path(), std::slice::from_ref(&sub))
+            .expect("subscriptions should save");
         let loaded = load_subscriptions(dir.path());
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].endpoint, sub.endpoint);
@@ -389,7 +395,9 @@ mod tests {
 
     #[test]
     fn remove_subscription_removes_by_endpoint() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // Delete path: removing an existing endpoint should prune only that
+        // entry and keep all other subscriptions intact.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
         let sub1 = WebPushSubscription {
             endpoint: "https://example.com/push/1".to_string(),
             keys: WebPushKeys {
@@ -404,8 +412,10 @@ mod tests {
                 auth: "a2".to_string(),
             },
         };
-        save_subscriptions(dir.path(), &[sub1.clone(), sub2.clone()]).unwrap();
-        let removed = remove_subscription(dir.path(), &sub1.endpoint).unwrap();
+        save_subscriptions(dir.path(), &[sub1.clone(), sub2.clone()])
+            .expect("subscriptions should save");
+        let removed =
+            remove_subscription(dir.path(), &sub1.endpoint).expect("remove should succeed");
         assert!(removed);
         let remaining = load_subscriptions(dir.path());
         assert_eq!(remaining.len(), 1);
@@ -414,8 +424,41 @@ mod tests {
 
     #[test]
     fn remove_subscription_nonexistent_returns_false() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let removed = remove_subscription(dir.path(), "https://example.com/nonexistent").unwrap();
+        // No-op path: deleting a non-existent endpoint should return false
+        // without mutating storage.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let removed = remove_subscription(dir.path(), "https://example.com/nonexistent")
+            .expect("remove should succeed");
         assert!(!removed);
+    }
+
+    #[test]
+    fn save_subscriptions_replaces_previous_file_contents() {
+        // Replace path: save operation should rewrite the full subscription
+        // set, dropping stale entries from older snapshots.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let old = WebPushSubscription {
+            endpoint: "https://example.com/push/old".to_string(),
+            keys: WebPushKeys {
+                p256dh: "old-key".to_string(),
+                auth: "old-auth".to_string(),
+            },
+        };
+        let fresh = WebPushSubscription {
+            endpoint: "https://example.com/push/new".to_string(),
+            keys: WebPushKeys {
+                p256dh: "new-key".to_string(),
+                auth: "new-auth".to_string(),
+            },
+        };
+
+        save_subscriptions(dir.path(), std::slice::from_ref(&old))
+            .expect("initial subscriptions should save");
+        save_subscriptions(dir.path(), std::slice::from_ref(&fresh))
+            .expect("replacement subscriptions should save");
+
+        let loaded = load_subscriptions(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].endpoint, fresh.endpoint);
     }
 }

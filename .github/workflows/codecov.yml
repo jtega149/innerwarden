@@ -24,21 +24,32 @@ jobs:
 
       - name: Cache cargo binaries
         id: cargo-bin-cache
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
         with:
           path: ~/.cargo/bin
-          key: ${{ runner.os }}-cargo-bin-tarpaulin-0.31.5
+          key: ${{ runner.os }}-cargo-bin-tarpaulin-0.33.0
 
       - name: Install cargo-tarpaulin
         if: steps.cargo-bin-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-tarpaulin --version 0.31.5 --locked
+        run: cargo install cargo-tarpaulin --version 0.33.0 --locked
 
+      # Tarpaulin failure must break the job. A silently-skipped coverage
+      # run produces a badge on main that shows yesterday's number for weeks.
       - name: Run coverage
-        run: cargo tarpaulin --workspace --timeout 600 --out xml --skip-clean --exclude-files "crates/sensor-ebpf/*" --engine llvm 2>&1 || true
+        run: |
+          cargo tarpaulin \
+            --workspace \
+            --timeout 600 \
+            --out xml \
+            --skip-clean \
+            --exclude-files "crates/sensor-ebpf/*" \
+            --exclude-files "crates/sensor-ebpf-types/*" \
+            --engine llvm
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: cobertura.xml
-          fail_ci_if_error: false
+          fail_ci_if_error: true
+          verbose: true

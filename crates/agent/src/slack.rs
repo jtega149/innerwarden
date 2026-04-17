@@ -249,6 +249,8 @@ mod tests {
 
     #[test]
     fn severity_emoji_maps_correctly() {
+        // Mapping path: each canonical severity must map to the expected
+        // emoji so operator triage can scan Slack alerts quickly.
         assert_eq!(severity_emoji("Critical"), "🚨");
         assert_eq!(severity_emoji("High"), "🔴");
         assert_eq!(severity_emoji("Medium"), "🟠");
@@ -258,6 +260,8 @@ mod tests {
 
     #[test]
     fn severity_color_maps_correctly() {
+        // Color path: attachment color should track severity consistently with
+        // dashboard semantics.
         assert_eq!(severity_color("Critical"), "#9b1c1c");
         assert_eq!(severity_color("High"), "#f43f5e");
         assert_eq!(severity_color("Medium"), "#f97316");
@@ -267,17 +271,30 @@ mod tests {
 
     #[test]
     fn slack_client_new_succeeds_with_valid_url() {
+        // Construction path: a syntactically valid webhook URL should create
+        // a Slack client without touching the network.
         let result = SlackClient::new("https://hooks.slack.com/services/T/B/xyz");
         assert!(result.is_ok());
     }
 
     #[test]
     fn severity_emoji_unknown_returns_info() {
+        // Fallback path: unknown severities should degrade to informational
+        // markers instead of panicking.
         assert_eq!(severity_emoji("Unknown"), "ℹ️");
     }
 
     #[test]
     fn severity_color_unknown_returns_gray() {
+        // Fallback path: unknown severities should use neutral gray.
         assert_eq!(severity_color("Unknown"), "#6b7280");
+    }
+
+    #[test]
+    fn severity_helpers_are_case_sensitive_by_design() {
+        // Validation path: lowercase severities currently fall back to
+        // neutral styling, documenting current behavior explicitly.
+        assert_eq!(severity_emoji("critical"), "ℹ️");
+        assert_eq!(severity_color("critical"), "#6b7280");
     }
 }

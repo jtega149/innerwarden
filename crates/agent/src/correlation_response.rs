@@ -267,6 +267,26 @@ async fn handle_completed_chain(
 // Repeat offender detection
 // ---------------------------------------------------------------------------
 
+/// Returns `true` and removes the reputation entry when `ip` is not a valid
+/// IP/CIDR target. A corrupted `ip-reputation.json` (e.g. stray octet > 255
+/// from a broken upstream feed) would otherwise reach the firewall, fail
+/// silently on add, and register a zombie "Active" lifecycle entry that can
+/// never be reverted — producing the orphaned-response dashboard alert.
+pub(crate) fn drop_invalid_repeat_offender(
+    ip: &str,
+    ip_reputations: &mut std::collections::HashMap<String, crate::ip_reputation::LocalIpReputation>,
+) -> bool {
+    if !crate::decision_block_ip::is_valid_block_target(ip) {
+        warn!(
+            ip = %ip,
+            "repeat-offender: skipping invalid target — removing from ip_reputations"
+        );
+        ip_reputations.remove(ip);
+        return true;
+    }
+    false
+}
+
 /// Check IPs blocked 3+ times → escalate to permanent block (7 days).
 async fn check_repeat_offenders(
     data_dir: &Path,
@@ -282,6 +302,11 @@ async fn check_repeat_offenders(
         .collect();
 
     for (ip, total_blocks) in repeat_ips {
+        // Guard: never feed a malformed target into the block pipeline.
+        if drop_invalid_repeat_offender(&ip, &mut state.ip_reputations) {
+            continue;
+        }
+
         let cooldown_key = format!("repeat-offender:{ip}");
         // Only fire once per 24h per IP.
         let cooldown_cutoff = Utc::now() - chrono::Duration::seconds(86400);
@@ -563,6 +588,88 @@ mod tests {
     use super::*;
     use crate::knowledge_graph::{graph::KnowledgeGraph, types::*};
 
+    // `drop_invalid_repeat_offender` is the gate that keeps corrupted
+    // `ip-reputation.json` entries from ever reaching the block pipeline.
+    // Cover every production-seen failure shape + the happy path.
+    #[test]
+    fn drop_invalid_removes_octet_out_of_range() {
+        use crate::ip_reputation::LocalIpReputation;
+        use std::collections::HashMap;
+
+        let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
+        map.insert("129.950.5.0".to_string(), LocalIpReputation::new());
+        let dropped = drop_invalid_repeat_offender("129.950.5.0", &mut map);
+        assert!(dropped);
+        assert!(!map.contains_key("129.950.5.0"));
+    }
+
+    #[test]
+    fn drop_invalid_keeps_valid_ipv4() {
+        use crate::ip_reputation::LocalIpReputation;
+        use std::collections::HashMap;
+
+        let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
+        map.insert("8.8.8.8".to_string(), LocalIpReputation::new());
+        let dropped = drop_invalid_repeat_offender("8.8.8.8", &mut map);
+        assert!(!dropped);
+        assert!(map.contains_key("8.8.8.8"));
+    }
+
+    #[test]
+    fn drop_invalid_keeps_valid_cidr() {
+        use crate::ip_reputation::LocalIpReputation;
+        use std::collections::HashMap;
+
+        let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
+        map.insert("136.216.0.0/16".to_string(), LocalIpReputation::new());
+        let dropped = drop_invalid_repeat_offender("136.216.0.0/16", &mut map);
+        assert!(!dropped);
+        assert!(map.contains_key("136.216.0.0/16"));
+    }
+
+    #[test]
+    fn drop_invalid_handles_every_production_bad_sample() {
+        use crate::ip_reputation::LocalIpReputation;
+        use std::collections::HashMap;
+
+        for bad in [
+            "129.491.8.0",
+            "129.950.5.15",
+            "129.950.5.0",
+            "129.952.2.0",
+            "130.806.3.0",
+            "129.950.5.5",
+            "137.274.6",
+            "130.932.0.0",
+            "129.525.8.0",
+            "130.890.9.0",
+            "130.806.1.17",
+        ] {
+            let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
+            map.insert(bad.to_string(), LocalIpReputation::new());
+            assert!(
+                drop_invalid_repeat_offender(bad, &mut map),
+                "'{bad}' must be classified as invalid"
+            );
+            assert!(map.is_empty(), "'{bad}' must be removed from reputations");
+        }
+    }
+
+    #[test]
+    fn drop_invalid_noop_when_ip_not_in_map() {
+        use crate::ip_reputation::LocalIpReputation;
+        use std::collections::HashMap;
+
+        // Even if the ip isn't in the map, the predicate should still return
+        // true/false based on validity, and remove() is a no-op.
+        let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
+        map.insert("1.2.3.4".to_string(), LocalIpReputation::new());
+        let dropped = drop_invalid_repeat_offender("129.950.5.0", &mut map);
+        assert!(dropped);
+        assert_eq!(map.len(), 1); // unchanged
+        assert!(map.contains_key("1.2.3.4"));
+    }
+
     #[test]
     fn extract_detector_from_incident_id() {
         assert_eq!(
@@ -839,5 +946,70 @@ mod tests {
 
         let result = find_multi_technique_ips(&graph, now - chrono::Duration::hours(1));
         assert!(result.is_empty(), "same detector 3x is not multi-technique");
+    }
+
+    // ─── Spec 024 contract tests ───────────────────────────────────────
+    //
+    // `drop_invalid_repeat_offender` is the sole guard that prevents
+    // repeat-offender escalation from feeding a malformed target into the
+    // block pipeline. Spec 024 formalises the contract so the guard cannot
+    // be deleted or reversed by a future edit without a loud test failure.
+    //
+    // Contract:
+    //   - drop_invalid(ip, map) returns true  ⇒ ip was invalid; it has been
+    //     evicted from the reputation map.
+    //   - drop_invalid(ip, map) returns false ⇒ ip is a valid block target;
+    //     map is unchanged for that ip.
+    //   - drop_invalid is pure in the ip input: no I/O, no logging that
+    //     could fail, no global state read. It is safe to call from inside
+    //     a hot loop.
+    //   - For every production-observed malformed ip (see the bad-sample
+    //     list in `drop_invalid_handles_every_production_bad_sample`) the
+    //     function MUST evict. Expanding that list over time is the point.
+
+    #[test]
+    fn contract_drop_invalid_is_pure_in_ip() {
+        use crate::ip_reputation::LocalIpReputation;
+        use std::collections::HashMap;
+
+        // Calling on an absent ip with a populated map must not touch
+        // other entries.
+        let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
+        map.insert("1.1.1.1".to_string(), LocalIpReputation::new());
+        map.insert("2.2.2.2".to_string(), LocalIpReputation::new());
+        let dropped = drop_invalid_repeat_offender("bogus-ip", &mut map);
+        assert!(dropped, "malformed ip must be reported as dropped");
+        assert_eq!(map.len(), 2, "unrelated entries must survive");
+        assert!(map.contains_key("1.1.1.1"));
+        assert!(map.contains_key("2.2.2.2"));
+    }
+
+    #[test]
+    fn contract_drop_invalid_boundary_is_true_valid_ip_passes_through() {
+        use crate::ip_reputation::LocalIpReputation;
+        use std::collections::HashMap;
+
+        let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
+        map.insert("203.0.113.55".to_string(), LocalIpReputation::new());
+        let dropped = drop_invalid_repeat_offender("203.0.113.55", &mut map);
+        assert!(!dropped, "valid public ip must not be dropped");
+        assert!(map.contains_key("203.0.113.55"));
+    }
+
+    #[test]
+    fn contract_drop_invalid_is_idempotent_on_already_absent_ips() {
+        use crate::ip_reputation::LocalIpReputation;
+        use std::collections::HashMap;
+
+        let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
+        map.insert("129.999.0.0".to_string(), LocalIpReputation::new());
+
+        // First call: evicts.
+        assert!(drop_invalid_repeat_offender("129.999.0.0", &mut map));
+        assert!(!map.contains_key("129.999.0.0"));
+
+        // Second call: still returns true (invalid is invalid), no panic.
+        assert!(drop_invalid_repeat_offender("129.999.0.0", &mut map));
+        assert!(!map.contains_key("129.999.0.0"));
     }
 }

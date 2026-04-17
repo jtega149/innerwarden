@@ -1,0 +1,143 @@
+# Codecov config. Public docs: https://docs.codecov.com/docs/codecov-yaml
+#
+# Goal: make coverage drift visible on PRs (not just observed),
+# split coverage per-crate so spec 023 batches can be tracked,
+# and stop counting generated/eBPF/test scaffolding against us.
+
+codecov:
+  require_ci_to_pass: true
+  notify:
+    wait_for_ci: true
+  branch: main
+
+coverage:
+  precision: 2
+  round: down
+  range: "40...85"
+
+  status:
+    project:
+      default:
+        target: auto              # compare to base commit
+        threshold: 0.5%           # allow small drops without failing
+        informational: false
+      agent:
+        paths: ["crates/agent/**"]
+        target: auto
+        threshold: 1%
+      ctl:
+        paths: ["crates/ctl/**"]
+        target: auto
+        threshold: 1%
+      sensor:
+        paths: ["crates/sensor/**"]
+        target: auto
+        threshold: 1%
+      dashboard:
+        paths: ["crates/agent/src/dashboard/**"]
+        target: auto
+        threshold: 1%
+
+    patch:
+      default:
+        # New code on a PR should land ≥70% covered, with a 15 percentage-
+        # point slack to absorb refactor PRs that move orchestration
+        # wiring (boot.rs, main.rs) which cannot be unit-tested without
+        # spinning up the full agent harness. Effective fail point is 55%.
+        # For feature PRs adding real logic, 15pp is slack — Codecov still
+        # surfaces the drop in the comment even when the gate passes.
+        target: 70%
+        threshold: 15%
+        if_ci_failed: error
+        informational: false
+      # Orchestration / boot wiring gets its own *informational* gauge so
+      # it is measured (not hidden) but never blocks merges. Real ceiling
+      # is set by integration tests, not unit tests.
+      orchestration:
+        paths:
+          - "crates/agent/src/main.rs"
+          - "crates/agent/src/loops/boot.rs"
+        target: 0%
+        informational: true
+
+comment:
+  # Restore the default sections so the PR comment shows project coverage,
+  # delta, and reach — not just the file list. Dropping `reach`/`header`
+  # made every PR look like coverage was worse because the overall number
+  # disappeared.
+  layout: "reach, diff, flags, components, files, header"
+  behavior: default
+  require_changes: true
+  show_carryforward_flags: true
+
+# Per-crate component view — shows cov % on each box in PR comments.
+# No per-component status checks: we don't want 12 separate red checks
+# the first time a small crate drifts by 2%. The project-level status
+# at `coverage.status.project.*` above is the single enforcement point.
+component_management:
+  individual_components:
+    - component_id: agent
+      name: agent
+      paths: ["crates/agent/**"]
+    - component_id: ctl
+      name: ctl
+      paths: ["crates/ctl/**"]
+    - component_id: sensor
+      name: sensor
+      paths: ["crates/sensor/**"]
+    - component_id: dashboard
+      name: dashboard
+      paths: ["crates/agent/src/dashboard/**"]
+    - component_id: killchain
+      name: killchain
+      paths: ["crates/killchain/**"]
+    - component_id: store
+      name: store
+      paths: ["crates/store/**"]
+    - component_id: shield
+      name: shield
+      paths: ["crates/shield/**"]
+    - component_id: dna
+      name: dna
+      paths: ["crates/dna/**"]
+    - component_id: hypervisor
+      name: hypervisor
+      paths: ["crates/hypervisor/**"]
+    - component_id: smm
+      name: smm
+      paths: ["crates/smm/**"]
+    - component_id: agent-guard
+      name: agent-guard
+      paths: ["crates/agent-guard/**"]
+    - component_id: core
+      name: core
+      paths: ["crates/core/**"]
+
+# Paths codecov ignores when computing %.
+#
+# Deliberately conservative: only exclude paths that cannot be instrumented
+# or that contain no Rust source at all. Integration tests in
+# `crates/*/tests/` are kept in the report because they execute during
+# `cargo test` and contribute real coverage signal; excluding them was an
+# earlier mistake that caused apparent coverage drops without changing
+# what the code actually tests.
+ignore:
+  - "crates/sensor-ebpf/**"           # no_std eBPF bytecode — cannot instrument
+  - "crates/sensor-ebpf-types/**"     # shared types, no runtime behavior
+  - "**/*/target/**"                  # cargo build artifacts
+  - "rules/**"                        # yaml rule data, not code
+  - "modules/**"                      # manifest-only
+  - "integrations/**"                 # manifest-only
+  - "docs/**"
+  - ".specify/**"
+  - "scripts/**"
+
+# Carryforward lets us skip re-running coverage for unchanged crates
+# and preserves their % in PR reports.
+flag_management:
+  default_rules:
+    carryforward: true
+    statuses:
+      - type: project
+        target: auto
+        threshold: 1%

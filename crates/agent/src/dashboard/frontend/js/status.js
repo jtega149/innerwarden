@@ -12,6 +12,9 @@ async function loadStatus() {
     status.textContent = 'Updated ' + new Date().toLocaleTimeString();
     content.innerHTML = renderStatus(s, col.collectors || []);
     loadDeepSecurity();
+    // Spec 024: populate the Metrics Drift section after the table
+    // skeleton lands in the DOM.
+    loadMetricsDrift();
   } catch(e) {
     status.textContent = 'error';
     content.innerHTML = '<div class="empty" style="padding:40px;color:var(--danger)">Failed: ' + esc(String(e.message)) + '</div>';
@@ -421,7 +424,128 @@ function renderStatus(s, collectors) {
       '</div></div>';
   }
 
+  // ── Section 6: Metrics Drift (spec 024) ──────────────────────────────
+  // The populated content is injected asynchronously by loadMetricsDrift().
+  html += '<div class="report-section" id="metrics-drift-section">' +
+    '<div class="report-section-title">' +
+      'Metrics Drift <span style="font-size:0.72rem;color:var(--muted);font-weight:normal">' +
+        '· spec 024 · scraping /metrics</span>' +
+    '</div>' +
+    '<div id="metrics-drift-body"><div class="muted">Loading…</div></div>' +
+    '</div>';
+
   return html;
+}
+
+// ─── Spec 024 Metrics Drift ────────────────────────────────────────────
+//
+// Reads the agent's own /metrics endpoint (Prometheus text, served by
+// dashboard/agent_api::api_prometheus_metrics) and renders the 10
+// spec-024 drift metrics. No external Prometheus server needed.
+//
+// Invoked by loadStatus() after renderStatus completes. Missing metrics
+// render as 0 rather than omitting rows so operators always see the
+// expected shape.
+
+const METRICS_DRIFT_KEYS = [
+  { key: 'innerwarden_incidents_per_hour',          labelDim: 'severity', heading: 'Incidents / hour',            alert: '±3σ from 7-day mean' },
+  { key: 'innerwarden_telegram_msgs_per_hour',      labelDim: null,       heading: 'Telegram msgs / hour',         alert: '>50/h warn · >200/h crit' },
+  { key: 'innerwarden_blocks_per_hour',             labelDim: 'backend',  heading: 'Blocks / hour',                alert: '±3σ from 7-day mean' },
+  { key: 'innerwarden_honeypot_sessions_per_hour',  labelDim: null,       heading: 'Honeypot sessions / hour',     alert: '0 for 24h · warn' },
+  { key: 'innerwarden_tracker_detections_per_hour', labelDim: 'pattern',  heading: 'Tracker detections / hour',    alert: '0 for 24h when incidents>10 · warn' },
+  { key: 'innerwarden_orphaned_responses_total',    labelDim: null,       heading: 'Orphaned responses (total)',   alert: 'Any increment · critical' },
+  { key: 'innerwarden_revert_failures_total',       labelDim: null,       heading: 'Revert failures (total)',      alert: 'increase over 1h >10 · warn' },
+  { key: 'innerwarden_ai_provider_errors_per_hour', labelDim: 'provider', heading: 'AI provider errors / hour',    alert: '>5/h · warn' },
+  { key: 'innerwarden_gate_suppressed_total',       labelDim: null,       heading: 'Gate suppressed (total)',      alert: 'low rate + high telegram volume = gate drift' },
+  { key: 'innerwarden_event_rate_per_hour',         labelDim: 'source',   heading: 'Event rate / hour',            alert: '0 for 1h = source silent' },
+];
+
+async function loadMetricsDrift() {
+  const body = document.getElementById('metrics-drift-body');
+  if (!body) return;
+  try {
+    const resp = await fetch('/metrics', { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const text = await resp.text();
+    const parsed = parsePrometheusText(text);
+    body.innerHTML = renderMetricsDrift(parsed);
+  } catch (e) {
+    body.innerHTML = '<div class="muted">Could not read /metrics: ' + esc(String(e.message)) + '</div>';
+  }
+}
+
+function parsePrometheusText(text) {
+  // Map: metric_name → Array<{labels: {k:v}, value: number}>
+  const out = new Map();
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    if (!raw || raw.startsWith('#')) continue;
+    // NAME{l1="v1",l2="v2"} VALUE  |  NAME VALUE
+    const m = raw.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(?:\{([^}]*)\})?\s+(-?\d+(?:\.\d+)?)/);
+    if (!m) continue;
+    const name = m[1];
+    const labels = {};
+    if (m[2]) {
+      const parts = m[2].split(',');
+      for (let p = 0; p < parts.length; p++) {
+        const pm = parts[p].match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"\s*$/);
+        if (pm) labels[pm[1]] = pm[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+      }
+    }
+    const val = Number(m[3]);
+    if (!out.has(name)) out.set(name, []);
+    out.get(name).push({ labels: labels, value: val });
+  }
+  return out;
+}
+
+function renderMetricsDrift(parsed) {
+  let html = '<div style="font-size:0.74rem;color:var(--muted);padding-bottom:6px">' +
+    'Live view of the 10 metrics scraped by <code>docs/prometheus-alerts.yaml</code>. ' +
+    'Zero across the board on a quiet host is expected; sudden jumps or collapses signal drift.' +
+    '</div>';
+  html += '<table class="report-table" style="font-size:0.78rem">' +
+    '<thead><tr>' +
+    '<th style="text-align:left">Metric</th>' +
+    '<th style="text-align:left">Dimension</th>' +
+    '<th style="text-align:right">Value</th>' +
+    '<th style="text-align:left">Alert rule</th>' +
+    '</tr></thead><tbody>';
+  for (let i = 0; i < METRICS_DRIFT_KEYS.length; i++) {
+    const entry = METRICS_DRIFT_KEYS[i];
+    const rows = parsed.get(entry.key) || [];
+    if (rows.length === 0) {
+      html += '<tr>' +
+        '<td><code>' + esc(entry.key) + '</code></td>' +
+        '<td class="muted">' + (entry.labelDim ? esc(entry.labelDim) + ': —' : '—') + '</td>' +
+        '<td style="text-align:right">0</td>' +
+        '<td class="muted">' + esc(entry.alert) + '</td>' +
+        '</tr>';
+      continue;
+    }
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r];
+      const dim = entry.labelDim
+        ? esc(entry.labelDim) + ': <code>' + esc(row.labels[entry.labelDim] || '—') + '</code>'
+        : '—';
+      html += '<tr>' +
+        '<td><code>' + esc(entry.key) + '</code></td>' +
+        '<td>' + dim + '</td>' +
+        '<td style="text-align:right">' + formatMetricValue(row.value) + '</td>' +
+        '<td class="muted">' + esc(entry.alert) + '</td>' +
+        '</tr>';
+    }
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function formatMetricValue(v) {
+  if (!isFinite(v)) return '-';
+  if (Math.abs(v) >= 100) return v.toFixed(0);
+  if (Math.abs(v) >= 10)  return v.toFixed(1);
+  return v.toFixed(2);
 }
 
 // On mobile: auto-collapse the list when a journey is opened, re-open via button
@@ -430,4 +554,3 @@ function collapseLeftOnMobile() {
     toggleLeftPanel();
   }
 }
-

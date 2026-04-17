@@ -271,6 +271,8 @@ mod tests {
 
     #[test]
     fn classify_iocs() {
+        // Classifier path: IOC type helpers should distinguish IP/hash/domain
+        // shapes without ambiguous cross-matches.
         assert!(is_ip_like("1.2.3.4"));
         assert!(is_ip_like("2001:db8::1"));
         assert!(!is_ip_like("example.com"));
@@ -287,14 +289,20 @@ mod tests {
 
     #[test]
     fn state_roundtrip() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // Persistence path: JSON-backed threat feed state should survive a
+        // save/load roundtrip when SQLite blob state is absent.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
         let mut state = ThreatFeedState::default();
         state.malicious_ips.insert("1.2.3.4".into());
         state.malicious_domains.insert("evil.com".into());
         state.malicious_hashes.insert("aa".repeat(32));
 
         let path = dir.path().join("threat-feeds.json");
-        std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string(&state).expect("state should serialize"),
+        )
+        .expect("state file should be written");
 
         let loaded = load_state(dir.path(), None);
         assert!(loaded.malicious_ips.contains("1.2.3.4"));
@@ -303,8 +311,41 @@ mod tests {
 
     #[test]
     fn empty_state_for_missing_file() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // Fallback path: missing threat-feeds.json should return an empty
+        // default state instead of failing startup.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
         let state = load_state(dir.path(), None);
         assert!(state.malicious_ips.is_empty());
+    }
+
+    #[test]
+    fn invalid_json_state_falls_back_to_default() {
+        // Corruption path: invalid JSON should be tolerated by returning a
+        // clean default state.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let path = dir.path().join("threat-feeds.json");
+        std::fs::write(&path, "{ not valid json").expect("invalid fixture should be written");
+
+        let state = load_state(dir.path(), None);
+        assert!(state.malicious_ips.is_empty());
+        assert!(state.malicious_domains.is_empty());
+        assert!(state.malicious_hashes.is_empty());
+    }
+
+    #[test]
+    fn domain_classifier_rejects_whitespace_and_urls() {
+        // Validation path: domain detection should reject malformed values and
+        // URL inputs to avoid incorrect IOC classification.
+        assert!(!is_domain_like("evil site.com"));
+        assert!(!is_domain_like("https://evil.com"));
+        assert!(!is_domain_like("192.0.2.10"));
+        assert!(is_domain_like("intel.example.org"));
+    }
+
+    #[test]
+    fn resolve_vt_api_key_prefers_explicit_config() {
+        // Resolution path: explicit config keys must win over environment
+        // lookups so runtime config remains deterministic.
+        assert_eq!(resolve_vt_api_key("vt-key-123"), "vt-key-123");
     }
 }

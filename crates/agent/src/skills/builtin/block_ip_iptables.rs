@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use tracing::{info, warn};
 
+use super::firewall_target::{format_skill_outcome, is_valid_firewall_target};
 use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 
 pub struct BlockIpIptables;
@@ -42,6 +43,17 @@ impl ResponseSkill for BlockIpIptables {
                 }
             };
 
+            if !is_valid_firewall_target(&ip) {
+                warn!(
+                    ip,
+                    "block-ip-iptables: rejecting invalid target before invoking iptables"
+                );
+                return SkillResult {
+                    success: false,
+                    message: format!("block-ip-iptables: {ip} is not a valid IP/CIDR"),
+                };
+            }
+
             if dry_run {
                 info!(ip, "DRY RUN: would execute: sudo iptables -A INPUT -s {ip} -j DROP -m comment --comment innerwarden");
                 return SkillResult {
@@ -67,30 +79,13 @@ impl ResponseSkill for BlockIpIptables {
                 .output()
                 .await;
 
-            match output {
-                Ok(out) if out.status.success() => {
-                    info!(ip, "blocked via iptables");
-                    SkillResult {
-                        success: true,
-                        message: format!("Blocked {ip} via iptables"),
-                    }
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!(ip, stderr = %stderr, "iptables block command failed");
-                    SkillResult {
-                        success: false,
-                        message: format!("iptables block failed for {ip}: {stderr}"),
-                    }
-                }
-                Err(e) => {
-                    warn!(ip, error = %e, "failed to spawn iptables command");
-                    SkillResult {
-                        success: false,
-                        message: format!("failed to run iptables: {e}"),
-                    }
-                }
+            let result = format_skill_outcome("iptables", &ip, output);
+            if result.success {
+                info!(ip, "blocked via iptables");
+            } else {
+                warn!(ip, message = %result.message, "iptables block command failed");
             }
+            result
         })
     }
 }
@@ -148,5 +143,26 @@ mod tests {
         assert!(BlockIpIptables.name().contains("iptables"));
         assert_eq!(BlockIpIptables.tier(), SkillTier::Open);
         assert!(BlockIpIptables.applicable_to().contains(&"port_scan"));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_target_before_spawn() {
+        for bad in ["129.950.5.0", "130.890.9.0", "not-an-ip", ""] {
+            let ctx = make_ctx(Some(bad));
+            let result = BlockIpIptables.execute(&ctx, true).await;
+            assert!(!result.success, "'{bad}' should be rejected");
+            assert!(
+                result.message.contains("not a valid") || result.message.contains("no target IP"),
+                "message for '{bad}' should explain rejection: {}",
+                result.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_accepts_valid_cidr() {
+        let ctx = make_ctx(Some("10.0.0.0/24"));
+        let result = BlockIpIptables.execute(&ctx, true).await;
+        assert!(result.success);
     }
 }

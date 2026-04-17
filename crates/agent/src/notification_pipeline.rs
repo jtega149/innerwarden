@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use innerwarden_core::entities::EntityType;
 use innerwarden_core::event::Severity;
 use innerwarden_core::incident::Incident;
+use serde::Serialize;
 
 use crate::config::{ChannelFilterLevel, NotificationPipelineConfig};
 
@@ -17,7 +18,7 @@ use crate::config::{ChannelFilterLevel, NotificationPipelineConfig};
 // ---------------------------------------------------------------------------
 
 /// A group of related incidents (same detector + entity) within a time window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub(crate) struct IncidentGroup {
     pub detector: String,
@@ -30,8 +31,10 @@ pub(crate) struct IncidentGroup {
     pub auto_resolved: bool,
     pub sample_incident_id: String,
     /// Whether the first notification for this group has been dispatched.
+    #[serde(skip)]
     first_notified: bool,
     /// Whether a count-threshold summary has already been emitted.
+    #[serde(skip)]
     threshold_summary_sent: bool,
 }
 
@@ -281,6 +284,21 @@ impl GroupingEngine {
         self.groups.values().cloned().collect()
     }
 
+    /// Serialise active groups to a JSON value suitable for the dashboard
+    /// `/api/incident-groups` endpoint. Spec 005 T017 / SC3 — ensures the
+    /// dashboard shows the full incident picture with live counters while
+    /// Telegram stays quiet on already-handled activity.
+    pub fn snapshot_json(&self) -> serde_json::Value {
+        // Sort by last_seen descending so the busiest group is at the top.
+        let mut groups: Vec<&IncidentGroup> = self.groups.values().collect();
+        groups.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        serde_json::json!({
+            "active_count": groups.len(),
+            "groups": groups,
+            "snapshot_ts": chrono::Utc::now().to_rfc3339(),
+        })
+    }
+
     /// Evict the oldest group (by first_seen) to make room.
     fn evict_oldest(&mut self) {
         if let Some(oldest_key) = self
@@ -466,6 +484,391 @@ pub(crate) fn is_admin_routine(
     }
 
     false
+}
+
+// ---------------------------------------------------------------------------
+// Spec 005 Phase 7 — Operator Feedback Loop
+// ---------------------------------------------------------------------------
+//
+// Implicit feedback via "absence of operator action". Each time the pipeline
+// emits a first notification for a group, we log a pending entry. An entry
+// older than IGNORE_WINDOW_SECS with no operator action recorded against the
+// same (detector, entity_type) key is converted into a persistent "ignore"
+// tally. Once a key has `IGNORE_THRESHOLD` tallies, future groups with that
+// key are considered operator-desensitised: the gate demotes them from
+// Actionable to daily-briefing.
+//
+// Explicit feedback — operator taps "Not a threat" / "Block" / "Allow" — is
+// routed through `on_operator_action`, which clears any pending entry AND
+// resets the tally for that key (positive signal: the operator is still
+// engaged with this class of threat).
+//
+// Persistence: `notification-feedback.jsonl` — one JSON line per event
+// (`sent`, `ignored`, `action`). The in-memory state is a pure projection
+// of the file and is rebuilt at startup, so the loop survives restarts.
+
+const IGNORE_WINDOW_SECS: i64 = 86_400; // 24h
+const IGNORE_THRESHOLD: u32 = 3;
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum FeedbackEvent {
+    Sent {
+        ts: DateTime<Utc>,
+        detector: String,
+        entity_type: EntityType,
+        entity_value: String,
+        incident_id: String,
+    },
+    Ignored {
+        ts: DateTime<Utc>,
+        detector: String,
+        entity_type: EntityType,
+        incident_id: String,
+    },
+    Action {
+        ts: DateTime<Utc>,
+        detector: String,
+        entity_type: EntityType,
+        action: String,
+    },
+}
+
+/// Tracks pending notifications and ignore tallies. Not Send+Sync because the
+/// agent only holds it inside AgentState which is already single-threaded in
+/// the main loop path.
+#[derive(Debug, Default)]
+pub(crate) struct FeedbackTracker {
+    /// Pending notifications that have not yet received operator attention.
+    /// Keyed by incident_id so operator actions can retire the exact entry.
+    pending: HashMap<String, PendingNotification>,
+    /// Count of ignored (detector, entity_type) pairs. Resets on any operator
+    /// action for the same key.
+    ignored_tally: HashMap<(String, EntityType), u32>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingNotification {
+    sent_at: DateTime<Utc>,
+    detector: String,
+    entity_type: EntityType,
+    /// Retained so the persisted `Sent` event captures which specific
+    /// entity fired without an extra hash lookup. Not read by the
+    /// in-memory demotion logic (which keys on detector + entity_type).
+    #[allow(dead_code)]
+    entity_value: String,
+    incident_id: String,
+}
+
+impl FeedbackTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that a notification was sent for an incident. Idempotent: a
+    /// second call for the same incident_id updates the timestamp only.
+    pub fn on_notification_sent(
+        &mut self,
+        detector: &str,
+        entity_type: EntityType,
+        entity_value: &str,
+        incident_id: &str,
+        now: DateTime<Utc>,
+    ) -> FeedbackEvent {
+        self.pending.insert(
+            incident_id.to_string(),
+            PendingNotification {
+                sent_at: now,
+                detector: detector.to_string(),
+                entity_type: entity_type.clone(),
+                entity_value: entity_value.to_string(),
+                incident_id: incident_id.to_string(),
+            },
+        );
+        FeedbackEvent::Sent {
+            ts: now,
+            detector: detector.to_string(),
+            entity_type,
+            entity_value: entity_value.to_string(),
+            incident_id: incident_id.to_string(),
+        }
+    }
+
+    /// Record an operator action for an incident (tap on Block / Ignore /
+    /// Allow). Clears any pending entry and resets the ignore tally for the
+    /// owning key.
+    pub fn on_operator_action(
+        &mut self,
+        incident_id: &str,
+        action: &str,
+        now: DateTime<Utc>,
+    ) -> Option<FeedbackEvent> {
+        let pending = self.pending.remove(incident_id)?;
+        let key = (pending.detector.clone(), pending.entity_type.clone());
+        self.ignored_tally.remove(&key);
+        Some(FeedbackEvent::Action {
+            ts: now,
+            detector: pending.detector,
+            entity_type: pending.entity_type,
+            action: action.to_string(),
+        })
+    }
+
+    /// Move every pending entry older than `IGNORE_WINDOW_SECS` into the
+    /// ignore tally and return the corresponding FeedbackEvents for
+    /// persistence.
+    pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<FeedbackEvent> {
+        let cutoff = now - chrono::Duration::seconds(IGNORE_WINDOW_SECS);
+        let ripe: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.sent_at < cutoff)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut events = Vec::with_capacity(ripe.len());
+        for id in ripe {
+            if let Some(p) = self.pending.remove(&id) {
+                let key = (p.detector.clone(), p.entity_type.clone());
+                *self.ignored_tally.entry(key).or_insert(0) += 1;
+                events.push(FeedbackEvent::Ignored {
+                    ts: now,
+                    detector: p.detector,
+                    entity_type: p.entity_type,
+                    incident_id: p.incident_id,
+                });
+            }
+        }
+        events
+    }
+
+    /// True when the (detector, entity_type) pair has reached the ignore
+    /// threshold and should be demoted. Used by the notification gate.
+    pub fn is_demoted(&self, detector: &str, entity_type: &EntityType) -> bool {
+        self.ignored_tally
+            .get(&(detector.to_string(), entity_type.clone()))
+            .copied()
+            .unwrap_or(0)
+            >= IGNORE_THRESHOLD
+    }
+
+    /// Number of pending notifications — surfaced for tests and dashboard.
+    #[allow(dead_code)]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Apply a persisted FeedbackEvent to in-memory state during startup
+    /// replay. `Sent` is only honoured if the notification is still fresh;
+    /// older `Sent` entries are ignored (the `Ignored` follow-up will have
+    /// been logged already).
+    pub fn replay_event(&mut self, event: &FeedbackEvent, now: DateTime<Utc>) {
+        let cutoff = now - chrono::Duration::seconds(IGNORE_WINDOW_SECS);
+        match event {
+            FeedbackEvent::Sent {
+                ts,
+                detector,
+                entity_type,
+                entity_value,
+                incident_id,
+            } => {
+                if *ts > cutoff {
+                    self.pending.insert(
+                        incident_id.clone(),
+                        PendingNotification {
+                            sent_at: *ts,
+                            detector: detector.clone(),
+                            entity_type: entity_type.clone(),
+                            entity_value: entity_value.clone(),
+                            incident_id: incident_id.clone(),
+                        },
+                    );
+                }
+            }
+            FeedbackEvent::Ignored {
+                detector,
+                entity_type,
+                incident_id,
+                ..
+            } => {
+                self.pending.remove(incident_id);
+                let key = (detector.clone(), entity_type.clone());
+                *self.ignored_tally.entry(key).or_insert(0) += 1;
+            }
+            FeedbackEvent::Action {
+                detector,
+                entity_type,
+                ..
+            } => {
+                let key = (detector.clone(), entity_type.clone());
+                self.ignored_tally.remove(&key);
+            }
+        }
+    }
+}
+
+/// File-based persistence for feedback events. JSONL, append-only.
+pub(crate) mod feedback_store {
+    use super::FeedbackEvent;
+    use std::io::Write;
+    use std::path::Path;
+
+    pub fn path(data_dir: &Path) -> std::path::PathBuf {
+        data_dir.join("notification-feedback.jsonl")
+    }
+
+    pub fn append(data_dir: &Path, event: &FeedbackEvent) -> anyhow::Result<()> {
+        let p = path(data_dir);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)?;
+        let line = serde_json::to_string(event)?;
+        writeln!(f, "{line}")?;
+        Ok(())
+    }
+
+    pub fn append_many(data_dir: &Path, events: &[FeedbackEvent]) -> anyhow::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let p = path(data_dir);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)?;
+        for event in events {
+            let line = serde_json::to_string(event)?;
+            writeln!(f, "{line}")?;
+        }
+        Ok(())
+    }
+
+    pub fn load(data_dir: &Path) -> Vec<FeedbackEvent> {
+        let p = path(data_dir);
+        let Ok(content) = std::fs::read_to_string(p) else {
+            return Vec::new();
+        };
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spec 005 Phase 8 — AI Batch Triage
+// ---------------------------------------------------------------------------
+//
+// At window close, batch every closed-group summary into a single prompt and
+// ask the AI to classify each as URGENT / INFO / SUPPRESS. The result drives
+// the Telegram dispatch for ambiguous cases: URGENT is forwarded even when
+// the per-group ChannelFilter would have deferred, SUPPRESS downgrades an
+// otherwise-actionable summary to daily-briefing, INFO is the default.
+//
+// Disabled by default (spec 005 §Phase 8, `[ai].batch_triage`). On AI API
+// failure the caller MUST fall back to per-group classification — this
+// module never hides errors from the caller.
+
+/// Per-group classification from the batched AI call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchClassification {
+    Urgent,
+    Info,
+    Suppress,
+}
+
+/// Build a batched prompt from a slice of GroupSummary. The prompt is a
+/// plain-text list numbered for easy parsing, plus an instruction block.
+/// Each line includes detector, entity, severity, count, and auto-resolved
+/// status. Returns None when there is nothing to triage.
+pub(crate) fn build_batch_prompt(summaries: &[GroupSummary]) -> Option<String> {
+    if summaries.is_empty() {
+        return None;
+    }
+    let mut prompt = String::from(
+        "You are a security operator classifying incident groups. For each \
+         line below, respond with one of:\n\
+         - URGENT: immediate operator attention needed\n\
+         - INFO:   informational, include in briefing only\n\
+         - SUPPRESS: routine noise, drop entirely\n\n\
+         Respond with one line per group in the format `N: URGENT` where N \
+         is the group index. Do not include any other text.\n\n\
+         Groups:\n",
+    );
+    for (idx, s) in summaries.iter().enumerate() {
+        prompt.push_str(&format!(
+            "{idx}: detector={} entity_type={:?} entity={} count={} severity={:?} auto_resolved={}\n",
+            s.detector, s.entity_type, s.entity_value, s.count, s.severity_max, s.auto_resolved
+        ));
+    }
+    Some(prompt)
+}
+
+/// Parse the AI response text into (index, classification) pairs. Lines that
+/// don't match the expected format are skipped. Indexes may be out of order;
+/// the caller is responsible for aligning them to the original slice.
+pub(crate) fn parse_batch_response(text: &str) -> Vec<(usize, BatchClassification)> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // `3: URGENT` | `3:URGENT` | `3 URGENT` | `3 - URGENT` — tolerate
+        // common AI-response shapes.
+        let (idx_part, class_part) = match line.find(|c: char| !c.is_ascii_digit()) {
+            Some(i) => (
+                &line[..i],
+                line[i..].trim_start_matches([':', '-', ' ', '\t']),
+            ),
+            None => continue,
+        };
+        let Ok(idx) = idx_part.parse::<usize>() else {
+            continue;
+        };
+        let up = class_part
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let class = match up.as_str() {
+            "URGENT" => BatchClassification::Urgent,
+            "INFO" => BatchClassification::Info,
+            "SUPPRESS" => BatchClassification::Suppress,
+            _ => continue,
+        };
+        out.push((idx, class));
+    }
+    out
+}
+
+/// Run the AI chat provider with the batch prompt, parse the response, and
+/// return the classifications aligned 1:1 with the input slice. On failure,
+/// returns None so the caller can fall back to per-group classification.
+///
+/// Used by the slow loop when `ai.batch_triage = true`.
+pub(crate) async fn run_batch_triage(
+    provider: &dyn crate::ai::AiProvider,
+    summaries: &[GroupSummary],
+) -> Option<Vec<BatchClassification>> {
+    let prompt = build_batch_prompt(summaries)?;
+    let system = "You are a terse incident classifier. Output one line per group, no prose.";
+    let response = match provider.chat(system, &prompt).await {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!("batch triage AI call failed: {e:#}");
+            return None;
+        }
+    };
+    let parsed = parse_batch_response(&response);
+    let mut out = vec![BatchClassification::Info; summaries.len()];
+    for (idx, class) in parsed {
+        if idx < out.len() {
+            out[idx] = class;
+        }
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,5 +1476,247 @@ mod tests {
         assert!(is_immediate_threat(&inc1));
         let inc2 = make_incident("systemd_persistence", "unknown", Severity::High);
         assert!(is_immediate_threat(&inc2));
+    }
+
+    // ─── Spec 005 T017 — snapshot for dashboard /api/incident-groups ───
+
+    #[test]
+    fn snapshot_json_empty_engine_has_zero_groups() {
+        let engine = GroupingEngine::new(&default_config());
+        let snap = engine.snapshot_json();
+        assert_eq!(snap["active_count"].as_u64(), Some(0));
+        assert!(snap["groups"].as_array().unwrap().is_empty());
+        assert!(snap["snapshot_ts"].as_str().is_some());
+    }
+
+    #[test]
+    fn snapshot_json_reflects_inserted_groups() {
+        let mut engine = GroupingEngine::new(&default_config());
+        let base = Utc::now() - chrono::Duration::minutes(5);
+        let inc_a = make_incident_at("ssh_bruteforce", "1.1.1.1", Severity::High, base);
+        engine.insert(&inc_a);
+        let inc_b = make_incident_at(
+            "port_scan",
+            "2.2.2.2",
+            Severity::Medium,
+            base + chrono::Duration::minutes(2),
+        );
+        engine.insert(&inc_b);
+
+        let snap = engine.snapshot_json();
+        assert_eq!(snap["active_count"].as_u64(), Some(2));
+        let groups = snap["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+
+        // Most recently-seen first: port_scan (2 min later) precedes ssh_bruteforce.
+        assert_eq!(groups[0]["detector"], "port_scan");
+        assert_eq!(groups[0]["entity_type"], "ip");
+        assert_eq!(groups[0]["entity_value"], "2.2.2.2");
+        assert_eq!(groups[0]["count"].as_u64(), Some(1));
+        assert_eq!(groups[0]["auto_resolved"].as_bool(), Some(false));
+        assert_eq!(groups[1]["detector"], "ssh_bruteforce");
+    }
+
+    #[test]
+    fn snapshot_json_preserves_auto_resolved_flag() {
+        let mut engine = GroupingEngine::new(&default_config());
+        let inc = make_incident("ssh_bruteforce", "1.2.3.4", Severity::High);
+        engine.insert(&inc);
+        engine.mark_auto_resolved(&inc);
+        let snap = engine.snapshot_json();
+        assert_eq!(
+            snap["groups"][0]["auto_resolved"].as_bool(),
+            Some(true),
+            "mark_auto_resolved must round-trip through the dashboard snapshot"
+        );
+    }
+
+    // ─── Spec 005 Phase 7 — Feedback tracker tests ────────────────────
+
+    fn now() -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    #[test]
+    fn feedback_pending_increments_and_decrements() {
+        let mut t = FeedbackTracker::new();
+        assert_eq!(t.pending_count(), 0);
+        t.on_notification_sent("ssh_bruteforce", EntityType::Ip, "1.2.3.4", "inc-1", now());
+        assert_eq!(t.pending_count(), 1);
+        let _ = t.on_operator_action("inc-1", "block", now());
+        assert_eq!(t.pending_count(), 0);
+    }
+
+    #[test]
+    fn feedback_aged_pending_converts_to_ignore_tally() {
+        let mut t = FeedbackTracker::new();
+        let old = Utc::now() - chrono::Duration::hours(25);
+        t.on_notification_sent("ssh_bruteforce", EntityType::Ip, "1.2.3.4", "inc-a", old);
+        let events = t.tick(Utc::now());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], FeedbackEvent::Ignored { .. }));
+        assert_eq!(t.pending_count(), 0);
+        assert!(!t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+    }
+
+    #[test]
+    fn feedback_demotes_after_three_ignores() {
+        let mut t = FeedbackTracker::new();
+        let old = Utc::now() - chrono::Duration::hours(25);
+        for i in 0..3 {
+            t.on_notification_sent(
+                "ssh_bruteforce",
+                EntityType::Ip,
+                "1.2.3.4",
+                &format!("inc-{i}"),
+                old,
+            );
+        }
+        t.tick(Utc::now());
+        assert!(t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+        // Different entity type → independent tally.
+        assert!(!t.is_demoted("ssh_bruteforce", &EntityType::User));
+    }
+
+    #[test]
+    fn feedback_operator_action_resets_ignore_tally() {
+        let mut t = FeedbackTracker::new();
+        let old = Utc::now() - chrono::Duration::hours(25);
+        for i in 0..3 {
+            t.on_notification_sent(
+                "ssh_bruteforce",
+                EntityType::Ip,
+                "1.2.3.4",
+                &format!("inc-{i}"),
+                old,
+            );
+        }
+        t.tick(Utc::now());
+        assert!(t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+
+        // Operator now engages with a fresh notification for the same key.
+        t.on_notification_sent(
+            "ssh_bruteforce",
+            EntityType::Ip,
+            "1.2.3.4",
+            "inc-fresh",
+            Utc::now(),
+        );
+        let _ = t.on_operator_action("inc-fresh", "block", Utc::now());
+        assert!(
+            !t.is_demoted("ssh_bruteforce", &EntityType::Ip),
+            "explicit operator engagement must clear the demotion"
+        );
+    }
+
+    #[test]
+    fn feedback_replay_reconstructs_state() {
+        // Simulate: three ignored events recorded historically, then an
+        // operator action — replay must land on "not demoted".
+        let mut t = FeedbackTracker::new();
+        let past = Utc::now() - chrono::Duration::hours(48);
+        for _ in 0..3 {
+            let ev = FeedbackEvent::Ignored {
+                ts: past,
+                detector: "ssh_bruteforce".into(),
+                entity_type: EntityType::Ip,
+                incident_id: "x".into(),
+            };
+            t.replay_event(&ev, Utc::now());
+        }
+        assert!(t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+
+        let action = FeedbackEvent::Action {
+            ts: past,
+            detector: "ssh_bruteforce".into(),
+            entity_type: EntityType::Ip,
+            action: "block".into(),
+        };
+        t.replay_event(&action, Utc::now());
+        assert!(!t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+    }
+
+    // ─── Spec 005 Phase 8 — AI batch triage tests ────────────────────
+
+    fn summary(detector: &str, entity: &str, count: u32, auto: bool) -> GroupSummary {
+        GroupSummary {
+            detector: detector.into(),
+            entity_type: EntityType::Ip,
+            entity_value: entity.into(),
+            count,
+            severity_max: Severity::High,
+            auto_resolved: auto,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn build_batch_prompt_is_none_when_empty() {
+        assert!(build_batch_prompt(&[]).is_none());
+    }
+
+    #[test]
+    fn build_batch_prompt_lists_each_group_on_its_own_line() {
+        let s1 = summary("ssh_bruteforce", "1.2.3.4", 42, true);
+        let s2 = summary("port_scan", "5.6.7.8", 3, false);
+        let prompt = build_batch_prompt(&[s1, s2]).unwrap();
+        assert!(prompt.contains("URGENT"));
+        assert!(prompt.contains("INFO"));
+        assert!(prompt.contains("SUPPRESS"));
+        assert!(prompt.contains("detector=ssh_bruteforce"));
+        assert!(prompt.contains("entity=5.6.7.8"));
+        // Each group is on its own numbered line.
+        assert!(prompt.contains("\n0: "));
+        assert!(prompt.contains("\n1: "));
+    }
+
+    #[test]
+    fn parse_batch_response_understands_common_shapes() {
+        let text = "0: URGENT\n1:INFO\n2 - SUPPRESS\n3 urgent\n";
+        let out = parse_batch_response(text);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], (0, BatchClassification::Urgent));
+        assert_eq!(out[1], (1, BatchClassification::Info));
+        assert_eq!(out[2], (2, BatchClassification::Suppress));
+        assert_eq!(out[3], (3, BatchClassification::Urgent));
+    }
+
+    #[test]
+    fn parse_batch_response_skips_garbage_lines() {
+        let text = "Sure, here are my classifications:\n\
+                    0: URGENT\n\
+                    (I'm not entirely sure about the second one)\n\
+                    1: SUPPRESS\n\
+                    Let me know if you want me to revise.\n";
+        let out = parse_batch_response(text);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], (0, BatchClassification::Urgent));
+        assert_eq!(out[1], (1, BatchClassification::Suppress));
+    }
+
+    #[test]
+    fn feedback_store_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![
+            FeedbackEvent::Sent {
+                ts: Utc::now(),
+                detector: "ssh_bruteforce".into(),
+                entity_type: EntityType::Ip,
+                entity_value: "1.2.3.4".into(),
+                incident_id: "inc-1".into(),
+            },
+            FeedbackEvent::Action {
+                ts: Utc::now(),
+                detector: "ssh_bruteforce".into(),
+                entity_type: EntityType::Ip,
+                action: "block".into(),
+            },
+        ];
+        feedback_store::append_many(dir.path(), &events).unwrap();
+        let loaded = feedback_store::load(dir.path());
+        assert_eq!(loaded.len(), 2);
+        assert!(matches!(loaded[0], FeedbackEvent::Sent { .. }));
+        assert!(matches!(loaded[1], FeedbackEvent::Action { .. }));
     }
 }
