@@ -127,11 +127,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
         for (name, hash) in &new_efivars {
             if let Some(old_hash) = efivar_hashes.get(name) {
                 if old_hash != hash {
-                    let severity = if name.starts_with("SecureBoot") || name.starts_with("dbx") {
-                        Severity::Critical
-                    } else {
-                        Severity::High
-                    };
+                    let severity = classify_efivar_change(name);
                     let ev = make_event(
                         &host,
                         severity,
@@ -188,28 +184,8 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
         let new_tainted = read_tainted();
         if new_tainted != kernel_tainted_baseline && new_tainted > kernel_tainted_baseline {
             let added = new_tainted & !kernel_tainted_baseline;
-            let mut reasons = Vec::new();
-            if added & 1 != 0 {
-                reasons.push("proprietary module");
-            }
-            if added & 4096 != 0 {
-                reasons.push("out-of-tree module");
-            }
-            if added & 8192 != 0 {
-                reasons.push("unsigned module");
-            }
-            if added & 256 != 0 {
-                reasons.push("ACPI table overridden");
-            }
-            if added & 128 != 0 {
-                reasons.push("kernel OOPS");
-            }
-
-            let severity = if added & (8192 | 128 | 256) != 0 {
-                Severity::Critical
-            } else {
-                Severity::High
-            };
+            let reasons = kernel_taint_reasons(added);
+            let severity = classify_kernel_taint_severity(added);
             let ev = make_event(
                 &host,
                 severity,
@@ -250,9 +226,7 @@ fn scan_esp_hashes() -> HashMap<String, String> {
         if let Ok(entries) = fs::read_dir(dir_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("efi")
-                    || path.extension().and_then(|e| e.to_str()) == Some("EFI")
-                {
+                if should_hash_esp_entry(&path) {
                     if let Some(hash) = sha256_file(&path) {
                         hashes.insert(path.display().to_string(), hash);
                     }
@@ -338,5 +312,121 @@ fn make_event(
         details: serde_json::Value::Object(detail_map),
         tags: tags.iter().map(|t| t.to_string()).collect(),
         entities: vec![],
+    }
+}
+
+fn should_hash_esp_entry(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("efi" | "EFI")
+    )
+}
+
+fn classify_efivar_change(name: &str) -> Severity {
+    if name.starts_with("SecureBoot") || name.starts_with("dbx") {
+        Severity::Critical
+    } else {
+        Severity::High
+    }
+}
+
+fn kernel_taint_reasons(added: u64) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if added & 1 != 0 {
+        reasons.push("proprietary module");
+    }
+    if added & 4096 != 0 {
+        reasons.push("out-of-tree module");
+    }
+    if added & 8192 != 0 {
+        reasons.push("unsigned module");
+    }
+    if added & 256 != 0 {
+        reasons.push("ACPI table overridden");
+    }
+    if added & 128 != 0 {
+        reasons.push("kernel OOPS");
+    }
+    reasons
+}
+
+fn classify_kernel_taint_severity(added: u64) -> Severity {
+    if added & (8192 | 128 | 256) != 0 {
+        Severity::Critical
+    } else {
+        Severity::High
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_hash_esp_entry_accepts_efi_extensions_only() {
+        // Validates ESP scanner filtering so only EFI binaries are tracked for integrity drift.
+        assert!(should_hash_esp_entry(Path::new(
+            "/boot/efi/EFI/BOOT/BOOTX64.EFI"
+        )));
+        assert!(should_hash_esp_entry(Path::new(
+            "/boot/efi/EFI/BOOT/shimx64.efi"
+        )));
+        assert!(!should_hash_esp_entry(Path::new(
+            "/boot/efi/EFI/BOOT/readme.txt"
+        )));
+    }
+
+    #[test]
+    fn classify_efivar_change_elevates_secure_boot_related_variables() {
+        // Ensures tampering on high-risk UEFI variables is always classified as critical.
+        assert!(matches!(
+            classify_efivar_change("SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            Severity::Critical
+        ));
+        assert!(matches!(
+            classify_efivar_change("dbx-d719b2cb-3d3a-4596-a3bc-dad00e67656f"),
+            Severity::Critical
+        ));
+    }
+
+    #[test]
+    fn classify_efivar_change_marks_other_watched_variables_as_high() {
+        // Covers non-critical UEFI variable branch to preserve existing alert severity.
+        assert!(matches!(
+            classify_efivar_change("KEK-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            Severity::High
+        ));
+    }
+
+    #[test]
+    fn kernel_taint_reasons_reports_all_matching_bits() {
+        // Guards reason rendering so analysts see complete context for taint-bit changes.
+        let reasons = kernel_taint_reasons(1 | 4096 | 128);
+        assert!(reasons.contains(&"proprietary module"));
+        assert!(reasons.contains(&"out-of-tree module"));
+        assert!(reasons.contains(&"kernel OOPS"));
+    }
+
+    #[test]
+    fn classify_kernel_taint_severity_is_critical_for_high_risk_bits() {
+        // Ensures unsigned modules, OOPS, and ACPI override bits stay in critical severity path.
+        assert!(matches!(
+            classify_kernel_taint_severity(8192),
+            Severity::Critical
+        ));
+        assert!(matches!(
+            classify_kernel_taint_severity(128),
+            Severity::Critical
+        ));
+        assert!(matches!(
+            classify_kernel_taint_severity(256),
+            Severity::Critical
+        ));
+    }
+
+    #[test]
+    fn classify_kernel_taint_severity_is_high_for_low_risk_bits() {
+        // Verifies non-critical taint additions retain high severity instead of being over-promoted.
+        assert!(matches!(classify_kernel_taint_severity(1), Severity::High));
     }
 }

@@ -4,7 +4,7 @@ mod detectors;
 mod sinks;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
     );
 
     let data_dir = Path::new(&cfg.output.data_dir);
-    let state_path = data_dir.join("state.json");
+    let state_path = state_path_for(data_dir);
 
     let mut state = State::load(&state_path)?;
     info!(cursors = state.cursors.len(), "state loaded");
@@ -198,18 +198,12 @@ async fn main() -> Result<()> {
     // Optional syslog CEF output (configured via env or future config section)
     let mut syslog_writer: Option<sinks::syslog_cef::SyslogCefWriter> = {
         let syslog_host = std::env::var("INNERWARDEN_SYSLOG_HOST").unwrap_or_default();
-        if syslog_host.is_empty() {
+        if !should_enable_syslog_sink(&syslog_host) {
             None
         } else {
-            let port: u16 = std::env::var("INNERWARDEN_SYSLOG_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(514);
-            let protocol = if std::env::var("INNERWARDEN_SYSLOG_TCP").is_ok() {
-                sinks::syslog_cef::SyslogProtocol::Tcp
-            } else {
-                sinks::syslog_cef::SyslogProtocol::Udp
-            };
+            let syslog_port = std::env::var("INNERWARDEN_SYSLOG_PORT").ok();
+            let port = parse_syslog_port(syslog_port.as_deref());
+            let protocol = choose_syslog_protocol(std::env::var("INNERWARDEN_SYSLOG_TCP").is_ok());
             info!(host = %syslog_host, port, "Syslog CEF output enabled");
             Some(sinks::syslog_cef::SyslogCefWriter::new(
                 sinks::syslog_cef::SyslogCefConfig {
@@ -734,7 +728,10 @@ async fn main() -> Result<()> {
     }
 
     // Spawn integrity collector
-    if cfg.collectors.integrity.enabled && !cfg.collectors.integrity.paths.is_empty() {
+    if should_spawn_integrity_collector(
+        cfg.collectors.integrity.enabled,
+        &cfg.collectors.integrity.paths,
+    ) {
         let ic = &cfg.collectors.integrity;
         let known_hashes: HashMap<String, String> = state
             .get_cursor("integrity")
@@ -1199,14 +1196,47 @@ async fn main() -> Result<()> {
 /// Load blocked IPs from the file written by the agent.
 /// Returns an empty set if the file does not exist.
 fn load_blocked_ips(data_dir: &Path) -> HashSet<String> {
-    let path = data_dir.join("blocked-ips.txt");
+    let path = blocked_ips_path_for(data_dir);
     match std::fs::read_to_string(&path) {
-        Ok(contents) => contents
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect(),
+        Ok(contents) => parse_blocked_ips(&contents),
         Err(_) => HashSet::new(),
+    }
+}
+
+fn state_path_for(data_dir: &Path) -> PathBuf {
+    data_dir.join("state.json")
+}
+
+fn blocked_ips_path_for(data_dir: &Path) -> PathBuf {
+    data_dir.join("blocked-ips.txt")
+}
+
+fn parse_blocked_ips(contents: &str) -> HashSet<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn should_spawn_integrity_collector(enabled: bool, paths: &[String]) -> bool {
+    enabled && !paths.is_empty()
+}
+
+fn should_enable_syslog_sink(syslog_host: &str) -> bool {
+    !syslog_host.is_empty()
+}
+
+fn parse_syslog_port(port: Option<&str>) -> u16 {
+    port.and_then(|raw| raw.parse::<u16>().ok()).unwrap_or(514)
+}
+
+fn choose_syslog_protocol(tcp_enabled: bool) -> sinks::syslog_cef::SyslogProtocol {
+    if tcp_enabled {
+        sinks::syslog_cef::SyslogProtocol::Tcp
+    } else {
+        sinks::syslog_cef::SyslogProtocol::Udp
     }
 }
 
@@ -1963,5 +1993,86 @@ fn syscall_name_to_nr(name: &str) -> Option<u32> {
         "sysinfo" => Some(179),
         "uname" => Some(160),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_core::event::Severity;
+
+    #[test]
+    fn parse_blocked_ips_discards_blank_and_whitespace_lines() {
+        // Covers parser normalization so blocked-ips feedback keeps only meaningful IP tokens.
+        let parsed = parse_blocked_ips("\n 1.2.3.4 \n\n10.0.0.8\n   \n");
+        assert!(parsed.contains("1.2.3.4"));
+        assert!(parsed.contains("10.0.0.8"));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn helper_paths_resolve_inside_data_dir() {
+        // Verifies path derivation remains deterministic for state and blocked-IP files.
+        let data_dir = Path::new("/var/lib/innerwarden");
+        assert_eq!(
+            state_path_for(data_dir),
+            PathBuf::from("/var/lib/innerwarden/state.json")
+        );
+        assert_eq!(
+            blocked_ips_path_for(data_dir),
+            PathBuf::from("/var/lib/innerwarden/blocked-ips.txt")
+        );
+    }
+
+    #[test]
+    fn should_spawn_integrity_collector_requires_flag_and_paths() {
+        // Ensures collector startup logic only runs when both config prerequisites are present.
+        assert!(should_spawn_integrity_collector(
+            true,
+            &[String::from("/etc/passwd")]
+        ));
+        assert!(!should_spawn_integrity_collector(true, &[]));
+        assert!(!should_spawn_integrity_collector(
+            false,
+            &[String::from("/etc/passwd")]
+        ));
+    }
+
+    #[test]
+    fn parse_syslog_port_uses_default_for_missing_or_invalid_values() {
+        // Guards sink selection fallback so malformed env vars cannot break startup.
+        assert_eq!(parse_syslog_port(None), 514);
+        assert_eq!(parse_syslog_port(Some("not-a-port")), 514);
+        assert_eq!(parse_syslog_port(Some("6514")), 6514);
+    }
+
+    #[test]
+    fn choose_syslog_protocol_tracks_tcp_toggle() {
+        // Validates protocol selection branch used by the optional syslog sink.
+        assert!(matches!(
+            choose_syslog_protocol(true),
+            sinks::syslog_cef::SyslogProtocol::Tcp
+        ));
+        assert!(matches!(
+            choose_syslog_protocol(false),
+            sinks::syslog_cef::SyslogProtocol::Udp
+        ));
+    }
+
+    #[test]
+    fn severity_rank_orders_levels_from_debug_to_critical() {
+        // Confirms dedup ranking keeps higher-severity incidents when multiple detectors fire.
+        assert_eq!(severity_rank(&Severity::Debug), 0);
+        assert_eq!(severity_rank(&Severity::Info), 1);
+        assert_eq!(severity_rank(&Severity::Low), 2);
+        assert_eq!(severity_rank(&Severity::Medium), 3);
+        assert_eq!(severity_rank(&Severity::High), 4);
+        assert_eq!(severity_rank(&Severity::Critical), 5);
+    }
+
+    #[test]
+    fn passthrough_sources_are_disabled_by_default() {
+        // Documents current behavior where passthrough mode is intentionally opt-in and off.
+        assert!(!is_passthrough_source("external.ids"));
     }
 }
