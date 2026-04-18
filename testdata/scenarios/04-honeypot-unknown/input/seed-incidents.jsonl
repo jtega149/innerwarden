@@ -1,0 +1,1 @@
+{"ts":"2026-04-18T10:00:00Z","host":"scen-04-honeypot-unknown","incident_id":"honeypot:9.9.9.9:2026-04-18T10:00:00Z","severity":"medium","title":"Honeypot hit from 9.9.9.9","summary":"tcp connect to :2222 from 9.9.9.9 (no reputation signals)","evidence":{"port":2222,"source_ip":"9.9.9.9"},"recommended_checks":[],"tags":["honeypot"],"entities":[{"type":"ip","value":"9.9.9.9"}]}
