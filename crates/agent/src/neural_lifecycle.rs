@@ -21,10 +21,28 @@ use tracing::{debug, info, warn};
 // Feature extraction (mirrored from innerwarden-gym/src/realdata.rs)
 // ---------------------------------------------------------------------------
 
-const NUM_FEATURES: usize = 58;
+// Feature layout (bump whenever kinds/bigrams/signals/graph blocks change size —
+// old models deserialise to None and are rebuilt on the next training cycle):
+//
+//   kinds    [0 .. KIND_SLOTS)                one-hot count per event kind
+//   bigrams  [BIGRAM_BASE .. SEQ_BASE)        attack-shaped kind transitions
+//   signals  [SEQ_BASE .. GRAPH_BASE)         hand-crafted sequence features
+//   graph    [GRAPH_BASE .. NUM_FEATURES)     knowledge-graph structural signals
+const KIND_SLOTS: usize = 31;
+const NUM_BIGRAMS: usize = 16;
+const BIGRAM_BASE: usize = KIND_SLOTS;
+const NUM_SEQUENCE: usize = 8;
+const SEQ_BASE: usize = BIGRAM_BASE + NUM_BIGRAMS;
+const NUM_GRAPH: usize = 10;
+const GRAPH_BASE: usize = SEQ_BASE + NUM_SEQUENCE;
+const NUM_FEATURES: usize = GRAPH_BASE + NUM_GRAPH;
 const WINDOW_SIZE: usize = 20;
 
-/// Map event kind to feature index (0-23).
+/// Map event kind to feature index (0..KIND_SLOTS). Slots 24-30 were added
+/// in v0.12 to cover kinds the production sensor was already emitting at
+/// meaningful volume (http.request, tcp_stream.ssh, memfd / mprotect probes,
+/// network.snapshot, file.extracted_from_network, kernel.bpf_program_loaded)
+/// but that the pre-012 autoencoder was silently dropping.
 fn kind_index(kind: &str) -> Option<usize> {
     match kind {
         "file.read_access" => Some(0),
@@ -51,28 +69,36 @@ fn kind_index(kind: &str) -> Option<usize> {
         "kernel.new_module_post_boot" => Some(21),
         "filesystem.mount" => Some(22),
         "network.listen" => Some(23),
+        "http.request" => Some(24),
+        "tcp_stream.ssh" => Some(25),
+        "memory.anon_executable" => Some(26),
+        "network.snapshot" => Some(27),
+        "memory.deleted_file_mapping" => Some(28),
+        "file.extracted_from_network" => Some(29),
+        "kernel.bpf_program_loaded" => Some(30),
         _ => None,
     }
 }
 
-/// Attack-indicative bigram transitions.
+/// Attack-indicative bigram transitions. Slot values follow `BIGRAM_BASE`
+/// (updates when `KIND_SLOTS` changes — keep in sync manually).
 const ATTACK_BIGRAMS: &[(usize, usize, usize)] = &[
-    (14, 13, 24), // ssh_failed → ssh_success
-    (13, 1, 25),  // ssh_success → shell_exec
-    (1, 0, 26),   // shell_exec → file_read
-    (0, 7, 27),   // file_read → outbound_connect
-    (1, 7, 28),   // shell_exec → outbound_connect
-    (8, 0, 29),   // sudo → file_read
-    (1, 16, 30),  // shell_exec → timestomp
-    (1, 17, 31),  // shell_exec → truncate
-    (3, 1, 32),   // fd_redirect → shell_exec
-    (19, 1, 33),  // privesc → shell_exec
-    (1, 20, 34),  // shell_exec → memfd_create
-    (7, 7, 35),   // outbound → outbound (beaconing)
-    (1, 1, 36),   // shell → shell (recon burst)
-    (21, 1, 37),  // module_load → shell_exec
-    (23, 9, 38),  // listen → accept
-    (4, 3, 39),   // clone → fd_redirect
+    (14, 13, BIGRAM_BASE),     // ssh_failed → ssh_success
+    (13, 1, BIGRAM_BASE + 1),  // ssh_success → shell_exec
+    (1, 0, BIGRAM_BASE + 2),   // shell_exec → file_read
+    (0, 7, BIGRAM_BASE + 3),   // file_read → outbound_connect
+    (1, 7, BIGRAM_BASE + 4),   // shell_exec → outbound_connect
+    (8, 0, BIGRAM_BASE + 5),   // sudo → file_read
+    (1, 16, BIGRAM_BASE + 6),  // shell_exec → timestomp
+    (1, 17, BIGRAM_BASE + 7),  // shell_exec → truncate
+    (3, 1, BIGRAM_BASE + 8),   // fd_redirect → shell_exec
+    (19, 1, BIGRAM_BASE + 9),  // privesc → shell_exec
+    (1, 20, BIGRAM_BASE + 10), // shell_exec → memfd_create
+    (7, 7, BIGRAM_BASE + 11),  // outbound → outbound (beaconing)
+    (1, 1, BIGRAM_BASE + 12),  // shell → shell (recon burst)
+    (21, 1, BIGRAM_BASE + 13), // module_load → shell_exec
+    (23, 9, BIGRAM_BASE + 14), // listen → accept
+    (4, 3, BIGRAM_BASE + 15),  // clone → fd_redirect
 ];
 
 /// Extract 48 features from a window of event kinds.
@@ -106,13 +132,13 @@ fn window_features(kinds: &[Option<usize>]) -> Vec<f32> {
         }
     }
 
-    // Layer 3: sequence signals [40-47]
+    // Layer 3: sequence signals [SEQ_BASE .. GRAPH_BASE)
 
-    // 40: kind diversity
+    // +0: kind diversity
     let unique: std::collections::HashSet<_> = kinds.iter().filter_map(|x| *x).collect();
-    f[40] = (unique.len() as f32 / 12.0).min(1.0);
+    f[SEQ_BASE] = (unique.len() as f32 / 12.0).min(1.0);
 
-    // 41: transition entropy
+    // +1: transition entropy
     {
         let mut bigram_counts = std::collections::HashMap::new();
         let mut total = 0u32;
@@ -130,11 +156,11 @@ fn window_features(kinds: &[Option<usize>]) -> Vec<f32> {
                     entropy -= p * p.log2();
                 }
             }
-            f[41] = (entropy / 9.2).min(1.0);
+            f[SEQ_BASE + 1] = (entropy / 9.2).min(1.0);
         }
     }
 
-    // 42: longest consecutive same-kind run
+    // +2: longest consecutive same-kind run
     {
         let mut max_run = 1u32;
         let mut current = 1u32;
@@ -146,13 +172,11 @@ fn window_features(kinds: &[Option<usize>]) -> Vec<f32> {
                 current = 1;
             }
         }
-        f[42] = (max_run as f32 / n).min(1.0);
+        f[SEQ_BASE + 2] = (max_run as f32 / n).min(1.0);
     }
 
-    // 43: has sensitive file read (based on kind index 0 = file.read_access presence)
-    // In agent, we only have kind indices — full summary check needs Event objects.
-    // Approximation: file.read_access after ssh.login_success = credential harvesting signal
-    f[43] = if kinds
+    // +3: credential harvesting signal (ssh.login_success → file.read_access)
+    f[SEQ_BASE + 3] = if kinds
         .windows(2)
         .any(|w| w[0] == Some(13) && w[1] == Some(0))
     {
@@ -161,7 +185,7 @@ fn window_features(kinds: &[Option<usize>]) -> Vec<f32> {
         0.0
     };
 
-    // 44: kill chain stage progression (how many distinct stages appear in order)
+    // +4: kill chain stage progression (how many distinct stages appear in order)
     {
         let mut stages_seen = 0u32;
         let mut last_stage = 0u32;
@@ -181,25 +205,26 @@ fn window_features(kinds: &[Option<usize>]) -> Vec<f32> {
                 last_stage = stage;
             }
         }
-        f[44] = (stages_seen as f32 / 7.0).min(1.0);
+        f[SEQ_BASE + 4] = (stages_seen as f32 / 7.0).min(1.0);
     }
 
-    // 45: command diversity (approximated by unique kinds in shell-heavy windows)
+    // +5: command diversity (approximated by unique kinds in shell-heavy windows)
     let shell_ratio = kinds.iter().filter(|&&k| k == Some(1)).count() as f32 / n;
-    f[45] = shell_ratio.min(1.0);
+    f[SEQ_BASE + 5] = shell_ratio.min(1.0);
 
-    // 46: network listener present
-    f[46] = if kinds.iter().any(|&k| k == Some(23) || k == Some(9)) {
+    // +6: network listener present
+    f[SEQ_BASE + 6] = if kinds.iter().any(|&k| k == Some(23) || k == Some(9)) {
         1.0
     } else {
         0.0
     };
 
-    // 47: window size normalized
-    f[47] = (n / 50.0).min(1.0);
+    // +7: window size normalized
+    f[SEQ_BASE + 7] = (n / 50.0).min(1.0);
 
-    // Features 48-57 are graph structural features (filled by enrich_with_graph)
-    // Initialized to 0.0 by default — safe for inference without graph data.
+    // Graph block [GRAPH_BASE .. NUM_FEATURES) is filled by
+    // `enrich_features_with_graph`. Initialised to 0.0 by default — safe for
+    // inference without graph data.
 
     f
 }
@@ -230,35 +255,37 @@ pub struct GraphFeatures {
     pub active_sessions: u32,
 }
 
-/// Enrich a feature vector (slots 48-57) with graph structural features.
+/// Enrich a feature vector with graph structural features. Writes to the
+/// `[GRAPH_BASE .. NUM_FEATURES)` block so the kind / bigram / sequence blocks
+/// upstream stay untouched.
 fn enrich_features_with_graph(f: &mut [f32], gf: &GraphFeatures) {
     if f.len() < NUM_FEATURES {
         return;
     }
-    // 48: average process degree normalized (0 = idle, 1 = 20+ avg connections)
-    f[48] = (gf.avg_process_degree / 20.0).min(1.0);
-    // 49: max process tree depth (deeper = more suspicious)
-    f[49] = (gf.max_process_tree_depth as f32 / 10.0).min(1.0);
-    // 50: threat intel IP count
-    f[50] = (gf.threat_intel_ip_count as f32 / 10.0).min(1.0);
-    // 51: writes to sensitive paths
-    f[51] = (gf.writes_to_sensitive as f32 / 20.0).min(1.0);
-    // 52: connected components (more = more isolated activity)
-    f[52] = (gf.connected_components as f32 / 20.0).min(1.0);
-    // 53: process/IP ratio anomaly (deviate from normal ~5:1)
-    f[53] = if gf.process_ip_ratio > 0.0 {
+    // +0: average process degree normalized (0 = idle, 1 = 20+ avg connections)
+    f[GRAPH_BASE] = (gf.avg_process_degree / 20.0).min(1.0);
+    // +1: max process tree depth (deeper = more suspicious)
+    f[GRAPH_BASE + 1] = (gf.max_process_tree_depth as f32 / 10.0).min(1.0);
+    // +2: threat intel IP count
+    f[GRAPH_BASE + 2] = (gf.threat_intel_ip_count as f32 / 10.0).min(1.0);
+    // +3: writes to sensitive paths
+    f[GRAPH_BASE + 3] = (gf.writes_to_sensitive as f32 / 20.0).min(1.0);
+    // +4: connected components (more = more isolated activity)
+    f[GRAPH_BASE + 4] = (gf.connected_components as f32 / 20.0).min(1.0);
+    // +5: process/IP ratio anomaly (deviate from normal ~5:1)
+    f[GRAPH_BASE + 5] = if gf.process_ip_ratio > 0.0 {
         (1.0 - (gf.process_ip_ratio / 5.0).min(1.0)).abs()
     } else {
         0.0
     };
-    // 54: high-degree hub count
-    f[54] = (gf.high_degree_nodes as f32 / 5.0).min(1.0);
-    // 55: incident count
-    f[55] = (gf.incident_count as f32 / 20.0).min(1.0);
-    // 56: total edge activity level
-    f[56] = (gf.total_edges as f32 / 10000.0).min(1.0);
-    // 57: active sessions
-    f[57] = (gf.active_sessions as f32 / 10.0).min(1.0);
+    // +6: high-degree hub count
+    f[GRAPH_BASE + 6] = (gf.high_degree_nodes as f32 / 5.0).min(1.0);
+    // +7: incident count
+    f[GRAPH_BASE + 7] = (gf.incident_count as f32 / 20.0).min(1.0);
+    // +8: total edge activity level
+    f[GRAPH_BASE + 8] = (gf.total_edges as f32 / 10000.0).min(1.0);
+    // +9: active sessions
+    f[GRAPH_BASE + 9] = (gf.active_sessions as f32 / 10.0).min(1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -648,8 +675,20 @@ impl AnomalyEngine {
     }
 
     /// Run nightly training on recent events.
-    /// Reads events JSONL from data_dir, trains autoencoder, saves model.
+    /// Reads events from SQLite (spec 016) when `store` is provided, falls
+    /// back to JSONL scan otherwise for older deployments + the test harness.
     pub fn train_nightly(&mut self) -> Result<(), String> {
+        self.train_nightly_with_store(None)
+    }
+
+    /// Variant that prefers a SQLite-backed event source. Production calls
+    /// this with `Some(&state.sqlite_store)` after spec 016 stopped writing
+    /// per-day events JSONL files — without the store argument the training
+    /// path finds zero windows and emits "insufficient data" forever.
+    pub fn train_nightly_with_store(
+        &mut self,
+        store: Option<&innerwarden_store::Store>,
+    ) -> Result<(), String> {
         let start = std::time::Instant::now();
         info!("anomaly: starting nightly training");
 
@@ -693,78 +732,143 @@ impl AnomalyEngine {
             );
         }
 
-        // Collect events from JSONL files (last N days)
+        // Collect events from the last N days. Production ingests through
+        // `innerwarden.db` (spec 016), so prefer the SQLite store when
+        // available; fall back to per-day JSONL scan only for pre-016
+        // deployments and the in-tree test harness.
         let cutoff =
             chrono::Utc::now() - chrono::Duration::days(self.config.training_retention_days as i64);
+        let cutoff_iso = cutoff.to_rfc3339();
         let mut all_kinds: Vec<Vec<Option<usize>>> = Vec::new();
-
-        let events_dir = &self.config.data_dir;
-        let entries = std::fs::read_dir(events_dir).map_err(|e| e.to_string())?;
-
         let mut total_events = 0u64;
         let mut skipped_attack = 0u64;
         let mut event_window: Vec<Option<usize>> = Vec::new();
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if !name.starts_with("events-") || !name.ends_with(".jsonl") {
-                continue;
-            }
+        let max_windows = (self.config.training_max_ram_mb as usize)
+            .saturating_mul(1024 * 1024)
+            .saturating_div(NUM_FEATURES.max(1) * 4)
+            .max(1);
+        // Each stored window hydrates into its feature vector later, so the
+        // raw cap is shared between RAM budget and the query limit.
+        let event_limit = max_windows.saturating_mul(5).max(200_000);
 
-            // Check RAM budget (rough estimate: 48 floats × 4 bytes × windows)
-            let estimated_mb = (all_kinds.len() * NUM_FEATURES * 4) / (1024 * 1024);
-            if estimated_mb > self.config.training_max_ram_mb as usize {
-                info!("anomaly: RAM budget reached ({}MB), sampling", estimated_mb);
-                break;
-            }
+        let ram_cap_mb = self.config.training_max_ram_mb as usize;
+        let timeout_secs = self.config.training_timeout_secs;
+        let mut timed_out = false;
 
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
+        if let Some(sq) = store {
+            match sq.events_for_training(&cutoff_iso, event_limit) {
+                Ok(rows) => {
+                    info!(
+                        "anomaly: sourcing training data from innerwarden.db ({} rows since {})",
+                        rows.len(),
+                        cutoff_iso
+                    );
+                    for (kind, ip) in rows {
+                        if !blocked_ips.is_empty() {
+                            if let Some(ref ip) = ip {
+                                if blocked_ips.contains(ip) {
+                                    skipped_attack += 1;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        event_window.push(kind_index(&kind));
+                        total_events += 1;
+                        if event_window.len() >= WINDOW_SIZE {
+                            all_kinds.push(event_window.clone());
+                            event_window.drain(..5);
+                        }
+
+                        let estimated_mb = (all_kinds.len() * NUM_FEATURES * 4) / (1024 * 1024);
+                        if estimated_mb > ram_cap_mb {
+                            info!(
+                                "anomaly: RAM budget reached ({}MB), truncating training window",
+                                estimated_mb
+                            );
+                            break;
+                        }
+                        if start.elapsed().as_secs() > timeout_secs {
+                            timed_out = true;
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("anomaly: sqlite training read failed: {e}");
+                }
+            }
+        }
+
+        // Either store was None or the store query emitted nothing — try the
+        // legacy JSONL scan so pre-016 layouts keep working.
+        if total_events == 0 {
+            let events_dir = &self.config.data_dir;
+            let entries = match std::fs::read_dir(events_dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    return Err(format!(
+                        "no sqlite training source and JSONL scan failed: {e}"
+                    ))
+                }
             };
 
-            for line in content.lines() {
-                let ev: serde_json::Value = match serde_json::from_str(line) {
-                    Ok(v) => v,
+            'files: for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if !name.starts_with("events-") || !name.ends_with(".jsonl") {
+                    continue;
+                }
+
+                let estimated_mb = (all_kinds.len() * NUM_FEATURES * 4) / (1024 * 1024);
+                if estimated_mb > ram_cap_mb {
+                    info!("anomaly: RAM budget reached ({}MB), sampling", estimated_mb);
+                    break;
+                }
+
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
                     Err(_) => continue,
                 };
 
-                // Skip events from blocked IPs (attack traffic).
-                // Train only on clean traffic so the model learns what "normal" looks like.
-                if !blocked_ips.is_empty() {
-                    let ip = ev
-                        .get("details")
-                        .and_then(|d| {
-                            d.get("src_ip")
-                                .or_else(|| d.get("ip"))
-                                .and_then(|v| v.as_str())
-                        })
-                        .unwrap_or("");
-                    if blocked_ips.contains(ip) {
-                        skipped_attack += 1;
-                        continue;
+                for line in content.lines() {
+                    let ev: serde_json::Value = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    let ip = ev.get("details").and_then(|d| {
+                        d.get("src_ip")
+                            .or_else(|| d.get("ip"))
+                            .and_then(|v| v.as_str())
+                    });
+                    if !blocked_ips.is_empty() {
+                        if let Some(ip) = ip {
+                            if blocked_ips.contains(ip) {
+                                skipped_attack += 1;
+                                continue;
+                            }
+                        }
+                    }
+
+                    event_window.push(kind_index(kind));
+                    total_events += 1;
+                    if event_window.len() >= WINDOW_SIZE {
+                        all_kinds.push(event_window.clone());
+                        event_window.drain(..5);
+                    }
+
+                    if start.elapsed().as_secs() > timeout_secs {
+                        timed_out = true;
+                        break 'files;
                     }
                 }
-
-                let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                let idx = kind_index(kind);
-
-                event_window.push(idx);
-                total_events += 1;
-
-                if event_window.len() >= WINDOW_SIZE {
-                    all_kinds.push(event_window.clone());
-                    // Stride of 5
-                    event_window.drain(..5);
-                }
-
-                // Timeout check
-                if start.elapsed().as_secs() > self.config.training_timeout_secs {
-                    warn!("anomaly: training timeout, using data collected so far");
-                    break;
-                }
             }
+        }
+
+        if timed_out {
+            warn!("anomaly: training timeout, using data collected so far");
         }
 
         if skipped_attack > 0 {
@@ -1226,11 +1330,11 @@ mod tests {
     fn bigram_features_nonzero() {
         // Signal path: attack bigrams should activate their dedicated slots
         // so transition patterns influence anomaly scoring.
-        // ssh_failed → ssh_success should activate bigram feature 24
+        // ssh_failed → ssh_success should activate the first bigram slot.
         let kinds = vec![Some(14), Some(13)];
         let f = window_features(&kinds);
         assert!(
-            f[24] > 0.0,
+            f[BIGRAM_BASE] > 0.0,
             "bigram ssh_failed→ssh_success should be nonzero"
         );
     }
@@ -1253,11 +1357,11 @@ mod tests {
             Some(2),  // process_exit
         ];
         let f = window_features(&kinds);
-        // Should detect at least 4 sequential stages
+        // Should detect at least 4 sequential stages (stage-progression slot).
         assert!(
-            f[44] >= 4.0 / 7.0,
+            f[SEQ_BASE + 4] >= 4.0 / 7.0,
             "kill chain progression should be detected: got {}",
-            f[44]
+            f[SEQ_BASE + 4]
         );
     }
 
@@ -1438,6 +1542,25 @@ mod tests {
     }
 
     #[test]
+    fn kind_index_covers_v012_additions() {
+        // Regression guard for the spec-025-follow-up widening: kinds that
+        // production was emitting at high volume (HTTP, raw TLS streams,
+        // memory probes, bpf loads) must map into the feature vector or the
+        // autoencoder trains on a biased slice of reality.
+        assert_eq!(kind_index("http.request"), Some(24));
+        assert_eq!(kind_index("tcp_stream.ssh"), Some(25));
+        assert_eq!(kind_index("memory.anon_executable"), Some(26));
+        assert_eq!(kind_index("network.snapshot"), Some(27));
+        assert_eq!(kind_index("memory.deleted_file_mapping"), Some(28));
+        assert_eq!(kind_index("file.extracted_from_network"), Some(29));
+        assert_eq!(kind_index("kernel.bpf_program_loaded"), Some(30));
+        // Feature layout contract: every mapped slot must fit inside the
+        // one-hot region.
+        assert!(KIND_SLOTS >= 31);
+        assert_eq!(BIGRAM_BASE, KIND_SLOTS);
+    }
+
+    #[test]
     fn enrich_features_with_graph_clamps_and_writes_expected_slots() {
         // Enrichment path: graph metrics should populate slots 48-57 and
         // clamp oversized values into [0, 1].
@@ -1456,16 +1579,136 @@ mod tests {
         };
         enrich_features_with_graph(&mut f, &gf);
 
-        for slot in &f[48..58] {
+        for slot in &f[GRAPH_BASE..NUM_FEATURES] {
             assert!(
                 (0.0..=1.0).contains(slot),
                 "enriched graph slot should be normalized into [0,1]"
             );
         }
-        assert_eq!(f[48], 1.0);
-        assert_eq!(f[49], 1.0);
-        assert_eq!(f[50], 1.0);
-        assert_eq!(f[57], 1.0);
+        assert_eq!(f[GRAPH_BASE], 1.0); // avg_process_degree saturates at 100/20
+        assert_eq!(f[GRAPH_BASE + 1], 1.0); // max_process_tree_depth saturates
+        assert_eq!(f[GRAPH_BASE + 2], 1.0); // threat_intel_ip_count saturates
+        assert_eq!(f[GRAPH_BASE + 9], 1.0); // active_sessions saturates
+    }
+
+    #[test]
+    fn train_nightly_with_store_uses_sqlite_events_and_calibrates_baseline() {
+        // Primary fix path: training must drain the SQLite event table instead
+        // of the JSONL directory that spec 016 stopped populating. A fresh
+        // engine pointed at an in-memory store with several hundred seeded
+        // events should produce a trained model + non-trivial baseline.
+        use chrono::Utc;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::{Event, Severity};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let kinds = [
+            "file.read_access",
+            "shell.command_exec",
+            "network.outbound_connect",
+            "ssh.login_success",
+            "http.request",
+            "tcp_stream.ssh",
+        ];
+        let mut events = Vec::new();
+        for i in 0..600 {
+            let kind = kinds[i % kinds.len()];
+            events.push(Event {
+                ts: Utc::now(),
+                host: "test-host".into(),
+                source: "test".into(),
+                kind: kind.into(),
+                severity: Severity::Info,
+                summary: "synthetic".into(),
+                details: serde_json::json!({"src_ip": "1.2.3.4"}),
+                tags: vec![],
+                entities: vec![EntityRef::ip("1.2.3.4")],
+            });
+        }
+        store
+            .insert_events_batch(&events)
+            .expect("seed events for training");
+
+        let mut engine = AnomalyEngine::new(AnomalyConfig {
+            data_dir: dir.path().to_path_buf(),
+            training_epochs: 4,
+            training_timeout_secs: 60,
+            training_max_ram_mb: 64,
+            training_retention_days: 30,
+            threshold: 0.5,
+            ..AnomalyConfig::default()
+        });
+        engine
+            .train_nightly_with_store(Some(&store))
+            .expect("sqlite-backed training should succeed");
+
+        assert!(engine.training_cycles >= 1, "one training cycle at minimum");
+        assert!(
+            engine.maturity > 0.0,
+            "maturity must advance after training"
+        );
+        assert!(
+            dir.path().join("anomaly-model.bin").exists(),
+            "model file must be written to data_dir"
+        );
+    }
+
+    #[test]
+    fn train_nightly_with_store_falls_back_to_jsonl_when_sqlite_is_empty() {
+        // Backward-compat path: pre-016 layouts keep working. A store without
+        // events + JSONL fixtures in data_dir should still feed the trainer.
+        use chrono::Utc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let today = Utc::now().format("%Y-%m-%d");
+        let jsonl_path = dir.path().join(format!("events-{today}.jsonl"));
+        let mut contents = String::new();
+        // 600 events → ~116 sliding windows at WINDOW_SIZE=20 / stride=5, just
+        // above the 100-window floor enforced by train_nightly.
+        for i in 0..600 {
+            let kind = if i % 2 == 0 {
+                "file.read_access"
+            } else {
+                "shell.command_exec"
+            };
+            contents.push_str(&format!(
+                r#"{{"ts":"2026-04-18T10:00:00Z","host":"h","source":"t","kind":"{kind}","severity":"info","summary":"","details":{{"src_ip":"9.9.9.9"}},"tags":[],"entities":[]}}
+"#
+            ));
+        }
+        std::fs::write(&jsonl_path, contents).expect("write jsonl fixture");
+
+        let mut engine = AnomalyEngine::new(AnomalyConfig {
+            data_dir: dir.path().to_path_buf(),
+            training_epochs: 2,
+            training_timeout_secs: 60,
+            training_max_ram_mb: 64,
+            training_retention_days: 30,
+            threshold: 0.5,
+            ..AnomalyConfig::default()
+        });
+        engine
+            .train_nightly_with_store(Some(&store))
+            .expect("jsonl fallback should produce a model");
+        assert!(engine.training_cycles >= 1);
+    }
+
+    #[test]
+    fn train_nightly_with_store_errors_when_nothing_to_read() {
+        // Failure path: no sqlite rows AND no JSONL files → explicit error so
+        // the slow loop logs instead of silently rebuilding an empty model.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut engine = AnomalyEngine::new(AnomalyConfig {
+            data_dir: dir.path().to_path_buf(),
+            training_retention_days: 7,
+            ..AnomalyConfig::default()
+        });
+        let err = engine
+            .train_nightly_with_store(Some(&store))
+            .expect_err("empty sources must error out");
+        assert!(err.contains("insufficient"), "got: {err}");
     }
 
     #[test]

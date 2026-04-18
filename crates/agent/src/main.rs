@@ -221,6 +221,15 @@ struct Cli {
     /// `<name>.bak-015-researchonly-<stamp>` before writing.
     #[arg(long)]
     backfill_015_research_only: bool,
+
+    /// One-shot: force the autoencoder's nightly training routine to run
+    /// immediately (instead of waiting for 03:00 UTC). Reads events from
+    /// `innerwarden.db`, trains `anomaly-model.bin` in place, then exits.
+    /// Used after a feature-layout bump (or after a stale / saturated model
+    /// is detected in production) so the operator doesn't have to wait a
+    /// whole day for the baseline to recalibrate.
+    #[arg(long)]
+    retrain_anomaly: bool,
 }
 
 // ---------------------------------------------------------------------------

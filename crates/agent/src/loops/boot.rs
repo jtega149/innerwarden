@@ -117,6 +117,50 @@ pub(crate) fn run_backfill_015_research_only(data_dir: &std::path::Path) -> Resu
     }
     Ok(())
 }
+/// One-shot: force the nightly autoencoder training run to happen now.
+/// Invoked via `innerwarden-agent --retrain-anomaly`. Reads events from
+/// `innerwarden.db`, trains, saves `anomaly-model.bin`, and prints the
+/// resulting baseline so the operator can check that scores will diversify.
+pub(crate) fn run_retrain_anomaly(cli: &crate::Cli) -> Result<()> {
+    let sqlite_store: Option<std::sync::Arc<innerwarden_store::Store>> =
+        match innerwarden_store::Store::open(&cli.data_dir) {
+            Ok(s) => {
+                info!(
+                    path = %cli.data_dir.join("innerwarden.db").display(),
+                    "sqlite store opened for retrain"
+                );
+                Some(std::sync::Arc::new(s))
+            }
+            Err(e) => {
+                warn!("sqlite store unavailable: {e:#} — falling back to JSONL scan");
+                None
+            }
+        };
+
+    let config = neural_lifecycle::AnomalyConfig {
+        data_dir: cli.data_dir.clone(),
+        ..neural_lifecycle::AnomalyConfig::default()
+    };
+
+    let mut engine = neural_lifecycle::AnomalyEngine::new(config);
+    engine
+        .train_nightly_with_store(sqlite_store.as_deref())
+        .map_err(|e| anyhow::anyhow!("autoencoder training failed: {e}"))?;
+
+    println!("autoencoder retrain complete:");
+    println!("  maturity       : {:.2}", engine.maturity);
+    println!("  cycles         : {}", engine.training_cycles);
+    println!(
+        "  model saved    : {}",
+        cli.data_dir.join("anomaly-model.bin").display()
+    );
+    println!(
+        "  previous       : {} (rotated)",
+        cli.data_dir.join("anomaly-model.prev.bin").display()
+    );
+    Ok(())
+}
+
 pub(crate) fn cleanup_015_backup_path(snapshot_path: &Path, stamp: &str) -> PathBuf {
     snapshot_path.with_extension(format!("json.bak-015-{stamp}"))
 }
@@ -150,6 +194,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
     if cli.backfill_015_research_only {
         return run_backfill_015_research_only(&cli.data_dir);
+    }
+
+    if cli.retrain_anomaly {
+        return run_retrain_anomaly(&cli);
     }
 
     if cli.report {
@@ -1184,7 +1232,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             let today_key = format!("anomaly_train:{}", chrono::Utc::now().format("%Y-%m-%d"));
                             if !state.store.has_cooldown(state_store::CooldownTable::Decision, &today_key) {
                                 info!("autoencoder: triggering nightly training");
-                                match state.anomaly_engine.train_nightly() {
+                                match state.anomaly_engine.train_nightly_with_store(
+                                    state.sqlite_store.as_deref(),
+                                ) {
                                     Ok(()) => {
                                         info!(
                                             maturity = format!("{:.2}", state.anomaly_engine.maturity),
@@ -1978,6 +2028,7 @@ mod tests {
             honeypot_sandbox_result: None,
             cleanup_015_graph_signal_quality: false,
             backfill_015_research_only: false,
+            retrain_anomaly: false,
         }
     }
 
@@ -2051,6 +2102,71 @@ mod tests {
                 .iter()
                 .any(|name| name.contains(".bak-015-researchonly-")),
             "backfill should create a .bak-015-researchonly-* backup"
+        );
+    }
+
+    #[test]
+    fn retrain_anomaly_errors_on_empty_data_dir() {
+        // Operator-triggered retrain must surface the training error back up
+        // instead of exiting 0 and giving a false-positive "all done". An
+        // empty data_dir has no events + no JSONL → train_nightly_with_store
+        // returns "insufficient data" → run_retrain_anomaly must bubble that.
+        let dir = TempDir::new().expect("tempdir");
+        let cli = once_cli(dir.path().to_path_buf());
+        let result = run_retrain_anomaly(&cli);
+        assert!(result.is_err(), "empty dir must fail, got {result:?}");
+        let msg = format!("{:#}", result.err().expect("err"));
+        assert!(
+            msg.contains("insufficient") || msg.contains("autoencoder"),
+            "error message should mention training failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn retrain_anomaly_writes_model_with_seeded_store() {
+        // Happy path: when the SQLite store has enough events to form ≥100
+        // windows, the one-shot flag trains a model and leaves it in
+        // data_dir so the running agent picks it up on next tick.
+        use chrono::Utc;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::{Event, Severity};
+
+        let dir = TempDir::new().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("on-disk store");
+        let kinds = [
+            "file.read_access",
+            "shell.command_exec",
+            "network.outbound_connect",
+            "http.request",
+            "tcp_stream.ssh",
+        ];
+        let mut events = Vec::new();
+        for i in 0..600 {
+            let kind = kinds[i % kinds.len()];
+            events.push(Event {
+                ts: Utc::now(),
+                host: "h".into(),
+                source: "t".into(),
+                kind: kind.into(),
+                severity: Severity::Info,
+                summary: "".into(),
+                details: serde_json::json!({"src_ip": "1.2.3.4"}),
+                tags: vec![],
+                entities: vec![EntityRef::ip("1.2.3.4")],
+            });
+        }
+        store
+            .insert_events_batch(&events)
+            .expect("seed events into on-disk store");
+        // Drop the handle so run_retrain_anomaly can reopen without SQLite
+        // lock contention.
+        drop(store);
+
+        let cli = once_cli(dir.path().to_path_buf());
+        run_retrain_anomaly(&cli).expect("retrain should succeed on a populated store");
+        assert!(
+            dir.path().join("anomaly-model.bin").exists(),
+            "retrain must produce anomaly-model.bin"
         );
     }
 

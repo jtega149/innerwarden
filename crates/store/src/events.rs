@@ -53,6 +53,45 @@ impl Store {
         Ok(())
     }
 
+    /// Stream event `(kind, src_ip)` tuples since `since_ts_iso`, up to `limit`,
+    /// in ascending `ts` order. Used by nightly autoencoder training — the
+    /// full `Event` payload is never needed there, so we return the two fields
+    /// that matter (kind for feature index, ip for blocked-IP filtering) and
+    /// avoid deserialising the rest.
+    ///
+    /// The JSONL-based training path read events sequentially from per-day
+    /// files. After spec 016 the raw events only live in SQLite, so this is
+    /// the sole source of training data on current production.
+    pub fn events_for_training(
+        &self,
+        since_ts_iso: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare_cached("SELECT kind, data FROM events WHERE ts >= ?1 ORDER BY ts LIMIT ?2")?;
+        let rows = stmt.query_map(params![since_ts_iso, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (kind, data) = row?;
+            let ip = serde_json::from_str::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|v| {
+                    v.get("details").and_then(|d| {
+                        d.get("src_ip")
+                            .or_else(|| d.get("ip"))
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                    })
+                });
+            out.push((kind, ip));
+        }
+        Ok(out)
+    }
+
     /// Read events with rowid > `after_id`, up to `limit`.
     /// Returns `(rowid, Event)` pairs for cursor tracking.
     pub fn events_since(&self, after_id: i64, limit: usize) -> Result<Vec<(i64, Event)>> {
@@ -156,6 +195,38 @@ mod tests {
         let deleted = store.delete_events_before("2099-01-01T00:00:00Z").unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(store.events_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_events_for_training_streams_kind_and_ip() {
+        let store = Store::open_memory().unwrap();
+        let mut ev = sample_event("ssh.login_failed");
+        ev.details = serde_json::json!({"src_ip": "1.2.3.4", "user": "root"});
+        store.insert_event(&ev).unwrap();
+        let mut ev2 = sample_event("http.request");
+        ev2.details = serde_json::json!({"ip": "5.6.7.8"});
+        store.insert_event(&ev2).unwrap();
+        let mut ev3 = sample_event("file.read_access");
+        ev3.details = serde_json::json!({"path": "/etc/passwd"});
+        store.insert_event(&ev3).unwrap();
+
+        let rows = store
+            .events_for_training("1970-01-01T00:00:00Z", 100)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ("ssh.login_failed".into(), Some("1.2.3.4".into())));
+        assert_eq!(rows[1], ("http.request".into(), Some("5.6.7.8".into())));
+        assert_eq!(rows[2].0, "file.read_access");
+        assert_eq!(rows[2].1, None);
+    }
+
+    #[test]
+    fn test_events_for_training_respects_window_cutoff() {
+        let store = Store::open_memory().unwrap();
+        store.insert_event(&sample_event("a")).unwrap();
+        let far_future = "2099-01-01T00:00:00Z";
+        let rows = store.events_for_training(far_future, 100).unwrap();
+        assert!(rows.is_empty(), "events older than cutoff must be skipped");
     }
 
     #[test]
