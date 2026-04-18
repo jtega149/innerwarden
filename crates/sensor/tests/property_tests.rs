@@ -312,10 +312,36 @@ mod host_drift {
             comm in "[a-z]{3,8}",
             filename in "/tmp/[a-z]{3,12}"
         )| {
-            let allowlisted = ["ld-linux", "ld.so", "ldconfig", "update",
-                               "dpkg", "apt", "rpm", "yum", "snap", "flatpak",
-                               "pip", "npm", "cargo", "go", "python", "node",
-                               "java", "innerwarden"];
+            let allowlisted = [
+                "ld-linux",
+                "ld.so",
+                "ldconfig",
+                "update",
+                "dpkg",
+                "apt",
+                "rpm",
+                "yum",
+                "snap",
+                "flatpak",
+                "pip",
+                "npm",
+                "npx",
+                "cargo",
+                "rustc",
+                "cc",
+                "gcc",
+                "g++",
+                "ld",
+                "as",
+                "ar",
+                "make",
+                "cmake",
+                "go",
+                "python",
+                "node",
+                "java",
+                "innerwarden",
+            ];
             if allowlisted.iter().any(|a| comm.starts_with(a)) {
                 return Ok(());
             }

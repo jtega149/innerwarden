@@ -243,4 +243,45 @@ mod tests {
         assert!(context.contains("Cloudflare edge blocking: ENABLED"));
         assert!(context.contains("Allowed skills: block-ip-ufw, honeypot"));
     }
+
+    #[test]
+    fn test_incident_detector_edge_cases() {
+        assert_eq!(incident_detector(""), "");
+        assert_eq!(incident_detector(":"), "");
+        assert_eq!(incident_detector("ssh:brute:force"), "ssh");
+    }
+
+    #[test]
+    fn test_guardian_mode_default_state() {
+        let cfg = config::AgentConfig::default();
+        // default responder.enabled is false
+        assert!(matches!(guardian_mode(&cfg), telegram::GuardianMode::Watch));
+    }
+
+    #[test]
+    fn test_build_agent_context_all_disabled() {
+        let mut cfg = config::AgentConfig::default();
+        // Explicitly disable things that might be enabled by default in AgentConfig::default()
+        cfg.firmware.enabled = false;
+        cfg.hypervisor.enabled = false;
+        cfg.killchain.enabled = false;
+        cfg.dna.enabled = false;
+        cfg.shield.enabled = false;
+        cfg.narrative.enabled = false;
+        cfg.briefing.enabled = false;
+
+        let graph = knowledge_graph::KnowledgeGraph::new();
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+
+        let context = build_agent_context(&cfg, std::path::Path::new("/var/lib/innerwarden"), &kg);
+
+        assert!(context.contains("Mode: 🔵 WATCH"));
+        assert!(context.contains("AI analysis: DISABLED"));
+        assert!(context.contains("Telegram bot: DISABLED"));
+        assert!(context.contains("AbuseIPDB enrichment: DISABLED"));
+        assert!(context.contains("GeoIP enrichment: DISABLED"));
+        assert!(context.contains("Fail2ban integration: DISABLED"));
+        assert!(context.contains("Slack notifications: DISABLED"));
+        assert!(context.contains("Cloudflare edge blocking: DISABLED"));
+    }
 }
