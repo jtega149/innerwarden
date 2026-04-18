@@ -615,6 +615,7 @@ pub(super) async fn api_live_feed_mitre(
 
 #[derive(Deserialize)]
 pub(super) struct GeoIpQuery {
+    #[serde(default)]
     ips: String,
 }
 
@@ -838,5 +839,16 @@ mod tests {
             items: empty,
         };
         assert!(response.items.is_empty());
+    }
+
+    #[test]
+    fn test_geoip_query_deserialization_empty_params() {
+        // Fix #152: ensure GeoIpQuery works without 'ips' parameter by defaulting to empty string.
+        let query: GeoIpQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(query.ips, "");
+
+        let query: GeoIpQuery =
+            serde_json::from_value(serde_json::json!({"ips": "1.2.3.4"})).unwrap();
+        assert_eq!(query.ips, "1.2.3.4");
     }
 }
