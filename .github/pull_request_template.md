@@ -12,6 +12,7 @@
 
 - [ ] `make check`
 - [ ] `make test`
+- [ ] `make scenario-qa` — if this PR touches anything that could change incident / telegram / block volumes
 
 ## Risk
 
@@ -19,6 +20,13 @@
 - [ ] Includes config or schema changes
 - [ ] Includes responder or privileged behavior changes
 - [ ] Includes dashboard or investigation UX changes
+
+## Spec 024 regression gate
+
+If this PR changes a gate threshold, cooldown, responder behaviour, notification policy, or any code on the incident → decision → notification → block path, it can silently drift the volumes asserted in `testdata/scenarios/`. Before merging:
+
+- [ ] I ran `make scenario-qa` locally; all 7 scenarios still pass (or I updated the matching `expected.json` envelope and explained why in the PR body)
+- [ ] OR this PR is docs / tests / CI only and cannot affect scenario volumes (tick this and skip the one above)
 
 ## Documentation
 
