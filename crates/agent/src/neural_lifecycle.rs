@@ -1542,6 +1542,25 @@ mod tests {
     }
 
     #[test]
+    fn kind_index_covers_v012_additions() {
+        // Regression guard for the spec-025-follow-up widening: kinds that
+        // production was emitting at high volume (HTTP, raw TLS streams,
+        // memory probes, bpf loads) must map into the feature vector or the
+        // autoencoder trains on a biased slice of reality.
+        assert_eq!(kind_index("http.request"), Some(24));
+        assert_eq!(kind_index("tcp_stream.ssh"), Some(25));
+        assert_eq!(kind_index("memory.anon_executable"), Some(26));
+        assert_eq!(kind_index("network.snapshot"), Some(27));
+        assert_eq!(kind_index("memory.deleted_file_mapping"), Some(28));
+        assert_eq!(kind_index("file.extracted_from_network"), Some(29));
+        assert_eq!(kind_index("kernel.bpf_program_loaded"), Some(30));
+        // Feature layout contract: every mapped slot must fit inside the
+        // one-hot region.
+        assert!(KIND_SLOTS >= 31);
+        assert_eq!(BIGRAM_BASE, KIND_SLOTS);
+    }
+
+    #[test]
     fn enrich_features_with_graph_clamps_and_writes_expected_slots() {
         // Enrichment path: graph metrics should populate slots 48-57 and
         // clamp oversized values into [0, 1].
@@ -1570,6 +1589,126 @@ mod tests {
         assert_eq!(f[GRAPH_BASE + 1], 1.0); // max_process_tree_depth saturates
         assert_eq!(f[GRAPH_BASE + 2], 1.0); // threat_intel_ip_count saturates
         assert_eq!(f[GRAPH_BASE + 9], 1.0); // active_sessions saturates
+    }
+
+    #[test]
+    fn train_nightly_with_store_uses_sqlite_events_and_calibrates_baseline() {
+        // Primary fix path: training must drain the SQLite event table instead
+        // of the JSONL directory that spec 016 stopped populating. A fresh
+        // engine pointed at an in-memory store with several hundred seeded
+        // events should produce a trained model + non-trivial baseline.
+        use chrono::Utc;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::{Event, Severity};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let kinds = [
+            "file.read_access",
+            "shell.command_exec",
+            "network.outbound_connect",
+            "ssh.login_success",
+            "http.request",
+            "tcp_stream.ssh",
+        ];
+        let mut events = Vec::new();
+        for i in 0..600 {
+            let kind = kinds[i % kinds.len()];
+            events.push(Event {
+                ts: Utc::now(),
+                host: "test-host".into(),
+                source: "test".into(),
+                kind: kind.into(),
+                severity: Severity::Info,
+                summary: "synthetic".into(),
+                details: serde_json::json!({"src_ip": "1.2.3.4"}),
+                tags: vec![],
+                entities: vec![EntityRef::ip("1.2.3.4")],
+            });
+        }
+        store
+            .insert_events_batch(&events)
+            .expect("seed events for training");
+
+        let mut engine = AnomalyEngine::new(AnomalyConfig {
+            data_dir: dir.path().to_path_buf(),
+            training_epochs: 4,
+            training_timeout_secs: 60,
+            training_max_ram_mb: 64,
+            training_retention_days: 30,
+            threshold: 0.5,
+            ..AnomalyConfig::default()
+        });
+        engine
+            .train_nightly_with_store(Some(&store))
+            .expect("sqlite-backed training should succeed");
+
+        assert!(engine.training_cycles >= 1, "one training cycle at minimum");
+        assert!(
+            engine.maturity > 0.0,
+            "maturity must advance after training"
+        );
+        assert!(
+            dir.path().join("anomaly-model.bin").exists(),
+            "model file must be written to data_dir"
+        );
+    }
+
+    #[test]
+    fn train_nightly_with_store_falls_back_to_jsonl_when_sqlite_is_empty() {
+        // Backward-compat path: pre-016 layouts keep working. A store without
+        // events + JSONL fixtures in data_dir should still feed the trainer.
+        use chrono::Utc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let today = Utc::now().format("%Y-%m-%d");
+        let jsonl_path = dir.path().join(format!("events-{today}.jsonl"));
+        let mut contents = String::new();
+        // 600 events → ~116 sliding windows at WINDOW_SIZE=20 / stride=5, just
+        // above the 100-window floor enforced by train_nightly.
+        for i in 0..600 {
+            let kind = if i % 2 == 0 {
+                "file.read_access"
+            } else {
+                "shell.command_exec"
+            };
+            contents.push_str(&format!(
+                r#"{{"ts":"2026-04-18T10:00:00Z","host":"h","source":"t","kind":"{kind}","severity":"info","summary":"","details":{{"src_ip":"9.9.9.9"}},"tags":[],"entities":[]}}
+"#
+            ));
+        }
+        std::fs::write(&jsonl_path, contents).expect("write jsonl fixture");
+
+        let mut engine = AnomalyEngine::new(AnomalyConfig {
+            data_dir: dir.path().to_path_buf(),
+            training_epochs: 2,
+            training_timeout_secs: 60,
+            training_max_ram_mb: 64,
+            training_retention_days: 30,
+            threshold: 0.5,
+            ..AnomalyConfig::default()
+        });
+        engine
+            .train_nightly_with_store(Some(&store))
+            .expect("jsonl fallback should produce a model");
+        assert!(engine.training_cycles >= 1);
+    }
+
+    #[test]
+    fn train_nightly_with_store_errors_when_nothing_to_read() {
+        // Failure path: no sqlite rows AND no JSONL files → explicit error so
+        // the slow loop logs instead of silently rebuilding an empty model.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut engine = AnomalyEngine::new(AnomalyConfig {
+            data_dir: dir.path().to_path_buf(),
+            training_retention_days: 7,
+            ..AnomalyConfig::default()
+        });
+        let err = engine
+            .train_nightly_with_store(Some(&store))
+            .expect_err("empty sources must error out");
+        assert!(err.contains("insufficient"), "got: {err}");
     }
 
     #[test]

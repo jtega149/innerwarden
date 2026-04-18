@@ -2105,6 +2105,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retrain_anomaly_errors_on_empty_data_dir() {
+        // Operator-triggered retrain must surface the training error back up
+        // instead of exiting 0 and giving a false-positive "all done". An
+        // empty data_dir has no events + no JSONL → train_nightly_with_store
+        // returns "insufficient data" → run_retrain_anomaly must bubble that.
+        let dir = TempDir::new().expect("tempdir");
+        let cli = once_cli(dir.path().to_path_buf());
+        let result = run_retrain_anomaly(&cli);
+        assert!(result.is_err(), "empty dir must fail, got {result:?}");
+        let msg = format!("{:#}", result.err().expect("err"));
+        assert!(
+            msg.contains("insufficient") || msg.contains("autoencoder"),
+            "error message should mention training failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn retrain_anomaly_writes_model_with_seeded_store() {
+        // Happy path: when the SQLite store has enough events to form ≥100
+        // windows, the one-shot flag trains a model and leaves it in
+        // data_dir so the running agent picks it up on next tick.
+        use chrono::Utc;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::{Event, Severity};
+
+        let dir = TempDir::new().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("on-disk store");
+        let kinds = [
+            "file.read_access",
+            "shell.command_exec",
+            "network.outbound_connect",
+            "http.request",
+            "tcp_stream.ssh",
+        ];
+        let mut events = Vec::new();
+        for i in 0..600 {
+            let kind = kinds[i % kinds.len()];
+            events.push(Event {
+                ts: Utc::now(),
+                host: "h".into(),
+                source: "t".into(),
+                kind: kind.into(),
+                severity: Severity::Info,
+                summary: "".into(),
+                details: serde_json::json!({"src_ip": "1.2.3.4"}),
+                tags: vec![],
+                entities: vec![EntityRef::ip("1.2.3.4")],
+            });
+        }
+        store
+            .insert_events_batch(&events)
+            .expect("seed events into on-disk store");
+        // Drop the handle so run_retrain_anomaly can reopen without SQLite
+        // lock contention.
+        drop(store);
+
+        let cli = once_cli(dir.path().to_path_buf());
+        run_retrain_anomaly(&cli).expect("retrain should succeed on a populated store");
+        assert!(
+            dir.path().join("anomaly-model.bin").exists(),
+            "retrain must produce anomaly-model.bin"
+        );
+    }
+
     #[tokio::test]
     async fn run_agent_once_boots_with_empty_data_dir() {
         let dir = TempDir::new().expect("tempdir");
