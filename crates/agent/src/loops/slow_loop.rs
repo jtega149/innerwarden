@@ -581,8 +581,7 @@ pub(crate) fn backfill_graph_decisions(data_dir: &std::path::Path, state: &mut A
     const RETROACTIVE_DISMISS_AGE_SECS: i64 = 15 * 60;
     {
         use crate::knowledge_graph::types::{Node, NodeType};
-        let cutoff = chrono::Utc::now()
-            - chrono::Duration::seconds(RETROACTIVE_DISMISS_AGE_SECS);
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(RETROACTIVE_DISMISS_AGE_SECS);
         let mut graph = state.knowledge_graph.write().unwrap();
         let orphan_ids: Vec<_> = graph
             .nodes_of_type(NodeType::Incident)
@@ -768,8 +767,7 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         // does not race with live AI triage on recently-created ones. Without
         // this, Caldera SIGMA/crypto_miner hits were dismissed before the AI
         // ever saw them (see bug #5 in docs/internal/bug-hunt-2026-04-18.md).
-        let mut orphan_incident =
-            crate::tests::test_incident_with_kind("198.51.100.51", "orphan");
+        let mut orphan_incident = crate::tests::test_incident_with_kind("198.51.100.51", "orphan");
         orphan_incident.ts = chrono::Utc::now() - chrono::Duration::minutes(30);
         {
             let mut graph = state.knowledge_graph.write().expect("graph write");

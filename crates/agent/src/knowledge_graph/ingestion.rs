@@ -2324,8 +2324,10 @@ mod tests {
     #[test]
     fn test_ingest_incident_skips_empty_service_entities() {
         let mut g = KnowledgeGraph::new();
-        let incident =
-            make_incident("empty-service:1", vec![EntityRef::service("   ".to_string())]);
+        let incident = make_incident(
+            "empty-service:1",
+            vec![EntityRef::service("   ".to_string())],
+        );
         g.ingest_incident(&incident);
         let incident_id = g
             .find_by_incident("empty-service:1")
