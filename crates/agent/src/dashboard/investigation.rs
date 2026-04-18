@@ -2001,7 +2001,7 @@ fn build_detector_journey(
     // no direct index. The graph typically holds O(hundreds) of incidents
     // so the linear pass is fine; add a secondary index later if needed.
     for id in graph.nodes_of_type(NodeType::Incident) {
-        let Some(Node::Incident {
+        if let Some(Node::Incident {
             incident_id,
             detector,
             severity,
@@ -2017,56 +2017,50 @@ fn build_detector_journey(
             research_only,
             ..
         }) = graph.get_node(id)
-        else {
-            continue;
-        };
-        if *research_only || detector != subject {
-            continue;
-        }
-        has_incident = true;
-
-        for edge in graph.outgoing_edges(id) {
-            if edge.relation != Relation::TriggeredBy {
+        {
+            if *research_only || detector != subject {
                 continue;
             }
-            match graph.get_node(edge.to) {
-                Some(Node::Ip { addr, .. }) => {
-                    related_ips.insert(addr.clone());
+            has_incident = true;
+
+            for edge in graph.outgoing_edges(id) {
+                if edge.relation == Relation::TriggeredBy {
+                    if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                        related_ips.insert(addr.clone());
+                    } else if let Some(Node::User { name, .. }) = graph.get_node(edge.to) {
+                        related_users.insert(name.clone());
+                    }
                 }
-                Some(Node::User { name, .. }) => {
-                    related_users.insert(name.clone());
-                }
-                _ => {}
             }
-        }
 
-        entries.push(JourneyEntry {
-            ts: *ts,
-            kind: "incident".to_string(),
-            data: serde_json::json!({
-                "incident_id": incident_id,
-                "severity": severity.to_lowercase(),
-                "title": title,
-                "summary": summary,
-                "tags": mitre_ids,
-                "detector": detector,
-            }),
-        });
-
-        if let Some(action) = decision {
             entries.push(JourneyEntry {
                 ts: *ts,
-                kind: "decision".to_string(),
+                kind: "incident".to_string(),
                 data: serde_json::json!({
-                    "action_type": action,
-                    "confidence": confidence.unwrap_or(0.0),
-                    "auto_executed": auto_executed,
-                    "reason": decision_reason.as_deref().unwrap_or(""),
-                    "target_ip": decision_target,
                     "incident_id": incident_id,
-                    "execution_result": if *auto_executed { "ok" } else { "skipped" },
+                    "severity": severity.to_lowercase(),
+                    "title": title,
+                    "summary": summary,
+                    "tags": mitre_ids,
+                    "detector": detector,
                 }),
             });
+
+            if let Some(action) = decision {
+                entries.push(JourneyEntry {
+                    ts: *ts,
+                    kind: "decision".to_string(),
+                    data: serde_json::json!({
+                        "action_type": action,
+                        "confidence": confidence.unwrap_or(0.0),
+                        "auto_executed": auto_executed,
+                        "reason": decision_reason.as_deref().unwrap_or(""),
+                        "target_ip": decision_target,
+                        "incident_id": incident_id,
+                        "execution_result": if *auto_executed { "ok" } else { "skipped" },
+                    }),
+                });
+            }
         }
     }
 
@@ -2089,11 +2083,16 @@ fn build_detector_journey(
         .iter()
         .filter(|e| e.kind == "decision")
         .filter_map(|e| e.data.get("action_type").and_then(|v| v.as_str()))
-        .find_map(|d| match d {
-            "block_ip" => Some("blocked"),
-            "honeypot" => Some("honeypot"),
-            "monitor" => Some("monitoring"),
-            _ => None,
+        .find_map(|d| {
+            if d == "block_ip" {
+                Some("blocked")
+            } else if d == "honeypot" {
+                Some("honeypot")
+            } else if d == "monitor" {
+                Some("monitoring")
+            } else {
+                None
+            }
         })
         .unwrap_or(if has_incident { "active" } else { "unknown" })
         .to_string();
@@ -2721,6 +2720,64 @@ mod tests {
     }
 
     #[test]
+    fn detector_journey_collects_triggered_user_and_ignores_non_triggered_entities() {
+        use crate::knowledge_graph::types::{Edge, Relation};
+
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("sigma", Some("198.51.100.9"));
+        graph.ingest_incident(&inc);
+        let inc_id = graph
+            .find_by_incident(&inc.incident_id)
+            .expect("incident node should exist");
+        let user_id = graph.ensure_user("alice");
+        let ignored_ip_id = graph.ensure_ip("203.0.113.88", Utc::now());
+        let other_id = graph.ensure_file("/tmp/ignored-evidence");
+        let now = Utc::now();
+
+        graph.add_edge(Edge::new(inc_id, user_id, Relation::TriggeredBy, now));
+        graph.add_edge(Edge::new(inc_id, ignored_ip_id, Relation::CorrelatedWith, now));
+        graph.add_edge(Edge::new(inc_id, other_id, Relation::TriggeredBy, now));
+
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", None);
+        assert!(
+            journey
+                .summary
+                .pivot_shortcuts
+                .iter()
+                .any(|s| s == "user:alice"),
+            "TriggeredBy User must be included as related user"
+        );
+        assert!(
+            !journey
+                .summary
+                .pivot_shortcuts
+                .iter()
+                .any(|s| s == "ip:203.0.113.88"),
+            "non-TriggeredBy edges must not contribute related entities"
+        );
+    }
+
+    #[test]
+    fn detector_journey_unknown_decision_falls_back_to_active() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("sigma", None);
+        graph.ingest_incident(&inc);
+        graph.ingest_decision(
+            &inc.incident_id,
+            "escalate_manually",
+            None,
+            0.5,
+            "unit test",
+            false,
+            Utc::now(),
+        );
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", None);
+        assert_eq!(journey.outcome, "active");
+    }
+
+    #[test]
     fn detector_journey_window_trims_old_entries() {
         // Two incidents: one recent, one > 1 hour old. Window 600s keeps
         // only the recent one.
@@ -2738,5 +2795,30 @@ mod tests {
         let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", Some(600));
         // Window drops the 2h-old incident, leaves just the fresh one.
         assert_eq!(journey.entries.len(), 1);
+    }
+
+    #[test]
+    fn build_journey_from_graph_detector_pivot_uses_detector_path() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("sigma", Some("198.51.100.77"));
+        graph.ingest_incident(&inc);
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+        let filters = InvestigationFilters::from_query(None, None);
+        let dir = TempDir::new().expect("tmpdir");
+
+        let journey = build_journey_from_graph(
+            &kg,
+            dir.path(),
+            "2026-04-18",
+            PivotKind::Detector,
+            "sigma",
+            &filters,
+            None,
+        );
+
+        assert_eq!(journey.subject_type, "detector");
+        assert_eq!(journey.subject, "sigma");
+        assert_eq!(journey.entries.len(), 1);
+        assert_eq!(journey.outcome, "active");
     }
 }

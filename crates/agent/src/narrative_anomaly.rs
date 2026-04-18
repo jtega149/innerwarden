@@ -143,6 +143,7 @@ fn correlated_anomaly_incident_id(now: chrono::DateTime<chrono::Utc>) -> String 
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone, Utc};
+    use tempfile::TempDir;
 
     #[test]
     fn anomaly_gap_seconds_is_absolute_between_timestamps() {
@@ -223,5 +224,25 @@ mod tests {
         ));
         // Same timestamp
         assert!(anomalies_converged_within_window(now, now, 60));
+    }
+
+    #[test]
+    fn process_anomalies_emits_fused_incident_with_formatted_summary() {
+        let dir = TempDir::new().expect("tmpdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let baseline_ts = Utc::now();
+        let autoencoder_ts = baseline_ts - Duration::seconds(30);
+        state.last_baseline_anomaly_ts = Some(baseline_ts);
+        state.last_autoencoder_anomaly_ts = Some(autoencoder_ts);
+        state.anomaly_engine.training_cycles = 21;
+
+        process_anomalies(dir.path(), "2026-04-18", &[], &mut state);
+
+        assert_eq!(state.neural_incidents.len(), 1);
+        let incident = &state.neural_incidents[0];
+        assert!(incident.summary.contains("agreed within 30 seconds"));
+        assert!(incident.summary.contains("autoencoder (21 days of training)"));
+        assert!(state.last_baseline_anomaly_ts.is_none());
+        assert!(state.last_autoencoder_anomaly_ts.is_none());
     }
 }

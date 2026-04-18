@@ -94,7 +94,11 @@ fn generate_calibration_suggestions(
 
 /// Discover local interface IPs from /proc/net/fib_trie.
 fn discover_ips() -> BTreeSet<String> {
-    let Ok(content) = std::fs::read_to_string("/proc/net/fib_trie") else {
+    discover_ips_from_path("/proc/net/fib_trie")
+}
+
+fn discover_ips_from_path(path: &str) -> BTreeSet<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return BTreeSet::new();
     };
     parse_fib_trie(&content)
@@ -119,26 +123,38 @@ fn parse_fib_trie(content: &str) -> BTreeSet<String> {
 
 /// Discover listening TCP ports and their owning processes.
 fn discover_listeners() -> BTreeMap<u16, BTreeSet<String>> {
+    let ss_stdout = std::process::Command::new("ss")
+        .args(["-tlnp"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    let proc_tcp = std::fs::read_to_string("/proc/net/tcp").ok();
+    let proc_tcp6 = std::fs::read_to_string("/proc/net/tcp6").ok();
+
+    discover_listeners_from_sources(
+        ss_stdout.as_deref(),
+        proc_tcp.as_deref(),
+        proc_tcp6.as_deref(),
+    )
+}
+
+fn discover_listeners_from_sources(
+    ss_stdout: Option<&str>,
+    proc_tcp: Option<&str>,
+    proc_tcp6: Option<&str>,
+) -> BTreeMap<u16, BTreeSet<String>> {
     let mut result: BTreeMap<u16, BTreeSet<String>> = BTreeMap::new();
-
-    // Try ss first (more info), fall back to /proc/net/tcp
-    if let Ok(output) = std::process::Command::new("ss").args(["-tlnp"]).output() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        result = parse_ss_listeners(&text);
+    if let Some(text) = ss_stdout {
+        result = parse_ss_listeners(text);
     }
-
     if result.is_empty() {
-        // Fallback: parse /proc/net/tcp
-        for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let parsed = parse_proc_net_tcp(&content);
-                for (port, procs) in parsed {
-                    result.entry(port).or_default().extend(procs);
-                }
+        for content in [proc_tcp, proc_tcp6].into_iter().flatten() {
+            let parsed = parse_proc_net_tcp(content);
+            for (port, procs) in parsed {
+                result.entry(port).or_default().extend(procs);
             }
         }
     }
-
     result
 }
 
@@ -184,7 +200,7 @@ fn parse_proc_net_tcp(content: &str) -> BTreeMap<u16, BTreeSet<String>> {
 
 /// Discover running systemd services.
 fn discover_services() -> BTreeSet<String> {
-    if let Ok(output) = std::process::Command::new("systemctl")
+    let stdout = std::process::Command::new("systemctl")
         .args([
             "list-units",
             "--type=service",
@@ -193,9 +209,14 @@ fn discover_services() -> BTreeSet<String> {
             "--plain",
         ])
         .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        return parse_systemctl_services(&text);
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    discover_services_from_stdout(stdout.as_deref())
+}
+
+fn discover_services_from_stdout(stdout: Option<&str>) -> BTreeSet<String> {
+    if let Some(text) = stdout {
+        return parse_systemctl_services(text);
     }
     BTreeSet::new()
 }
@@ -214,14 +235,18 @@ fn parse_systemctl_services(text: &str) -> BTreeSet<String> {
 
 /// Discover active outbound connections and their destination IPs/domains.
 fn discover_outbound() -> BTreeMap<String, BTreeSet<String>> {
-    if let Ok(output) = std::process::Command::new("ss")
+    let stdout = std::process::Command::new("ss")
         .args(["-tnp", "state", "established"])
         .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        return parse_ss_outbound(&text);
-    }
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    discover_outbound_from_stdout(stdout.as_deref())
+}
 
+fn discover_outbound_from_stdout(stdout: Option<&str>) -> BTreeMap<String, BTreeSet<String>> {
+    if let Some(text) = stdout {
+        return parse_ss_outbound(text);
+    }
     BTreeMap::new()
 }
 
@@ -309,6 +334,7 @@ mod tests {
     fn test_parse_ss_listeners() {
         // Mock output without Netid column (index 3 is Local Address:Port)
         let stdout = r#"State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0
 LISTEN 0      128          0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=1234,fd=3))
 LISTEN 0      100             *:80            *:*       users:(("nginx",pid=5678,fd=4))
 "#;
@@ -321,6 +347,7 @@ LISTEN 0      100             *:80            *:*       users:(("nginx",pid=5678
     fn test_parse_proc_net_tcp() {
         let content = r#"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000
+   1: 00000000:0035 00000000:0000 01 00000000:00000000 00:00000000 00000000     0        0 55555 1 0000000000000000
    1: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 67890 1 0000000000000000
 "#;
         let listeners = parse_proc_net_tcp(content);
@@ -343,10 +370,109 @@ sshd.service   loaded active running   OpenBSD Secure Shell server
     fn test_parse_ss_outbound() {
         // Mock output without Netid column (index 4 is Peer Address:Port)
         let stdout = r#"State      Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+ESTAB
+ESTAB      0      0      1.2.3.4:40000      127.0.0.1:22 users:(("ssh",pid=1,fd=3))
 ESTAB      0      0      1.2.3.4:45678      8.8.8.8:443  users:(("curl",pid=999,fd=3))
+ESTAB      0      0      1.2.3.4:56789      1.1.1.1:443
 "#;
         let outbound = parse_ss_outbound(stdout);
         assert!(outbound.contains_key("8.8.8.8:443"));
+        assert!(outbound.contains_key("1.1.1.1:443"));
+        assert_eq!(
+            outbound
+                .get("1.1.1.1:443")
+                .and_then(|set| set.iter().next())
+                .map(std::string::String::as_str),
+            Some("?")
+        );
+    }
+
+    #[test]
+    fn test_discover_ips_from_missing_path_is_empty() {
+        let ips = discover_ips_from_path("/definitely/missing/innerwarden-fib-trie");
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn test_discover_ips_from_path_reads_and_parses_file() {
+        let unique = format!(
+            "innerwarden-fib-trie-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("unix epoch")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        let content = r#"Main:
+  |-- 0.0.0.0/0
+     |-- 10.9.8.7
+        |-- 10.9.8.7/32 host LOCAL
+     |-- 127.0.0.1
+        |-- 127.0.0.1/32 host LOCAL
+"#;
+        std::fs::write(&path, content).expect("write fib_trie fixture");
+        let ips = discover_ips_from_path(path.to_str().expect("utf-8 path"));
+        let _ = std::fs::remove_file(&path);
+        assert!(ips.contains("10.9.8.7"));
+        assert!(!ips.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_cmd_calibrate_smoke() {
+        assert!(cmd_calibrate().is_ok());
+    }
+
+    #[test]
+    fn test_discover_listeners_from_sources_uses_ss_when_available() {
+        let listeners = discover_listeners_from_sources(
+            Some(
+                r#"State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      128          0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=1234,fd=3))
+"#,
+            ),
+            None,
+            None,
+        );
+        assert_eq!(listeners.get(&22).unwrap().iter().next().unwrap(), "sshd");
+    }
+
+    #[test]
+    fn test_discover_listeners_from_sources_falls_back_to_proc_data() {
+        let listeners = discover_listeners_from_sources(
+            Some("State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"),
+            Some(
+                r#"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000
+"#,
+            ),
+            Some(""),
+        );
+        assert!(listeners.contains_key(&22));
+    }
+
+    #[test]
+    fn test_discover_services_from_stdout_handles_some_and_none() {
+        let some = discover_services_from_stdout(Some(
+            "dbus.service loaded active running D-Bus System Message Bus\n",
+        ));
+        assert!(some.contains("dbus.service"));
+
+        let none = discover_services_from_stdout(None);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn test_discover_outbound_from_stdout_handles_some_and_none() {
+        let some = discover_outbound_from_stdout(Some(
+            r#"State      Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+ESTAB      0      0      1.2.3.4:45678      8.8.8.8:443  users:(("curl",pid=999,fd=3))
+"#,
+        ));
+        assert!(some.contains_key("8.8.8.8:443"));
+
+        let none = discover_outbound_from_stdout(None);
+        assert!(none.is_empty());
     }
 
     #[test]

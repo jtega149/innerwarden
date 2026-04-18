@@ -199,30 +199,7 @@ pub(crate) fn cmd_configure_sensitivity(cli: &Cli, level: &str) -> Result<()> {
     println!("✅ Notification sensitivity: {level}");
     println!("   Telegram + webhook min_severity = \"{min_severity}\"");
 
-    // Apply detector thresholds (math logic from calibrate module)
-    match crate::calibrate::calculate_sensitivity_overrides(level) {
-        Ok(overrides) => {
-            println!("   Applying detector thresholds for '{level}' mode:");
-            for (key, val) in overrides {
-                // key is like "detectors.ssh_bruteforce.threshold"
-                let parts: Vec<&str> = key.split('.').collect();
-                if parts.len() == 3 {
-                    let section = format!("{}.{}", parts[0], parts[1]);
-                    let field = parts[2];
-                    if let Err(e) =
-                        config_editor::write_int(&cli.agent_config, &section, field, val)
-                    {
-                        eprintln!("     [warn] failed to set {key}: {e:#}");
-                    } else {
-                        println!("     - {key} = {val}");
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("   [warn] failed to calculate thresholds for '{level}': {e:#}");
-        }
-    }
+    apply_detector_threshold_overrides(&cli.agent_config, level);
 
     match level.to_lowercase().as_str() {
         "quiet" => println!("   You'll only be notified for Critical events."),
@@ -249,6 +226,38 @@ pub(crate) fn cmd_configure_sensitivity(cli: &Cli, level: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn apply_detector_threshold_overrides(agent_config: &Path, level: &str) {
+    // Keep this call resilient - thresholds are best-effort and must not block
+    // the user's chosen notification sensitivity change.
+    match crate::calibrate::calculate_sensitivity_overrides(level) {
+        Ok(overrides) => apply_detector_threshold_map(agent_config, level, overrides),
+        Err(e) => {
+            eprintln!("   [warn] failed to calculate thresholds for '{level}': {e:#}");
+        }
+    }
+}
+
+fn apply_detector_threshold_map(
+    agent_config: &Path,
+    level: &str,
+    overrides: std::collections::BTreeMap<String, i64>,
+) {
+    println!("   Applying detector thresholds for '{level}' mode:");
+    for (key, val) in overrides {
+        // key is like "detectors.ssh_bruteforce.threshold"
+        let parts: Vec<&str> = key.split('.').collect();
+        if parts.len() == 3 {
+            let section = format!("{}.{}", parts[0], parts[1]);
+            let field = parts[2];
+            if let Err(e) = config_editor::write_int(agent_config, &section, field, val) {
+                eprintln!("     [warn] failed to set {key}: {e:#}");
+            } else {
+                println!("     - {key} = {val}");
+            }
+        }
+    }
 }
 
 pub(crate) fn cmd_configure_2fa(cli: &Cli) -> Result<()> {
@@ -2167,4 +2176,90 @@ pub(crate) fn cmd_completions(shell: &str) -> Result<()> {
 
     clap_complete::generate(shell_enum, &mut cmd, "innerwarden", &mut std::io::stdout());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_test_cli(data_dir: &Path, dry_run: bool) -> Cli {
+        Cli {
+            sensor_config: data_dir.join("config.toml"),
+            agent_config: data_dir.join("agent.toml"),
+            data_dir: data_dir.to_path_buf(),
+            dry_run,
+            command: crate::Command::Decisions {
+                days: 1,
+                action: None,
+            },
+        }
+    }
+
+    #[test]
+    fn apply_detector_threshold_map_writes_valid_detector_keys() {
+        let dir = TempDir::new().unwrap();
+        let cfg = dir.path().join("agent.toml");
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("detectors.ssh_bruteforce.threshold".to_string(), 7);
+        overrides.insert("detectors.packet_flood.syn_threshold".to_string(), 111);
+
+        apply_detector_threshold_map(&cfg, "normal", overrides);
+
+        let content = std::fs::read_to_string(&cfg).unwrap();
+        assert!(content.contains("[detectors.ssh_bruteforce]"));
+        assert!(content.contains("threshold = 7"));
+        assert!(content.contains("[detectors.packet_flood]"));
+        assert!(content.contains("syn_threshold = 111"));
+    }
+
+    #[test]
+    fn apply_detector_threshold_map_ignores_malformed_keys() {
+        let dir = TempDir::new().unwrap();
+        let cfg = dir.path().join("agent.toml");
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("detectors.ssh_bruteforce.threshold".to_string(), 5);
+        overrides.insert("detectors.invalid".to_string(), 999);
+
+        apply_detector_threshold_map(&cfg, "normal", overrides);
+
+        let content = std::fs::read_to_string(&cfg).unwrap();
+        assert!(content.contains("threshold = 5"));
+        assert!(!content.contains("999"));
+    }
+
+    #[test]
+    fn apply_detector_threshold_map_handles_write_failures_gracefully() {
+        let dir = TempDir::new().unwrap();
+        let cfg = dir.path().join("missing").join("agent.toml");
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("detectors.ssh_bruteforce.threshold".to_string(), 5);
+
+        apply_detector_threshold_map(&cfg, "normal", overrides);
+
+        assert!(!cfg.exists());
+    }
+
+    #[test]
+    fn apply_detector_threshold_overrides_handles_invalid_level() {
+        let dir = TempDir::new().unwrap();
+        let cfg = dir.path().join("agent.toml");
+        apply_detector_threshold_overrides(&cfg, "not-a-real-level");
+        assert!(!cfg.exists());
+    }
+
+    #[test]
+    fn cmd_configure_sensitivity_writes_notification_and_detector_thresholds() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+
+        let _ = cmd_configure_sensitivity(&cli, "normal");
+
+        let content = std::fs::read_to_string(&cli.agent_config).unwrap();
+        assert!(content.contains("[telegram]"));
+        assert!(content.contains("min_severity = \"high\""));
+        assert!(content.contains("[webhook]"));
+        assert!(content.contains("[detectors.ssh_bruteforce]"));
+        assert!(content.contains("threshold = 5"));
+    }
 }
