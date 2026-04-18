@@ -178,15 +178,13 @@
           <button id="flt-apply" class="full" type="button">Apply</button>
         </div>
       </div>
-      <div style="display:none">
-        <div class="pivot-tabs">
-          <button type="button" class="pivot-tab active" data-pivot="ip">IP</button>
-          <button type="button" class="pivot-tab" data-pivot="user">User</button>
-          <button type="button" class="pivot-tab" data-pivot="detector">Detector</button>
-        </div>
-        <div id="clusterList"></div>
-        <div id="topDetectors"></div>
+      <div class="pivot-tabs">
+        <button type="button" class="pivot-tab active" data-pivot="ip">IP</button>
+        <button type="button" class="pivot-tab" data-pivot="user">User</button>
+        <button type="button" class="pivot-tab" data-pivot="detector">Detector</button>
       </div>
+      <div id="clusterList" style="display:none"></div>
+      <div id="topDetectors" style="display:none"></div>
       <div class="search-wrap">
         <input id="entitySearch" type="search" placeholder="search threats…" autocomplete="off" spellcheck="false" />
       </div>
