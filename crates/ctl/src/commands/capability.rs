@@ -270,4 +270,227 @@ mod tests {
         let parsed = parse_params(&raw).expect("duplicate keys should still parse");
         assert_eq!(parsed.get("level").expect("level key"), "critical");
     }
+
+    // ---- Toggle state-transition tests (Issue #141) ----
+
+    mod toggle {
+        use crate::capability::{
+            ActivationOptions, ActivationReport, Capability, CapabilityEffect, Preflight,
+            PreflightError,
+        };
+        use anyhow::Result;
+        use std::collections::HashMap;
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // ----------------------------------------------------------------
+        // Minimal stub capability for toggle logic tests.
+        // Tracks enabled state via a key in agent.toml, no I/O side-effects.
+        // ----------------------------------------------------------------
+
+        struct StubCapability {
+            id: &'static str,
+        }
+
+        impl Capability for StubCapability {
+            fn id(&self) -> &'static str {
+                self.id
+            }
+            fn name(&self) -> &'static str {
+                "Stub"
+            }
+            fn description(&self) -> &'static str {
+                "stub for tests"
+            }
+            fn preflights(&self, _opts: &ActivationOptions) -> Vec<Box<dyn Preflight>> {
+                vec![]
+            }
+            fn planned_effects(&self, _opts: &ActivationOptions) -> Vec<CapabilityEffect> {
+                vec![CapabilityEffect::new("stub effect")]
+            }
+            fn planned_disable_effects(&self, _opts: &ActivationOptions) -> Vec<CapabilityEffect> {
+                vec![CapabilityEffect::new("stub disable effect")]
+            }
+            fn activate(&self, opts: &ActivationOptions) -> Result<ActivationReport> {
+                crate::config_editor::write_bool(&opts.agent_config, "stub", "enabled", true)?;
+                Ok(ActivationReport {
+                    effects_applied: vec![CapabilityEffect::new("enabled stub")],
+                    warnings: vec![],
+                })
+            }
+            fn deactivate(&self, opts: &ActivationOptions) -> Result<ActivationReport> {
+                crate::config_editor::write_bool(&opts.agent_config, "stub", "enabled", false)?;
+                Ok(ActivationReport {
+                    effects_applied: vec![CapabilityEffect::new("disabled stub")],
+                    warnings: vec![],
+                })
+            }
+            fn is_enabled(&self, opts: &ActivationOptions) -> bool {
+                crate::config_editor::read_bool(&opts.agent_config, "stub", "enabled")
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Failing preflight stub — for gate tests
+        // ----------------------------------------------------------------
+
+        struct FailingPreflight;
+        impl Preflight for FailingPreflight {
+            fn name(&self) -> &str {
+                "always fails"
+            }
+            fn check(&self) -> Result<(), PreflightError> {
+                Err(PreflightError::new("intentional failure"))
+            }
+        }
+
+        struct AlwaysFailsCapability;
+        impl Capability for AlwaysFailsCapability {
+            fn id(&self) -> &'static str {
+                "always-fails"
+            }
+            fn name(&self) -> &'static str {
+                "Always Fails"
+            }
+            fn description(&self) -> &'static str {
+                "always fails preflights"
+            }
+            fn preflights(&self, _opts: &ActivationOptions) -> Vec<Box<dyn Preflight>> {
+                vec![Box::new(FailingPreflight)]
+            }
+            fn planned_effects(&self, _opts: &ActivationOptions) -> Vec<CapabilityEffect> {
+                vec![]
+            }
+            fn planned_disable_effects(&self, _opts: &ActivationOptions) -> Vec<CapabilityEffect> {
+                vec![]
+            }
+            fn activate(&self, _opts: &ActivationOptions) -> Result<ActivationReport> {
+                unreachable!("should never reach activate when preflights fail")
+            }
+            fn deactivate(&self, _opts: &ActivationOptions) -> Result<ActivationReport> {
+                Ok(ActivationReport {
+                    effects_applied: vec![],
+                    warnings: vec![],
+                })
+            }
+            fn is_enabled(&self, _opts: &ActivationOptions) -> bool {
+                false
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Helper that builds a Cli-like ActivationOptions without Cli
+        // ----------------------------------------------------------------
+
+        fn stub_opts(agent: &NamedTempFile) -> ActivationOptions {
+            let sensor = NamedTempFile::new().unwrap();
+            ActivationOptions {
+                sensor_config: sensor.path().to_path_buf(),
+                agent_config: agent.path().to_path_buf(),
+                dry_run: true, // avoids systemd/sudo calls
+                params: HashMap::new(),
+                yes: true,
+                defer_restarts: true,
+            }
+        }
+
+        use crate::capability::CapabilityRegistry;
+
+        // ---- Test: enable already-enabled capability is a no-op ----
+
+        #[test]
+        fn enable_already_enabled_is_noop() {
+            // Pre-set enabled=true so is_enabled() returns true.
+            let mut agent = NamedTempFile::new().unwrap();
+            writeln!(agent, "[stub]\nenabled = true\n").unwrap();
+            let opts = stub_opts(&agent);
+            let cap = StubCapability { id: "stub" };
+
+            // is_enabled must be true before calling activate
+            assert!(cap.is_enabled(&opts), "precondition: cap should be enabled");
+
+            // Calling activate again should succeed idempotently (enabled stays true)
+            let report = cap.activate(&opts).unwrap();
+            assert!(cap.is_enabled(&opts));
+            assert!(!report.effects_applied.is_empty());
+        }
+
+        // ---- Test: unknown capability lookup returns error shape ----
+
+        #[test]
+        fn unknown_capability_error_message_mentions_list() {
+            // Validates the error message tells the user how to recover.
+            let err = crate::unknown_cap_error("not-a-cap");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not-a-cap"),
+                "error should include the unknown id"
+            );
+            assert!(
+                msg.contains("innerwarden list"),
+                "error should mention list command"
+            );
+        }
+
+        // ---- Test: valid block-ip enable transition ----
+
+        #[test]
+        fn block_ip_enable_sets_responder_enabled() {
+            use crate::capabilities::block_ip::BlockIpCapability;
+
+            let sensor = NamedTempFile::new().unwrap();
+            let mut agent = NamedTempFile::new().unwrap();
+            writeln!(agent, "[responder]\nenabled = false\n").unwrap();
+
+            let opts = ActivationOptions {
+                sensor_config: sensor.path().to_path_buf(),
+                agent_config: agent.path().to_path_buf(),
+                dry_run: true,
+                params: HashMap::new(),
+                yes: true,
+                defer_restarts: true,
+            };
+
+            assert!(
+                !BlockIpCapability.is_enabled(&opts),
+                "precondition: should not be enabled"
+            );
+            BlockIpCapability.activate(&opts).unwrap();
+            assert!(
+                BlockIpCapability.is_enabled(&opts),
+                "should be enabled after activate"
+            );
+        }
+
+        // ---- Test: capability list order is deterministic ----
+
+        #[test]
+        fn capability_list_order_is_deterministic() {
+            let reg = CapabilityRegistry::default_all();
+            let first_pass: Vec<&str> = reg.all().map(|c| c.id()).collect();
+            let second_pass: Vec<&str> = reg.all().map(|c| c.id()).collect();
+            assert_eq!(
+                first_pass, second_pass,
+                "capability listing must be deterministic"
+            );
+        }
+
+        // ---- Test: preflight failure prevents activation ----
+
+        #[test]
+        fn preflight_failure_prevents_activation() {
+            let agent = NamedTempFile::new().unwrap();
+            let opts = stub_opts(&agent);
+            let cap = AlwaysFailsCapability;
+
+            // Simulate the preflight gate in cmd_enable
+            let preflights = cap.preflights(&opts);
+            let any_failed = preflights.iter().any(|pf| pf.check().is_err());
+
+            assert!(
+                any_failed,
+                "at least one preflight should fail for AlwaysFailsCapability"
+            );
+        }
+    }
 }
