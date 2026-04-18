@@ -1,15 +1,14 @@
 # Spec 024 scenario #3 — honeypot hit from a known-bad IP.
 #
-# STATUS: WIP. Real honeypot sessions + AbuseIPDB reputation lookup
-# require a pre-seeded attacker profile and a network connect to the
-# honeypot port (2222 on Linux with root). The scenario-qa harness
-# runs headless without root, so for now this scenario exercises the
-# rest of the pipeline against an empty input and asserts only that
-# nothing explodes.
+# The scenario seeds two SQLite rows before running the agent:
+#   - `input/seed-incidents.jsonl`   -> one honeypot incident on port 2222
+#                                       from 6.6.6.6
+#   - `input/seed-kv.jsonl`          -> AbuseIPDB cache entry for 6.6.6.6
+#                                       with confidence_score=90
 #
-# Follow-up: add `input/incidents.jsonl` + sqlite-seed support in the
-# runner so we can feed a synthetic honeypot session incident and
-# assert the gate escalates on reputation score > 50.
+# This exercises the real per-incident reputation lookup (SQLite cache
+# before live API) and the stub AI's "known-bad → BlockIp" branch. A
+# real TCP listener on :2222 would require root on the CI runner.
 
 [sensor.agent]
 host_id = "scen-03-honeypot-known-bad"

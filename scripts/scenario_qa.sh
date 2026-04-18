@@ -348,6 +348,21 @@ run_scenario() {
   fi
   wait "$sensor_pid" 2>/dev/null || true
 
+  # Seed pre-formed incidents / honeypot sessions for scenarios that cannot be
+  # driven through the sensor on this runner (no eBPF, no root listener, no
+  # packet generator). See scripts/scenario_seed.py for fixture format.
+  local seed_log="$work_dir/seed.log"
+  if ! "$PYTHON_BIN" "$ROOT_DIR/scripts/scenario_seed.py" \
+        --scenario-dir "$scenario_dir" \
+        --data-dir "$data_dir" > "$seed_log" 2>&1; then
+    echo "[scenario-qa] seed failed for $scenario" >&2
+    cat "$seed_log" >&2
+    if [[ "$KEEP_TMP" != "1" ]]; then
+      rm -rf "$work_dir"
+    fi
+    return 1
+  fi
+
   local agent_exit_code=0
   set +e
   INNERWARDEN_MOCK_TELEGRAM=1 \

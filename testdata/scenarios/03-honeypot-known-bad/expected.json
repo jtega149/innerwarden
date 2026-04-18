@@ -1,9 +1,9 @@
 {
-  "status": "wip",
-  "description": "Honeypot hit from an IP known to be malicious (AbuseIPDB score > 50). Target envelope per spec 024: 1 incident, 1 telegram, 1 block. Current fixture cannot reproduce the honeypot session without root + a real listener, so the envelope is deliberately wide until the runner gains a sqlite-seed mechanism.",
-  "last_reviewed": "2026-04-17",
-  "incidents": { "min": 0, "max": 2 },
-  "telegram_msgs": { "min": 0, "max": 2 },
-  "blocks": { "min": 0, "max": 2 },
-  "decisions_auto_executed": { "min": 0, "max": 2 }
+  "status": "ready",
+  "description": "Honeypot hit on :2222 from a known-bad IP (6.6.6.6, AbuseIPDB score 90/100). The scenario seeds both the incident and the AbuseIPDB reputation cache entry so the agent's per-incident lookup consults SQLite instead of hitting the live API. Stub AI escalates to BlockIp once it sees confidence_score>50. Target envelope per spec 024: 1 incident, \u22641 telegram, 1 block.",
+  "last_reviewed": "2026-04-18",
+  "incidents": { "min": 1, "max": 1 },
+  "telegram_msgs": { "min": 0, "max": 1 },
+  "blocks": { "min": 1, "max": 1 },
+  "decisions_auto_executed": { "min": 1, "max": 1 }
 }

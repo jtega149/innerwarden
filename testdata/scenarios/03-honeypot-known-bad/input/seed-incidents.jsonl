@@ -1,0 +1,1 @@
+{"ts":"2026-04-18T10:00:00Z","host":"scen-03-honeypot","incident_id":"honeypot:6.6.6.6:2026-04-18T10:00:00Z","severity":"high","title":"Honeypot hit from 6.6.6.6","summary":"tcp connect to :2222 from 6.6.6.6 (known-bad per AbuseIPDB 90/100)","evidence":{"port":2222,"source_ip":"6.6.6.6"},"recommended_checks":[],"tags":["honeypot"],"entities":[{"type":"ip","value":"6.6.6.6"}]}
