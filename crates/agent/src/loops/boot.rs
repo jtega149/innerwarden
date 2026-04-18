@@ -1503,6 +1503,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     }
 
                     // ── Safeguard: flush AbuseIPDB delayed report queue ──
+                    // Defense-in-depth: even though `check_block_eligibility_with_safelist`
+                    // refuses blocks on cloud-provider IPs, the queue can carry
+                    // entries queued before the fix deployed. Reporting a
+                    // Cloudflare edge to AbuseIPDB pollutes the public feed
+                    // AND burns our 1k/day report quota — the operator email
+                    // on 2026-04-18 ("You've exhausted your daily limit of
+                    // 1,000 requests for report endpoint") was direct
+                    // fallout of the CL-008 cascade. Filter one more time
+                    // before sending.
                     {
                         let report_cutoff = chrono::Utc::now() - chrono::Duration::seconds(ABUSEIPDB_REPORT_DELAY_SECS);
                         let ready: Vec<_> = state.abuseipdb_report_queue
@@ -1510,11 +1519,28 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             .filter(|(_, _, _, ts)| *ts < report_cutoff)
                             .cloned()
                             .collect();
+                        let mut dropped_cloud = 0usize;
                         if let Some(ref client) = state.abuseipdb {
                             for (ip, comment, categories, _) in &ready {
+                                if let Some(provider) = cloud_safelist::identify_provider(ip) {
+                                    dropped_cloud += 1;
+                                    warn!(
+                                        ip,
+                                        provider,
+                                        "AbuseIPDB report dropped: target is in cloud safelist"
+                                    );
+                                    continue;
+                                }
                                 client.report(ip, categories, comment).await;
                                 info!(ip, "AbuseIPDB report sent (after 5min delay)");
                             }
+                        }
+                        if dropped_cloud > 0 {
+                            info!(
+                                dropped_cloud,
+                                "AbuseIPDB queue flush: dropped {} cloud-provider entries",
+                                dropped_cloud
+                            );
                         }
                         state.abuseipdb_report_queue.retain(|(_, _, _, ts)| *ts >= report_cutoff);
                     }
