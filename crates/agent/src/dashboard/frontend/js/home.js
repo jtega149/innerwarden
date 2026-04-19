@@ -283,13 +283,19 @@ async function loadBriefing() {
     section.style.display = '';
     var content = document.getElementById('briefingContent');
     var btn = document.getElementById('briefingBtn');
+    // SSE can fire refresh while the Home view is hidden; children may
+    // briefly be null during markup rerender. Guard each write so the
+    // whole loadHome pipeline does not throw on null.textContent /
+    // null.innerHTML.
     if (data.available) {
       var age = data.generated_at ? new Date(data.generated_at).toLocaleTimeString() : '';
-      content.innerHTML = '<div style="margin-bottom:8px;font-size:0.65rem;color:var(--muted)">Generated ' + age + '</div>' +
-        '<div>' + esc(data.summary).replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') + '</div>';
-      btn.textContent = 'Regenerate';
-    } else {
-      // Spec 017 Change 7 — exact approved English copy.
+      if (content) {
+        content.innerHTML = '<div style="margin-bottom:8px;font-size:0.65rem;color:var(--muted)">Generated ' + age + '</div>' +
+          '<div>' + esc(data.summary).replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') + '</div>';
+      }
+      if (btn) btn.textContent = 'Regenerate';
+    } else if (content) {
+      // Spec 017 Change 7 exact approved English copy.
       content.innerHTML = '<div class="briefing-empty">' +
         esc("No briefing yet. You're protected, and we are still monitoring. Generate a briefing now for a quick summary.") +
         '</div>';

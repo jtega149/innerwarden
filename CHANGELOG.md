@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- test(agent): increased `crates/agent/src/report.rs` line coverage from 89.1% (929/1043) to 93.4% (974/1043), including direct happy-path and edge-case tests for every public function.
+
 ---
 
 ## [0.12.2] - 2026-04-18
