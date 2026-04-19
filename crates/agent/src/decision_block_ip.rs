@@ -426,7 +426,8 @@ mod tests {
     #[test]
     fn consult_circuit_breaker_allows_under_threshold() {
         let store = mem_store();
-        let out = consult_circuit_breaker(&store, ts("2026-04-19T12:00:00Z"), "1.2.3.4", 100, "pause");
+        let out =
+            consult_circuit_breaker(&store, ts("2026-04-19T12:00:00Z"), "1.2.3.4", 100, "pause");
         assert!(out.is_none(), "fresh breaker must allow");
     }
 
