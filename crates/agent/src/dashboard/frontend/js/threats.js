@@ -260,7 +260,8 @@ async function downloadSnapshot(format) {
       body
     );
   } catch (e) {
-    document.getElementById('refreshStatus').textContent = 'export err: ' + e.message;
+    var s = document.getElementById('refreshStatus');
+    if (s) s.textContent = 'export err: ' + e.message;
   }
 }
 
@@ -558,9 +559,11 @@ async function refreshLeft(forceRefreshJourney = false) {
 
     applyEntitySearch();  // D9: re-apply filter after full reload
     syncUrl();
-    document.getElementById('refreshStatus').textContent = new Date().toLocaleTimeString();
+    var s = document.getElementById('refreshStatus');
+    if (s) s.textContent = new Date().toLocaleTimeString();
   } catch (e) {
-    document.getElementById('refreshStatus').textContent = 'err: ' + e.message;
+    var s = document.getElementById('refreshStatus');
+    if (s) s.textContent = 'err: ' + e.message;
   }
 }
 
