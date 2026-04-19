@@ -579,9 +579,18 @@ pub struct AiConfig {
     pub protected_ips: Vec<String>,
 
     /// Minimum incident severity sent to AI analysis.
-    /// "high" (default) = only High/Critical go to AI.
-    /// "medium" = Medium/High/Critical go to AI (more aggressive, more API calls).
+    /// "medium" (default) = Medium/High/Critical go to AI.
+    /// "high" = only High/Critical go to AI (more conservative, fewer API calls).
     /// "low" = all incidents go to AI (expensive, not recommended).
+    ///
+    /// The default was "high" prior to v0.12.4. Production audit on
+    /// 2026-04-15 found 1812 incidents → 0 AI-executed blocks; the "high"
+    /// floor combined with the confidence_threshold bug in spec 018
+    /// meant most real threats never reached AI triage. Lowering to
+    /// "medium" lets AI see the Medium-severity layer (where most bot
+    /// campaigns live) while keeping Low in the noise-gate. Operators
+    /// with OpenAI/Anthropic cost sensitivity can set this back to
+    /// "high" explicitly; Ollama local is free.
     #[serde(default = "default_ai_min_severity")]
     pub min_severity: String,
 
@@ -621,7 +630,7 @@ fn default_batch_window_secs() -> u64 {
 }
 
 fn default_ai_min_severity() -> String {
-    "high".to_string()
+    "medium".to_string()
 }
 
 impl Default for AiConfig {
@@ -2826,9 +2835,12 @@ approval_ttl_secs = 300
     // -- AI config tests --
 
     #[test]
-    fn ai_parsed_min_severity_defaults_to_high() {
+    fn ai_parsed_min_severity_defaults_to_medium() {
+        // v0.12.4: default floor lowered from "high" to "medium" so AI
+        // triage sees the Medium-severity layer (where most bot campaigns
+        // live). Operators can still set "high" in agent.toml explicitly.
         let cfg = AiConfig::default();
-        assert_eq!(cfg.parsed_min_severity(), Severity::High);
+        assert_eq!(cfg.parsed_min_severity(), Severity::Medium);
     }
 
     #[test]
@@ -2838,6 +2850,8 @@ approval_ttl_secs = 300
         assert_eq!(cfg.parsed_min_severity(), Severity::Low);
         cfg.min_severity = "medium".into();
         assert_eq!(cfg.parsed_min_severity(), Severity::Medium);
+        cfg.min_severity = "high".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::High);
         cfg.min_severity = "critical".into();
         assert_eq!(cfg.parsed_min_severity(), Severity::Critical);
     }
