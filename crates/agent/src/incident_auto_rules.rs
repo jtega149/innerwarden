@@ -35,10 +35,14 @@ const AUTO_RULES: &[AutoRule] = &[
         detector: "credential_stuffing",
         duration_label: "24h",
     },
-    AutoRule {
-        detector: "packet_flood",
-        duration_label: "24h",
-    },
+    // `packet_flood` is intentionally NOT in this list. The rate-anomaly
+    // sub-pattern (`packet_flood:rate_anomaly`) is too prone to per-IP
+    // false positives — the prod 2026-04-22 incident with IP
+    // 160.119.76.50 fired a 24h block from 4 HTTP GETs to public paths
+    // (`/`, `/favicon.ico`, `/robots.txt`, `/.well-known/security.txt`).
+    // packet_flood incidents still flow through the normal AI pipeline
+    // (and through the Layer-1 attribution gates in the detector itself);
+    // they just no longer auto-block without an AI gate review.
     AutoRule {
         detector: "port_scan",
         duration_label: "12h",
@@ -319,8 +323,21 @@ mod tests {
         let detectors: Vec<&str> = AUTO_RULES.iter().map(|r| r.detector).collect();
         assert!(detectors.contains(&"ssh_bruteforce"));
         assert!(detectors.contains(&"credential_stuffing"));
-        assert!(detectors.contains(&"packet_flood"));
         assert!(detectors.contains(&"port_scan"));
         assert!(detectors.contains(&"web_scan"));
+    }
+
+    #[test]
+    fn auto_rules_must_not_include_packet_flood() {
+        // Regression guard for the prod 2026-04-22 false positive
+        // (IP 160.119.76.50): the `packet_flood:rate_anomaly` sub-pattern
+        // is too noisy to auto-block without an AI gate review. The
+        // detector still fires; the AI pipeline still sees it; only the
+        // Layer-1 deterministic auto-block path is removed.
+        let detectors: Vec<&str> = AUTO_RULES.iter().map(|r| r.detector).collect();
+        assert!(
+            !detectors.contains(&"packet_flood"),
+            "packet_flood must not auto-block; review the AI pipeline path"
+        );
     }
 }

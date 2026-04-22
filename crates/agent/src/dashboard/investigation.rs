@@ -1111,7 +1111,16 @@ pub(super) fn build_journey_from_graph(
             ));
         }
 
-        // Severity assessment
+        // Severity assessment. Bug fix (prod 2026-04-22, IP
+        // 160.119.76.50): the previous version emitted both "Low
+        // activity — Not dangerous" AND "AI has blocked this IP" on
+        // the same journey, which is contradictory and undermines
+        // operator trust in the dashboard. Now: when the system
+        // already blocked but the activity profile says "low /
+        // routine", surface the contradiction explicitly as a
+        // possible auto-rule false positive instead of pretending
+        // both are fine.
+        let low_activity_no_intel = total_incidents <= 2 && !has_threat_intel;
         if critical > 0 {
             summary.hints.push(format!(
                 "{} critical and {} high severity incident{}. Investigate immediately.",
@@ -1125,17 +1134,24 @@ pub(super) fn build_journey_from_graph(
                 total_incidents,
                 if total_incidents > 1 { "s" } else { "" }
             ));
-        } else if total_incidents <= 2 && !has_threat_intel {
+        } else if low_activity_no_intel && !blocked {
             summary.hints.push(
                 "Low activity — likely a routine internet scanner. Not dangerous.".to_string(),
             );
         }
 
-        // Outcome
+        // Outcome — never paired with "Not dangerous" above.
         if blocked {
-            summary
-                .hints
-                .push("AI has blocked this IP. No further action needed.".to_string());
+            if low_activity_no_intel {
+                summary.hints.push(
+                    "Auto-blocked despite low activity and no threat-intel hit — possible false positive, review the triggering rule."
+                        .to_string(),
+                );
+            } else {
+                summary
+                    .hints
+                    .push("AI has blocked this IP. No further action needed.".to_string());
+            }
         } else if outcome == "active" || outcome == "monitoring" {
             if total_incidents <= 2 && critical == 0 && high == 0 {
                 summary.hints.push(
@@ -1655,7 +1671,13 @@ pub(super) fn derive_chapters(entries: &[JourneyEntry]) -> Vec<JourneyChapter> {
         return vec![];
     }
 
-    // Assign each entry to a logical stage
+    // Assign each entry to a logical stage. Bug fix (prod 2026-04-22,
+    // IP 160.119.76.50): the previous catch-all dumped every event
+    // kind into `initial_access_attempt`, which then got rendered as
+    // "Brute-force burst" / "Login attempt(s)" — including plain HTTP
+    // GETs and `tcp_stream.ssh` taps. Only events that actually look
+    // like login attempts go to `initial_access_attempt`; everything
+    // else falls through to `observed_activity` with neutral wording.
     let stages: Vec<&str> = entries
         .iter()
         .map(|e| match e.kind.as_str() {
@@ -1665,14 +1687,17 @@ pub(super) fn derive_chapters(entries: &[JourneyEntry]) -> Vec<JourneyChapter> {
                     .get("event_kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if kind.contains("port_scan") {
+                if kind.contains("port_scan") || kind.starts_with("dns.") || kind.contains("recon")
+                {
                     "reconnaissance"
                 } else if kind.contains("login_success") || kind.contains("_accepted") {
                     "access_success"
-                } else if kind.contains("sudo") {
+                } else if kind.contains("sudo") || kind.contains("privesc") {
                     "privilege_abuse"
-                } else {
+                } else if is_login_attempt_kind(kind) {
                     "initial_access_attempt"
+                } else {
+                    "observed_activity"
                 }
             }
             "incident" => {
@@ -1720,12 +1745,55 @@ pub(super) fn derive_chapters(entries: &[JourneyEntry]) -> Vec<JourneyChapter> {
     chapters
 }
 
+/// Classify whether an event kind represents a login attempt that
+/// should be grouped under `initial_access_attempt`. Anything that does
+/// not match this is generic activity and lands in `observed_activity`.
+///
+/// Conservative on purpose: false negatives (a real login attempt
+/// mislabeled as activity) are noticeably less harmful than false
+/// positives (an HTTP GET mislabeled as "brute-force burst", which
+/// pushed the prod 2026-04-22 false-block decision).
+pub(super) fn is_login_attempt_kind(kind: &str) -> bool {
+    kind.contains("login_failed")
+        || kind.contains("login_failure")
+        || kind.contains("login_attempt")
+        || kind.contains("auth_failed")
+        || kind.contains("auth_failure")
+        || kind.contains("ssh_bruteforce")
+        || kind.contains("credential_stuffing")
+        || kind.contains("invalid_user")
+        || kind.contains("password_attempt")
+}
+
 /// Generate human-readable title / summary / highlights for a chapter.
 pub(super) fn describe_chapter(
     stage: &str,
     entries: &[JourneyEntry],
 ) -> (String, String, Vec<String>) {
     match stage {
+        "observed_activity" => {
+            // Neutral wording for the catch-all bucket so plain HTTP
+            // GETs / TCP taps / file reads no longer surface as
+            // "Brute-force burst".
+            let kinds: Vec<String> = entries
+                .iter()
+                .filter_map(|e| {
+                    e.data
+                        .get("event_kind")
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .take(5)
+                .collect();
+            let title = format!("Observed activity ({} events)", entries.len());
+            let summary = if kinds.is_empty() {
+                "Generic activity not classified as an attack stage".to_string()
+            } else {
+                format!("Event kinds: {}", kinds.join(", "))
+            };
+            (title, summary, kinds)
+        }
         "reconnaissance" => {
             let title = "Reconnaissance activity".to_string();
             let summary = format!("{} probe event(s) detected", entries.len());
@@ -2825,5 +2893,177 @@ mod tests {
         assert_eq!(journey.subject, "sigma");
         assert_eq!(journey.entries.len(), 1);
         assert_eq!(journey.outcome, "active");
+    }
+
+    // ── Bug fix: journey misclassification of plain HTTP/TCP events ──
+
+    #[test]
+    fn is_login_attempt_kind_matches_login_event_families() {
+        for k in [
+            "ssh.login_failed",
+            "auth.login_failure",
+            "login_attempt",
+            "ssh.invalid_user",
+            "credential_stuffing.burst",
+            "ssh_bruteforce",
+            "password_attempt.shadow",
+        ] {
+            assert!(is_login_attempt_kind(k), "{k} should be a login attempt");
+        }
+    }
+
+    #[test]
+    fn is_login_attempt_kind_rejects_generic_traffic() {
+        for k in [
+            "http.request",
+            "tcp_stream.ssh",
+            "file.read_access",
+            "dns.query",
+            "ssh.login_success",
+        ] {
+            assert!(
+                !is_login_attempt_kind(k),
+                "{k} should NOT be classified as a login attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_chapters_groups_plain_http_as_observed_activity_not_brute_force() {
+        // Reproduces the prod 2026-04-22 IP 160.119.76.50 journey:
+        // four HTTP GETs to public paths used to render as
+        // "Brute-force burst (4 attempts)" / "Login attempt(s)".
+        // After the fix they belong in `observed_activity` with a
+        // neutral title.
+        let ts = Utc.with_ymd_and_hms(2026, 4, 22, 16, 51, 54).unwrap();
+        let entries = vec![
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "http.request"}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "http.request"}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "http.request"}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "http.request"}),
+            },
+        ];
+
+        let chapters = derive_chapters(&entries);
+        assert_eq!(chapters.len(), 1);
+        let ch = &chapters[0];
+        assert_eq!(ch.stage, "observed_activity");
+        assert!(
+            !ch.title.contains("Brute-force"),
+            "title leaked old brute-force wording: {}",
+            ch.title
+        );
+        assert!(
+            !ch.title.contains("Login"),
+            "title still claims login: {}",
+            ch.title
+        );
+        assert!(
+            ch.title.contains("Observed activity"),
+            "title should be neutral, got {}",
+            ch.title
+        );
+    }
+
+    #[test]
+    fn derive_chapters_keeps_real_login_failures_as_initial_access_attempt() {
+        // Make sure the fix did not silence real brute-force grouping.
+        let ts = Utc.with_ymd_and_hms(2026, 4, 22, 16, 51, 54).unwrap();
+        let entries: Vec<JourneyEntry> = (0..5)
+            .map(|i| JourneyEntry {
+                ts: ts + chrono::Duration::seconds(i),
+                kind: "event".to_string(),
+                data: serde_json::json!({
+                    "event_kind": "ssh.login_failed",
+                    "details": {"user": format!("user{i}")}
+                }),
+            })
+            .collect();
+
+        let chapters = derive_chapters(&entries);
+        assert_eq!(chapters.len(), 1);
+        let ch = &chapters[0];
+        assert_eq!(ch.stage, "initial_access_attempt");
+        assert!(ch.title.contains("Brute-force burst"));
+    }
+
+    // ── Bug fix: contradictory hints (Not dangerous + AI has blocked) ──
+
+    fn ip_journey_with_block(blocked: bool) -> JourneyResponse {
+        // Real call path: build_journey_from_graph runs the IP-pivot
+        // intelligence enrichment that the bug actually lives in.
+        // Going through build_journey_summary directly would skip
+        // it, which is why my first attempt at this test failed.
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let mut inc = detector_test_incident("packet_flood", Some("160.119.76.50"));
+        inc.incident_id = "packet_flood:rate_anomaly:2026-04-22".into();
+        graph.ingest_incident(&inc);
+        if blocked {
+            graph.ingest_decision(
+                &inc.incident_id,
+                "block_ip",
+                Some("160.119.76.50"),
+                0.95,
+                "Auto-blocked: packet_flood (rule-based)",
+                true,
+                chrono::Utc::now(),
+            );
+        }
+
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+        let filters = InvestigationFilters::from_query(None, None);
+        let dir = TempDir::new().expect("tmpdir");
+        build_journey_from_graph(
+            &kg,
+            dir.path(),
+            &chrono::Utc::now().date_naive().to_string(),
+            PivotKind::Ip,
+            "160.119.76.50",
+            &filters,
+            None,
+        )
+    }
+
+    #[test]
+    fn ip_summary_does_not_emit_not_dangerous_when_blocked() {
+        // Reproduces the contradiction the operator flagged on
+        // 2026-04-22: same journey said "Not dangerous" AND "AI has
+        // blocked this IP". After the fix, "Not dangerous" must not
+        // appear when the IP is blocked.
+        let journey = ip_journey_with_block(true);
+        let joined = journey.summary.hints.join(" || ");
+        assert!(
+            !joined.contains("Not dangerous"),
+            "hints contradict outcome (blocked + Not dangerous): {joined}"
+        );
+        assert!(
+            joined.contains("possible false positive") || joined.contains("AI has blocked"),
+            "expected FP-review hint or block confirmation, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn ip_summary_emits_low_activity_only_when_not_blocked() {
+        let journey = ip_journey_with_block(false);
+        let joined = journey.summary.hints.join(" || ");
+        assert!(
+            joined.contains("Low activity") || joined.contains("Routine scanner"),
+            "expected low-activity hint when not blocked, got: {joined}"
+        );
     }
 }

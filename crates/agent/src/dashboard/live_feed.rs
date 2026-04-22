@@ -662,28 +662,43 @@ pub(super) struct GeoIpResult {
 // Filter out internal detections, system noise, and advisory-only detectors.
 pub(super) fn is_internal(inc: &innerwarden_core::incident::Incident) -> bool {
     let det = inc.incident_id.split(':').next().unwrap_or("");
-    // Advisory-only detectors (observe, never block)
+    let has_external_ip = inc
+        .entities
+        .iter()
+        .any(|e| e.r#type == innerwarden_core::entities::EntityType::Ip);
+    is_internal_incident_fields(det, &inc.title, has_external_ip)
+}
+
+/// Field-level "internal noise" predicate, shared by `is_internal`
+/// (which takes a full `Incident`) and the agent_api / dashboard code
+/// that walks `knowledge_graph::Node::Incident` directly. Pulled out
+/// so the public Live Feed and the operator dashboard agree on what
+/// counts as a "real" incident — without it, `Home → Detections` and
+/// `Site → Events (24h)` reported wildly different numbers (126 vs
+/// 22 was the surfacing report on 2026-04-22).
+pub(super) fn is_internal_incident_fields(
+    detector: &str,
+    title: &str,
+    has_external_ip: bool,
+) -> bool {
+    // Advisory-only detectors (observe, never block).
     if matches!(
-        det,
+        detector,
         "neural_anomaly" | "host_drift" | "network_sniffing" | "discovery_burst"
     ) {
         return true;
     }
-    // No external IP = internal noise
-    if !inc
-        .entities
-        .iter()
-        .any(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
-    {
+    // No external IP = internal noise.
+    if !has_external_ip {
         return true;
     }
-    let t = inc.title.to_lowercase();
-    // Inner Warden processes doing setuid for skills
+    let t = title.to_lowercase();
+    // Inner Warden processes doing setuid for skills.
     t.contains("(en-agent)")
         || t.contains("(n-shield)")
         || t.contains("(en-sensor)")
         || t.contains("innerwarden")
-        // System daemons that legitimately do setuid
+        // System daemons that legitimately do setuid.
         || t.contains("(timesyncd)")
         || t.contains("(systemd)")
         || t.contains("(networkd)")
@@ -943,6 +958,50 @@ mod tests {
             mk_decision("research", "block_ip", Some("10.0.0.99")),
         ];
         assert_eq!(count_unique_ips_blocked(&decisions, &real), 1);
+    }
+
+    #[test]
+    fn is_internal_incident_fields_flags_advisory_only_detectors() {
+        for det in [
+            "neural_anomaly",
+            "host_drift",
+            "network_sniffing",
+            "discovery_burst",
+        ] {
+            assert!(
+                is_internal_incident_fields(det, "anything", true),
+                "{det} must be classified as internal/advisory"
+            );
+        }
+    }
+
+    #[test]
+    fn is_internal_incident_fields_requires_external_ip() {
+        assert!(is_internal_incident_fields(
+            "ssh_bruteforce",
+            "ssh brute force",
+            false
+        ));
+        assert!(!is_internal_incident_fields(
+            "ssh_bruteforce",
+            "ssh brute force",
+            true
+        ));
+    }
+
+    #[test]
+    fn is_internal_incident_fields_strips_self_traffic_titles() {
+        for title in [
+            "ssh_bruteforce: bash (en-agent)",
+            "exec.privesc (innerwarden)",
+            "network connection (sshd)",
+            "file modify (cron)",
+        ] {
+            assert!(
+                is_internal_incident_fields("ssh_bruteforce", title, true),
+                "{title} should be classified as internal noise"
+            );
+        }
     }
 
     #[test]

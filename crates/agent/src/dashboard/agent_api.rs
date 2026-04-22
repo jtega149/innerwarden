@@ -95,10 +95,13 @@ fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static s
 // ---------------------------------------------------------------------------
 
 /// Count unique IP addresses that have an auto-executed `block_ip`
-/// decision attached to an Incident node currently live in the graph.
-/// Keeps the "Blocked Today" KPI aligned across `/api/live-feed` and
-/// `/api/agent/security-context`. Extracted as a pure function so it
-/// can be unit-tested against a small in-memory graph fixture.
+/// decision attached to a non-internal Incident node currently live
+/// in the graph. Keeps the "Blocked Today" KPI aligned across
+/// `/api/live-feed`, the dashboard Home, and `/api/agent/security-context`.
+///
+/// Filters out research-only and "internal noise" incidents the same
+/// way the public Live Feed does, so the same IP that the site shows
+/// as a real attacker is the one that surfaces in this counter.
 pub(super) fn count_unique_ips_blocked_in_graph(
     graph: &crate::knowledge_graph::KnowledgeGraph,
 ) -> usize {
@@ -109,21 +112,37 @@ pub(super) fn count_unique_ips_blocked_in_graph(
         let Some(Node::Incident {
             decision,
             auto_executed,
+            detector,
+            title,
+            research_only,
             ..
         }) = graph.get_node(id)
         else {
             continue;
         };
+        if *research_only {
+            continue;
+        }
         let Some(dec) = decision else { continue };
         if dec != "block_ip" || !*auto_executed {
             continue;
         }
+        // Walk edges once so we know both whether there is an
+        // external IP (filter input) and which IPs to count.
+        let mut external_ips: Vec<String> = Vec::new();
         for edge in graph.outgoing_edges(id) {
             if edge.relation == Relation::TriggeredBy {
                 if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
-                    blocked_ips.insert(addr.clone());
+                    external_ips.push(addr.clone());
                 }
             }
+        }
+        let has_external_ip = !external_ips.is_empty();
+        if super::live_feed::is_internal_incident_fields(detector, title, has_external_ip) {
+            continue;
+        }
+        for ip in external_ips {
+            blocked_ips.insert(ip);
         }
     }
     blocked_ips.len()
@@ -138,16 +157,37 @@ pub(super) async fn api_agent_security_context(
     use crate::knowledge_graph::types::{Node, NodeType};
     let graph = state.knowledge_graph.read().unwrap();
 
+    use crate::knowledge_graph::types::Relation;
     let incident_nodes = graph.nodes_of_type(NodeType::Incident);
-    let total_incidents = incident_nodes.len();
+    let mut total_incidents = 0usize;
     let mut high_or_critical = 0usize;
     let mut detector_counts = std::collections::HashMap::<String, usize>::new();
 
+    // Fix (prod 2026-04-22): align "Detections Today" on /home with the
+    // public Live Feed's "Events (24h)". Without filtering, the agent
+    // counted advisory-only detectors and self-traffic that the site
+    // hides — making the same incident set show 126 here and 22 on
+    // the site for the same window.
     for &id in &incident_nodes {
         if let Some(Node::Incident {
-            detector, severity, ..
+            detector,
+            severity,
+            title,
+            research_only,
+            ..
         }) = graph.get_node(id)
         {
+            if *research_only {
+                continue;
+            }
+            let has_external_ip = graph.outgoing_edges(id).iter().any(|e| {
+                e.relation == Relation::TriggeredBy
+                    && matches!(graph.get_node(e.to), Some(Node::Ip { .. }))
+            });
+            if super::live_feed::is_internal_incident_fields(detector, title, has_external_ip) {
+                continue;
+            }
+            total_incidents += 1;
             let sev = severity.to_lowercase();
             if sev == "high" || sev == "critical" {
                 high_or_critical += 1;
@@ -1379,6 +1419,91 @@ enabled = false
     #[test]
     fn count_unique_ips_blocked_in_graph_empty_graph_returns_zero() {
         let graph = crate::knowledge_graph::KnowledgeGraph::new();
+        assert_eq!(count_unique_ips_blocked_in_graph(&graph), 0);
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_in_graph_skips_advisory_only_detectors() {
+        // Bug fix (prod 2026-04-22 cross-view inconsistency): the
+        // counter now matches the public Live Feed by ignoring
+        // advisory-only detectors (`neural_anomaly`, `host_drift`,
+        // ...). Without this, /home reported 126 detections while
+        // the site showed 22 over the same window.
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let ip_id = graph.upsert_node(Node::Ip {
+            addr: "203.0.113.50".into(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 10,
+            is_tor: false,
+            first_seen: now,
+            last_seen: now,
+            attempted_usernames: vec![],
+        });
+        let inc_id = graph.upsert_node(Node::Incident {
+            incident_id: "host_drift:noise:1".into(),
+            detector: "host_drift".into(),
+            severity: "low".into(),
+            title: "drift".into(),
+            summary: "S".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            confidence: Some(0.95),
+            decision_reason: None,
+            decision_target: Some("203.0.113.50".into()),
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(inc_id, ip_id, Relation::TriggeredBy, now));
+
+        // host_drift is advisory-only — must not surface in the
+        // operator-facing counter even though the decision happened.
+        assert_eq!(count_unique_ips_blocked_in_graph(&graph), 0);
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_in_graph_skips_research_only_incidents() {
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let ip_id = graph.upsert_node(Node::Ip {
+            addr: "203.0.113.51".into(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 10,
+            is_tor: false,
+            first_seen: now,
+            last_seen: now,
+            attempted_usernames: vec![],
+        });
+        let inc_id = graph.upsert_node(Node::Incident {
+            incident_id: "ssh_bruteforce:research:1".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "brute".into(),
+            summary: "S".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            confidence: Some(0.95),
+            decision_reason: None,
+            decision_target: Some("203.0.113.51".into()),
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: true,
+        });
+        graph.add_edge(Edge::new(inc_id, ip_id, Relation::TriggeredBy, now));
+
         assert_eq!(count_unique_ips_blocked_in_graph(&graph), 0);
     }
 

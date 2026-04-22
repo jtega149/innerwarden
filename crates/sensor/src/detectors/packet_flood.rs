@@ -35,6 +35,15 @@ const UDP_KINDS: &[&str] = &[
 /// 4. Slowloris     - many stale connections from same IP
 /// 5. Multi-vector  - 2+ patterns trigger simultaneously
 /// 6. Connection rate anomaly - current rate >> historical baseline
+///
+/// Rate-anomaly attribution gates: a per-minute spike is only blamed on
+/// a single IP when that IP is unambiguously the cause. Both gates must
+/// hold; otherwise the alert is dropped (the spike is real but
+/// unattributable). See [`PacketFloodDetector::check_rate_anomaly`] for
+/// the prod incident that motivated these (160.119.76.50, 2026-04-22).
+const RATE_ATTRIBUTION_MIN_EVENTS: usize = 10;
+const RATE_ATTRIBUTION_MIN_SHARE: f64 = 0.30;
+
 pub struct PacketFloodDetector {
     host: String,
 
@@ -362,32 +371,61 @@ impl PacketFloodDetector {
         }
 
         let current = self.current_minute_conns as f64;
-        if current > baseline * self.rate_multiplier {
-            let alert_key = "packet_flood:rate_anomaly".to_string();
-            if !self.is_in_cooldown(&alert_key, now) {
-                self.alerted.insert(alert_key, now);
-                // Use the top contributing IP from the current minute bucket
-                // instead of the triggering event's IP (which may not have one).
-                let top_ip = self
-                    .current_minute_ips
-                    .iter()
-                    .max_by_key(|(_, count)| *count)
-                    .map(|(ip, _)| ip.clone())
-                    .unwrap_or_default();
-                return Some(self.build_incident(
-                    &top_ip,
-                    now,
-                    "rate_anomaly",
-                    Severity::High,
-                    format!(
-                        "Connection rate anomaly: {}/min vs {:.0}/min baseline",
-                        self.current_minute_conns, baseline
-                    ),
-                ));
-            }
+        if current <= baseline * self.rate_multiplier {
+            return None;
+        }
+        let alert_key = "packet_flood:rate_anomaly".to_string();
+        if self.is_in_cooldown(&alert_key, now) {
+            return None;
         }
 
-        None
+        // Find the top contributing IP from the current minute bucket.
+        let (top_ip, top_count) = self
+            .current_minute_ips
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(ip, count)| (ip.clone(), *count))?;
+
+        // Bug fix (prod 2026-04-22, IP 160.119.76.50 false positive):
+        // the previous version blamed any anomalous-minute spike on the
+        // single top contributor, even when that contributor only had
+        // 4 events in a 50+/min spike (i.e. just normal HTTP page load
+        // alongside other traffic). Require the attributed IP to be a
+        // **dominant** contributor before turning the spike into a
+        // per-IP block. Two independent gates:
+        //
+        //   1. Absolute floor: top contributor must have at least
+        //      RATE_ATTRIBUTION_MIN_EVENTS events in this minute.
+        //      4 GETs to `/`, `/favicon.ico`, `/robots.txt`,
+        //      `/.well-known/security.txt` is page-load shape, not
+        //      flood shape.
+        //   2. Share floor: top contributor must account for at least
+        //      RATE_ATTRIBUTION_MIN_SHARE of the minute's total. A
+        //      diffuse spike with no single offender is a baseline
+        //      shift, not an attack from one IP.
+        //
+        // Both must hold. If either fails the spike is real but
+        // unattributable, and we drop the alert rather than blame the
+        // wrong IP.
+        let share = top_count as f64 / current;
+        if (top_count as usize) < RATE_ATTRIBUTION_MIN_EVENTS || share < RATE_ATTRIBUTION_MIN_SHARE
+        {
+            return None;
+        }
+
+        self.alerted.insert(alert_key, now);
+        Some(self.build_incident(
+            &top_ip,
+            now,
+            "rate_anomaly",
+            Severity::High,
+            format!(
+                "Connection rate anomaly: {}/min vs {:.0}/min baseline (top IP {top_count} events, {:.0}% share)",
+                self.current_minute_conns,
+                baseline,
+                share * 100.0,
+            ),
+        ))
     }
 
     fn is_in_cooldown(&self, key: &str, now: DateTime<Utc>) -> bool {
@@ -1216,5 +1254,122 @@ mod tests {
                 "single-IP SYN should not trigger DDoS alert"
             );
         }
+    }
+
+    // Helper used by the rate-anomaly attribution tests below: warm
+    // up `det` with `baseline_per_minute` events per minute for 5
+    // minutes from `start`, attributed to a single seed IP that the
+    // attribution gates will reject (low share).
+    fn seed_baseline(
+        det: &mut PacketFloodDetector,
+        start: DateTime<Utc>,
+        baseline_per_minute: i64,
+    ) {
+        for minute in 0..5 {
+            for conn in 0..baseline_per_minute {
+                let ts = start + Duration::minutes(minute) + Duration::seconds(conn * 5);
+                det.process(&network_event("8.8.8.1", ts));
+            }
+            // Force minute bucket rollover.
+            let next_minute = start + Duration::minutes(minute + 1);
+            det.process(&network_event("8.8.8.1", next_minute));
+        }
+    }
+
+    fn rate_anomaly_in(results: &[Incident]) -> Option<&Incident> {
+        results.iter().find(|i| i.summary.contains("rate anomaly"))
+    }
+
+    // ── Bug fix: rate anomaly must NOT blame a low-volume top IP ─────────
+    #[test]
+    fn rate_anomaly_skips_alert_when_top_contributor_below_min_events() {
+        // Reproduces the prod 2026-04-22 false positive (IP
+        // 160.119.76.50): the minute spike was real but the blamed
+        // IP only had 4 events (HTTP page-load shape, not flood).
+        let mut det = new_detector();
+        let start = Utc::now();
+        seed_baseline(&mut det, start, 1);
+
+        // Spike to 60/min total: a noisy `8.8.8.2` at 50 events
+        // (the real cause) plus the "victim" IP at only 4 events
+        // (page-load shape). Use a fresh batch of unique IPs for the
+        // remainder so no other IP can dominate.
+        let spike_start = start + Duration::minutes(6);
+        let mut all_results = Vec::new();
+
+        // Inject the victim IP first with exactly 4 events — under
+        // RATE_ATTRIBUTION_MIN_EVENTS (10).
+        for i in 0..4 {
+            let ts = spike_start + Duration::seconds(i);
+            all_results.extend(det.process(&network_event("160.119.76.50", ts)));
+        }
+        // Pad with many distinct IPs so no single IP reaches the
+        // 30% share floor either. 56 events spread across 56 IPs.
+        for i in 0..56 {
+            let ts = spike_start + Duration::seconds(4 + i);
+            let pad_ip = format!("10.20.{}.{}", i / 256, i % 256);
+            all_results.extend(det.process(&network_event(&pad_ip, ts)));
+        }
+
+        assert!(
+            rate_anomaly_in(&all_results).is_none(),
+            "rate anomaly must not fire when no IP clears the attribution floor"
+        );
+    }
+
+    #[test]
+    fn rate_anomaly_skips_alert_when_top_contributor_below_min_share() {
+        // Spike from many small contributors: top IP has 11 events
+        // (over the 10-event floor) but in a 60-event minute that is
+        // 18% share, under the 30% share floor. Must not blame.
+        let mut det = new_detector();
+        let start = Utc::now();
+        seed_baseline(&mut det, start, 1);
+
+        let spike_start = start + Duration::minutes(6);
+        let mut all_results = Vec::new();
+        // Order matters: dump the diffuse pad first so no IP holds
+        // a transient majority while check_rate_anomaly is firing on
+        // intermediate events. Then layer the would-be top
+        // contributor on top once dilution is in place.
+        for i in 0..49 {
+            let ts = spike_start + Duration::seconds(i);
+            let pad_ip = format!("12.20.{}.{}", i / 256, i % 256);
+            all_results.extend(det.process(&network_event(&pad_ip, ts)));
+        }
+        for i in 0..11 {
+            let ts = spike_start + Duration::seconds(49 + i);
+            all_results.extend(det.process(&network_event("11.11.11.11", ts)));
+        }
+
+        assert!(
+            rate_anomaly_in(&all_results).is_none(),
+            "rate anomaly must not blame a top IP that holds <30% of the spike"
+        );
+    }
+
+    #[test]
+    fn rate_anomaly_fires_when_attribution_floors_are_satisfied() {
+        // Sanity: a real flood from one IP satisfies both floors and
+        // the alert still fires. Guards against my fix accidentally
+        // blocking the legitimate detection path.
+        let mut det = new_detector();
+        let start = Utc::now();
+        seed_baseline(&mut det, start, 1);
+
+        let spike_start = start + Duration::minutes(6);
+        let mut all_results = Vec::new();
+        for i in 0..40 {
+            let ts = spike_start + Duration::seconds(i);
+            all_results.extend(det.process(&network_event("66.66.66.66", ts)));
+        }
+
+        let inc = rate_anomaly_in(&all_results)
+            .expect("real single-source flood should trigger rate anomaly");
+        assert_eq!(inc.severity, Severity::High);
+        assert!(
+            inc.summary.contains("share"),
+            "summary should expose the attribution share"
+        );
     }
 }
