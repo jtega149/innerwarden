@@ -169,6 +169,29 @@ pub(crate) fn backfill_015_research_only_backup_path(snapshot_path: &Path, stamp
     snapshot_path.with_extension(format!("json.bak-015-researchonly-{stamp}"))
 }
 
+/// Build the primary AI provider used for the spec-029 capability
+/// router. Three branches:
+/// - `enabled = false` → `None` (Falco mode)
+/// - `enabled = true`, build succeeds → `Some(Arc<dyn AiProvider>)`
+/// - `enabled = true`, build fails → log warning, `None`
+///
+/// Extracted from `run_agent` so the branch logic is reachable from a
+/// unit test without spinning up the agent loop.
+pub(crate) fn build_primary_provider(
+    ai_cfg: &crate::config::AiConfig,
+) -> Option<Arc<dyn ai::AiProvider>> {
+    if !ai_cfg.enabled {
+        return None;
+    }
+    match ai::build_provider(ai_cfg) {
+        Ok(p) => Some(Arc::from(p)),
+        Err(e) => {
+            warn!("failed to create AI provider: {e:#}");
+            None
+        }
+    }
+}
+
 pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     if cli.dashboard_generate_password_hash {
         dashboard::generate_password_hash_interactive()?;
@@ -285,6 +308,41 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     let (agent_alert_tx, mut agent_alert_rx) =
         tokio::sync::mpsc::channel::<dashboard::AgentGuardAlert>(64);
 
+    // Build the primary AI provider and capability router ONCE, before
+    // the dashboard spawn. Both the dashboard task and the main agent
+    // loop share the same `Arc`-wrapped provider and the same router
+    // (which is `Clone`-cheap because it only holds `Arc<dyn AiProvider>`
+    // handles). Constructing them here instead of twice (once for the
+    // dashboard at line ~351, once for the agent at line ~661) avoids
+    // re-parsing the ONNX classifier model and re-initialising provider
+    // HTTP clients — measured saving ≈200 MB transient heap during boot
+    // (jeprof on 2026-04-22). Branch logic is in `build_primary_provider`
+    // so the `enabled / build-err / disabled` paths are unit-tested
+    // without spinning up the rest of the agent.
+    let ai_provider = build_primary_provider(&cfg.ai);
+    let ai_router = ai::router::build_from_config(
+        ai_provider.as_ref().map(Arc::clone),
+        &cfg.ai.classifier,
+        &cfg.ai.llm,
+        Some(&cfg.ai.shadow),
+        cfg.ai.confidence_threshold,
+        |slot, provider_name| {
+            info!(
+                slot,
+                provider = provider_name,
+                "AI router: per-role slot configured"
+            );
+        },
+        |slot, provider_name, err| {
+            warn!(
+                slot,
+                provider = provider_name,
+                "failed to build per-role provider, falling back to primary: {err:#}"
+            );
+        },
+    );
+    info!(router = %ai_router.describe(), "AI router ready");
+
     if cli.dashboard {
         let auth = dashboard::DashboardAuth::try_from_env()?;
         let action_cfg = dashboard::DashboardActionConfig {
@@ -348,27 +406,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         let agent_alert_tx = agent_alert_tx.clone();
         let deep_security = deep_security_snapshot.clone();
         let dashboard_graph = shared_graph.clone();
-        let dashboard_ai: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.enabled {
-            match ai::build_provider(&cfg.ai) {
-                Ok(p) => Some(Arc::from(p)),
-                Err(e) => {
-                    warn!("briefing AI provider failed: {e:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        // Spec 029 PR-C.2: dedicated router for the dashboard spawn.
-        // Logic (including tracing) lives in `ai::router::build_for_dashboard`
-        // so it is unit-tested and this boot path stays a single call.
-        let dashboard_router = ai::router::build_for_dashboard(
-            dashboard_ai.as_ref().map(Arc::clone),
-            &cfg.ai.classifier,
-            &cfg.ai.llm,
-            Some(&cfg.ai.shadow),
-            cfg.ai.confidence_threshold,
-        );
+        // Share the router built above with the dashboard. `AiRouter` is
+        // `Clone` and only holds `Arc` handles, so this does not duplicate
+        // any provider state.
+        let dashboard_router = ai_router.clone();
         let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
         let briefing_hour = cfg.briefing.hour;
         let briefing_minute = cfg.briefing.minute;
@@ -652,52 +693,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             }
         });
     }
-
-    // Build the primary AI provider once; it feeds the spec 029
-    // capability router. When `[ai.classifier]` / `[ai.llm]` are not
-    // set, both router slots hold this same provider (legacy
-    // behaviour). When they are set, the router builds dedicated
-    // per-role providers and reserves this primary for fallback.
-    let ai_provider: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.enabled {
-        match ai::build_provider(&cfg.ai) {
-            Ok(p) => Some(Arc::from(p)),
-            Err(e) => {
-                warn!("failed to create AI provider: {e:#}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Spec 029 PR-C.1: per-role providers. When `[ai.classifier].enabled`
-    // is true, build a separate provider for the classifier slot;
-    // otherwise the primary `[ai]` provider fills that slot (PR-B
-    // back-compat). Same for `[ai.llm]`. Branch logic lives in the
-    // unit-testable `ai::router::build_from_config`; this block just
-    // wires tracing callbacks.
-    let ai_router = ai::router::build_from_config(
-        ai_provider.as_ref().map(Arc::clone),
-        &cfg.ai.classifier,
-        &cfg.ai.llm,
-        Some(&cfg.ai.shadow),
-        cfg.ai.confidence_threshold,
-        |slot, provider_name| {
-            info!(
-                slot,
-                provider = provider_name,
-                "AI router: per-role slot configured"
-            );
-        },
-        |slot, provider_name, err| {
-            warn!(
-                slot,
-                provider = provider_name,
-                "failed to build per-role provider, falling back to primary: {err:#}"
-            );
-        },
-    );
-    info!(router = %ai_router.describe(), "AI router ready");
 
     let mut state = AgentState {
         skill_registry: skills::SkillRegistry::default_builtin(),
@@ -2377,5 +2372,38 @@ url = "http://127.0.0.1:9/hooks"
             result.is_ok(),
             "run_agent feature-rich config failed: {result:?}"
         );
+    }
+
+    // ── build_primary_provider ───────────────────────────────────────
+
+    #[test]
+    fn build_primary_provider_returns_none_when_disabled() {
+        let mut cfg = crate::config::AiConfig::default();
+        cfg.enabled = false;
+        assert!(build_primary_provider(&cfg).is_none());
+    }
+
+    #[test]
+    fn build_primary_provider_returns_none_on_unknown_provider() {
+        // `provider = "this-does-not-exist"` makes `ai::build_provider`
+        // return `Err`, which `build_primary_provider` swallows into
+        // `None` after logging. Guards against accidentally turning the
+        // build error into a panic.
+        let mut cfg = crate::config::AiConfig::default();
+        cfg.enabled = true;
+        cfg.provider = "this-does-not-exist".into();
+        assert!(build_primary_provider(&cfg).is_none());
+    }
+
+    #[test]
+    fn build_primary_provider_returns_some_for_ollama_default() {
+        // Ollama's `build_provider` does not require a network connection
+        // at construction time — it just stores the base URL. So a
+        // default Ollama config produces a real provider handle without
+        // tests needing a running ollama server.
+        let mut cfg = crate::config::AiConfig::default();
+        cfg.enabled = true;
+        cfg.provider = "ollama".into();
+        assert!(build_primary_provider(&cfg).is_some());
     }
 }

@@ -32,6 +32,7 @@ build_one() {
   local pkg="$1"
   local features=""
   [ "$pkg" = "innerwarden-sensor" ] && features="--features ebpf"
+  [ "$pkg" = "innerwarden-agent" ] && features="--features local-classifier"
   echo "[2/4] Building $pkg..."
   $SSH "source ~/.cargo/env && cd $REMOTE_DIR && cargo build --release -p $pkg $features 2>&1 | tail -1"
 }

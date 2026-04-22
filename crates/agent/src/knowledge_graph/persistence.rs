@@ -5,7 +5,7 @@ use super::graph::KnowledgeGraph;
 use super::types::*;
 use tracing::warn;
 
-/// Serializable snapshot of the graph for persistence.
+/// Owned snapshot used by load (deserialize moves into KnowledgeGraph).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct GraphSnapshot {
     nodes: HashMap<NodeId, Node>,
@@ -22,19 +22,40 @@ struct GraphSnapshot {
     total_events_ingested: usize,
 }
 
+/// Borrowed view for serialization. Avoids cloning the entire graph
+/// state every save (272 MB transient allocation per slow_loop tick on
+/// the production agent at 1354-profile baseline). Wire format is
+/// identical to `GraphSnapshot`, so saves written via this struct round-
+/// trip through `GraphSnapshot::deserialize` unchanged.
+#[derive(serde::Serialize)]
+struct GraphSnapshotRef<'a> {
+    nodes: &'a HashMap<NodeId, Node>,
+    edges: &'a Vec<Edge>,
+    next_id: NodeId,
+    source_counts: &'a HashMap<String, usize>,
+    kind_counts: &'a HashMap<String, usize>,
+    event_timeline: &'a std::collections::BTreeMap<String, HashMap<String, usize>>,
+    total_events_ingested: usize,
+}
+
+impl<'a> GraphSnapshotRef<'a> {
+    fn from_graph(g: &'a KnowledgeGraph) -> Self {
+        Self {
+            nodes: &g.nodes,
+            edges: &g.edges,
+            next_id: g.next_id,
+            source_counts: &g.source_counts,
+            kind_counts: &g.kind_counts,
+            event_timeline: &g.event_timeline,
+            total_events_ingested: g.total_events_ingested,
+        }
+    }
+}
+
 impl KnowledgeGraph {
     /// Save the graph to a JSON file with rotation (T029: keep last 3 snapshots).
     pub fn save_snapshot(&self, path: &Path) -> anyhow::Result<()> {
-        let snapshot = GraphSnapshot {
-            nodes: self.nodes.clone(),
-            edges: self.edges.clone(),
-            next_id: self.next_id,
-            source_counts: self.source_counts.clone(),
-            kind_counts: self.kind_counts.clone(),
-            event_timeline: self.event_timeline.clone(),
-            total_events_ingested: self.total_events_ingested,
-        };
-
+        let snapshot = GraphSnapshotRef::from_graph(self);
         let data = serde_json::to_vec(&snapshot)?;
 
         // T029: rotate previous snapshots before writing new one
@@ -44,8 +65,8 @@ impl KnowledgeGraph {
 
         tracing::info!(
             "Knowledge graph snapshot saved: {} nodes, {} edges, {} bytes",
-            snapshot.nodes.len(),
-            snapshot.edges.len(),
+            self.nodes.len(),
+            self.edges.len(),
             data.len()
         );
 
@@ -183,15 +204,7 @@ impl KnowledgeGraph {
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
-        let snapshot = GraphSnapshot {
-            nodes: self.nodes.clone(),
-            edges: self.edges.clone(),
-            next_id: self.next_id,
-            source_counts: self.source_counts.clone(),
-            kind_counts: self.kind_counts.clone(),
-            event_timeline: self.event_timeline.clone(),
-            total_events_ingested: self.total_events_ingested,
-        };
+        let snapshot = GraphSnapshotRef::from_graph(self);
         let data = serde_json::to_vec(&snapshot)?;
         store.save_graph_snapshot(&today, &data, self.node_count(), self.edge_count())?;
         tracing::info!(
@@ -373,6 +386,28 @@ mod tests {
 
         let g = KnowledgeGraph::load_snapshot(&path);
         assert_eq!(g.node_count(), 0);
+    }
+
+    #[test]
+    fn save_to_store_and_load_from_store_roundtrip() {
+        // Covers the SQLite-backed persistence path. Equivalent to
+        // `test_save_and_load_snapshot` but for `save_to_store` /
+        // `load_from_store`, which were only exercised in production
+        // before this test (slow_loop calls them every tick).
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+
+        let mut g = KnowledgeGraph::new();
+        let proc_id = g.ensure_process(4321, 1, "redis-server", 0, Utc::now());
+        let ip_id = g.ensure_ip("203.0.113.7", Utc::now());
+        g.add_edge(Edge::new(proc_id, ip_id, Relation::ConnectedTo, Utc::now()));
+
+        g.save_to_store(&store).expect("save_to_store");
+
+        let g2 = KnowledgeGraph::load_from_store(&store).expect("load_from_store");
+        assert_eq!(g2.node_count(), g.node_count());
+        assert_eq!(g2.edge_count(), g.edge_count());
+        assert!(g2.find_by_pid(4321).is_some());
+        assert!(g2.find_by_ip("203.0.113.7").is_some());
     }
 
     #[test]

@@ -285,41 +285,6 @@ pub fn build_from_config(
     }
 }
 
-/// Convenience wrapper over `build_from_config` that emits the
-/// dashboard-flavoured tracing lines. Called twice at boot (once for
-/// the agent loop, once for the dashboard spawn) so the callbacks
-/// live here, not inline in `loops/boot.rs`, which keeps the boot
-/// path flat and makes the tracing covered by a router unit test.
-pub fn build_for_dashboard(
-    primary: Option<Arc<dyn AiProvider>>,
-    classifier_cfg: &crate::config::RoleProviderConfig,
-    llm_cfg: &crate::config::RoleProviderConfig,
-    shadow_cfg: Option<&crate::config::ShadowConfig>,
-    confidence_threshold: f32,
-) -> AiRouter {
-    build_from_config(
-        primary,
-        classifier_cfg,
-        llm_cfg,
-        shadow_cfg,
-        confidence_threshold,
-        |slot, provider_name| {
-            tracing::info!(
-                slot,
-                provider = provider_name,
-                "dashboard router: per-role slot configured"
-            );
-        },
-        |slot, provider_name, err| {
-            tracing::warn!(
-                slot,
-                provider = provider_name,
-                "dashboard router: per-role provider build failed, falling back to primary: {err:#}"
-            );
-        },
-    )
-}
-
 fn resolve_slot(
     slot_name: &'static str,
     primary: &Option<Arc<dyn AiProvider>>,
@@ -991,53 +956,6 @@ mod tests {
         // Fallback callback fired even though the fallback itself
         // yielded None. Operators still see "we tried and failed".
         assert_eq!(fallbacks.lock().unwrap().len(), 1);
-    }
-
-    // ── build_for_dashboard ─────────────────────────────────────────
-
-    #[test]
-    fn build_for_dashboard_legacy_primary_fills_both_slots() {
-        let primary = arc("legacy", AiCapabilities::ALL);
-        let r = build_for_dashboard(
-            Some(Arc::clone(&primary)),
-            &RoleProviderConfig::default(),
-            &RoleProviderConfig::default(),
-            None,
-            0.85_f32,
-        );
-        assert_eq!(r.decider().unwrap().name(), "legacy");
-        assert_eq!(r.any_llm().unwrap().name(), "legacy");
-    }
-
-    #[test]
-    fn build_for_dashboard_no_primary_no_per_role_is_disabled() {
-        let r = build_for_dashboard(
-            None,
-            &RoleProviderConfig::default(),
-            &RoleProviderConfig::default(),
-            None,
-            0.85_f32,
-        );
-        assert!(r.is_disabled());
-    }
-
-    #[test]
-    fn build_for_dashboard_per_role_build_failure_falls_back_to_primary() {
-        let primary = arc("primary", AiCapabilities::ALL);
-        let classifier_cfg = RoleProviderConfig {
-            enabled: true,
-            provider: "nonexistent-provider".into(),
-            ..Default::default()
-        };
-        let r = build_for_dashboard(
-            Some(Arc::clone(&primary)),
-            &classifier_cfg,
-            &RoleProviderConfig::default(),
-            None,
-            0.85_f32,
-        );
-        assert_eq!(r.decider().unwrap().name(), "primary");
-        assert_eq!(r.any_llm().unwrap().name(), "primary");
     }
 
     // ── shadow routing ──────────────────────────────────────────────
