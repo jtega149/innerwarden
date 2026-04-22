@@ -24,6 +24,31 @@ context_events = 10
 confidence_threshold = 0.8
 incident_poll_secs = 2
 
+# Spec 029: per-role AI providers via the capability router. The
+# `[ai.classifier]` slot, when populated, handles `Decide` / `Classify`
+# capabilities locally without touching the cloud LLM. The
+# `local_classifier` provider loads the SecureBERT model installed by
+# `innerwarden install-classifier` (87 MB MiniLM L6 default, 478 MB
+# RoBERTa V1 alternative). When unset, Decide falls through to the
+# cloud LLM in `[ai]`.
+#
+# [ai.classifier]
+# provider = "local_classifier"
+# base_url = "/var/lib/innerwarden/models/classifier"
+# # auto_exec_threshold: confidence above which the classifier is
+# # trusted to fire `auto_execute=true` decisions without a second
+# # opinion. Below the threshold the decision is logged as
+# # advisory-only.
+# auto_exec_threshold = 0.85
+#
+# [ai.llm]
+# # Free-form generation slot (briefing, explain, simulate_shell). When
+# # unset, falls back to the primary [ai] provider above. Useful when
+# # the operator wants a cheap classifier on the hot path and a more
+# # capable model only for the daily briefing.
+# provider = "openai"
+# model = "gpt-4o-mini"
+
 [correlation]
 enabled = true
 window_seconds = 300
