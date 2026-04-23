@@ -507,9 +507,44 @@ pub(super) async fn api_agent_guard_list(
 
 // ---------------------------------------------------------------------------
 
+/// `GET /metrics` — Prometheus exposition format.
+///
+/// The body reads per-tick telemetry snapshots from disk, the `responses`
+/// blob/JSON (path-canonicalized) from either SQLite or the data
+/// directory, and two synchronous SQLite queries inside
+/// `append_spec024_metrics`. Running this on an async worker thread would
+/// stall every other dashboard request handled by the same worker under
+/// WAL contention (`RECURRING_BUGS.md` "Dashboard handlers block tokio
+/// worker threads"). `tokio::task::spawn_blocking` moves the work to the
+/// blocking pool so async workers stay responsive.
 pub(super) async fn api_prometheus_metrics(
     State(state): State<DashboardState>,
 ) -> axum::response::Response {
+    let body = tokio::task::spawn_blocking(move || {
+        build_prometheus_metrics_text(&state, chrono::Utc::now())
+    })
+    .await
+    .unwrap_or_default();
+
+    axum::response::Response::builder()
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(Body::from(body))
+        .unwrap()
+        .into_response()
+}
+
+/// Pure helper extracted from `api_prometheus_metrics` so the heavy work
+/// runs on the blocking pool and stays unit-testable. Same logic as
+/// before — only the scope of the synchronous calls changed. The single
+/// `now` parameter replaces the two separate clock reads the handler
+/// used to make (legacy `resolve_date(None)` used `Local::now()` for the
+/// telemetry snapshot date and `Utc::now()` for the spec 024 window);
+/// `resolve_date(None)` is preserved intentionally to keep the telemetry
+/// filename behavior byte-identical.
+pub(super) fn build_prometheus_metrics_text(
+    state: &DashboardState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
     let date = resolve_date(None);
 
     // Read latest telemetry snapshot (small file, already cached)
@@ -629,13 +664,9 @@ pub(super) async fn api_prometheus_metrics(
 
     // Spec 024 drift metrics — appended after legacy metrics so any existing
     // Prometheus scrape keeps reading the same fields.
-    append_spec024_metrics(&mut out, &state, chrono::Utc::now());
+    append_spec024_metrics(&mut out, state, now);
 
-    axum::response::Response::builder()
-        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-        .body(Body::from(out))
-        .unwrap()
-        .into_response()
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1943,6 +1974,87 @@ enabled = false
         assert!(out.contains("innerwarden_ai_provider_errors_per_hour{provider=\"unknown\"} 4"));
         assert!(out.contains("innerwarden_gate_suppressed_total 5"));
         assert!(out.contains("innerwarden_event_rate_per_hour{source=\"auth.log\"} 30.00"));
+    }
+
+    // ── Spec 035 A4: /metrics async handler anchor ──────────────────
+    //
+    // The async handler moves the full metrics build (telemetry snapshot
+    // read, `responses` blob/JSON path canonicalize + read, and two
+    // synchronous SQLite queries inside `append_spec024_metrics`) to the
+    // blocking pool via `tokio::task::spawn_blocking`. These two tests
+    // pin the contract:
+    //   1. The extracted sync builder emits the expected HELP/TYPE
+    //      headers even on an empty state — Prometheus `rate()` and
+    //      absent-alert queries rely on these being present.
+    //   2. The async handler's response shape (status + content-type +
+    //      body containing builder output) is preserved across the
+    //      spawn_blocking wrap.
+    // A future refactor that re-inlines the sync calls into the async
+    // handler will not break these tests (they still pass) — the guard
+    // against re-regression is the `ReleaseNotes` + the module-level
+    // comment. For a non-blocking-runtime proof, see the multi-thread
+    // integration in scenario-qa (too flaky to pin as a unit timing
+    // test).
+
+    #[test]
+    fn build_prometheus_metrics_text_emits_stable_headers_on_empty_state() {
+        let td = tmpdir();
+        let state = dashboard_state_for_metrics(td.path(), None);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let out = super::build_prometheus_metrics_text(&state, now);
+
+        for family in &[
+            "innerwarden_events_total",
+            "innerwarden_incidents_total",
+            "innerwarden_decisions_total",
+            "innerwarden_ai_calls_total",
+            "innerwarden_ai_latency_avg_ms",
+            "innerwarden_errors_total",
+            "innerwarden_executions_total",
+            "innerwarden_incidents_per_hour",
+            "innerwarden_blocks_per_hour",
+        ] {
+            assert!(
+                out.contains(&format!("# HELP {family} "))
+                    && out.contains(&format!("# TYPE {family} ")),
+                "metric family {family} missing HELP/TYPE headers on empty state",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_prometheus_metrics_handler_returns_builder_output_with_prom_content_type() {
+        use axum::body::to_bytes;
+        use axum::extract::State;
+
+        let td = tmpdir();
+        let state = dashboard_state_for_metrics(td.path(), None);
+        let response = super::api_prometheus_metrics(State(state)).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            content_type,
+            "text/plain; version=0.0.4; charset=utf-8",
+            "Prometheus exposition content-type must survive spawn_blocking wrap",
+        );
+
+        let body = response.into_body();
+        let bytes = to_bytes(body, 64 * 1024).await.expect("body bytes");
+        let body_str = std::str::from_utf8(&bytes).expect("utf8 body");
+        assert!(
+            body_str.contains("# HELP innerwarden_events_total")
+                && body_str.contains("# HELP innerwarden_incidents_per_hour"),
+            "handler response must include both legacy and spec 024 headers produced by the sync builder",
+        );
     }
 
     #[test]
