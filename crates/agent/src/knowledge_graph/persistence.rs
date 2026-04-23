@@ -120,6 +120,17 @@ fn maybe_decompress(blob: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Serialised + gzipped snapshot ready for I/O. Returned by
+/// `KnowledgeGraph::serialize_snapshot_bytes` so the caller can drop
+/// the read lock before doing any disk or SQLite work — see slow_loop
+/// for the rationale.
+pub struct SerializedSnapshot {
+    pub bytes: Vec<u8>,
+    pub uncompressed_size: usize,
+    pub nodes_count: usize,
+    pub edges_count: usize,
+}
+
 /// Owned snapshot used by load (deserialize moves into KnowledgeGraph).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct GraphSnapshot {
@@ -168,30 +179,58 @@ impl<'a> GraphSnapshotRef<'a> {
 }
 
 impl KnowledgeGraph {
+    /// Serialize + gzip the graph snapshot into a `Vec<u8>` ready for
+    /// `std::fs::write` or `Store::save_graph_snapshot`. Holds **no
+    /// locks** — the caller is expected to be inside a `read()` guard
+    /// when invoking this; it returns owned bytes so the lock can drop
+    /// before any I/O happens.
+    ///
+    /// Pre-2026-04-23 the slow_loop held a `write()` guard for the
+    /// whole save (cleanup → compact → enforce → fs::write → sqlite
+    /// bind), blocking every dashboard request for hundreds of ms each
+    /// 60s tick. Splitting "make bytes" from "write bytes" lets the
+    /// caller release the lock before any disk/SQLite work.
+    pub fn serialize_snapshot_bytes(&self) -> anyhow::Result<SerializedSnapshot> {
+        let snapshot = GraphSnapshotRef::from_graph(self);
+        let json = serde_json::to_vec(&snapshot)?;
+        let data = gzip_snapshot_bytes(&json);
+        Ok(SerializedSnapshot {
+            bytes: data,
+            uncompressed_size: json.len(),
+            nodes_count: self.nodes.len(),
+            edges_count: self.edges.len(),
+        })
+    }
+
     /// Save the graph to a JSON file with rotation (T029: keep last 3 snapshots).
     ///
     /// Bytes are gzip-compressed before write (typical JSON payload shrinks
     /// 6-10× — 47 MB → ~5 MB on the prod baseline at 14k nodes / 145k edges).
     /// Reader detects the format via the gzip magic header so legacy
     /// uncompressed snapshots still load.
+    ///
+    /// Convenience wrapper around `serialize_snapshot_bytes` for callers
+    /// that don't need to release the read lock between serialize and
+    /// write (test code, one-shot CLI). Hot-path callers should serialize
+    /// under a read lock and write outside it — see slow_loop.
     pub fn save_snapshot(&self, path: &Path) -> anyhow::Result<()> {
-        let snapshot = GraphSnapshotRef::from_graph(self);
-        let json = serde_json::to_vec(&snapshot)?;
-        let data = gzip_snapshot_bytes(&json);
+        let snap = self.serialize_snapshot_bytes()?;
+        Self::write_snapshot_bytes(path, &snap)
+    }
 
-        // T029: rotate previous snapshots before writing new one
+    /// Write pre-serialized snapshot bytes to disk with rotation.
+    /// Holds no graph lock — pair with `serialize_snapshot_bytes` from
+    /// inside a read guard, then call this after the guard drops.
+    pub fn write_snapshot_bytes(path: &Path, snap: &SerializedSnapshot) -> anyhow::Result<()> {
         rotate_snapshots(path, 3);
-
-        std::fs::write(path, &data)?;
-
+        std::fs::write(path, &snap.bytes)?;
         tracing::info!(
-            nodes = self.nodes.len(),
-            edges = self.edges.len(),
-            bytes_on_disk = data.len(),
-            bytes_uncompressed = json.len(),
+            nodes = snap.nodes_count,
+            edges = snap.edges_count,
+            bytes_on_disk = snap.bytes.len(),
+            bytes_uncompressed = snap.uncompressed_size,
             "Knowledge graph snapshot saved"
         );
-
         Ok(())
     }
 
@@ -228,6 +267,10 @@ impl KnowledgeGraph {
     }
 
     /// Save a dated snapshot: `graph-snapshot-YYYY-MM-DD.json` with rotation.
+    /// Convenience wrapper retained for one-shot callers (CLI, tests). The
+    /// agent slow_loop uses `serialize_snapshot_bytes` + `write_snapshot_bytes`
+    /// directly so it can drop the read lock before the disk write.
+    #[allow(dead_code)]
     pub fn save_dated_snapshot(&self, data_dir: &Path) -> anyhow::Result<()> {
         let path = Self::dated_snapshot_path(data_dir);
         self.save_snapshot(&path)
@@ -342,20 +385,32 @@ impl KnowledgeGraph {
     /// the slice into its internal buffer, so the smaller the BLOB the
     /// less memory the slow_loop allocates per tick (the prod baseline
     /// at 14k nodes / 145k edges shrinks from ~47 MB JSON to ~5 MB gzip).
+    ///
+    /// Convenience wrapper around `serialize_snapshot_bytes`. Hot-path
+    /// callers (slow_loop) should serialize under read lock and call
+    /// `Self::store_snapshot_bytes` after the lock drops.
+    #[allow(dead_code)]
     pub fn save_to_store(&self, store: &innerwarden_store::Store) -> anyhow::Result<()> {
+        let snap = self.serialize_snapshot_bytes()?;
+        Self::store_snapshot_bytes(store, &snap)
+    }
+
+    /// Push pre-serialized snapshot bytes to the SQLite store. Holds no
+    /// graph lock — pair with `serialize_snapshot_bytes`.
+    pub fn store_snapshot_bytes(
+        store: &innerwarden_store::Store,
+        snap: &SerializedSnapshot,
+    ) -> anyhow::Result<()> {
         let today = chrono::Local::now()
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
-        let snapshot = GraphSnapshotRef::from_graph(self);
-        let json = serde_json::to_vec(&snapshot)?;
-        let data = gzip_snapshot_bytes(&json);
-        store.save_graph_snapshot(&today, &data, self.node_count(), self.edge_count())?;
+        store.save_graph_snapshot(&today, &snap.bytes, snap.nodes_count, snap.edges_count)?;
         tracing::info!(
-            nodes = self.node_count(),
-            edges = self.edge_count(),
-            bytes_in_blob = data.len(),
-            bytes_uncompressed = json.len(),
+            nodes = snap.nodes_count,
+            edges = snap.edges_count,
+            bytes_in_blob = snap.bytes.len(),
+            bytes_uncompressed = snap.uncompressed_size,
             "Graph snapshot saved to SQLite"
         );
         Ok(())
@@ -856,5 +911,78 @@ mod tests {
         let store = innerwarden_store::Store::open_memory().unwrap();
         assert!(KnowledgeGraph::load_dated_from_store(&store, "../etc/passwd").is_none());
         assert!(KnowledgeGraph::load_dated_from_store(&store, "").is_none());
+    }
+
+    // ── lock-scope split tests ───────────────────────────────────────
+    //
+    // Anchors for the slow_loop refactor: serialize_snapshot_bytes runs
+    // under a read lock and returns owned bytes; write_snapshot_bytes
+    // and store_snapshot_bytes consume those bytes WITHOUT touching the
+    // graph. The pair must round-trip identically to the legacy
+    // `save_snapshot` / `save_to_store` convenience wrappers so external
+    // callers (tests, CLI) keep working.
+
+    #[test]
+    fn serialize_snapshot_bytes_round_trips_via_write_snapshot_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+
+        let mut g = KnowledgeGraph::new();
+        let p = g.ensure_process(101, 1, "redis", 0, Utc::now());
+        let ip = g.ensure_ip("203.0.113.42", Utc::now());
+        g.add_edge(Edge::new(p, ip, Relation::ConnectedTo, Utc::now()));
+
+        let snap = g.serialize_snapshot_bytes().expect("serialize");
+        assert_eq!(snap.nodes_count, g.node_count());
+        assert_eq!(snap.edges_count, g.edge_count());
+        assert!(snap.bytes.len() > 0);
+        assert!(
+            snap.uncompressed_size > snap.bytes.len(),
+            "gzip should shrink"
+        );
+        // Magic byte sniff — proves it's compressed before write.
+        assert_eq!(&snap.bytes[0..2], &[0x1f, 0x8b]);
+
+        KnowledgeGraph::write_snapshot_bytes(&path, &snap).expect("write");
+
+        let loaded = KnowledgeGraph::load_snapshot(&path);
+        assert_eq!(loaded.node_count(), g.node_count());
+        assert_eq!(loaded.edge_count(), g.edge_count());
+        assert!(loaded.find_by_pid(101).is_some());
+        assert!(loaded.find_by_ip("203.0.113.42").is_some());
+    }
+
+    #[test]
+    fn serialize_then_store_snapshot_bytes_round_trips_through_sqlite() {
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+
+        let mut g = KnowledgeGraph::new();
+        for i in 0..10 {
+            g.ensure_ip(&format!("198.51.100.{i}"), Utc::now());
+        }
+
+        let snap = g.serialize_snapshot_bytes().expect("serialize");
+        KnowledgeGraph::store_snapshot_bytes(&store, &snap).expect("store");
+
+        let loaded = KnowledgeGraph::load_from_store(&store).expect("load");
+        for i in 0..10 {
+            assert!(loaded.find_by_ip(&format!("198.51.100.{i}")).is_some());
+        }
+    }
+
+    #[test]
+    fn legacy_save_snapshot_still_round_trips() {
+        // Convenience wrapper kept for tests / CLI must keep working
+        // with the new split-API plumbing.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+
+        let mut g = KnowledgeGraph::new();
+        g.ensure_ip("10.0.0.1", Utc::now());
+
+        g.save_snapshot(&path).expect("legacy save_snapshot");
+
+        let loaded = KnowledgeGraph::load_snapshot(&path);
+        assert!(loaded.find_by_ip("10.0.0.1").is_some());
     }
 }

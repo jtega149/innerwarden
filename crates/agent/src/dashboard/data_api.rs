@@ -82,6 +82,7 @@ pub(super) async fn api_overview(
             ai_ignored: 0,
             unresolved_count: 0,
             safely_resolved: 0,
+            handled_ips_today: 0,
             severity_breakdown: std::collections::HashMap::new(),
             allowlisted_count: 0,
             top_detectors: vec![],
@@ -94,7 +95,7 @@ pub(super) async fn api_overview(
     let metrics = graph.metrics();
 
     // Count decisions from Incident nodes
-    use crate::knowledge_graph::types::{Node, NodeType};
+    use crate::knowledge_graph::types::{Node, NodeType, Relation};
     let incident_nodes = graph.nodes_of_type(NodeType::Incident);
     let mut by_detector: BTreeMap<String, usize> = BTreeMap::new();
     let mut decisions_count = 0usize;
@@ -105,12 +106,32 @@ pub(super) async fn api_overview(
     let mut safely_resolved = 0usize;
     let mut severity_breakdown: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    // Unique IP entities the AI took a non-ignore action on. Drives the
+    // home tile "X handled today" so it matches the unique-IP grouping
+    // shown on the Threats tab (`NUMBER_CONSISTENCY.md` row "handled
+    // count").
+    let mut handled_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut allowlisted_count = 0usize;
+
+    // Operator filter passed via query string. Applied AFTER the canonical
+    // internal/research filter so the operator filter narrows what's
+    // already legitimate, not what's noise.
+    let sev_min_rank = query
+        .severity_min
+        .as_deref()
+        .map(crate::dashboard::investigation::severity_rank)
+        .unwrap_or(0);
+    let detector_substring = query
+        .detector
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_ascii_lowercase());
 
     for &id in &incident_nodes {
         if let Some(Node::Incident {
             detector,
+            title,
             decision,
             decision_target,
             severity,
@@ -119,10 +140,46 @@ pub(super) async fn api_overview(
             ..
         }) = graph.get_node(id)
         {
-            // Spec 015 follow-up: skip research-only incidents so overview
-            // counts reflect actual operator workload, not self-traffic.
+            // Spec 015 follow-up: skip research-only incidents.
             if *research_only {
                 continue;
+            }
+            // Apply the SAME canonical filter the live-feed and threats tab
+            // use, so the home overview counts match the entries those
+            // surfaces actually display. Without this, advisory-only
+            // detectors (`neural_anomaly`, etc) and IW-system noise
+            // (`(en-agent)`, etc) inflate the home counts vs threats.
+            let has_external_ip = graph
+                .outgoing_edges(id)
+                .iter()
+                .filter(|e| e.relation == Relation::TriggeredBy)
+                .any(|e| {
+                    matches!(
+                        graph.get_node(e.to),
+                        Some(Node::Ip {
+                            is_internal: false,
+                            ..
+                        })
+                    )
+                });
+            if crate::dashboard::live_feed::is_internal_incident_fields(
+                detector,
+                title,
+                has_external_ip,
+            ) {
+                continue;
+            }
+            // Operator-supplied severity filter (?severity_min=high).
+            if sev_min_rank > 0
+                && crate::dashboard::investigation::severity_rank(severity) < sev_min_rank
+            {
+                continue;
+            }
+            // Operator-supplied detector substring filter (?detector=ssh).
+            if let Some(needle) = &detector_substring {
+                if !detector.to_ascii_lowercase().contains(needle) {
+                    continue;
+                }
             }
             if *is_allowlisted {
                 allowlisted_count += 1;
@@ -133,11 +190,17 @@ pub(super) async fn api_overview(
                 .or_insert(0) += 1;
             if let Some(dec) = decision {
                 decisions_count += 1;
+                let target_is_ip = decision_target.as_ref().is_some_and(|t| t.contains('.'));
                 match dec.as_str() {
                     "ignore" => ai_ignored += 1,
                     "monitor" => {
                         ai_confirmed += 1;
                         safely_resolved += 1;
+                        if target_is_ip {
+                            if let Some(ip) = decision_target {
+                                handled_ips.insert(ip.clone());
+                            }
+                        }
                     }
                     "request_confirmation" => {
                         ai_confirmed += 1;
@@ -145,13 +208,11 @@ pub(super) async fn api_overview(
                     }
                     _ => {
                         ai_confirmed += 1;
-                        // Only count as "responded" if the target looks like
-                        // an IP. Pre-fix FPs like sandbox_evasion blocked a
-                        // PID (numeric string) which is not a real response.
-                        let target_is_ip =
-                            decision_target.as_ref().is_some_and(|t| t.contains('.'));
                         if target_is_ip {
                             ai_responded += 1;
+                            if let Some(ip) = decision_target {
+                                handled_ips.insert(ip.clone());
+                            }
                         }
                         safely_resolved += 1;
                     }
@@ -169,6 +230,7 @@ pub(super) async fn api_overview(
     top_detectors.truncate(6);
 
     let telemetry = crate::telemetry::read_latest_snapshot(&state.data_dir, &date);
+    let handled_ips_today = handled_ips.len();
     Json(OverviewResponse {
         date,
         events_count: metrics.edge_count, // edges ≈ events (each event creates edges)
@@ -179,6 +241,7 @@ pub(super) async fn api_overview(
         ai_ignored,
         unresolved_count,
         safely_resolved,
+        handled_ips_today,
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -592,7 +655,7 @@ pub(super) fn compute_overview_from_graph(
     data_dir: &Path,
     date: &str,
 ) -> OverviewResponse {
-    use crate::knowledge_graph::types::{Node, NodeType};
+    use crate::knowledge_graph::types::{Node, NodeType, Relation};
 
     let metrics = graph.metrics();
     let incident_nodes = graph.nodes_of_type(NodeType::Incident);
@@ -607,10 +670,12 @@ pub(super) fn compute_overview_from_graph(
     let mut severity_breakdown: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut allowlisted_count = 0usize;
+    let mut handled_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for &id in &incident_nodes {
         if let Some(Node::Incident {
             detector,
+            title,
             decision,
             decision_target,
             severity,
@@ -619,9 +684,28 @@ pub(super) fn compute_overview_from_graph(
             ..
         }) = graph.get_node(id)
         {
-            // Spec 015 follow-up: skip research-only incidents so overview
-            // counts reflect actual operator workload, not self-traffic.
             if *research_only {
+                continue;
+            }
+            // Same canonical filter as `api_overview` and the live feed.
+            let has_external_ip = graph
+                .outgoing_edges(id)
+                .iter()
+                .filter(|e| e.relation == Relation::TriggeredBy)
+                .any(|e| {
+                    matches!(
+                        graph.get_node(e.to),
+                        Some(Node::Ip {
+                            is_internal: false,
+                            ..
+                        })
+                    )
+                });
+            if crate::dashboard::live_feed::is_internal_incident_fields(
+                detector,
+                title,
+                has_external_ip,
+            ) {
                 continue;
             }
             if *is_allowlisted {
@@ -633,11 +717,17 @@ pub(super) fn compute_overview_from_graph(
                 .or_insert(0) += 1;
             if let Some(dec) = decision {
                 decisions_count += 1;
+                let target_is_ip = decision_target.as_ref().is_some_and(|t| t.contains('.'));
                 match dec.as_str() {
                     "ignore" => ai_ignored += 1,
                     "monitor" => {
                         ai_confirmed += 1;
                         safely_resolved += 1;
+                        if target_is_ip {
+                            if let Some(ip) = decision_target {
+                                handled_ips.insert(ip.clone());
+                            }
+                        }
                     }
                     "request_confirmation" => {
                         ai_confirmed += 1;
@@ -645,10 +735,11 @@ pub(super) fn compute_overview_from_graph(
                     }
                     _ => {
                         ai_confirmed += 1;
-                        let target_is_ip =
-                            decision_target.as_ref().is_some_and(|t| t.contains('.'));
                         if target_is_ip {
                             ai_responded += 1;
+                            if let Some(ip) = decision_target {
+                                handled_ips.insert(ip.clone());
+                            }
                         }
                         safely_resolved += 1;
                     }
@@ -664,6 +755,7 @@ pub(super) fn compute_overview_from_graph(
     top_detectors.sort_by(|a, b| b.count.cmp(&a.count).then(a.detector.cmp(&b.detector)));
     top_detectors.truncate(6);
 
+    let handled_ips_today = handled_ips.len();
     OverviewResponse {
         date: date.to_string(),
         events_count: metrics.edge_count,
@@ -674,6 +766,7 @@ pub(super) fn compute_overview_from_graph(
         ai_ignored,
         unresolved_count,
         safely_resolved,
+        handled_ips_today,
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -724,6 +817,12 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
 
     let unresolved_count = ai_confirmed.saturating_sub(ai_responded);
     let safely_resolved = ai_responded;
+    // JSONL fallback path (legacy, test-only): treat each "responded"
+    // decision target as a unique IP for the handled count. Imperfect
+    // (no dedup since we have no easy access to the IP value here) but
+    // matches the lower bound. The graph-backed `compute_overview_from_graph`
+    // is the canonical path in production.
+    let handled_ips_today = ai_responded;
 
     OverviewResponse {
         date: date.to_string(),
@@ -735,6 +834,7 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
         ai_ignored,
         unresolved_count,
         safely_resolved,
+        handled_ips_today,
         severity_breakdown: std::collections::HashMap::new(),
         allowlisted_count: 0,
         top_detectors,

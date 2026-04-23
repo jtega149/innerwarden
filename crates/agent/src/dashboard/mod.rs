@@ -1317,6 +1317,7 @@ mod tests {
                 ai_ignored: 0,
                 unresolved_count: 1,
                 safely_resolved: 0,
+                handled_ips_today: 0,
                 severity_breakdown: std::collections::HashMap::new(),
                 allowlisted_count: 0,
                 top_detectors: vec![],

@@ -8,9 +8,11 @@ pub(super) async fn api_entities(
 ) -> Json<EntitiesResponse> {
     let date = resolve_date(query.date.as_deref());
     let limit = normalize_limit(query.limit);
+    let filters =
+        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    // Build attackers from knowledge graph
-    let attackers = build_attackers_from_graph(&state.knowledge_graph, limit);
+    // Build attackers from knowledge graph (filters applied inline).
+    let attackers = build_attackers_from_graph(&state.knowledge_graph, limit, &filters);
     Json(EntitiesResponse { date, attackers })
 }
 
@@ -21,8 +23,10 @@ pub(super) async fn api_pivots(
     let date = resolve_date(query.date.as_deref());
     let limit = normalize_limit(query.limit);
     let group_by = PivotKind::parse(query.group_by.as_deref());
+    let filters =
+        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    let items = build_pivots_from_graph(&state.knowledge_graph, group_by, limit);
+    let items = build_pivots_from_graph(&state.knowledge_graph, group_by, limit, &filters);
     Json(PivotResponse {
         date,
         group_by: group_by.as_str().to_string(),
@@ -249,7 +253,7 @@ fn build_export_response(
         let graph = kg.read().unwrap();
         compute_overview_from_graph(&graph, &data_dir, &date)
     };
-    let pivots = build_pivots_from_graph(&kg, group_by, limit);
+    let pivots = build_pivots_from_graph(&kg, group_by, limit, &filters);
     let clusters = build_cluster_items_from_graph(&kg, limit, window_seconds);
     let journey = subject.as_ref().filter(|s| !s.is_empty()).map(|s| {
         build_journey_from_graph(
@@ -317,9 +321,12 @@ pub(super) fn build_pivots_from_graph(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     group_by: PivotKind,
     limit: usize,
+    filters: &InvestigationFilters,
 ) -> Vec<PivotItem> {
     use crate::knowledge_graph::types::*;
     let graph = kg.read().unwrap();
+    let sev_min_rank = filters.severity_min_rank();
+    let detector_substring = filters.detector_lower();
 
     let node_type = match group_by {
         PivotKind::Ip => NodeType::Ip,
@@ -413,17 +420,59 @@ pub(super) fn build_pivots_from_graph(
         std::collections::HashMap::new();
 
     for inc_id in graph.nodes_of_type(NodeType::Incident) {
-        // Skip research_only incidents — same filter as api_incidents
-        // and api_overview. Without this, self-traffic IPs like
-        // 149.154.166.110 (Telegram Bot API) appear in the Threats tab
-        // entity list with 198 incidents, even though every one of them
-        // is research_only. The operator sees a "threat" that is actually
-        // the agent's own notification traffic and is one click away from
-        // blocking their own Telegram integration.
-        if let Some(Node::Incident { research_only, .. }) = graph.get_node(inc_id) {
+        // Apply the SAME filter the public site live-feed applies, so the
+        // Threats tab and the site agree on what counts as a "real"
+        // incident. Pre-2026-04-23 the threats tab applied only
+        // `research_only` + `internal_ips` + `self_traffic_ips`, but the
+        // site additionally rejects advisory-only detectors
+        // (`neural_anomaly`, `host_drift`, `network_sniffing`,
+        // `discovery_burst`) and IW system processes via title-prefix
+        // (`(en-agent)`, `(en-sensor)`, `(systemd)`, etc.). The filter is
+        // canonicalised in `live_feed::is_internal_incident_fields`; both
+        // surfaces call it via the same code path so any future change
+        // updates both at once. See `NUMBER_CONSISTENCY.md` row
+        // "blocks today / IPs blocked".
+        let skip = if let Some(Node::Incident {
+            research_only,
+            detector,
+            title,
+            severity,
+            ..
+        }) = graph.get_node(inc_id)
+        {
             if *research_only {
-                continue;
+                true
+            } else {
+                let has_external_ip = graph
+                    .outgoing_edges(inc_id)
+                    .iter()
+                    .filter(|e| e.relation == Relation::TriggeredBy)
+                    .any(|e| {
+                        matches!(
+                            graph.get_node(e.to),
+                            Some(Node::Ip {
+                                is_internal: false,
+                                ..
+                            })
+                        )
+                    });
+                let internal = crate::dashboard::live_feed::is_internal_incident_fields(
+                    detector,
+                    title,
+                    has_external_ip,
+                );
+                let below_severity = sev_min_rank > 0 && severity_rank(severity) < sev_min_rank;
+                let detector_mismatch = match &detector_substring {
+                    Some(needle) => !detector.to_ascii_lowercase().contains(needle),
+                    None => false,
+                };
+                internal || below_severity || detector_mismatch
             }
+        } else {
+            false
+        };
+        if skip {
+            continue;
         }
         for edge in graph.outgoing_edges(inc_id) {
             if edge.relation != Relation::TriggeredBy {
@@ -527,8 +576,9 @@ pub(super) fn severity_rank(s: &str) -> u8 {
 pub(super) fn build_attackers_from_graph(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     limit: usize,
+    filters: &InvestigationFilters,
 ) -> Vec<AttackerSummary> {
-    build_pivots_from_graph(kg, PivotKind::Ip, limit)
+    build_pivots_from_graph(kg, PivotKind::Ip, limit, filters)
         .into_iter()
         .map(|p| AttackerSummary {
             ip: p.value,

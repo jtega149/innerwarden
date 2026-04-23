@@ -9,11 +9,18 @@ pub(super) async fn api_honeypot_sessions(
     let honeypot_dir = state.data_dir.join("honeypot");
 
     // Collect blocked IPs from knowledge graph (Phase 6A: no JSONL reads).
-    // Includes all block_ip decisions (dry-run and executed) to match original semantics.
-    let mut blocked_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
-    {
+    // Includes all block_ip decisions (dry-run and executed) to match
+    // original semantics. Runs on the blocking pool because the KG read
+    // lock can be contended with the slow_loop write path; holding it
+    // here on an async worker would stall sibling dashboard requests
+    // (`RECURRING_BUGS.md` "Dashboard handlers block tokio worker
+    // threads"). The rest of this handler uses `tokio::fs::*` so there
+    // are no other blocking sinks to wrap.
+    let kg = std::sync::Arc::clone(&state.knowledge_graph);
+    let blocked_ips: std::collections::HashSet<String> = tokio::task::spawn_blocking(move || {
         use crate::knowledge_graph::types::{Node, NodeType};
-        let graph = state.knowledge_graph.read().unwrap();
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let graph = kg.read().unwrap();
         for id in graph.nodes_of_type(NodeType::Incident) {
             if let Some(Node::Incident {
                 decision: Some(dec),
@@ -22,11 +29,14 @@ pub(super) async fn api_honeypot_sessions(
             }) = graph.get_node(id)
             {
                 if dec == "block_ip" {
-                    blocked_ips.insert(target.clone());
+                    set.insert(target.clone());
                 }
             }
         }
-    }
+        set
+    })
+    .await
+    .unwrap_or_default();
 
     // Read session metadata files
     let mut sessions: Vec<serde_json::Value> = Vec::new();

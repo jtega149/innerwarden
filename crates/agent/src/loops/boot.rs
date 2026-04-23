@@ -837,6 +837,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         store,
         baseline: baseline::BaselineStore::load(&cli.data_dir, sqlite_store.as_deref()),
         sqlite_store: sqlite_store.clone(),
+        sqlite_store_path: cli.data_dir.clone(),
+        sqlite_reopen_last_attempt: None,
         maintenance_scheduler: if sqlite_store.is_some() {
             Some(innerwarden_store::maintenance::MaintenanceScheduler::new())
         } else {

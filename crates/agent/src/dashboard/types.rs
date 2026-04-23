@@ -68,10 +68,11 @@ pub(crate) struct ActionResponse {
 pub(crate) struct ListQuery {
     pub(super) limit: Option<usize>,
     pub(super) date: Option<String>,
+    pub(super) severity_min: Option<String>,
+    pub(super) detector: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // severity_min/detector accepted for API forward-compat; graph filters land in spec 016
 pub(crate) struct EntitiesQuery {
     pub(super) limit: Option<usize>,
     pub(super) date: Option<String>,
@@ -151,6 +152,14 @@ pub(crate) struct OverviewResponse {
     pub(super) unresolved_count: usize,
     /// Incidents safely resolved (blocked, killed, contained, monitored, honeypot).
     pub(super) safely_resolved: usize,
+    /// Distinct attacker IPs the AI took a non-ignore action on today.
+    /// Reported by the home tile so the number matches what the operator
+    /// sees when they click through to the Threats tab (which dedupes by
+    /// IP). Pre-2026-04-23 home displayed `safely_resolved` (incident
+    /// count) and threats displayed unique-IP-count; the operator saw
+    /// "54 handled" but counted only ~14 entries on the threats page.
+    /// See `NUMBER_CONSISTENCY.md` row "handled count".
+    pub(super) handled_ips_today: usize,
     /// Breakdown by severity level: {"critical": N, "high": N, ...}
     pub(super) severity_breakdown: std::collections::HashMap<String, usize>,
     /// Incidents from allowlisted IPs/users (can be hidden in dashboard).
@@ -395,8 +404,7 @@ impl PivotKind {
     }
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // fields consumed by `#[cfg(test)]` legacy JSONL helpers until spec 016
+#[derive(Debug, Clone, Default)]
 pub(crate) struct InvestigationFilters {
     pub(super) severity_min: Option<u8>,
     pub(super) detector: Option<String>,
@@ -422,6 +430,19 @@ impl InvestigationFilters {
             severity_min,
             detector,
         }
+    }
+
+    /// Severity rank threshold (0 = no filter). Same numeric scale as
+    /// `crate::dashboard::investigation::severity_rank` so producers and
+    /// consumers compare against the same totem.
+    pub(crate) fn severity_min_rank(&self) -> u8 {
+        self.severity_min.unwrap_or(0)
+    }
+
+    /// Lowercased detector substring for `contains` filtering. `None`
+    /// means "match all detectors".
+    pub(crate) fn detector_lower(&self) -> Option<&str> {
+        self.detector.as_deref()
     }
 }
 

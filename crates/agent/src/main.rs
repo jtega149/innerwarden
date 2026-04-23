@@ -495,6 +495,16 @@ struct AgentState {
     /// xdp_block_times, trust_rules. Primary source of truth for reads.
     store: state_store::StateStore,
     sqlite_store: Option<Arc<innerwarden_store::Store>>,
+    /// Path used to (re-)open `sqlite_store`. Persisted on the state so
+    /// `try_recover_sqlite_store` can lazily retry the open after a
+    /// boot-time `database is locked` race; pre-2026-04-23 a failed
+    /// initial open left the store as `None` for the entire process
+    /// lifetime, silently dropping every SQLite-mediated write
+    /// (graph snapshots, blob writes, cursor updates).
+    sqlite_store_path: std::path::PathBuf,
+    /// Last attempted reopen instant — guards against tight retry loops
+    /// when the underlying error is permanent (e.g. disk full).
+    sqlite_reopen_last_attempt: Option<std::time::Instant>,
     /// SQLite maintenance scheduler (None when sqlite_store is None).
     maintenance_scheduler: Option<innerwarden_store::maintenance::MaintenanceScheduler>,
     /// Attacker intelligence profiles: IP → unified profile.

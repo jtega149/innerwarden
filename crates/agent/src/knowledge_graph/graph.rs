@@ -1024,7 +1024,18 @@ impl KnowledgeGraph {
                 .or_default() += 1;
         }
 
-        let total_degree: usize = self.nodes.keys().map(|id| self.all_edges(*id).len()).sum();
+        // Total degree from adjacency-list lengths. Pre-2026-04-23 this
+        // was `self.nodes.keys().map(|id| self.all_edges(*id).len()).sum()`
+        // which allocated + sorted a `Vec<&Edge>` per node — O(N × E_avg
+        // log E_avg) and called from inside the slow_loop write lock
+        // that also held disk + SQLite I/O. Same anti-pattern
+        // `enforce_memory_limit` had; this is its sibling. Self-loops
+        // contribute +2 here vs +1 in the old all_edges (which de-duped
+        // the same edge appearing in both outgoing[A] and incoming[A]);
+        // we accept the rounding — avg_degree is diagnostic only.
+        let outgoing_total: usize = self.outgoing.values().map(Vec::len).sum();
+        let incoming_total: usize = self.incoming.values().map(Vec::len).sum();
+        let total_degree = outgoing_total + incoming_total;
         let avg_degree = if self.nodes.is_empty() {
             0.0
         } else {

@@ -11,6 +11,46 @@ use crate::{
     shield_inline, telemetry_tick, AgentState,
 };
 
+/// Lazy-reopen `sqlite_store` if a boot-time race left it as `None`.
+/// Throttled to one attempt per `STORE_REOPEN_BACKOFF_SECS` so a
+/// permanent error (disk full, schema corruption) does not become a
+/// tight retry loop. Idempotent: returns immediately if the store is
+/// already open.
+const STORE_REOPEN_BACKOFF_SECS: u64 = 60;
+pub(crate) fn try_recover_sqlite_store(state: &mut AgentState) {
+    if state.sqlite_store.is_some() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if let Some(last) = state.sqlite_reopen_last_attempt {
+        if now.duration_since(last).as_secs() < STORE_REOPEN_BACKOFF_SECS {
+            return;
+        }
+    }
+    state.sqlite_reopen_last_attempt = Some(now);
+
+    match innerwarden_store::Store::open(&state.sqlite_store_path) {
+        Ok(s) => {
+            info!(
+                path = %state.sqlite_store_path.join("innerwarden.db").display(),
+                "sqlite store recovered after boot-time failure"
+            );
+            state.sqlite_store = Some(std::sync::Arc::new(s));
+            // Spin up the maintenance scheduler too — it was None at
+            // boot for the same reason.
+            if state.maintenance_scheduler.is_none() {
+                state.maintenance_scheduler =
+                    Some(innerwarden_store::maintenance::MaintenanceScheduler::new());
+            }
+        }
+        Err(e) => {
+            // Quiet warn — same message format as the boot path so log
+            // grep surfaces the persistence problem the same way.
+            warn!("sqlite store still unavailable: {e:#}");
+        }
+    }
+}
+
 /// Refresh operator IPs from active SSH sessions.
 /// Replaces the entire set - IPs whose sessions ended are automatically removed.
 pub(crate) fn refresh_operator_ips(state: &mut AgentState, allowlist: &config::AllowlistConfig) {
@@ -54,6 +94,16 @@ pub(crate) async fn process_narrative_tick(
     cfg: &config::AgentConfig,
     state: &mut AgentState,
 ) -> Result<usize> {
+    // Lazy-recover SQLite store after a boot-time `database is locked`
+    // race. Pre-2026-04-23 a failed initial `Store::open` left
+    // `state.sqlite_store` as `None` for the entire process lifetime,
+    // silently dropping every SQLite-mediated write (graph snapshots,
+    // blob writes, agent cursors). Discovered during the Finding 5
+    // canary on 2026-04-23 — the SQLite snapshot save was a silent
+    // no-op for hours after a contended startup. See
+    // `RECURRING_BUGS.md` "sqlite_store stuck at None after boot race".
+    try_recover_sqlite_store(state);
+
     let today = chrono::Local::now()
         .date_naive()
         .format("%Y-%m-%d")
@@ -152,34 +202,71 @@ pub(crate) async fn process_narrative_tick(
         // (ingested above). No separate JSONL write needed.
     }
 
-    // Periodic graph maintenance (cleanup expired + dated snapshot every 60s)
+    // Periodic graph maintenance (cleanup expired + dated snapshot every 60s).
+    //
+    // Pre-2026-04-23 this whole block ran under a single `write()` guard
+    // that wrapped cleanup + compact + enforce + serialize + gzip +
+    // fs::write + SQLite bind + cleanup_old_snapshots. Every dashboard
+    // request blocked on that write lock for hundreds of ms each tick.
+    //
+    // The fix splits into three lock scopes:
+    //   1. WRITE lock: cheap mutations only (cleanup_expired, compact_edges,
+    //      enforce_memory_limit). All in-memory, no I/O.
+    //   2. READ lock: serialize the snapshot bytes (allows concurrent
+    //      dashboard reads). Returns owned `SerializedSnapshot`.
+    //   3. NO lock: disk + SQLite writes + cleanup_old_snapshots.
+    //
+    // Worst-case dashboard latency under contention drops from "duration
+    // of the entire 60s-tick block" to "duration of cleanup+compact+enforce"
+    // (sub-ms with the `last_edge_ts` cache from PR #261).
     if state.last_graph_snapshot.elapsed().as_secs() >= 60 {
+        // Scope 1: cheap mutations under WRITE lock.
         {
             let mut graph = state.knowledge_graph.write().unwrap();
             graph.cleanup_expired(chrono::Utc::now());
             graph.compact_edges();
             graph.enforce_memory_limit();
-            // Phase 7: save to dated snapshot (graph-snapshot-YYYY-MM-DD.json)
-            if let Err(e) = graph.save_dated_snapshot(data_dir) {
-                warn!("knowledge graph snapshot failed: {e:#}");
+        }
+
+        // Scope 2: serialize snapshot + metrics under READ lock so
+        // dashboard handlers can read concurrently. The bytes are owned
+        // and outlive the lock scope.
+        let serialised = {
+            let graph = state.knowledge_graph.read().unwrap();
+            let bytes = match graph.serialize_snapshot_bytes() {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    warn!("knowledge graph snapshot serialise failed: {e:#}");
+                    None
+                }
+            };
+            let metrics_json = serde_json::to_vec(&graph.metrics()).ok();
+            (bytes, metrics_json)
+        };
+
+        // Scope 3: I/O outside any lock.
+        let (snapshot_bytes, metrics_json) = serialised;
+        if let Some(snap) = snapshot_bytes {
+            let path = knowledge_graph::KnowledgeGraph::dated_snapshot_path(data_dir);
+            if let Err(e) = knowledge_graph::KnowledgeGraph::write_snapshot_bytes(&path, &snap) {
+                warn!("knowledge graph snapshot write failed: {e:#}");
             }
-            // Spec 016: also save to SQLite store
             if let Some(ref sq) = state.sqlite_store {
-                if let Err(e) = graph.save_to_store(sq) {
+                if let Err(e) = knowledge_graph::KnowledgeGraph::store_snapshot_bytes(sq, &snap) {
                     warn!("knowledge graph SQLite snapshot failed: {e:#}");
                 }
             }
-            let metrics = graph.metrics();
-            if let Ok(json) = serde_json::to_vec(&metrics) {
-                let _ = std::fs::write(data_dir.join("graph-stats.json"), json);
-            }
-            // Phase 7: cleanup old snapshots (keep 7 days)
-            knowledge_graph::KnowledgeGraph::cleanup_old_snapshots(data_dir, 7);
-            // Spec 016: also cleanup SQLite snapshots
-            if let Some(ref sq) = state.sqlite_store {
-                knowledge_graph::KnowledgeGraph::cleanup_store_snapshots(sq, 7);
-            }
         }
+        if let Some(json) = metrics_json {
+            let _ = std::fs::write(data_dir.join("graph-stats.json"), json);
+        }
+        // Phase 7: cleanup old snapshots (keep 7 days). File-system scan
+        // and unlink — also lock-free.
+        knowledge_graph::KnowledgeGraph::cleanup_old_snapshots(data_dir, 7);
+        if let Some(ref sq) = state.sqlite_store {
+            knowledge_graph::KnowledgeGraph::cleanup_store_snapshots(sq, 7);
+        }
+
         state.last_graph_snapshot = std::time::Instant::now();
     }
 

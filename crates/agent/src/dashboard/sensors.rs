@@ -5,6 +5,14 @@ use super::*;
 /// GET /api/sensors - sensor activity time-series for dashboard graphs.
 /// Returns event counts bucketed by 5-minute intervals, grouped by source.
 /// Cached for 30 seconds to avoid re-reading the events file on every request.
+///
+/// Cache miss path holds the KG read lock and walks every Incident node to
+/// build the detector timeline. `tokio::task::spawn_blocking` keeps that
+/// work off the async worker thread (see `RECURRING_BUGS.md` "Dashboard
+/// handlers block tokio worker threads"). The 30s cache makes contention
+/// rare but the spawn_blocking is correctness, not optimisation: a slow
+/// path that pins an async worker can starve sibling handlers regardless
+/// of frequency.
 pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     // Check cache (30s TTL)
     {
@@ -18,7 +26,11 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
         }
     }
 
-    let result = api_sensors_inner(&state).await;
+    let kg = std::sync::Arc::clone(&state.knowledge_graph);
+    let data_dir = state.data_dir.clone();
+    let result = tokio::task::spawn_blocking(move || build_sensors_payload(&kg, &data_dir))
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
 
     // Update cache
     {
@@ -33,11 +45,22 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
     Json(result)
 }
 
+/// Async-safe variant retained for any future caller that already runs on
+/// a blocking thread (e.g. integration test). Production handler uses
+/// `build_sensors_payload` via `spawn_blocking`.
+#[allow(dead_code)]
 pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
+    build_sensors_payload(&state.knowledge_graph, &state.data_dir)
+}
+
+fn build_sensors_payload(
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    data_dir: &std::path::Path,
+) -> serde_json::Value {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     use crate::knowledge_graph::types::{Node, NodeType};
-    let graph = state.knowledge_graph.read().unwrap();
+    let graph = kg.read().unwrap();
 
     // Event telemetry — prefer graph counters, fall back to telemetry snapshot
     let (total_events_val, sources) = if graph.total_events_ingested > 0 {
@@ -50,7 +73,7 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
         (graph.total_events_ingested, s)
     } else {
         // Fallback: read from telemetry snapshot (has events_by_collector)
-        let telem = crate::telemetry::read_latest_snapshot(&state.data_dir, &today);
+        let telem = crate::telemetry::read_latest_snapshot(data_dir, &today);
         match telem {
             Some(t) => {
                 let total = t.events_by_collector.values().sum::<u64>() as usize;

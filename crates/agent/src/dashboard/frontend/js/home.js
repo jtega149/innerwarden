@@ -149,9 +149,14 @@ function computeHomeState(payload) {
   // tile and the briefing now quote the same field, so the operator no
   // longer sees "9 blocked" in the hero while the KPI says 50 and the
   // briefing says 48 for the same time window.
-  var handled = overview.safely_resolved || 0;
+  // Use the unique-IP-handled count so the number matches the entry
+  // count on the Threats tab (which dedupes by attacker IP). Fallback
+  // to safely_resolved (incident-count) for back-compat with older
+  // backends that don't yet emit handled_ips_today.
+  var handled = (overview.handled_ips_today != null ? overview.handled_ips_today : (overview.safely_resolved || 0));
+  var unit = handled === 1 ? 'attacker' : 'attackers';
   var subText = handled > 0
-    ? handled + ' handled today. AI is on shift.'
+    ? handled + ' ' + unit + ' handled today. AI is on shift.'
     : 'All systems monitoring. Nothing requires your attention.';
 
   return {
@@ -212,11 +217,10 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
   var didEl  = document.getElementById('homeNowDid');
   if (!whatEl || !didEl) return;
 
-  // Same source as updateHomeKpis and computeHomeState: overview.safely_resolved.
-  // Counts every non-"ignore" decision today (block + monitor + honeypot +
-  // kill + suspend). Older code summed currently-active entities, which
-  // decay with TTL and so understated the number the briefing reported.
-  var handled = overview.safely_resolved || 0;
+  // Use unique-IP-handled count so it matches the Threats tab entry
+  // count (which dedupes by attacker IP). Falls back to safely_resolved
+  // if backend hasn't been upgraded yet.
+  var handled = (overview.handled_ips_today != null ? overview.handled_ips_today : (overview.safely_resolved || 0));
   var total = totalEventsScanned || overview.events_count || 0;
 
   // Line 1 — Trust signal: volume scanned
@@ -236,7 +240,8 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
   if (handled === 0) {
     line2 = 'Nothing suspicious found. All systems operating normally.';
   } else {
-    line2 = 'Handled ' + handled + ' threat' + (handled === 1 ? '' : 's') + ' today. AI is on shift.';
+    var word = handled === 1 ? 'attacker' : 'attackers';
+    line2 = 'Handled ' + handled + ' ' + word + ' today. AI is on shift.';
   }
   didEl.textContent = line2;
 }
