@@ -1063,4 +1063,68 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
 
         assert_eq!(count, 0);
     }
+
+    // ── try_recover_sqlite_store (Fix #8 anchor) ─────────────────────
+    //
+    // Boot-time `database is locked` race could leave state.sqlite_store
+    // as None for the entire process lifetime. The recovery helper
+    // retries on each slow_loop tick (60 s back-off so a permanent
+    // error doesn't become a tight retry loop).
+
+    #[test]
+    fn try_recover_sqlite_store_is_noop_when_already_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        // Inject a real store handle so the function thinks we're recovered.
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        state.sqlite_store = Some(std::sync::Arc::new(store));
+        let last_attempt_before = state.sqlite_reopen_last_attempt;
+
+        try_recover_sqlite_store(&mut state);
+
+        assert!(state.sqlite_store.is_some(), "store handle preserved");
+        // Last-attempt timestamp must NOT change — early return path.
+        assert_eq!(state.sqlite_reopen_last_attempt, last_attempt_before);
+    }
+
+    #[test]
+    fn try_recover_sqlite_store_attempts_reopen_when_none_and_throttles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        // Force "store unavailable" state.
+        state.sqlite_store = None;
+        state.sqlite_reopen_last_attempt = None;
+        state.sqlite_store_path = dir.path().to_path_buf();
+
+        // First call: should attempt reopen. Tempdir is writable so the
+        // open succeeds — proves the recovery path actually works, not
+        // just the early return.
+        try_recover_sqlite_store(&mut state);
+        assert!(
+            state.sqlite_store.is_some(),
+            "recovery should succeed against a writable temp directory"
+        );
+        assert!(
+            state.sqlite_reopen_last_attempt.is_some(),
+            "last-attempt timestamp must be set after recovery"
+        );
+    }
+
+    #[test]
+    fn try_recover_sqlite_store_respects_60s_backoff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.sqlite_store = None;
+        // Pretend we just attempted 5 seconds ago.
+        state.sqlite_reopen_last_attempt = Some(std::time::Instant::now());
+
+        try_recover_sqlite_store(&mut state);
+
+        // Should have skipped the actual open call (back-off active).
+        // The store stays None because we never attempted.
+        assert!(
+            state.sqlite_store.is_none(),
+            "back-off must skip the reopen call"
+        );
+    }
 }

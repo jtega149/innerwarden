@@ -3138,4 +3138,152 @@ mod tests {
             "expected low-activity hint when not blocked, got: {joined}"
         );
     }
+
+    // ── build_pivots_from_graph filter behavior (Inconsistencies 2 + 3) ─
+    //
+    // Anchors for two complementary fixes:
+    //   - Inconsistency 2: incidents that pass `is_internal_incident_fields`
+    //     (advisory-only detectors, IW-system processes) must be excluded.
+    //   - Inconsistency 3: operator-supplied severity_min and detector
+    //     filters must narrow the result set.
+
+    fn make_kg_with_attackers(
+    ) -> std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>> {
+        use crate::knowledge_graph::types::*;
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = Utc::now();
+        // External IP, ssh_bruteforce HIGH — should pass all filters.
+        let ip_a = g.ensure_ip("203.0.113.10", now);
+        let inc_a_id = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:1".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "SSH brute force from 203.0.113.10".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            decision_target: Some("203.0.113.10".into()),
+            confidence: Some(0.95),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_a_id, ip_a, Relation::TriggeredBy, now));
+        // External IP, port_scan LOW — passes filter only without severity_min.
+        let ip_b = g.ensure_ip("198.51.100.20", now);
+        let inc_b_id = g.add_node(Node::Incident {
+            incident_id: "port_scan:1".into(),
+            detector: "port_scan".into(),
+            severity: "low".into(),
+            title: "Port scan from 198.51.100.20".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("monitor".into()),
+            decision_target: Some("198.51.100.20".into()),
+            confidence: Some(0.6),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_b_id, ip_b, Relation::TriggeredBy, now));
+        // Advisory-only detector — must be EXCLUDED by Inconsistency 2 fix.
+        let ip_c = g.ensure_ip("192.0.2.30", now);
+        let inc_c_id = g.add_node(Node::Incident {
+            incident_id: "neural_anomaly:1".into(),
+            detector: "neural_anomaly".into(),
+            severity: "high".into(),
+            title: "Neural anomaly".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            decision_target: None,
+            confidence: None,
+            decision_reason: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_c_id, ip_c, Relation::TriggeredBy, now));
+        std::sync::Arc::new(std::sync::RwLock::new(g))
+    }
+
+    #[test]
+    fn build_pivots_from_graph_excludes_advisory_only_detectors() {
+        let kg = make_kg_with_attackers();
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default());
+        // 2 attackers should remain (ssh + port_scan). neural_anomaly is filtered.
+        let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
+        assert!(ips.contains("203.0.113.10"));
+        assert!(ips.contains("198.51.100.20"));
+        assert!(
+            !ips.contains("192.0.2.30"),
+            "neural_anomaly is advisory-only and must not appear as an attacker"
+        );
+    }
+
+    #[test]
+    fn build_pivots_from_graph_severity_min_filter_narrows_results() {
+        let kg = make_kg_with_attackers();
+        let high_only = InvestigationFilters::from_query(Some("high"), None);
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &high_only);
+        let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
+        assert!(
+            ips.contains("203.0.113.10"),
+            "ssh_bruteforce HIGH should pass"
+        );
+        assert!(
+            !ips.contains("198.51.100.20"),
+            "port_scan LOW must be filtered when severity_min=high"
+        );
+    }
+
+    #[test]
+    fn build_pivots_from_graph_detector_filter_narrows_results() {
+        let kg = make_kg_with_attackers();
+        let ssh_only = InvestigationFilters::from_query(None, Some("ssh"));
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &ssh_only);
+        let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
+        assert!(
+            ips.contains("203.0.113.10"),
+            "ssh_bruteforce should match detector=ssh"
+        );
+        assert!(
+            !ips.contains("198.51.100.20"),
+            "port_scan must not match detector=ssh"
+        );
+    }
+
+    #[test]
+    fn build_pivots_from_graph_combined_filters_intersect() {
+        let kg = make_kg_with_attackers();
+        let critical_ssh = InvestigationFilters::from_query(Some("critical"), Some("ssh"));
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &critical_ssh);
+        // No ssh incident is critical-severity → empty.
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn build_attackers_from_graph_forwards_filters() {
+        let kg = make_kg_with_attackers();
+        let high = InvestigationFilters::from_query(Some("high"), None);
+        let attackers = build_attackers_from_graph(&kg, 100, &high);
+        let ips: std::collections::HashSet<&str> =
+            attackers.iter().map(|a| a.ip.as_str()).collect();
+        assert!(ips.contains("203.0.113.10"));
+        assert!(!ips.contains("198.51.100.20"));
+    }
 }

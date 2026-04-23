@@ -566,4 +566,62 @@ mod tests {
         assert!(action_cfg.enabled);
         assert!(action_cfg.execution_guard_enabled);
     }
+
+    // ── build_sensors_payload (Finding 4 anchor) ─────────────────────
+    //
+    // The handler runs this on the blocking pool. The payload structure
+    // must be stable; the test pins the JSON shape so a future refactor
+    // (e.g. the spawn_blocking wrapper changing arg order) cannot
+    // accidentally drop a field.
+
+    #[test]
+    fn build_sensors_payload_returns_expected_shape_on_empty_graph() {
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = build_sensors_payload(&kg, dir.path());
+
+        // Required fields: date, total_events, total_incidents, sources,
+        // top_kinds, detectors, event_timeline, detector_timeline.
+        for field in [
+            "date",
+            "total_events",
+            "total_incidents",
+            "sources",
+            "top_kinds",
+            "detectors",
+            "event_timeline",
+            "detector_timeline",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "build_sensors_payload missing required field {field}"
+            );
+        }
+        assert_eq!(payload["total_events"].as_u64(), Some(0));
+        assert_eq!(payload["total_incidents"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn build_sensors_payload_counts_telemetry_from_graph() {
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        // Inject telemetry counters directly so we don't depend on the
+        // event-ingest pipeline. Sensors handler reads these counters
+        // directly when total_events_ingested > 0.
+        g.record_event_telemetry("auth_log", "ssh.login_failed", chrono::Utc::now());
+        g.record_event_telemetry("auth_log", "ssh.login_failed", chrono::Utc::now());
+        g.record_event_telemetry("nginx_access", "http.request", chrono::Utc::now());
+
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = build_sensors_payload(&kg, dir.path());
+
+        assert_eq!(payload["total_events"].as_u64(), Some(3));
+        let sources = payload["sources"].as_array().expect("sources array");
+        // Two distinct sources, sorted by count desc — auth_log first.
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0]["name"].as_str(), Some("auth_log"));
+        assert_eq!(sources[0]["count"].as_u64(), Some(2));
+    }
 }

@@ -1060,4 +1060,123 @@ mod tests {
         let Json(body) = api_ai_explain(State(state), Query(query)).await;
         assert_eq!(body["error"], "Missing 'value' parameter");
     }
+
+    // ── compute_overview_from_graph behaviour (Inconsistencies 1 + 3) ─
+    //
+    // Two anchors:
+    //   - handled_ips_today = unique IPs with non-ignore decision
+    //     (matches Threats tab entry count, NUMBER_CONSISTENCY.md row
+    //     "handled count").
+    //   - filter predicates inside the loop honor the canonical
+    //     `is_internal_incident_fields` (so home counts match site
+    //     counts).
+
+    fn make_overview_kg() -> crate::knowledge_graph::KnowledgeGraph {
+        use crate::knowledge_graph::types::*;
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        // Two real attackers, both blocked. Same IP repeated in two
+        // incidents to prove the dedup works.
+        let ip_a = g.ensure_ip("203.0.113.10", now);
+        for tag in ["1", "2"] {
+            let inc = g.add_node(Node::Incident {
+                incident_id: format!("ssh_bruteforce:{tag}"),
+                detector: "ssh_bruteforce".into(),
+                severity: "high".into(),
+                title: "SSH brute force".into(),
+                summary: "".into(),
+                ts: now,
+                mitre_ids: vec![],
+                decision: Some("block_ip".into()),
+                decision_target: Some("203.0.113.10".into()),
+                confidence: Some(0.95),
+                decision_reason: None,
+                auto_executed: true,
+                is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
+                research_only: false,
+            });
+            g.add_edge(Edge::new(inc, ip_a, Relation::TriggeredBy, now));
+        }
+        // Different IP, monitored.
+        let ip_b = g.ensure_ip("198.51.100.20", now);
+        let inc_b = g.add_node(Node::Incident {
+            incident_id: "port_scan:1".into(),
+            detector: "port_scan".into(),
+            severity: "low".into(),
+            title: "Port scan".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("monitor".into()),
+            decision_target: Some("198.51.100.20".into()),
+            confidence: Some(0.6),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_b, ip_b, Relation::TriggeredBy, now));
+        // Advisory-only detector — must NOT count toward overview.
+        let ip_c = g.ensure_ip("192.0.2.30", now);
+        let inc_c = g.add_node(Node::Incident {
+            incident_id: "neural_anomaly:1".into(),
+            detector: "neural_anomaly".into(),
+            severity: "high".into(),
+            title: "Neural anomaly".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            decision_target: Some("192.0.2.30".into()),
+            confidence: None,
+            decision_reason: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_c, ip_c, Relation::TriggeredBy, now));
+        g
+    }
+
+    #[test]
+    fn compute_overview_handled_ips_today_dedupes_by_ip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let g = make_overview_kg();
+        let out = compute_overview_from_graph(&g, dir.path(), "2026-04-23");
+        // 203.0.113.10 has TWO block_ip decisions (same IP, 2 incidents).
+        // 198.51.100.20 has ONE monitor decision.
+        // 192.0.2.30 is filtered (advisory-only).
+        // Unique IPs handled = 2.
+        assert_eq!(out.handled_ips_today, 2);
+        // safely_resolved counts INCIDENTS — block_ip × 2 + monitor × 1 = 3.
+        assert_eq!(out.safely_resolved, 3);
+        // ai_responded counts only IP-targeted non-monitor decisions = 2 (both block_ip).
+        assert_eq!(out.ai_responded, 2);
+    }
+
+    #[test]
+    fn compute_overview_filters_advisory_only_detectors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let g = make_overview_kg();
+        let out = compute_overview_from_graph(&g, dir.path(), "2026-04-23");
+        // The advisory-only neural_anomaly incident must NOT appear in
+        // top_detectors and must NOT be counted in any decision counter.
+        let detectors: Vec<&str> = out
+            .top_detectors
+            .iter()
+            .map(|d| d.detector.as_str())
+            .collect();
+        assert!(!detectors.contains(&"neural_anomaly"));
+        // ai_confirmed should count 3 (2 block + 1 monitor) — not 4.
+        assert_eq!(out.ai_confirmed, 3);
+    }
 }
