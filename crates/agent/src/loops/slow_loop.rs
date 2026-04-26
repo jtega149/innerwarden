@@ -248,6 +248,63 @@ fn record_telemetry_observation(state: &mut AgentState, events: &[innerwarden_co
     state.telemetry.observe_events(events);
 }
 
+/// Track operator IPs from event stream: any successful SSH/auth login
+/// over `publickey` is treated as an operator session (the remote side
+/// proved possession of a private key on the server's authorized_keys).
+/// Pure in-memory: reads `events` slice, writes `state.operator_ips`
+/// HashMap. No SQLite, no I/O, no blocking work — `block_in_place` not
+/// needed. Spec 037 I-05d — code organization, no behavior change vs
+/// the inline scan that lived directly inside `process_narrative_tick`.
+///
+/// Position-load-bearing: must run AFTER events are read into
+/// `events_entries` and BEFORE the same tick's downstream consumers
+/// (`decision_block_ip`, `incident_auto_rules`, `correlation_response`,
+/// etc.) which all read `state.operator_ips` to skip blocking the
+/// operator's own session. Keep this call between
+/// `record_telemetry_observation` and `update_narrative_accumulator`
+/// in `process_narrative_tick`.
+fn track_operator_ips_from_events(
+    state: &mut AgentState,
+    events: &[innerwarden_core::event::Event],
+) {
+    for ev in events {
+        if ev.kind == "ssh.login_success"
+            || ev.kind == "auth.login_success"
+            || ev.kind == "auth.session_opened"
+        {
+            let method = ev
+                .details
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if method == "publickey" {
+                let ip = ev
+                    .details
+                    .get("ip")
+                    .or_else(|| ev.details.get("src_ip"))
+                    .and_then(|v| v.as_str());
+                if let Some(ip) = ip {
+                    let is_new = !state.operator_ips.contains_key(ip);
+                    state
+                        .operator_ips
+                        .insert(ip.to_string(), std::time::Instant::now());
+                    if is_new {
+                        let user = ev
+                            .details
+                            .get("user")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        info!(
+                            user,
+                            ip, "operator session detected (publickey) — IP protected"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Roll the per-day narrative accumulator forward one tick: reset its
 /// internal counters if the calendar date changed since the last tick,
 /// then ingest the new events. Pure in-memory, no SQLite, no shared
@@ -349,43 +406,12 @@ pub(crate) async fn process_narrative_tick(
 
     record_telemetry_observation(state, &events_entries);
 
-    // Track operator IPs: any SSH login via publickey is an operator (has the private key).
-    for ev in &events_entries {
-        if ev.kind == "ssh.login_success"
-            || ev.kind == "auth.login_success"
-            || ev.kind == "auth.session_opened"
-        {
-            let method = ev
-                .details
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if method == "publickey" {
-                let ip = ev
-                    .details
-                    .get("ip")
-                    .or_else(|| ev.details.get("src_ip"))
-                    .and_then(|v| v.as_str());
-                if let Some(ip) = ip {
-                    let is_new = !state.operator_ips.contains_key(ip);
-                    state
-                        .operator_ips
-                        .insert(ip.to_string(), std::time::Instant::now());
-                    if is_new {
-                        let user = ev
-                            .details
-                            .get("user")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?");
-                        info!(
-                            user,
-                            ip, "operator session detected (publickey) — IP protected"
-                        );
-                    }
-                }
-            }
-        }
-    }
+    // Track operator IPs (publickey-authenticated sessions). Position
+    // is load-bearing — multiple downstream consumers in the same tick
+    // (`decision_block_ip`, `incident_auto_rules`, `correlation_response`,
+    // ...) read `state.operator_ips` to avoid blocking the operator's
+    // own session. See `track_operator_ips_from_events` doc comment.
+    track_operator_ips_from_events(state, &events_entries);
 
     // Feed new events into the narrative accumulator (incremental, no file re-read)
     update_narrative_accumulator(state, &today, &events_entries);
@@ -1666,6 +1692,77 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         assert!(
             day2_synth.is_empty(),
             "date change must reset accumulator; synthetic view should be empty after reset"
+        );
+    }
+
+    // ── Spec 037 I-05d — operator IP tracking extraction anchor ────
+    //
+    // The function is the inline scan that previously lived directly
+    // in `process_narrative_tick`. Two invariants matter for the
+    // extraction:
+    //   1. With a publickey login event present, the source IP is
+    //      added to `state.operator_ips` (and stays in the map after
+    //      the call returns).
+    //   2. With no qualifying events, the function is a no-op — the
+    //      map is unchanged. Critical because position in the tick
+    //      is load-bearing for downstream consumers and we don't want
+    //      a no-event tick to mutate state in any way.
+
+    fn pubkey_login_event(ip: &str) -> innerwarden_core::event::Event {
+        innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            source: "auth.log".into(),
+            kind: "ssh.login_success".into(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: "seed".into(),
+            details: serde_json::json!({"method": "publickey", "ip": ip, "user": "ops"}),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn track_operator_ips_inserts_publickey_login_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        assert!(state.operator_ips.is_empty(), "fixture starts clean");
+
+        let events = vec![pubkey_login_event("203.0.113.42")];
+        track_operator_ips_from_events(&mut state, &events);
+
+        assert!(
+            state.operator_ips.contains_key("203.0.113.42"),
+            "publickey login IP must land in operator_ips for downstream consumers"
+        );
+    }
+
+    #[test]
+    fn track_operator_ips_is_noop_when_no_qualifying_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        assert!(state.operator_ips.is_empty());
+
+        // Empty slice — the most common case (most ticks have no
+        // login events at all).
+        track_operator_ips_from_events(&mut state, &[]);
+        assert!(
+            state.operator_ips.is_empty(),
+            "empty events must not mutate state"
+        );
+
+        // Non-empty slice but nothing publickey-authenticated. A
+        // password login or an unrelated kind must NOT enter the map.
+        let mut password_login = pubkey_login_event("198.51.100.7");
+        password_login.details = serde_json::json!({"method": "password", "ip": "198.51.100.7"});
+        let unrelated = innerwarden_core::event::Event {
+            kind: "file.read_access".into(),
+            ..pubkey_login_event("203.0.113.99")
+        };
+        track_operator_ips_from_events(&mut state, &[password_login, unrelated]);
+        assert!(
+            state.operator_ips.is_empty(),
+            "non-publickey events must not pollute operator_ips"
         );
     }
 
