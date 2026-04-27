@@ -552,6 +552,36 @@ pub async fn serve(
     }
 }
 
+/// Apply a Unix file mode and `warn!` on failure with structured
+/// context. Replaces the prior `let _ = std::fs::set_permissions(..)`
+/// pattern at the two TLS auto-gen sites in `build_tls_config`
+/// (Spec 037 I-13 PR-2). Silent failure was security-relevant: a
+/// `chmod` error on the freshly-generated TLS private key would
+/// leave it at the file's creation mode (typically 0644 under the
+/// process umask) instead of 0600, exposing the private key to any
+/// local user. The warn surfaces the failure to the operator log
+/// without changing the observable behaviour: the file is left in
+/// whatever state the failed chmod left it (same as the prior
+/// `let _ =`), the caller continues, and the dashboard binds with
+/// whatever cert state is on disk.
+///
+/// Function is `#[cfg(unix)]` to match the original gating; the
+/// PermissionsExt API used for `from_mode` is Unix-only. Returns
+/// `()` (infallible) so call sites stay one-line and the calling
+/// `build_tls_config` flow is unchanged in shape.
+#[cfg(unix)]
+fn set_file_mode_or_warn(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        warn!(
+            path = %path.display(),
+            intended_mode = format!("{mode:#o}"),
+            error = %e,
+            "failed to set TLS file permissions (file left at previous mode)"
+        );
+    }
+}
+
 /// Build RustlsConfig from cert/key files or auto-generate a self-signed cert.
 async fn build_tls_config(
     data_dir: &std::path::Path,
@@ -616,12 +646,14 @@ async fn build_tls_config(
         std::fs::write(&key_file, &key_pem)
             .with_context(|| format!("failed to write {}", key_file.display()))?;
 
-        // Restrict key file permissions
+        // Restrict key file permissions. Failure is surfaced via
+        // `warn!` (Spec 037 I-13 PR-2) — silent chmod failure on
+        // the private key would expose it at the umask's default
+        // mode (typically 0644) to any local user.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600));
-            let _ = std::fs::set_permissions(&cert_file, std::fs::Permissions::from_mode(0o644));
+            set_file_mode_or_warn(&key_file, 0o600);
+            set_file_mode_or_warn(&cert_file, 0o644);
         }
 
         info!(
@@ -1900,6 +1932,213 @@ mod tests {
         assert!(
             should_require_api_auth("0.0.0.0:8787"),
             "agent_api still relies on should_require_api_auth for non-loopback auth"
+        );
+    }
+
+    // ── Spec 037 I-13 PR-2 — TLS file-perms warn anchors ──────────
+    //
+    // PR-2 of I-13 converts the two `let _ = std::fs::set_permissions(..)`
+    // sites in `build_tls_config` into a `warn!`-on-failure pattern via
+    // the `set_file_mode_or_warn` helper. Silent chmod failure on the
+    // freshly-generated TLS private key was security-relevant: a
+    // failed chmod would leave the key at the umask default (typically
+    // 0644) and expose it to any local user. Tests pin three
+    // contracts:
+    //
+    //   1. The wrapper does NOT panic on a non-existent path. Matches
+    //      the prior `let _ =` no-panic property.
+    //   2. The wrapper EMITS a `warn!` carrying path + intended_mode +
+    //      error context when the underlying `set_permissions` fails.
+    //   3. The wrapper applies the requested mode AND emits NO warn
+    //      on the happy path (real file, accessible).
+
+    #[cfg(unix)]
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal `tracing_subscriber::fmt::MakeWriter` impl used to
+    /// capture warn output during the failure-path test. Same shape
+    /// as the helper used in `dashboard::auth::tests` (PR-1) — kept
+    /// scoped to this mod so PR-1 does not need to surface a public
+    /// test helper just for I-13's reuse.
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_file_mode_or_warn_does_not_panic_on_missing_path() {
+        let bad_path = std::path::PathBuf::from("/this/path/never/ever/exists/innerwarden-i13-tls");
+        // Must not panic even though `set_permissions` returns
+        // ErrorKind::NotFound on this input.
+        set_file_mode_or_warn(&bad_path, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_file_mode_or_warn_emits_warn_with_context_on_failure() {
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let bad_path =
+            std::path::PathBuf::from("/this/path/never/ever/exists/innerwarden-i13-tls-warn");
+
+        tracing::subscriber::with_default(subscriber, || {
+            set_file_mode_or_warn(&bad_path, 0o600);
+        });
+
+        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+
+        assert!(
+            captured_str.contains("failed to set TLS file permissions"),
+            "warn message missing — got: {captured_str}"
+        );
+        // Path must be present so the operator can identify which
+        // file failed to chmod (key vs cert).
+        assert!(
+            captured_str.contains("innerwarden-i13-tls-warn"),
+            "path field missing or wrong — got: {captured_str}"
+        );
+        // Intended mode must be present in octal form — operator
+        // needs to know whether the failed chmod was on the 0o600
+        // (key) or 0o644 (cert) site, since 0o600 failure is the
+        // security-critical case.
+        assert!(
+            captured_str.contains("0o600"),
+            "intended_mode field missing or not in octal — got: {captured_str}"
+        );
+        assert!(
+            captured_str.contains("error="),
+            "error field missing — got: {captured_str}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_tls_config_auto_gen_writes_files_with_intended_perms() {
+        // Coverage anchor for the two call sites of
+        // `set_file_mode_or_warn` inside `build_tls_config` (key 0o600,
+        // cert 0o644). The unit tests on the helper itself prove the
+        // wrapper behaves correctly; this test proves the calling code
+        // actually invokes it with the right modes against the right
+        // files. Without this test the patch-coverage gate flagged the
+        // call sites as uncovered (PR-2 first push hit 33.33% on
+        // `codecov/patch`).
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // `cert_path = None` + `key_path = None` forces the auto-gen
+        // branch — the path that contains the two `set_file_mode_or_warn`
+        // call sites under test.
+        let _config = build_tls_config(dir.path(), None, None)
+            .await
+            .expect("build_tls_config must auto-generate a self-signed cert in a writable tempdir");
+
+        let key_path = dir.path().join("dashboard-key.pem");
+        let cert_path = dir.path().join("dashboard-cert.pem");
+
+        let key_mode = std::fs::metadata(&key_path)
+            .expect("key file must exist after build_tls_config")
+            .permissions()
+            .mode()
+            & 0o7777;
+        let cert_mode = std::fs::metadata(&cert_path)
+            .expect("cert file must exist after build_tls_config")
+            .permissions()
+            .mode()
+            & 0o7777;
+
+        // 0o600 on the key is the security-critical assertion. A
+        // regression that drops the chmod (or moves it to a path that
+        // does not exist before the file is written) would leak the
+        // private key at umask default.
+        assert_eq!(
+            key_mode, 0o600,
+            "build_tls_config must chmod the private key to 0o600 after generation"
+        );
+        assert_eq!(
+            cert_mode, 0o644,
+            "build_tls_config must chmod the cert to 0o644 after generation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_file_mode_or_warn_applies_mode_silently_on_writable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Inverse anchor: on a real, writable file the wrapper
+        // applies the requested mode AND does NOT emit a warn.
+        // Captures via the same subscriber pattern so a future
+        // regression that always-warns is caught.
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("fake-key.pem");
+        std::fs::write(&target, b"placeholder").expect("write fixture");
+        // Start at a permissive mode so the assertion below is
+        // meaningful (we want to prove the chmod actually moved it).
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .expect("seed perms");
+
+        tracing::subscriber::with_default(subscriber, || {
+            set_file_mode_or_warn(&target, 0o600);
+        });
+
+        // The mode must be exactly 0o600 after the helper runs. The
+        // `& 0o7777` mask drops the file-type bits (S_IFREG etc.)
+        // that PermissionsExt::mode() returns alongside the mode
+        // bits — without it the comparison fails on platforms that
+        // include S_IFREG in the returned u32.
+        let applied = std::fs::metadata(&target)
+            .expect("stat target")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            applied, 0o600,
+            "set_file_mode_or_warn must apply the requested mode on the happy path"
+        );
+
+        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+        assert!(
+            !captured_str.contains("failed to set TLS file permissions"),
+            "successful chmod must not emit the failure warn — got: {captured_str}"
         );
     }
 }
