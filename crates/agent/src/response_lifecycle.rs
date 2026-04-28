@@ -39,6 +39,31 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::{info, warn};
 
+/// Read a v2 response-lifecycle snapshot file, surfacing genuine I/O
+/// failure via `warn!` while staying silent on `NotFound` (steady
+/// state on first boot before any snapshot has been written).
+/// Replaces the silent `if let Ok(content) = read_to_string(&path)`
+/// fallback in `try_load_v2` (Spec 037 I-13 follow-up #2).
+///
+/// On a real I/O error (perms, FS error) the operator loses the
+/// response-lifecycle state across restart and the agent silently
+/// starts with an empty lifecycle table. The warn carries path +
+/// error so the operator can recover the file or fix permissions.
+fn read_v2_snapshot_or_warn(path: &std::path::Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "response lifecycle v2 snapshot read failed (lifecycle state lost across restart)"
+            );
+            None
+        }
+    }
+}
+
 /// Maximum number of revert attempts before an entry is declared Orphaned
 /// and an alert is raised.
 const MAX_REVERT_ATTEMPTS: u32 = 3;
@@ -501,7 +526,7 @@ impl ResponseLifecycle {
             }
         }
         let path = data_dir.join("responses.snapshot.json");
-        if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Some(content) = read_v2_snapshot_or_warn(&path) {
             if let Some(lc) = Self::from_v2_content(&content) {
                 tracing::info!("loaded response lifecycle from responses.snapshot.json (v2)");
                 return Some(lc);
@@ -2422,6 +2447,54 @@ mod tests {
         assert!(
             !lc.is_tracked("203.0.113.9", &ResponseBackend::Ufw),
             "backend identity must be part of the tracked key"
+        );
+    }
+
+    // Spec 037 I-13 follow-up #2: read_v2_snapshot_or_warn
+    //
+    // Wraps the silent `if let Ok(content) = read_to_string(&path)`
+    // fallback in `try_load_v2`. NotFound is steady state on first
+    // boot; only real I/O errors should warn.
+
+    #[test]
+    fn read_v2_snapshot_or_warn_returns_none_silently_on_not_found() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("responses.snapshot.json");
+
+        let result = read_v2_snapshot_or_warn(&path);
+        assert!(result.is_none(), "missing file must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("response lifecycle v2 snapshot read failed"),
+            "NotFound must NOT emit warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn read_v2_snapshot_or_warn_returns_none_and_warns_on_io_failure() {
+        // Park target path beneath a regular file so `read_to_string`
+        // returns NotADirectory / similar (any non-NotFound error).
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a regular file").expect("seed blocker");
+        let path = blocking_file.join("responses.snapshot.json");
+
+        let result = read_v2_snapshot_or_warn(&path);
+        assert!(result.is_none(), "io-failure must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("response lifecycle v2 snapshot read failed"),
+            "io-failure warn missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
         );
     }
 }

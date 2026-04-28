@@ -642,6 +642,32 @@ type ParsedModel = (
     u32,      // training cycles
 );
 
+/// Read the saved `anomaly-model.bin`, surfacing genuine I/O failure
+/// via `warn!` while staying silent on `NotFound` (steady state on
+/// first boot before training has produced a model). Replaces the
+/// silent `if let Ok(data) = std::fs::read(&model_path)` site in
+/// `AnomalyEngine::new` (Spec 037 I-13 follow-up #2).
+///
+/// On a real I/O error (perms, FS error) the operator loses the
+/// trained model state across restart and the agent silently starts
+/// fresh in observation mode without flagging that the existing
+/// model was unreadable. The warn carries path + error so the
+/// operator can recover the model or fix permissions.
+fn read_anomaly_model_or_warn(path: &Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(data) => Some(data),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "anomaly model read failed (starting fresh in observation mode)"
+            );
+            None
+        }
+    }
+}
+
 /// Parse a saved `anomaly-model.bin` into engine fields. Accepts both the
 /// pre-percentile v1 layout (where we synthesise a flat anchor table —
 /// forces the new inference path to fall back to z-score until the next
@@ -766,7 +792,7 @@ impl AnomalyEngine {
     pub fn new(config: AnomalyConfig) -> Self {
         let model_path = config.data_dir.join("anomaly-model.bin");
         let (net, baseline_mse, baseline_std, anchors, maturity, cycles) =
-            if let Ok(data) = std::fs::read(&model_path) {
+            if let Some(data) = read_anomaly_model_or_warn(&model_path) {
                 parse_model_file(&data).unwrap_or_else(|| {
                     info!("anomaly: existing model rejected by loader, starting fresh");
                     (None, 0.0, 1.0, vec![0.0; BASELINE_PERCENTILES], 0.0, 0)
@@ -2389,6 +2415,53 @@ mod tests {
         assert!(
             counts.iter().all(|(d, _, _)| d != "neural_anomaly"),
             "numeric entity placeholders must be ignored"
+        );
+    }
+
+    // Spec 037 I-13 follow-up #2: read_anomaly_model_or_warn
+    //
+    // Wraps the silent `if let Ok(data) = std::fs::read(&model_path)`
+    // site in `AnomalyEngine::new`. NotFound is steady state on first
+    // boot; only real I/O errors should warn.
+
+    #[test]
+    fn read_anomaly_model_or_warn_returns_some_silently_on_existing_file() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("anomaly-model.bin");
+        std::fs::write(&path, b"\x00\x01\x02\x03").expect("seed model file");
+
+        let result = read_anomaly_model_or_warn(&path);
+        assert!(result.is_some(), "existing file must yield Some(Vec)");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("anomaly model read failed"),
+            "happy path must not emit warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn read_anomaly_model_or_warn_returns_none_and_warns_on_io_failure() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a regular file").expect("seed blocker");
+        let path = blocking_file.join("anomaly-model.bin");
+
+        let result = read_anomaly_model_or_warn(&path);
+        assert!(result.is_none(), "io-failure must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("anomaly model read failed"),
+            "io-failure warn missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
         );
     }
 }
