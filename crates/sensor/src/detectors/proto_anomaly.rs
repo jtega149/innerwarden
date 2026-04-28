@@ -78,15 +78,23 @@ impl ProtoAnomalyDetector {
             return incidents;
         }
 
+        // Spec 037 I-15: trim + filter empty so the "?" fallback covers
+        // both "key missing" and "key present but empty/whitespace".
+        // Without the filter, src_ip="" would propagate into incident
+        // summaries and EntityRefs as a literal empty string.
         let src_ip = event
             .details
             .get("src_ip")
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .unwrap_or("?");
         let dst_ip = event
             .details
             .get("dst_ip")
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .unwrap_or("?");
         let dst_port = event
             .details

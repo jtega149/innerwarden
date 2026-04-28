@@ -324,17 +324,23 @@ fn event_to_atom(
     let details = &event.details;
     let kind = event.kind.as_str();
 
+    // Spec 037 I-15: trim + filter empty/whitespace so DNA fingerprints
+    // never key on an unactionable "" IP, which would collapse multiple
+    // distinct attackers into a single fake DNA bucket.
     let source_ip = details
         .get("src_ip")
         .or_else(|| details.get("ip"))
         .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(String::from)
         .or_else(|| {
             event
                 .entities
                 .iter()
                 .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
-                .map(|e| e.value.clone())
+                .map(|e| e.value.trim().to_string())
+                .filter(|s| !s.is_empty())
         });
 
     let comm = details

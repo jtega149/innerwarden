@@ -194,11 +194,15 @@ impl ScoringEngine {
             self.recent_severities.pop_front();
         }
 
+        // Spec 037 I-15: filter empty/whitespace so an "" never enters
+        // recent_ips and later becomes a cooldown HashMap key.
         if let Some(ip) = event
             .details
             .get("ip")
             .or(event.details.get("src_ip"))
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         {
             self.recent_ips.push_back(ip.to_string());
             if self.recent_ips.len() > 20 {
@@ -221,12 +225,25 @@ impl ScoringEngine {
             "scoring: model inference"
         );
 
-        // Cooldown per source IP
-        let source_ip = self.recent_ips.back().cloned().unwrap_or_default();
+        // Cooldown per source IP.
+        //
+        // Spec 037 I-15: never use "" as a cooldown HashMap key. Empty
+        // recent_ips means "no source IP threaded through to scoring",
+        // which is a different state from "no cooldown registered yet
+        // for this IP". Filter empty/whitespace and skip the cooldown
+        // bookkeeping entirely when no IP is available.
+        let source_ip = self
+            .recent_ips
+            .back()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let now = chrono::Utc::now();
-        if let Some(&last) = self.cooldowns.get(&source_ip) {
-            if (now - last).num_seconds() < self.cooldown_secs {
-                return None;
+        if let Some(ref ip) = source_ip {
+            if let Some(&last) = self.cooldowns.get(ip) {
+                if (now - last).num_seconds() < self.cooldown_secs {
+                    return None;
+                }
             }
         }
 
@@ -237,7 +254,9 @@ impl ScoringEngine {
         }
 
         if score > self.threshold {
-            self.cooldowns.insert(source_ip, now);
+            if let Some(ip) = source_ip {
+                self.cooldowns.insert(ip, now);
+            }
             let explanation =
                 format!(
                 "Neural model scored {:.0}% attack probability from {} recent events (kinds: {})",
@@ -431,5 +450,41 @@ mod tests {
         engine.observe(&make_event("ssh.login_failed", Severity::Medium));
         engine.reset();
         assert!(engine.recent_kinds.is_empty());
+    }
+
+    // Spec 037 I-15: empty/whitespace src_ip must never enter recent_ips.
+    // Otherwise it later becomes a cooldown HashMap key and conflates
+    // distinct attackers under a single fake "no IP" identity.
+    fn make_event_with_src_ip(src_ip: &str) -> Event {
+        Event {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            source: "test".into(),
+            kind: "network.connection".into(),
+            severity: Severity::Info,
+            summary: String::new(),
+            details: serde_json::json!({ "src_ip": src_ip }),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn observe_skips_empty_src_ip_in_recent_ips() {
+        let mut engine = ScoringEngine::new(0.7);
+        engine.observe(&make_event_with_src_ip(""));
+        engine.observe(&make_event_with_src_ip("   "));
+        assert!(
+            engine.recent_ips.is_empty(),
+            "empty / whitespace src_ip must not enter recent_ips, got: {:?}",
+            engine.recent_ips
+        );
+    }
+
+    #[test]
+    fn observe_keeps_valid_src_ip_in_recent_ips() {
+        let mut engine = ScoringEngine::new(0.7);
+        engine.observe(&make_event_with_src_ip("198.51.100.5"));
+        assert_eq!(engine.recent_ips, vec!["198.51.100.5".to_string()]);
     }
 }

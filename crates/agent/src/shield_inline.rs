@@ -76,14 +76,20 @@ pub(crate) fn process_events(
     let now = chrono::Utc::now();
 
     for event in events {
-        // Extract source IP from event
-        let ip = event
+        // Extract source IP from event.
+        // Spec 037 I-15: trim + filter empty/whitespace so an
+        // unactionable "" never reaches the SYN-flood ring buffer or
+        // the Cloudflare edge push.
+        let Some(ip) = event
             .details
             .get("src_ip")
             .or_else(|| event.details.get("ip"))
-            .and_then(|v| v.as_str());
-
-        let Some(ip) = ip else { continue };
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
 
         // Skip non-network events
         let is_network = event.kind.starts_with("network.")

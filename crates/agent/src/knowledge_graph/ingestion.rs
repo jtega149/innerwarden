@@ -5,11 +5,20 @@ use super::graph::KnowledgeGraph;
 use super::types::*;
 
 /// Helper to extract a string field from event.details JSON.
+///
+/// Spec 037 I-15: normalize empty strings to `None` to avoid propagating
+/// invalid IPs (and other invalid string fields) as graph node keys,
+/// EntityRefs, or display labels. Whitespace-only strings are also
+/// treated as missing -- a value the operator cannot act on is the same
+/// as no value at all. Callers that need to distinguish "key absent"
+/// from "key present but empty" must read `event.details` directly.
 fn detail_str(event: &Event, key: &str) -> Option<String> {
     event
         .details
         .get(key)
         .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
@@ -2965,5 +2974,42 @@ mod tests {
             };
             graph.ingest_incident(&incident);
         }
+    }
+
+    // Spec 037 I-15: detail_str must filter "" / whitespace to None.
+    // Without this guard, downstream graph nodes / EntityRefs / display
+    // labels propagate empty-string IPs that the operator cannot act on.
+
+    fn make_event_with_ip(ip: &str) -> Event {
+        use innerwarden_core::event::Severity;
+        Event {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            source: "test".into(),
+            kind: "test.event".into(),
+            severity: Severity::Info,
+            summary: String::new(),
+            details: serde_json::json!({ "src_ip": ip }),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detail_str_returns_none_for_empty_string() {
+        let event = make_event_with_ip("");
+        assert_eq!(detail_str(&event, "src_ip"), None);
+    }
+
+    #[test]
+    fn detail_str_returns_none_for_whitespace_only() {
+        let event = make_event_with_ip("   ");
+        assert_eq!(detail_str(&event, "src_ip"), None);
+    }
+
+    #[test]
+    fn detail_str_returns_some_trimmed_for_valid_value() {
+        let event = make_event_with_ip("  1.2.3.4  ");
+        assert_eq!(detail_str(&event, "src_ip"), Some("1.2.3.4".to_string()));
     }
 }

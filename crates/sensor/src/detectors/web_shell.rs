@@ -109,12 +109,17 @@ impl WebShellDetector {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Skip internal/Docker IPs — legitimate app traffic
+        // Skip internal/Docker IPs — legitimate app traffic.
+        // Spec 037 I-15: an empty/whitespace src_ip is unactionable for
+        // web-shell attribution; bail out rather than continuing with
+        // a fake source IP that later appears as "" in the incident
+        // summary and EntityRef.
         let src_ip = event
             .details
             .get("src_ip")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
         if super::is_internal_ip(src_ip) {
             return None;
         }
@@ -149,11 +154,9 @@ impl WebShellDetector {
             return None;
         }
 
-        let src_ip = event
-            .details
-            .get("src_ip")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        // src_ip is already trimmed and non-empty thanks to the
+        // early-return guard above (Spec 037 I-15); no second
+        // unwrap_or fallback needed.
         let pattern = if is_polyglot {
             "polyglot_upload"
         } else {

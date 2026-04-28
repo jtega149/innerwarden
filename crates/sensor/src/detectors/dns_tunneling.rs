@@ -132,11 +132,14 @@ impl DnsTunnelingDetector {
 
         // ── DNS capture path: raw socket DNS queries ────────────────────
         if event.kind == "dns.query" && event.source == "dns_capture" {
-            return self.process_dns_query(
-                event,
-                event.details.get("domain")?.as_str()?,
-                event.details.get("src_ip")?.as_str()?,
-            );
+            // Spec 037 I-15: filter "" / whitespace src_ip so DNS
+            // tunneling tracking never keys on an unactionable empty IP.
+            let domain = event.details.get("domain")?.as_str()?.trim();
+            let src_ip = event.details.get("src_ip")?.as_str()?.trim();
+            if domain.is_empty() || src_ip.is_empty() {
+                return None;
+            }
+            return self.process_dns_query(event, domain, src_ip);
         }
 
         None

@@ -180,9 +180,17 @@ impl PacketFloodDetector {
         }
 
         // --- UDP amplification detection ---
+        // Spec 037 I-15: require both src_ip and dst_ip rather than
+        // threading "" through the ring buffer + unique_sources
+        // HashSet. UDP amp detection needs the source IP for
+        // `unique_sources.len() >= 2` to mean anything; an empty
+        // entry would collapse multiple no-IP events into a single
+        // fake "source" and skew the threshold check. We only skip
+        // this detection path -- later branches (HTTP flood, etc.)
+        // still run for events that matched another pattern.
         if is_udp_event(event) {
-            if let Some(dst_ip) = extract_dest_ip(event) {
-                let src_ip = extract_source_ip(event).unwrap_or_default();
+            if let (Some(dst_ip), Some(src_ip)) = (extract_dest_ip(event), extract_source_ip(event))
+            {
                 let cutoff = now - self.udp_window;
                 let ring = self.udp_events.entry(dst_ip.clone()).or_default();
                 ring.push_back((now, src_ip));
@@ -517,6 +525,10 @@ impl PacketFloodDetector {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Spec 037 I-15: trim + filter "" / whitespace so no extractor in the
+// packet-flood path can return Some("") into ring buffers, EntityRefs,
+// or threshold HashSets. Callers see "missing" and "empty" as one
+// state -- a value the operator cannot act on is no value at all.
 fn extract_source_ip(event: &Event) -> Option<String> {
     event
         .details
@@ -524,6 +536,8 @@ fn extract_source_ip(event: &Event) -> Option<String> {
         .and_then(|v| v.as_str())
         .or_else(|| event.details.get("ip").and_then(|v| v.as_str()))
         .or_else(|| event.details.get("remote_ip").and_then(|v| v.as_str()))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
@@ -533,6 +547,8 @@ fn extract_dest_ip(event: &Event) -> Option<String> {
         .get("dst_ip")
         .and_then(|v| v.as_str())
         .or_else(|| event.details.get("dest_ip").and_then(|v| v.as_str()))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
@@ -1370,6 +1386,42 @@ mod tests {
         assert!(
             inc.summary.contains("share"),
             "summary should expose the attribution share"
+        );
+    }
+
+    // Spec 037 I-15: UDP amp must skip events without a source IP
+    // rather than threading "" through the ring buffer. Two anchors:
+    //   1. UDP event with valid src_ip => ring tracks it normally
+    //   2. UDP event with src_ip="" => empty entry must NOT enter the
+    //      ring (would otherwise collapse multiple no-IP events into a
+    //      single fake "source" and skew the unique_sources threshold)
+
+    #[test]
+    fn udp_amp_tracks_event_with_valid_source_ip() {
+        let mut det = new_detector();
+        let now = Utc::now();
+        det.process(&udp_event("198.51.100.10", "203.0.113.5", now));
+
+        let ring = det
+            .udp_events
+            .get("203.0.113.5")
+            .expect("dst_ip ring must exist after a tracked UDP event");
+        assert_eq!(ring.len(), 1, "valid src_ip must enter the ring");
+        assert_eq!(ring[0].1, "198.51.100.10");
+    }
+
+    #[test]
+    fn udp_amp_skips_event_with_empty_source_ip() {
+        let mut det = new_detector();
+        let now = Utc::now();
+        // src_ip="" is the leak we are guarding against. The ring for
+        // dst_ip must not be created, because no source was tracked.
+        det.process(&udp_event("", "203.0.113.5", now));
+
+        assert!(
+            det.udp_events.get("203.0.113.5").is_none(),
+            "empty src_ip must NOT create a ring entry; got: {:?}",
+            det.udp_events.get("203.0.113.5")
         );
     }
 }

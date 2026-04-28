@@ -880,12 +880,17 @@ impl AnomalyEngine {
         );
 
         if score > self.config.threshold {
-            // Cooldown check
+            // Cooldown check.
+            // Spec 037 I-15: trim + filter empty so the "unknown" fallback
+            // covers both "key missing" and "key present but empty";
+            // otherwise an "" cooldown key would conflate distinct attackers.
             let source = event
                 .details
                 .get("ip")
                 .or(event.details.get("src_ip"))
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .unwrap_or("unknown")
                 .to_string();
             let now = chrono::Utc::now();
@@ -1078,10 +1083,15 @@ impl AnomalyEngine {
                         Err(_) => continue,
                     };
                     let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    // Spec 037 I-15: trim + filter so blocked-IP filtering
+                    // never matches against an "" entry (defense-in-depth
+                    // even though blocked_ips itself should never contain "").
                     let ip = ev.get("details").and_then(|d| {
                         d.get("src_ip")
                             .or_else(|| d.get("ip"))
                             .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                     });
                     if !blocked_ips.is_empty() {
                         if let Some(ip) = ip {

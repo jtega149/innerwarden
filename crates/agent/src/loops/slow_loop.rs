@@ -278,11 +278,16 @@ fn track_operator_ips_from_events(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if method == "publickey" {
+                // Spec 037 I-15: filter empty/whitespace so an unactionable
+                // "" never enters operator_ips and corrupts the SSH-session
+                // protection logic.
                 let ip = ev
                     .details
                     .get("ip")
                     .or_else(|| ev.details.get("src_ip"))
-                    .and_then(|v| v.as_str());
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
                 if let Some(ip) = ip {
                     let is_new = !state.operator_ips.contains_key(ip);
                     state
