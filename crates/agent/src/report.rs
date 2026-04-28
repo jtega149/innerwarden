@@ -21,8 +21,38 @@ use innerwarden_core::{entities::EntityType, event::Event, incident::Incident};
 use serde::Serialize;
 use serde_json::Value;
 
+use tracing::warn;
+
 use crate::decisions::DecisionEntry;
 use crate::telemetry;
+
+/// Open a per-day KPI JSONL file (events / incidents / decisions),
+/// surfacing genuine I/O failure via `warn!` while staying silent on
+/// the steady-state `NotFound` case (most days have no JSONL on disk
+/// because the reporting window scans 30 days back). Replaces three
+/// silent `if let Ok(f) = File::open(&path)` sites in the 30-day KPI
+/// scan loop (Spec 037 I-13 follow-up #2, third slice).
+///
+/// `kind` is the bounded label "events" / "incidents" / "decisions"
+/// so the operator can identify which KPI lost data. Returns
+/// `Some(File)` so the caller drives the BufReader; `None` means
+/// either the file did not exist (normal) or the open failed and the
+/// warn already fired.
+fn open_kpi_file_or_warn(path: &Path, kind: &str) -> Option<File> {
+    match File::open(path) {
+        Ok(f) => Some(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                kind,
+                path = %path.display(),
+                error = %e,
+                "report KPI file open failed (per-day count for this kind dropped)"
+            );
+            None
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct GeneratedReport {
@@ -1044,7 +1074,7 @@ fn compute_recent_window_at(
     for date in &dates_to_scan {
         // ── Events ──────────────────────────────────────────────────────────
         let path = safe_dated_file(data_dir, "events", date, "jsonl");
-        if let Ok(f) = File::open(&path) {
+        if let Some(f) = open_kpi_file_or_warn(&path, "events") {
             for line in BufReader::new(f).lines().map_while(Result::ok) {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -1070,7 +1100,7 @@ fn compute_recent_window_at(
 
         // ── Incidents ────────────────────────────────────────────────────────
         let path = safe_dated_file(data_dir, "incidents", date, "jsonl");
-        if let Ok(f) = File::open(&path) {
+        if let Some(f) = open_kpi_file_or_warn(&path, "incidents") {
             for line in BufReader::new(f).lines().map_while(Result::ok) {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -1104,7 +1134,7 @@ fn compute_recent_window_at(
 
         // ── Decisions ────────────────────────────────────────────────────────
         let path = safe_dated_file(data_dir, "decisions", date, "jsonl");
-        if let Ok(f) = File::open(&path) {
+        if let Some(f) = open_kpi_file_or_warn(&path, "decisions") {
             for line in BufReader::new(f).lines().map_while(Result::ok) {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -3221,6 +3251,81 @@ mod tests {
         assert_eq!(
             win.events, 1,
             "legacy HH:MM key must be interpreted as the snapshot's date (yesterday) and counted"
+        );
+    }
+
+    // Spec 037 I-13 follow-up #2 (third slice): open_kpi_file_or_warn
+    //
+    // Wraps the three silent `if let Ok(f) = File::open(&path)` sites in
+    // the 30-day KPI scan loop (events / incidents / decisions).
+    // `NotFound` is the steady state (most days have no JSONL on disk),
+    // so the helper warns only on genuine I/O failures.
+
+    #[test]
+    fn open_kpi_file_or_warn_returns_some_silently_on_existing_file() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events-2026-04-28.jsonl");
+        std::fs::write(&path, b"{}\n").expect("seed kpi file");
+
+        let result = open_kpi_file_or_warn(&path, "events");
+        assert!(result.is_some(), "existing file must yield Some(File)");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("report KPI file open failed"),
+            "happy path must not emit failure warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn open_kpi_file_or_warn_returns_none_silently_on_not_found() {
+        // The 30-day KPI scan reaches dates with no JSONL on disk
+        // every iteration; warning on each would flood logs. Only
+        // genuine I/O failures should surface.
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("incidents-2026-04-28.jsonl");
+
+        let result = open_kpi_file_or_warn(&path, "incidents");
+        assert!(result.is_none(), "missing file must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.is_empty() || !captured.contains("report KPI file open failed"),
+            "NotFound is steady state and must NOT emit a warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn open_kpi_file_or_warn_returns_none_and_warns_on_io_failure() {
+        // Force `File::open` to fail with something other than NotFound
+        // by parking the path beneath a regular file: the open call
+        // returns NotADirectory (Linux) or similar -- not NotFound.
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a regular file").expect("seed blocker");
+        let path = blocking_file.join("decisions-2026-04-28.jsonl");
+
+        let result = open_kpi_file_or_warn(&path, "decisions");
+        assert!(result.is_none(), "io-failure path must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("report KPI file open failed"),
+            "io-failure warn missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("kind=\"decisions\"") || captured.contains("kind=decisions"),
+            "kind label missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
         );
     }
 }
