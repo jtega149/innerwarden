@@ -237,6 +237,57 @@ pub fn remove_from_allowlist(
 ///
 /// Used for training data collection and FP-rate tracking.  The file
 /// is created if missing and each entry is one JSON line.
+/// Append the false-positive report entry to `fp-reports-{date}.jsonl`,
+/// surfacing both failure modes (file open + line write) via `warn!`
+/// with structured context. Replaces the prior nested
+/// `if let Ok(mut f) = OpenOptions::new()...open(..)` + silent
+/// `let _ = writeln!(...)` cascade (Spec 037 I-13 follow-up #2,
+/// sibling of `append_allowlist_history_or_warn` shipped in PR #319).
+///
+/// Failure here means an operator-marked false positive disappears.
+/// Detection-tuning workflows read these JSONL files to retrain the
+/// classifier and to diff which detectors are creating noise; a silent
+/// drop means the feedback loop swallows the operator's annotation.
+/// Carrying incident_id/detector/reporter in the warn lets the operator
+/// reconstruct what was lost.
+fn append_fp_report_or_warn(
+    path: &std::path::Path,
+    entry: &serde_json::Value,
+    incident_id: &str,
+    detector: &str,
+    reporter: &str,
+) {
+    use std::io::Write;
+    let mut f = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                incident_id,
+                detector,
+                reporter,
+                error = %e,
+                "false-positive report file open failed (FP entry lost)"
+            );
+            return;
+        }
+    };
+    if let Err(e) = writeln!(f, "{}", entry) {
+        warn!(
+            path = %path.display(),
+            incident_id,
+            detector,
+            reporter,
+            error = %e,
+            "false-positive report write failed (FP entry lost)"
+        );
+    }
+}
+
 pub fn log_false_positive(
     data_dir: &std::path::Path,
     incident_id: &str,
@@ -252,14 +303,7 @@ pub fn log_false_positive(
         "reporter": reporter,
         "action": "reported_fp"
     });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", entry);
-    }
+    append_fp_report_or_warn(&path, &entry, incident_id, detector, reporter);
 }
 
 #[cfg(test)]
@@ -365,6 +409,99 @@ mod tests {
         assert!(
             captured.contains("action=\"remove\"") || captured.contains("action=remove"),
             "action field missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
+        );
+    }
+
+    // Spec 037 I-13 follow-up #2 (sibling slice): append_fp_report_or_warn
+    //
+    // Same two-level cascade shape as append_allowlist_history_or_warn
+    // (open + write nested), wrapping the FP report append in
+    // log_false_positive. Operator-marked false positives feed
+    // detector-tuning workflows; silent drops broke the feedback loop.
+
+    #[test]
+    fn append_fp_report_or_warn_appends_silently_on_writable_path() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fp-reports-2026-04-28.jsonl");
+        let entry = serde_json::json!({
+            "ts": "2026-04-28T08:00:00Z",
+            "incident_id": "inc-abc-1",
+            "detector": "ssh_bruteforce",
+            "reporter": "alice",
+            "action": "reported_fp",
+        });
+
+        append_fp_report_or_warn(&path, &entry, "inc-abc-1", "ssh_bruteforce", "alice");
+
+        let written = std::fs::read_to_string(&path).expect("fp report file");
+        assert!(
+            written.contains("inc-abc-1"),
+            "entry must be appended, got: {written}"
+        );
+        assert!(
+            written.ends_with('\n'),
+            "writeln! must terminate with newline, got: {written:?}"
+        );
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("false-positive report"),
+            "happy path must not emit any failure warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn append_fp_report_or_warn_emits_warn_on_open_failure() {
+        // Force `OpenOptions::open(create=true)` to fail by parking
+        // the target path beneath a regular file.
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a regular file").expect("seed blocker");
+        let path = blocking_file.join("fp-reports-2026-04-28.jsonl");
+
+        let entry = serde_json::json!({
+            "ts": "2026-04-28T08:00:00Z",
+            "incident_id": "inc-xyz-9",
+            "detector": "credential_stuffing",
+            "reporter": "bob",
+            "action": "reported_fp",
+        });
+
+        append_fp_report_or_warn(&path, &entry, "inc-xyz-9", "credential_stuffing", "bob");
+
+        assert!(
+            !path.exists(),
+            "open under a regular-file parent must not produce the file"
+        );
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("false-positive report file open failed"),
+            "open-failure warn missing, got: {captured}"
+        );
+        // Every structured field promised by the helper rustdoc must
+        // be in the captured output.
+        assert!(
+            captured.contains("incident_id=\"inc-xyz-9\"")
+                || captured.contains("incident_id=inc-xyz-9"),
+            "incident_id field missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("detector=\"credential_stuffing\"")
+                || captured.contains("detector=credential_stuffing"),
+            "detector field missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("reporter=\"bob\"") || captured.contains("reporter=bob"),
+            "reporter field missing, got: {captured}"
         );
         assert!(
             captured.contains("error="),
