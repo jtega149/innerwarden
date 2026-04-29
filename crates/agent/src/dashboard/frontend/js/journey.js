@@ -454,6 +454,7 @@ async function loadJourney(subjectType, subjectValue) {
       <div class="journey-header">
         <span class="journey-ip">${esc(j.subject || subjectValue)}</span>
         <span class="${outcomeCls(typeof outcomeOf === 'function' ? outcomeOf({outcome: j.outcome}) : j.outcome)}">${outcomeLabel(typeof outcomeOf === 'function' ? outcomeOf({outcome: j.outcome}) : j.outcome)}</span>
+        ${blockStateBadgeHtml(j.block_state)}
         <span class="journey-time">${esc(first)} → ${esc(last)}</span>
       </div>
       <div class="journey-subtitle">${esc((j.subject_type || subjectType).toUpperCase())} journey · ${j.entries.length} timeline entries · click any row to expand</div>

@@ -836,6 +836,53 @@ mod tests {
 
     // ── Existing tests (unchanged) ──────────────────────────────────────
 
+    // ── Phase 4 (audit RC-4) frontend wiring anchors ────────────────────
+    //
+    // The dashboard ships its frontend as `include_str!` constants
+    // bundled into the agent binary at build time. Anchor that the
+    // PR #335 backend contract (block_state on AttackerSummary +
+    // JourneyResponse) is actually consumed by the bundled JS. If a
+    // future cleanup deletes the helper or renames the field, the
+    // operator would silently lose the kernel-evidence badge — these
+    // tests fail loudly instead.
+
+    #[test]
+    fn helpers_js_exports_block_state_badge_renderer() {
+        assert!(
+            JS_HELPERS.contains("function blockStateBadgeHtml"),
+            "blockStateBadgeHtml helper is missing from bundled helpers.js"
+        );
+        // The three branches must all be reachable from the helper.
+        assert!(JS_HELPERS.contains("blocked_now"));
+        assert!(JS_HELPERS.contains("blocked_historical"));
+    }
+
+    #[test]
+    fn threats_js_renders_block_state_on_attacker_card() {
+        assert!(
+            JS_THREATS.contains("blockStateBadgeHtml(item.block_state)"),
+            "threats.js card renderer must read item.block_state from \
+             AttackerSummary; otherwise the kernel-evidence badge never \
+             ships to the operator"
+        );
+    }
+
+    #[test]
+    fn journey_js_renders_block_state_in_header() {
+        assert!(
+            JS_JOURNEY.contains("blockStateBadgeHtml(j.block_state)"),
+            "journey.js header must read j.block_state from JourneyResponse"
+        );
+    }
+
+    #[test]
+    fn app_css_defines_kernel_evidence_badge_classes() {
+        // The CSS class names are referenced by helpers.js — anchor
+        // both ends so a rename on either side fails the build.
+        assert!(APP_CSS.contains(".badge-kernel-active"));
+        assert!(APP_CSS.contains(".badge-kernel-expired"));
+    }
+
     #[test]
     fn normalize_limit_is_bounded() {
         assert_eq!(normalize_limit(None), 50);

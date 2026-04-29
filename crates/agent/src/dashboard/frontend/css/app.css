@@ -1163,6 +1163,12 @@
     .badge-contained { background: rgba(58,194,126,0.15); color: var(--ok); font-size:0.62rem; padding:2px 7px; border-radius:4px; font-weight:600; }
     .badge-unresolved { background: rgba(244,63,94,0.15); color: var(--danger); font-size:0.62rem; padding:2px 7px; border-radius:4px; font-weight:600; }
     .badge-noise { background: rgba(255,255,255,0.06); color: var(--dim); font-size:0.62rem; padding:2px 7px; border-radius:4px; font-weight:600; }
+    /* Phase 4 (audit RC-4) kernel-evidence badges. Distinguishes
+       "AI decided to block" (existing badge-blocked) from "kernel
+       is currently enforcing the block" (badge-kernel-active) and
+       "kernel block has expired" (badge-kernel-expired). */
+    .badge-kernel-active  { background: rgba(58,194,126,0.20);  color: var(--ok);     border: 1px solid rgba(58,194,126,0.40); }
+    .badge-kernel-expired { background: rgba(255,193,7,0.10);   color: #f4d35e;       border: 1px solid rgba(255,193,7,0.25); }
     .pulse-dot.contained { background: var(--ok); animation: none; }
     .responsive-table { display:block; overflow-x:auto; -webkit-overflow-scrolling:touch; }
     .responsive-table table { min-width:600px; }

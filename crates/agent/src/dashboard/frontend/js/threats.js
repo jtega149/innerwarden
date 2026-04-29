@@ -199,6 +199,11 @@ function renderCard(item) {
   const outBadgeCls = outBadgeMap[mappedOutcome] || 'badge-monitor';
   const outBadgeLabel = (OUTCOME_META[mappedOutcome] || {}).label || 'Observing';
   badges += `<span class="card-badge ${outBadgeCls}">${outBadgeLabel}</span>`;
+  // Phase 4: kernel-evidence badge appended after the AI-decision
+  // badge so the operator sees "Blocked (AI) · Kernel · 45m" when
+  // the kernel is still enforcing, and "Blocked (AI) · Expired"
+  // when the TTL elapsed but no fresh block has been re-issued.
+  badges += blockStateBadgeHtml(item.block_state);
 
   const ago = (ts) => {
     if (!ts) return '';

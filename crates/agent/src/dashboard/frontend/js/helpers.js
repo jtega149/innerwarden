@@ -154,6 +154,41 @@ function outcomeBadgeHtml(outcome) {
   return '';
 }
 
+// Phase 4 (audit RC-4): render the kernel-evidence block_state shipped
+// by the backend (PR #335) into a small operator-visible badge.
+//
+// `state` matches the BlockState enum from threat_contract.rs:
+//   { kind: "blocked_now",      since_ms, ttl_secs, expires_in_secs }
+//   { kind: "blocked_historical", last_block_ms }
+//   { kind: "open" }
+//
+// Returns '' for "open" and for missing state — the existing outcome
+// badge already conveys "no kernel block" so we don't add visual
+// clutter for the steady state. Only the two affirmative kernel
+// states get a dedicated badge.
+function blockStateBadgeHtml(state) {
+  if (!state || !state.kind) return '';
+  if (state.kind === 'blocked_now') {
+    var ttl = Number(state.expires_in_secs);
+    var label = '🛡️ KERNEL';
+    var tip = 'Kernel-level block currently active.';
+    if (Number.isFinite(ttl) && ttl > 0) {
+      var humanTtl = ttl >= 3600
+        ? Math.floor(ttl / 3600) + 'h'
+        : ttl >= 60
+        ? Math.floor(ttl / 60) + 'm'
+        : ttl + 's';
+      label += ' · ' + humanTtl;
+      tip = 'Kernel-level block active. Expires in ~' + humanTtl + '.';
+    }
+    return '<span class="card-badge badge-kernel-active" title="' + tip + '">' + label + '</span>';
+  }
+  if (state.kind === 'blocked_historical') {
+    return '<span class="card-badge badge-kernel-expired" title="Kernel-level block has expired (TTL elapsed). The agent remembers issuing it but the kernel no longer enforces it.">⚠️ EXPIRED</span>';
+  }
+  return '';
+}
+
 function humanIncidentTitle(detector, rawTitle, ip) {
   var label = humanLabel(detector);
   if (ip) label += ' \u2014 ' + ip;
