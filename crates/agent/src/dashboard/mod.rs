@@ -934,14 +934,59 @@ mod tests {
     }
 
     #[test]
-    fn index_html_carries_kpi_pair_lines_for_paired_unit_rendering() {
-        // The Phase 7 redesign: three KPI tiles each gain a sub-line
-        // showing the secondary unit (incidents under a unique-IP
-        // count, etc). Anchor the new IDs so a future tile rework
-        // doesn't silently drop them.
-        assert!(INDEX_HTML.contains("homeKpiThreatsPair"));
-        assert!(INDEX_HTML.contains("homeKpiRespondedPair"));
-        assert!(INDEX_HTML.contains("homeKpiEventsPair"));
+    fn index_html_carries_summary_pyramid_for_layperson_ux() {
+        // Phase 9 (2026-04-29 redesign): the 3-tile/6-number KPI row
+        // was replaced with a narrative summary pyramid. The pyramid
+        // has 4 main rows (watched / flagged / acted / awaiting) and
+        // 4 action sub-rows (blocked / watching / honeypot / trusted).
+        // Anchor the new IDs so a future redesign doesn't silently
+        // drop the layperson-readable surface.
+        assert!(INDEX_HTML.contains("homeSummaryWatched"));
+        assert!(INDEX_HTML.contains("homeSummaryFlagged"));
+        assert!(INDEX_HTML.contains("homeSummaryActed"));
+        assert!(INDEX_HTML.contains("homeSummaryAwaiting"));
+        assert!(INDEX_HTML.contains("homeSummaryBlocked"));
+        assert!(INDEX_HTML.contains("homeSummaryWatching"));
+        assert!(INDEX_HTML.contains("homeSummaryHoneypot"));
+        assert!(INDEX_HTML.contains("homeSummaryTrusted"));
+        // The time-scope label must show the elapsed window so the
+        // ambiguous "Today" doesn't reappear.
+        assert!(INDEX_HTML.contains("homeSummaryWindow"));
+    }
+
+    #[test]
+    fn home_js_renders_summary_pyramid_with_plain_english() {
+        // The new updateHomeSummary function must populate the four
+        // main lines + four sub-rows. Anchor to detect any silent
+        // refactor that drops one of the lines.
+        assert!(JS_HOME.contains("homeSummaryWatched"));
+        assert!(JS_HOME.contains("homeSummaryFlagged"));
+        assert!(JS_HOME.contains("homeSummaryActed"));
+        assert!(JS_HOME.contains("homeSummaryAwaiting"));
+        assert!(JS_HOME.contains("computeElapsedHoursUtc"));
+        // Plain-English copy strings must be present so a future
+        // refactor that "fixes" them to jargon fails the test.
+        assert!(JS_HOME.contains("All clear"));
+        assert!(JS_HOME.contains("You are protected"));
+    }
+
+    #[test]
+    fn index_html_pending_panel_uses_plain_english_labels() {
+        // Phase 9: the pending panel labels were renamed from SOC
+        // jargon ("In flight", "Cooldown'd") to operator-readable
+        // English. Anchor the new strings.
+        assert!(INDEX_HTML.contains("Being analyzed now"));
+        assert!(INDEX_HTML.contains("AI escalated to you"));
+        assert!(INDEX_HTML.contains("Same threat already decided"));
+        assert!(INDEX_HTML.contains("No decision after 1 hour"));
+    }
+
+    #[test]
+    fn app_css_defines_summary_pyramid_styles() {
+        assert!(APP_CSS.contains(".summary-pyramid"));
+        assert!(APP_CSS.contains(".summary-row"));
+        assert!(APP_CSS.contains(".summary-row-needs-review"));
+        assert!(APP_CSS.contains(".summary-sub-row"));
     }
 
     #[test]

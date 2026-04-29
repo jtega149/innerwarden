@@ -156,31 +156,28 @@ function computeHomeState(payload) {
       maxSeverity: 'medium',
       heroClass: 'status-hero alert-medium',
       heroIcon: '⏳',
-      heroTitle: 'AI catching up',
-      heroSub: (healthVerb.pending_in_flight || 0) +
-        ' incidents in flight. Decisions arriving with delay.',
+      heroTitle: 'Heavy attack volume',
+      heroSub: 'System is catching up — give it a few minutes. ' +
+        (healthVerb.pending_in_flight || 0) + ' threats being analyzed now.',
       healthAlertReasons: []
     };
   }
 
-  // Phase 7B: "Abandoned backlog" — AI is fine right now, but earlier
-  // incidents got abandoned (no decision within 1h, but recent
-  // decisions are flowing). Soft yellow signal: orphan-recovery
-  // slow_loop pass will sweep them automatically; operator gets a
-  // heads-up rather than a false "AI is wedged" alarm.
+  // Phase 9: "Abandoned backlog" — plain-English copy. Operator
+  // sees "Cleaning up" verb instead of jargon. Yellow signal stays
+  // because something IS happening (sweep) but it's not a real
+  // problem — AI is processing normally.
   if (healthVerb && healthVerb.kind === 'abandoned_backlog') {
     var abN = healthVerb.stuck_count || 0;
-    var abLastSecs = healthVerb.last_decision_secs_ago || 0;
-    var lastMin = Math.max(1, Math.floor(abLastSecs / 60));
     return {
       state: 'abandoned_backlog',
       maxSeverity: 'medium',
       heroClass: 'status-hero alert-medium',
       heroIcon: '🧹',
-      heroTitle: 'AI Protection Active',
-      heroSub: abN + ' earlier incident' + (abN === 1 ? '' : 's') +
-        ' abandoned without decision. Recovery pass will sweep them shortly. ' +
-        'AI is currently processing — last decision ' + lastMin + ' min ago.',
+      heroTitle: 'Cleaning up old backlog',
+      heroSub: abN + ' threat' + (abN === 1 ? '' : 's') +
+        ' from earlier without a decision. Auto-cleanup runs every 10 minutes. ' +
+        'Current protection is unaffected.',
       healthAlertReasons: []
     };
   }
@@ -221,18 +218,26 @@ function computeHomeState(payload) {
   // count on the Threats tab (which dedupes by attacker IP). Fallback
   // to safely_resolved (incident-count) for back-compat with older
   // backends that don't yet emit handled_ips_today.
+  // Phase 9: plain-English copy answering "are you safe right now?"
+  // No jargon. Hero verb adapts to the operator's day.
   var handled = (overview.handled_ips_today != null ? overview.handled_ips_today : (overview.safely_resolved || 0));
-  var unit = handled === 1 ? 'attacker' : 'attackers';
-  var subText = handled > 0
-    ? handled + ' ' + unit + ' handled today. AI is on shift.'
-    : 'All systems monitoring. Nothing requires your attention.';
+  var heroTitle;
+  var subText;
+  if (handled === 0) {
+    heroTitle = 'All clear';
+    subText = 'Nothing suspicious today.';
+  } else {
+    heroTitle = 'You are protected';
+    var unit = handled === 1 ? 'break-in attempt' : 'break-in attempts';
+    subText = handled + ' ' + unit + ' today, all stopped.';
+  }
 
   return {
     state: 'protection_active',
     maxSeverity: 'info',
     heroClass: 'status-hero alert-info',
-    heroIcon: '\uD83D\uDEE1',
-    heroTitle: 'AI Protection Active',
+    heroIcon: '✅',
+    heroTitle: heroTitle,
     heroSub: subText,
     healthAlertReasons: []
   };
@@ -328,70 +333,140 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
 // When `snapshot` is missing (legacy KG fallback path or sleep mode)
 // we render the old single-number layout from the flat fields, so
 // existing tests and pre-Phase-7 deployments don't crash.
+// Phase 9 (2026-04-29 UX redesign): renamed to make intent obvious.
+// The Home page no longer has 3 KPI tiles — it has a narrative
+// summary pyramid that answers "what happened today?" in 4 lines
+// from raw activity volume down to the only thing operator action
+// is required on. Plain English on every line; SOC jargon
+// ("Detections", "Handled") replaced with verbs anyone reads.
 function updateHomeKpis(overview, totalEventsScanned) {
-  var snap = overview && overview.snapshot;
-  var threatsEl = document.getElementById('homeKpiThreats');
-  var respondedEl = document.getElementById('homeKpiResponded');
-  var eventsEl = document.getElementById('homeKpiEvents');
-  var threatsPair = document.getElementById('homeKpiThreatsPair');
-  var respondedPair = document.getElementById('homeKpiRespondedPair');
-  var eventsPair = document.getElementById('homeKpiEventsPair');
+  updateHomeSummary(overview, totalEventsScanned);
+}
 
+// Render the summary pyramid: 4 main lines (watched / flagged /
+// acted / awaiting) plus 4 sub-rows breaking down the action types.
+// Each line is operator-readable in isolation; the pyramid as a
+// whole tells the funnel story (13K events -> 29 incidents -> 26
+// attackers acted on -> 0 awaiting) without forcing the operator
+// to do mental math across separate tiles.
+function updateHomeSummary(overview, totalEventsScanned) {
+  var snap = overview && overview.snapshot;
+
+  // Line 1 — Watched.
+  var watched = 0;
   if (snap) {
-    // Handled = blocked + observing + honeypot (operator-action buckets).
-    // Render attackers (unique IPs) as the hero number; incidents as
-    // the supporting line.
-    var handledAttackers =
+    watched = snap.events_today || totalEventsScanned || overview.events_count || 0;
+  } else {
+    watched = totalEventsScanned || overview.events_count || 0;
+  }
+  setText('homeSummaryWatched', formatBigNumber(watched));
+
+  // Line 2 — Flagged.
+  var flaggedAttackers = 0;
+  var flaggedIncidents = 0;
+  if (snap) {
+    flaggedAttackers =
+      (snap.buckets.blocked.unique_attackers || 0) +
+      (snap.buckets.observing.unique_attackers || 0) +
+      (snap.buckets.honeypot.unique_attackers || 0) +
+      (snap.buckets.attention.unique_attackers || 0) +
+      (snap.buckets.allowlisted.unique_attackers || 0);
+    flaggedIncidents =
+      (snap.buckets.blocked.incidents || 0) +
+      (snap.buckets.observing.incidents || 0) +
+      (snap.buckets.honeypot.incidents || 0) +
+      (snap.buckets.attention.incidents || 0) +
+      (snap.buckets.allowlisted.incidents || 0);
+  } else {
+    flaggedAttackers = overview.handled_ips_today || 0;
+    flaggedIncidents = overview.incidents_count || 0;
+  }
+  setText('homeSummaryFlagged', flaggedAttackers);
+  setText(
+    'homeSummaryFlaggedUnit',
+    flaggedAttackers === 1 ? 'attacker' : 'attackers'
+  );
+  var flaggedHint = '';
+  if (flaggedAttackers > 0) {
+    flaggedHint = 'Across ' + flaggedIncidents + ' separate ' +
+      (flaggedIncidents === 1 ? 'incident' : 'incidents') + '.';
+  } else {
+    flaggedHint = 'Nothing suspicious today.';
+  }
+  setText('homeSummaryFlaggedHint', flaggedHint);
+
+  // Line 3 — Acted.
+  var actedAttackers = 0;
+  var blockedAttackers = 0;
+  var watchingAttackers = 0;
+  var honeypotAttackers = 0;
+  var allowlistedAttackers = 0;
+  if (snap) {
+    actedAttackers =
       (snap.buckets.blocked.unique_attackers || 0) +
       (snap.buckets.observing.unique_attackers || 0) +
       (snap.buckets.honeypot.unique_attackers || 0);
-    var handledIncidents =
-      (snap.buckets.blocked.incidents || 0) +
-      (snap.buckets.observing.incidents || 0) +
-      (snap.buckets.honeypot.incidents || 0);
-    if (threatsEl) threatsEl.textContent = handledAttackers;
-    if (threatsPair) threatsPair.textContent = handledIncidents + (handledIncidents === 1 ? ' action' : ' actions');
-
-    // Detections = total qualifying incidents today (sum across all
-    // operator-relevant buckets except dismissed). Hero number is the
-    // unique-attacker count to match the Threats list group counts.
-    var detectionAttackers =
-      handledAttackers +
-      (snap.buckets.attention.unique_attackers || 0) +
-      (snap.buckets.allowlisted.unique_attackers || 0);
-    var detectionIncidents =
-      handledIncidents +
-      (snap.buckets.attention.incidents || 0) +
-      (snap.buckets.allowlisted.incidents || 0);
-    if (respondedEl) respondedEl.textContent = detectionAttackers;
-    if (respondedPair) respondedPair.textContent =
-      detectionIncidents + (detectionIncidents === 1 ? ' incident' : ' incidents');
-
-    // Events Scanned: comes from telemetry (sensor counter), date-
-    // filtered. No secondary unit — it's already operator-clear.
-    var evTotal = snap.events_today || totalEventsScanned || overview.events_count || 0;
-    if (eventsEl) eventsEl.textContent = formatBigNumber(evTotal);
-    if (eventsPair) eventsPair.textContent = '';
+    blockedAttackers = snap.buckets.blocked.unique_attackers || 0;
+    watchingAttackers = snap.buckets.observing.unique_attackers || 0;
+    honeypotAttackers = snap.buckets.honeypot.unique_attackers || 0;
+    allowlistedAttackers = snap.buckets.allowlisted.unique_attackers || 0;
   } else {
-    // Legacy path: single-number tiles, no secondary line.
-    if (threatsEl) threatsEl.textContent = overview.safely_resolved || 0;
-    if (respondedEl) respondedEl.textContent = overview.incidents_count || 0;
-    var fallbackTotal = totalEventsScanned || overview.events_count || 0;
-    if (eventsEl) eventsEl.textContent = formatBigNumber(fallbackTotal);
-    if (threatsPair) threatsPair.textContent = '';
-    if (respondedPair) respondedPair.textContent = '';
-    if (eventsPair) eventsPair.textContent = '';
+    actedAttackers = overview.handled_ips_today || 0;
   }
+  setText('homeSummaryActed', actedAttackers);
+  setText('homeSummaryBlocked', blockedAttackers);
+  setText('homeSummaryWatching', watchingAttackers);
+  setText('homeSummaryHoneypot', honeypotAttackers);
+  setText('homeSummaryTrusted', allowlistedAttackers);
+  var actedHint = '';
+  if (actedAttackers > 0 && flaggedAttackers > 0) {
+    var pct = Math.round((actedAttackers / flaggedAttackers) * 100);
+    actedHint = pct + '% of suspicious activity was handled automatically.';
+  }
+  setText('homeSummaryActedHint', actedHint);
 
-  // Fixed sub-labels: Today / Today / Live (today)
-  setKpiWindow('homeKpiThreatsWindow',   formatWindow('today'));
-  setKpiWindow('homeKpiRespondedWindow', formatWindow('today'));
-  setKpiWindow('homeKpiEventsWindow',    'Live (today)');
+  // Line 4 — Awaiting.
+  var awaiting = 0;
+  if (snap) {
+    awaiting = snap.buckets.attention.unique_attackers || 0;
+  } else {
+    awaiting = overview.attention_count || 0;
+  }
+  setText('homeSummaryAwaiting', awaiting);
+  var awaitingHint = '';
+  var attentionRow = document.getElementById('homeSummaryAttentionRow');
+  if (awaiting > 0) {
+    awaitingHint = (awaiting === 1 ? 'This attacker' : 'These attackers') +
+      ' need your judgement — open Threats to review.';
+    if (attentionRow) attentionRow.classList.add('summary-row-needs-review');
+  } else {
+    awaitingHint = 'Nothing right now.';
+    if (attentionRow) attentionRow.classList.remove('summary-row-needs-review');
+  }
+  setText('homeSummaryAwaitingHint', awaitingHint);
 
-  // Phase 7: pending breakdown panel — visible only when there is
-  // pending work to look at. Hidden in the steady state so the Home
-  // view stays clean.
+  // Time scope: "since midnight UTC (last 14h)" — shows both the
+  // anchor (UTC midnight, since that's what the backend filters by)
+  // and the elapsed time so the operator knows how much of the day
+  // has been observed. Ambiguous "Today" was the audit feedback.
+  var elapsed = computeElapsedHoursUtc();
+  var elapsedText = elapsed >= 1
+    ? 'since midnight UTC · last ' + elapsed + 'h'
+    : 'since midnight UTC';
+  setText('homeSummaryWindow', elapsedText);
+
+  // Phase 9: pending breakdown panel still appears when total>0,
+  // but with plain-English labels rendered from the snapshot.
   updatePendingPanel(snap);
+}
+
+function computeElapsedHoursUtc() {
+  var now = new Date();
+  var midnightUtc = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0
+  ));
+  var ms = now.getTime() - midnightUtc.getTime();
+  return Math.max(0, Math.floor(ms / (3600 * 1000)));
 }
 
 function formatBigNumber(total) {
@@ -430,24 +505,25 @@ function updatePendingPanel(snap) {
   // time stuck>0, which gave false alarms whenever the AI was
   // healthily processing the steady stream.
   var hint = '';
+  // Phase 9: hint copy in plain English. The variant identifies the
+  // ONE thing the operator should know — not all four numbers in
+  // SOC-jargon prose.
   var hintHealth = snap && snap.health;
   if (hintHealth && hintHealth.kind === 'ai_not_responding') {
     var hintLast = hintHealth.last_decision_secs_ago;
     var hintLastPart = (hintLast == null)
-      ? 'no decisions today'
-      : 'last decision ' + Math.floor(hintLast / 60) + ' min ago';
-    hint = pending.stuck + ' incident' + (pending.stuck === 1 ? '' : 's') +
-      ' stuck >1h, ' + hintLastPart + ' — AI provider/classifier likely down.';
+      ? 'no decisions yet today'
+      : 'last decision ' + Math.floor(hintLast / 60) + ' minutes ago';
+    hint = 'AI stopped responding (' + hintLastPart + '). Check the agent logs.';
   } else if (hintHealth && hintHealth.kind === 'abandoned_backlog') {
-    hint = pending.stuck + ' incident' + (pending.stuck === 1 ? '' : 's') +
-      ' abandoned earlier (deploy-orphan or AI skip). Orphan recovery pass ' +
-      'will auto-dismiss them shortly. AI is processing normally.';
+    hint = pending.stuck + ' threat' + (pending.stuck === 1 ? '' : 's') +
+      ' without a decision yet. The system will auto-clean within 10 minutes.';
   } else if (pending.declined_by_ai > 0) {
-    hint = pending.declined_by_ai + ' incident' +
+    hint = pending.declined_by_ai + ' threat' +
       (pending.declined_by_ai === 1 ? '' : 's') +
-      ' need operator triage (AI declined to decide).';
+      ' need your judgement.';
   } else if (pending.in_flight > 50) {
-    hint = pending.in_flight + ' incidents in flight — AI is catching up.';
+    hint = 'Heavy attack volume. AI is catching up — give it a few minutes.';
   }
   var hintEl = document.getElementById('homePendingHint');
   if (hintEl) hintEl.textContent = hint;

@@ -1236,6 +1236,111 @@
     .threat-group.outcome-allowlisted .threat-group-header {
       background: rgba(168, 124, 240, 0.06);
     }
+
+    /* Phase 9 (2026-04-29 UX redesign): summary pyramid. Replaces the
+       3-tile/6-number KPI row with a narrative funnel that tells the
+       operator the story top-to-bottom in plain English. Each row
+       has a verb (watched / flagged / acted on / awaiting), a number,
+       a unit, and a short explanation. Sub-rows breakdown the action
+       types (blocked / watching / honeypot / trusted). The "awaiting"
+       row turns amber when count > 0 to draw the eye to the only
+       line that may need operator action. */
+    .summary-pyramid {
+      list-style: none;
+      padding: 0;
+      margin: 8px 0 0 0;
+    }
+    .summary-row {
+      display: grid;
+      grid-template-columns: 28px auto 1fr;
+      align-items: baseline;
+      padding: 8px 4px;
+      gap: 12px;
+      cursor: pointer;
+      border-radius: 8px;
+      transition: background 0.12s;
+    }
+    .summary-row:hover {
+      background: rgba(120, 229, 255, 0.04);
+    }
+    .summary-row-divider {
+      height: 1px;
+      background: var(--line);
+      margin: 6px 0;
+      border-radius: 0;
+      cursor: default;
+    }
+    .summary-row-divider:hover { background: var(--line); }
+    .summary-row-attention {
+      /* Default: subtle line. When .summary-row-needs-review fires,
+         the row goes amber so the eye lands here. */
+    }
+    .summary-row-needs-review {
+      background: rgba(244, 180, 0, 0.08);
+      border-left: 3px solid rgba(244, 180, 0, 0.5);
+      padding-left: 5px; /* compensate for border */
+    }
+    .summary-icon {
+      font-size: 1.0rem;
+      line-height: 1.4;
+    }
+    .summary-text {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .summary-line-label {
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .summary-line-num {
+      font-size: 1.55rem;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.0;
+      letter-spacing: -0.01em;
+    }
+    .summary-line-unit {
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+    .summary-explain {
+      font-size: 0.68rem;
+      color: var(--dim);
+      grid-column: 2 / -1;
+      margin-top: 2px;
+      font-style: italic;
+    }
+    .summary-sub-row {
+      display: grid;
+      grid-template-columns: 24px 1fr 50px;
+      align-items: center;
+      padding: 4px 8px 4px 32px; /* indent under the parent acted row */
+      gap: 8px;
+      cursor: pointer;
+      font-size: 0.74rem;
+      color: var(--text);
+      border-radius: 6px;
+      transition: background 0.12s;
+    }
+    .summary-sub-row:hover {
+      background: rgba(120, 229, 255, 0.04);
+    }
+    .summary-icon-small {
+      font-size: 0.78rem;
+      opacity: 0.85;
+    }
+    .summary-text-small {
+      color: var(--muted);
+    }
+    .summary-line-num-small {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+      text-align: right;
+    }
     .pulse-dot.contained { background: var(--ok); animation: none; }
     .responsive-table { display:block; overflow-x:auto; -webkit-overflow-scrolling:touch; }
     .responsive-table table { min-width:600px; }
