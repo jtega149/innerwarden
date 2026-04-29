@@ -277,7 +277,18 @@ impl PidTracker {
                     "proximity": prox,
                     "matched_bits": matched,
                     "missing_bits": missing,
-                    "timeline": timeline_json
+                    "timeline": timeline_json,
+                    // Phase 11 (audit RC-2 / Slice C+): expose the
+                    // process identity in structured form so the
+                    // agent's self-traffic filter can dismiss
+                    // false positives where the "attacker" is
+                    // actually the operator's own ssh / scp / apt /
+                    // snap. Pre-Phase-11 these fields lived only in
+                    // the title and recommended_checks strings,
+                    // forcing string parsing in the filter.
+                    "pid": pid,
+                    "comm": state.comm,
+                    "uid": state.uid,
                 });
 
                 if c2.is_some() {
@@ -372,7 +383,14 @@ impl PidTracker {
                     "pattern": pattern_upper,
                     "chain_flags": chain_flags_hex,
                     "chain_bits": matched,
-                    "timeline": timeline_json
+                    "timeline": timeline_json,
+                    // Phase 11 (audit RC-2 / Slice C+): structured
+                    // process identity so downstream filters (self-
+                    // traffic FP, operator-session FP) can act on
+                    // typed fields instead of parsing the title.
+                    "pid": pid,
+                    "comm": state.comm,
+                    "uid": uid,
                 });
 
                 if c2.is_some() {

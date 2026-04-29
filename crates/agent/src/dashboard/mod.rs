@@ -982,6 +982,39 @@ mod tests {
     }
 
     #[test]
+    fn index_html_uses_lucide_svg_icons_not_emoji() {
+        // Phase 11B (2026-04-29): the Home pyramid icons match the
+        // marketing site's lucide-react set. Anchor that the inline
+        // SVG paths are bundled so a future "simplification" back to
+        // emoji is caught at build time.
+        // Activity icon (📡 watched): unique polyline points string.
+        assert!(INDEX_HTML.contains("polyline points=\"22 12 18 12 15 21 9 3 6 12 2 12\""));
+        // ShieldCheck icon (🛡️ acted): the inner check mark path.
+        assert!(INDEX_HTML.contains("m9 12 2 2 4-4"));
+        // Eye icon (👁️ watching).
+        assert!(INDEX_HTML.contains("M2.062 12.348"));
+        // Bug icon (🍯 honeypot).
+        assert!(INDEX_HTML.contains("M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"));
+        // Handshake icon (🤝 trusted).
+        assert!(INDEX_HTML.contains("m11 17 2 2a1 1 0 1 0 3-3"));
+        // Emojis must NOT remain in the summary pyramid block.
+        // (They may appear elsewhere in the file — search inside
+        // the pyramid block specifically.)
+        let pyramid_start = INDEX_HTML.find("summary-pyramid").expect("pyramid present");
+        let pyramid_end = INDEX_HTML[pyramid_start..]
+            .find("homePendingPanel")
+            .expect("panel after pyramid")
+            + pyramid_start;
+        let pyramid = &INDEX_HTML[pyramid_start..pyramid_end];
+        for emoji in ["📡", "🎯", "🛡️", "⛔", "👁️", "🍯", "🤝", "⚠️"] {
+            assert!(
+                !pyramid.contains(emoji),
+                "emoji {emoji} still in summary pyramid after Phase 11B"
+            );
+        }
+    }
+
+    #[test]
     fn app_css_defines_summary_pyramid_styles() {
         assert!(APP_CSS.contains(".summary-pyramid"));
         assert!(APP_CSS.contains(".summary-row"));

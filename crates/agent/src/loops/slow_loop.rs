@@ -838,6 +838,20 @@ pub(crate) async fn process_narrative_tick(
             &kc_incidents,
             &state.operator_ips,
         );
+        // Phase 11A (audit RC-2 / 2026-04-29): self-traffic FP filter.
+        // Catches the apt/snap-update + ssh-jump class of false
+        // positives that the operator-session filter doesn't cover
+        // because the c2_ip is a cloud-provider destination, not the
+        // operator's laptop. Process identity (comm/uid) is what we
+        // key on — apt running as root or ssh running as ubuntu uid
+        // get auto-dismissed; an attacker exploiting a service
+        // account (uid 1-999) running ssh / curl still goes to the
+        // AI router for a real decision.
+        crate::killchain_inline::dismiss_self_traffic_incidents(
+            data_dir,
+            state.sqlite_store.as_ref(),
+            &kc_incidents,
+        );
         let gate_counter = state.telemetry.gate_suppressed_counter();
         killchain_inline::notify_telegram(
             &state.telegram_client,

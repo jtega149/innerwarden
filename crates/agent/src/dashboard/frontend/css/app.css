@@ -1281,9 +1281,24 @@
       padding-left: 5px; /* compensate for border */
     }
     .summary-icon {
-      font-size: 1.0rem;
-      line-height: 1.4;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      color: var(--accent);
     }
+    .summary-icon svg {
+      width: 20px;
+      height: 20px;
+      stroke: currentColor;
+      flex-shrink: 0;
+    }
+    /* Per-row colour cues so each verb has its own visual identity. */
+    .summary-row:nth-child(1) .summary-icon { color: var(--accent); }
+    .summary-row:nth-child(2) .summary-icon { color: var(--warn, #f4d35e); }
+    .summary-row:nth-child(3) .summary-icon { color: var(--ok); }
+    .summary-row-attention .summary-icon { color: var(--danger); }
     .summary-text {
       display: flex;
       align-items: baseline;
@@ -1329,9 +1344,23 @@
       background: rgba(120, 229, 255, 0.04);
     }
     .summary-icon-small {
-      font-size: 0.78rem;
-      opacity: 0.85;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      color: var(--muted);
     }
+    .summary-icon-small svg {
+      width: 14px;
+      height: 14px;
+      stroke: currentColor;
+    }
+    /* Sub-row colour cues by index (Blocked / Watching / Honeypot / Trusted). */
+    .summary-sub-row:nth-of-type(5) .summary-icon-small { color: var(--ok); }       /* blocked */
+    .summary-sub-row:nth-of-type(6) .summary-icon-small { color: var(--accent); }   /* watching */
+    .summary-sub-row:nth-of-type(7) .summary-icon-small { color: var(--orange, #ff8c42); } /* honeypot */
+    .summary-sub-row:nth-of-type(8) .summary-icon-small { color: #a87cf0; }         /* trusted */
     .summary-text-small {
       color: var(--muted);
     }

@@ -162,14 +162,22 @@ pub(crate) fn dismiss_operator_session_incidents(
         return;
     }
     for inc in incidents {
-        // Pull the c2_ip from the killchain evidence (the "target"
-        // remote IP of the suspected exfil). If it's not in the
-        // operator session map, leave the incident alone — the
-        // standard pipeline will handle it.
-        let target_ip = inc
-            .get("evidence")
-            .and_then(|e| e.get("c2_ip"))
-            .and_then(|v| v.as_str());
+        // Phase 11 fix: the killchain tracker emits `evidence` as an
+        // array containing one object (`evidence: [{...}]`). The
+        // pre-Phase-11 read tried `.get("evidence").get("c2_ip")`
+        // which works only when evidence is an object — silently
+        // returning None on the real array schema. Net effect: the
+        // operator-session FP dismiss never fired in prod for the
+        // 2 weeks since Phase 7B shipped. The helper below reads
+        // both shapes (array-of-one and bare object) to keep the
+        // dismiss compatible with any tracker variant that lands.
+        let evidence_obj = inc.get("evidence").and_then(|e| match e {
+            serde_json::Value::Array(arr) => arr.first(),
+            obj @ serde_json::Value::Object(_) => Some(obj),
+            _ => None,
+        });
+        let Some(ev) = evidence_obj else { continue };
+        let target_ip = ev.get("c2_ip").and_then(|v| v.as_str());
         let Some(target_ip) = target_ip else { continue };
         if !operator_ips.contains_key(target_ip) {
             continue;
@@ -182,11 +190,7 @@ pub(crate) fn dismiss_operator_session_incidents(
         if incident_id.is_empty() {
             continue;
         }
-        let pattern = inc
-            .get("evidence")
-            .and_then(|e| e.get("pattern"))
-            .and_then(|p| p.as_str())
-            .unwrap_or("?");
+        let pattern = ev.get("pattern").and_then(|p| p.as_str()).unwrap_or("?");
         let entry = crate::decisions::DecisionEntry {
             ts: chrono::Utc::now(),
             incident_id: incident_id.to_string(),
@@ -215,6 +219,148 @@ pub(crate) fn dismiss_operator_session_incidents(
                 incident_id = %incident_id,
                 error = %e,
                 "killchain: failed to write operator-session-fp dismiss decision"
+            );
+        }
+    }
+}
+
+/// Phase 11 (audit RC-2 / 2026-04-29 Slice C+): kill chain incidents
+/// where the process making the socket is a well-known operator or
+/// system tool (`ssh`, `scp`, `rsync`, `apt`, `snap`, etc.) running
+/// under a regular-user uid (>=1000) are auto-dismissed inline. This
+/// is the "Microsoft Azure outbound apt update" class of false
+/// positives that surfaced post-Phase-7 — the agent's own apt/snap
+/// update process trips `socket+sensitive_read` against legitimate
+/// cloud destinations and the dashboard reports them as DATA_EXFIL.
+///
+/// The dismiss carries `ai_provider="self-traffic-fp"` and a reason
+/// explaining the process+uid match so the audit log makes the call
+/// visible. The operator can grep decisions for this provider to
+/// audit all auto-dismissed false positives over time.
+///
+/// Heuristic — process is "self-traffic-class" when:
+/// 1. comm is in `SELF_TRAFFIC_COMMS` (operator/system tools), AND
+/// 2. uid >= 1000 (regular operator) OR uid == 0 (root, system tool)
+///
+/// Anything else stays for the AI router to decide.
+const SELF_TRAFFIC_COMMS: &[&str] = &[
+    // Operator-driven outbound tooling: SSH jumps, file copies, git ops, package managers.
+    "ssh",
+    "scp",
+    "sftp",
+    "rsync",
+    "git",
+    "git-remote-", // git-remote-https etc (truncated form)
+    "curl",
+    "wget",
+    // System package management & daemons that legitimately do
+    // socket + sensitive_read against cloud / mirror endpoints.
+    "apt",
+    "apt-get",
+    "snap",
+    "snapd",
+    "systemd-resolv",  // truncated systemd-resolved
+    "systemd-network", // truncated systemd-networkd
+    "chronyd",
+    "ntpd",
+    "fwupdmgr",
+    "unattended-upgr", // truncated unattended-upgrade
+    "needrestart",
+    // Cloud-init / systemd helpers that fetch metadata at boot.
+    "cloud-init",
+];
+
+pub(crate) fn dismiss_self_traffic_incidents(
+    data_dir: &Path,
+    sqlite_store: Option<&std::sync::Arc<innerwarden_store::Store>>,
+    incidents: &[serde_json::Value],
+) {
+    if incidents.is_empty() {
+        return;
+    }
+    for inc in incidents {
+        // Pull comm + uid from the structured evidence (Phase 11
+        // schema bump in `crates/killchain`). Bail on missing fields
+        // so a future schema change doesn't silently mis-dismiss.
+        let evidence = inc.get("evidence").and_then(|v| v.as_array());
+        let Some(evidence_arr) = evidence else {
+            continue;
+        };
+        let Some(ev) = evidence_arr.first() else {
+            continue;
+        };
+        let comm = ev.get("comm").and_then(|v| v.as_str()).unwrap_or("");
+        let uid = ev.get("uid").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+        let pid = ev.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+        let pattern = ev
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let c2_ip = ev
+            .get("c2_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if comm.is_empty() {
+            continue;
+        }
+
+        // Self-traffic check: comm matches a known operator/system
+        // tool; uid must be either root (system services) or a
+        // regular user (operator). Reject service-account uids in
+        // the 1-999 range (web servers etc) — those running ssh /
+        // curl deserve a real AI decision.
+        let comm_match = SELF_TRAFFIC_COMMS
+            .iter()
+            .any(|prefix| comm == *prefix || comm.starts_with(prefix));
+        if !comm_match {
+            continue;
+        }
+        let uid_ok = uid == 0 || uid >= 1000;
+        if !uid_ok {
+            continue;
+        }
+
+        let incident_id = inc
+            .get("incident_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if incident_id.is_empty() {
+            continue;
+        }
+        let entry = crate::decisions::DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: incident_id.to_string(),
+            host: std::env::var("HOSTNAME")
+                .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+                .unwrap_or_else(|_| "unknown".to_string()),
+            ai_provider: "self-traffic-fp".to_string(),
+            action_type: "dismiss".to_string(),
+            target_ip: if c2_ip.is_empty() {
+                None
+            } else {
+                Some(c2_ip.clone())
+            },
+            target_user: None,
+            skill_id: None,
+            confidence: 1.0,
+            auto_executed: true,
+            dry_run: false,
+            reason: format!(
+                "Auto-dismissed: kill chain {pattern} target {c2_ip} fired by process \
+                 {comm} (PID {pid}, UID {uid}). {comm} is a known operator/system tool, \
+                 not attacker activity (apt/snap update, ssh jump, git fetch, etc)."
+            ),
+            estimated_threat: "none".to_string(),
+            execution_result: "dismissed".to_string(),
+            prev_hash: None,
+        };
+        if let Err(e) = crate::decisions::append_chained(data_dir, &entry, sqlite_store) {
+            warn!(
+                incident_id = %incident_id,
+                error = %e,
+                "killchain: failed to write self-traffic-fp dismiss decision"
             );
         }
     }
@@ -398,6 +544,39 @@ mod tests {
     }
 
     #[test]
+    fn dismiss_operator_session_handles_array_evidence_from_tracker() {
+        // The killchain tracker emits `evidence: [{...}]` (array of
+        // one object). Pre-Phase-11 the dismiss helper read from
+        // object-shape evidence and silently failed on array data,
+        // so the operator-session FP never fired in prod for 2 weeks
+        // after Phase 7B was deployed. This anchor pins the
+        // array-shape read path so the regression is caught at
+        // build time if the read regresses.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:1234:2026-04-29T15:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "20.26.156.215",
+                "pid": 1234,
+                "comm": "ssh",
+                "uid": 1001,
+            }]
+        })];
+        let mut operator_ips = std::collections::HashMap::new();
+        operator_ips.insert("20.26.156.215".to_string(), std::time::Instant::now());
+        dismiss_operator_session_incidents(tmp.path(), Some(&store), &incidents, &operator_ips);
+        assert_eq!(
+            store.decisions_count().unwrap(),
+            1,
+            "array-shape evidence must be read correctly"
+        );
+    }
+
+    #[test]
     fn dismiss_operator_session_is_noop_when_inputs_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let store =
@@ -415,6 +594,126 @@ mod tests {
         let empty_ops: std::collections::HashMap<String, std::time::Instant> =
             std::collections::HashMap::new();
         dismiss_operator_session_incidents(tmp.path(), Some(&store), &incidents, &empty_ops);
+        assert_eq!(store.decisions_count().unwrap(), 0);
+    }
+
+    // ── Phase 11A: self-traffic FP anchors ────────────────────────────
+    //
+    // dismiss_self_traffic_incidents must (1) write a dismiss when
+    // comm matches a self-traffic tool with operator uid, (2) skip
+    // incidents whose process is unknown / a service account, (3)
+    // be a no-op on incidents missing structured pid/comm/uid in
+    // evidence (forward-compatibility with older tracker schemas).
+
+    #[test]
+    fn dismiss_self_traffic_writes_dismiss_for_apt_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:1234:2026-04-29T10:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "20.26.156.215",
+                "pid": 1234,
+                "comm": "apt",
+                "uid": 0,
+            }]
+        })];
+        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        assert_eq!(store.decisions_count().unwrap(), 1);
+        let decisions = store
+            .decisions_for_incident("kill_chain:detected:DATA_EXFIL:1234:2026-04-29T10:00Z")
+            .unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&decisions[0]).unwrap();
+        assert_eq!(decoded["action_type"], "dismiss");
+        assert_eq!(decoded["ai_provider"], "self-traffic-fp");
+    }
+
+    #[test]
+    fn dismiss_self_traffic_writes_dismiss_for_ssh_operator_uid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:5678:2026-04-29T11:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "203.0.113.50",
+                "pid": 5678,
+                "comm": "ssh",
+                "uid": 1001,
+            }]
+        })];
+        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        assert_eq!(store.decisions_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn dismiss_self_traffic_skips_unknown_comm() {
+        // A process that's not in SELF_TRAFFIC_COMMS must NOT be
+        // dismissed — needs to go to the AI router for a real call.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:9999:2026-04-29T12:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "203.0.113.99",
+                "pid": 9999,
+                "comm": "evil_tool",
+                "uid": 1001,
+            }]
+        })];
+        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        assert_eq!(store.decisions_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn dismiss_self_traffic_skips_service_account_uid() {
+        // A web server (uid 33 / www-data) running ssh is NOT typical
+        // operator activity — could be lateral movement via stolen
+        // shell. Don't auto-dismiss.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:7777:2026-04-29T13:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "203.0.113.20",
+                "pid": 7777,
+                "comm": "ssh",
+                "uid": 33,
+            }]
+        })];
+        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        assert_eq!(store.decisions_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn dismiss_self_traffic_skips_incidents_without_structured_evidence() {
+        // Forward-compat: an incident from an older killchain version
+        // without comm/uid/pid in evidence must NOT be dismissed
+        // blindly. AI router handles it.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:1111:2026-04-29T14:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "203.0.113.5",
+                // No pid/comm/uid — older schema.
+            }]
+        })];
+        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
         assert_eq!(store.decisions_count().unwrap(), 0);
     }
 
