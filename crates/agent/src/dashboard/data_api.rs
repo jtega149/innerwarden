@@ -430,13 +430,87 @@ pub(super) fn compute_overview_counts_from_sqlite(
     }
     counts.handled_ips_today = handled_ips.len();
 
-    // Finalise per-bucket unique-attacker counts.
-    buckets.blocked.unique_attackers = bucket_attackers_blocked.len();
-    buckets.observing.unique_attackers = bucket_attackers_observing.len();
-    buckets.honeypot.unique_attackers = bucket_attackers_honeypot.len();
-    buckets.dismissed.unique_attackers = bucket_attackers_dismissed.len();
-    buckets.allowlisted.unique_attackers = bucket_attackers_allowlisted.len();
-    buckets.attention.unique_attackers = bucket_attackers_attention.len();
+    // Phase 10 (2026-04-29): unify the attacker-count semantic across
+    // every dashboard surface. Pre-Phase-10 this function emitted
+    // per-bucket sets where the same IP could appear in multiple
+    // buckets (one IP with mixed block_ip + dismiss decisions ended up
+    // in BOTH buckets). The Threats list, on the other hand, used
+    // `aggregate_outcomes` precedence to assign each IP to exactly
+    // ONE bucket. Three surfaces showed three different "blocked"
+    // numbers for the same data — operator-visible bug.
+    //
+    // The fix: count per-IP aggregate outcome, the same way the
+    // Threats list does. Each IP appears in exactly one bucket.
+    // Sums-to-total of all bucket attackers = total unique IPs today.
+    // Now Home pyramid + Threats list groups + top header tiles all
+    // show the same numbers by construction.
+    let mut ip_outcomes: std::collections::HashMap<String, Vec<&'static str>> =
+        std::collections::HashMap::new();
+    let mut ip_allowlisted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in &decoded {
+        if row.is_allowlisted {
+            for ip in &row.external_ips {
+                ip_allowlisted.insert(ip.clone());
+            }
+            continue;
+        }
+        let outcome =
+            super::threat_contract::classify_decision(row.action_type.as_deref(), Some("ok"));
+        for ip in &row.external_ips {
+            ip_outcomes.entry(ip.clone()).or_default().push(outcome);
+        }
+    }
+    // Walk per-IP, derive aggregate outcome via the same precedence
+    // the Threats list uses, increment that bucket's counter once.
+    for (ip, outcomes) in &ip_outcomes {
+        if ip_allowlisted.contains(ip) {
+            // Allowlisted-precedence override: IP shows up in the
+            // allowlisted group regardless of other incident outcomes
+            // it had today (matches build_attackers_from_sqlite).
+            continue;
+        }
+        let aggregate = super::threat_contract::aggregate_outcomes(outcomes.iter().copied());
+        match aggregate {
+            super::threat_contract::OUTCOME_BLOCKED => {
+                buckets.blocked.unique_attackers += 1;
+            }
+            super::threat_contract::OUTCOME_HONEYPOT => {
+                buckets.honeypot.unique_attackers += 1;
+            }
+            super::threat_contract::OUTCOME_MONITORING => {
+                buckets.observing.unique_attackers += 1;
+            }
+            super::threat_contract::OUTCOME_DISMISSED => {
+                buckets.dismissed.unique_attackers += 1;
+            }
+            _ => {
+                buckets.attention.unique_attackers += 1;
+            }
+        }
+    }
+    buckets.allowlisted.unique_attackers = ip_allowlisted.len();
+
+    // The legacy flat counters (blocked_count, observing_count,
+    // attention_count) were ALSO per-incident KPI bucketing. Phase 10
+    // rewrites them to match aggregate-attacker semantics so the top
+    // header tiles agree with the pyramid and the threats list. The
+    // pre-Phase-10 incident-level counts are still available via the
+    // bucket.incidents fields when a power user wants them.
+    counts.blocked_count = buckets.blocked.unique_attackers + buckets.honeypot.unique_attackers;
+    counts.observing_count = buckets.observing.unique_attackers;
+    counts.attention_count = buckets.attention.unique_attackers;
+
+    // Drop the old per-incident attacker sets; they're shadowed by
+    // the aggregate computation above. Keeping the variable names
+    // out of scope past this point would be dead code.
+    let _ = (
+        bucket_attackers_blocked,
+        bucket_attackers_observing,
+        bucket_attackers_honeypot,
+        bucket_attackers_dismissed,
+        bucket_attackers_allowlisted,
+        bucket_attackers_attention,
+    );
 
     // Top detectors built from the same `by_detector` accumulator the
     // legacy flat path uses, so both shapes agree by construction.
@@ -2158,6 +2232,110 @@ mod tests {
         );
         // Severity histogram for the bucket.
         assert_eq!(snap.buckets.blocked.severities.get("high"), Some(&4));
+    }
+
+    #[test]
+    fn sqlite_overview_snapshot_unique_attacker_uses_aggregate_outcome_not_per_incident() {
+        // Phase 10 anchor: when an IP has mixed-outcome incidents
+        // (some blocked, some dismissed), the unique_attackers count
+        // must follow the same aggregate_outcomes precedence the
+        // Threats list uses — each IP appears in EXACTLY ONE bucket.
+        // Pre-Phase-10 the same IP could appear in both buckets,
+        // making the Home pyramid sub-rows disagree with the Threats
+        // list group counts and the top header tiles.
+        let store = make_overview_test_store();
+        let date = "2026-04-29";
+        // IP A: 1 block_ip + 5 dismiss decisions. Aggregate = blocked.
+        // Pre-Phase-10 this IP would have been counted in BOTH the
+        // blocked bucket (1x) and the dismissed bucket (5x).
+        // Post-Phase-10 it counts as 1 in blocked and 0 in dismissed.
+        insert_test_incident(
+            &store,
+            "ssh:bf:A1",
+            "2026-04-29T01:00:00Z",
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.10"),
+        );
+        insert_test_decision(
+            &store,
+            "ssh:bf:A1",
+            "2026-04-29T01:00:01Z",
+            "block_ip",
+            Some("203.0.113.10"),
+        );
+        for i in 0..5 {
+            let id = format!("noise:A:{i}");
+            insert_test_incident(
+                &store,
+                &id,
+                &format!("2026-04-29T0{}:00:00Z", 2 + i),
+                "proto_anomaly",
+                "low",
+                "weird ssh",
+                Some("203.0.113.10"),
+            );
+            insert_test_decision(
+                &store,
+                &id,
+                "2026-04-29T02:00:01Z",
+                "dismiss",
+                Some("203.0.113.10"),
+            );
+        }
+        // IP B: 3 monitor decisions only. Aggregate = monitoring.
+        for i in 0..3 {
+            let id = format!("watch:B:{i}");
+            insert_test_incident(
+                &store,
+                &id,
+                &format!("2026-04-29T0{}:00:00Z", 1 + i),
+                "ssh_bruteforce",
+                "medium",
+                "brute",
+                Some("203.0.113.20"),
+            );
+            insert_test_decision(
+                &store,
+                &id,
+                "2026-04-29T01:00:01Z",
+                "monitor",
+                Some("203.0.113.20"),
+            );
+        }
+
+        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
+            .expect("counts");
+        let snap = counts.snapshot.expect("snap");
+        // IP A is in blocked (precedence override), NOT in dismissed.
+        // IP B is in observing.
+        assert_eq!(snap.buckets.blocked.unique_attackers, 1, "IP A");
+        assert_eq!(snap.buckets.dismissed.unique_attackers, 0, "IP A NOT here");
+        assert_eq!(snap.buckets.observing.unique_attackers, 1, "IP B");
+        // Sum of unique_attackers across buckets = total unique IPs.
+        let total = snap.buckets.blocked.unique_attackers
+            + snap.buckets.honeypot.unique_attackers
+            + snap.buckets.observing.unique_attackers
+            + snap.buckets.dismissed.unique_attackers
+            + snap.buckets.allowlisted.unique_attackers
+            + snap.buckets.attention.unique_attackers;
+        assert_eq!(total, 2, "two unique IPs in total");
+        // Incident counts stay per-outcome (this is the operator's
+        // "actions taken" count, not "attackers").
+        assert_eq!(snap.buckets.blocked.incidents, 1);
+        assert_eq!(snap.buckets.dismissed.incidents, 5);
+        assert_eq!(snap.buckets.observing.incidents, 3);
+        // Legacy flat counters now match the aggregate-attacker
+        // semantic too — they're what the Threats top tiles read.
+        assert_eq!(
+            counts.blocked_count, 1,
+            "matches buckets.blocked.unique_attackers"
+        );
+        assert_eq!(
+            counts.observing_count, 1,
+            "matches buckets.observing.unique_attackers"
+        );
     }
 
     #[test]
