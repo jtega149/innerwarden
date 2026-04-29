@@ -265,7 +265,7 @@ function renderCard(item) {
       </div>
       <div class="card-detectors">${esc(dets)}</div>
       <div class="card-meta">
-        <span class="card-counts">${item.incident_count || 0} inc · ${item.event_count || 0} evt</span>
+        <span class="card-counts">${item.incident_count || 0} inc${(item.event_count || 0) > 0 ? ' · ' + item.event_count + ' evt' : ''}</span>
         <span class="card-time">${ago(item.last_seen)}</span>
       </div>
       ${badges ? `<div class="card-badges">${badges}</div>` : ''}
@@ -419,6 +419,29 @@ function setThreatsDate(date) {
   refreshLeft(true);
 }
 
+// Phase 14 (QA polish, 2026-04-29): KPI tile sub-labels were hardcoded
+// to "Today" but the underlying data is scoped by the `flt-date` picker.
+// When operator picked 2026-04-22 to investigate yesterday's incident,
+// the tiles still read "Today" — misleading. This helper makes the
+// sub-label match the active scope: "Today" when the picker is empty
+// or set to today's UTC date, otherwise the literal YYYY-MM-DD.
+function syncThreatsKpiWindowLabels() {
+  var dateInput = document.getElementById('flt-date');
+  var picked = dateInput ? (dateInput.value || '') : '';
+  var todayStr = new Date().toISOString().slice(0, 10);
+  var label = (picked === '' || picked === todayStr) ? 'Today' : picked;
+  ['kpi-confirmed', 'kpi-responded', 'kpi-noise'].forEach(function(id) {
+    var card = document.getElementById(id);
+    if (!card) return;
+    var win = card.parentElement && card.parentElement.querySelector('.kpi-window');
+    // kpi-responded reads "Now" (live observing) — leave it alone, only
+    // the date-scoped tiles ("Blocked Today" / "Needs attention Today")
+    // need to track the picker.
+    if (!win || win.textContent.trim() === 'Now') return;
+    win.textContent = label;
+  });
+}
+
 function setThreatsPivot(p) {
   // Phase 13 (QA fix #4 follow-up, 2026-04-29): the Phase-12 fix
   // targeted `#journeyPane` (an element that doesn't exist in the
@@ -502,6 +525,7 @@ async function refreshLeftLive() {
     updateKpi('kpi-confirmed', kpiBlocked);
     updateKpi('kpi-responded', kpiObserving);
     updateKpi('kpi-noise',     kpiAttention);
+    syncThreatsKpiWindowLabels();
 
     const list = document.getElementById('attackerList');
     const newItems = items.filter(it => !state.knownItemValues.has(it.value));
@@ -522,7 +546,14 @@ async function refreshLeftLive() {
       );
       if (existing && !newItems.includes(item)) {
         const countEl = existing.querySelector('.card-counts');
-        if (countEl) countEl.textContent = `${item.incident_count} inc · ${item.event_count} ev`;
+        if (countEl) {
+          // Phase 14 (QA polish): hide "0 evt" tail when we have no
+          // event-count data (mirrors renderCard above so the SSE
+          // refresh path doesn't reintroduce the noisy "· 0 evt"
+          // suffix the operator complained about).
+          const evt = item.event_count || 0;
+          countEl.textContent = `${item.incident_count} inc${evt > 0 ? ' · ' + evt + ' evt' : ''}`;
+        }
       }
     }
     if (newItems.length > 0) applyEntitySearch();  // D9: filter newly inserted cards
@@ -597,6 +628,7 @@ async function refreshLeft(forceRefreshJourney = false) {
     setText('kpi-confirmed', kpiBlocked);
     setText('kpi-responded', kpiObserving);
     setText('kpi-noise', kpiAttention);
+    syncThreatsKpiWindowLabels();
     // Spec 037 Threats UX bundle: the kpi-events / kpi-incidents /
     // kpi-attackers / clusterList / topDetectors writes that used to
     // live here targeted DOM nodes that PR #188 already removed. The

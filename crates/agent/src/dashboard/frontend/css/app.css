@@ -250,10 +250,18 @@
       cursor: pointer;
       min-height: 36px;
     }
+    /* Phase 14 (QA polish, 2026-04-29): the previous active state was
+       a 11% accent fill with 35% accent border — visually identical to
+       the inactive hover (6% fill). Operator could not tell which tab
+       was selected without re-clicking. Stronger fill (22%), bolder
+       border (60%), and bold weight on the label so the active tab is
+       unambiguously the selected one. */
     .pivot-tab.active {
       color: var(--accent);
-      border-color: rgba(120, 229, 255, 0.35);
-      background: rgba(120, 229, 255, 0.11);
+      border-color: rgba(120, 229, 255, 0.60);
+      background: rgba(120, 229, 255, 0.22);
+      font-weight: 700;
+      box-shadow: 0 0 0 1px rgba(120, 229, 255, 0.20) inset;
     }
     .pivot-tab:hover:not(.active) {
       background: rgba(120, 229, 255, 0.06);

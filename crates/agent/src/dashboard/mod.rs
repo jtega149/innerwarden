@@ -1023,6 +1023,80 @@ mod tests {
     }
 
     #[test]
+    fn phase_14_qa_polish_anchors_present() {
+        // Phase 14 (QA polish, 2026-04-29): bundle anchors for the six
+        // operator-reported polish fixes. Each one was a small
+        // user-visible behaviour that's easy to break in a future
+        // refactor that doesn't know what the fix was for; pin them.
+
+        // 1. compare-date placeholder + clarifying title (operator
+        //    confused this with the main date picker).
+        assert!(
+            INDEX_HTML.contains("Compare with another date"),
+            "flt-compare-date placeholder must explain the field"
+        );
+
+        // 2. detector autocomplete datalist is wired and seeded.
+        assert!(
+            INDEX_HTML.contains("list=\"detector-options\""),
+            "flt-detector must reference the datalist"
+        );
+        assert!(
+            INDEX_HTML.contains("<datalist id=\"detector-options\">"),
+            "datalist with known detector slugs must be present"
+        );
+        for det in ["ssh_bruteforce", "kill_chain", "honeypot"] {
+            assert!(
+                INDEX_HTML.contains(det),
+                "datalist must include '{det}' detector slug"
+            );
+        }
+
+        // 3. Show-details stopPropagation: the inner button used to
+        //    bubble its click up to the wrapper's showView('sensors'),
+        //    so the operator landed on Sensors instead of expanding
+        //    the inline list.
+        assert!(
+            JS_HOME.contains("event.stopPropagation();toggleCollectorDetails()"),
+            "Show details button must stop the click from bubbling to the wrapper"
+        );
+
+        // 4. Hide "0 evt" tail when event_count is zero. Both render
+        //    paths (initial render and SSE refresh) must respect it.
+        assert!(
+            JS_THREATS.contains("(item.event_count || 0) > 0 ? ' \u{00b7} '"),
+            "renderCard must hide '0 evt' tail when event_count is zero"
+        );
+        assert!(
+            JS_THREATS.contains("evt > 0 ? ' \u{00b7} ' + evt + ' evt' : ''"),
+            "SSE count refresh must hide '0 evt' tail too"
+        );
+
+        // 5. Pivot tab active state contrast bumped so the selected
+        //    tab is visibly distinct from the inactive hover state.
+        assert!(
+            APP_CSS.contains("rgba(120, 229, 255, 0.22)"),
+            "pivot-tab.active must use the stronger 22% accent fill"
+        );
+        assert!(
+            APP_CSS.contains("rgba(120, 229, 255, 0.60)"),
+            "pivot-tab.active must use the bolder 60% accent border"
+        );
+
+        // 6. KPI window labels on Threats track the active flt-date
+        //    so they don't read "Today" while showing yesterday's
+        //    data.
+        assert!(
+            JS_THREATS.contains("syncThreatsKpiWindowLabels"),
+            "helper that re-labels the KPI window strings must exist"
+        );
+        assert!(
+            JS_THREATS.contains("'Today'"),
+            "Today label still used when picker is empty or matches today"
+        );
+    }
+
+    #[test]
     fn app_css_defines_pending_panel_and_allowlisted_outcome() {
         assert!(APP_CSS.contains(".pending-grid"));
         assert!(APP_CSS.contains(".pending-cell-warn"));

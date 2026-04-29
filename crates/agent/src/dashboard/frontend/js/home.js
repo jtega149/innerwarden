@@ -624,7 +624,13 @@ function updateCollectorStrip(sensors) {
 
   var html = '<div class="' + summaryClass + '">' +
     active.length + ' of ' + total + ' data sources active' +
-    ' <button type="button" class="collector-details-toggle" onclick="toggleCollectorDetails()">Show details</button>' +
+    // Phase 14 (QA polish, 2026-04-29): the wrapper section has
+    // onclick="showView('sensors')" so clicking anywhere on the card
+    // navigates away. Without stopPropagation, clicking "Show details"
+    // also fired the wrapper's onclick — so the inline expand never
+    // worked, the operator just landed on the Sensors view. Stop the
+    // bubble before invoking the toggle.
+    ' <button type="button" class="collector-details-toggle" onclick="event.stopPropagation();toggleCollectorDetails()">Show details</button>' +
     '</div>';
 
   html += '<div id="homeCollectorDetails" class="collector-details" style="display:none">';

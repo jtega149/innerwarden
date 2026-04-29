@@ -268,7 +268,14 @@
       </div>
       <div id="advFilters" style="display:none">
         <div class="filters">
-          <input id="flt-compare-date" type="date" title="compare date" />
+          <!-- Phase 14 (QA polish, 2026-04-29): operator confused
+               this with the main date picker because the title was
+               just "compare date". Now explicit: this picks a SECOND
+               date to compare to the main date filter (delta view).
+               Empty = no comparison. -->
+          <input id="flt-compare-date" type="date"
+                 placeholder="Compare with another date"
+                 title="Compare to a second date (leave empty for no comparison)" />
           <select id="flt-window">
             <option value="">window: full day</option>
             <option value="900">last 15m</option>
@@ -281,7 +288,49 @@
             <option value="high">high+</option>
             <option value="medium">medium+</option>
           </select>
-          <input id="flt-detector" type="text" placeholder="filter by detector" />
+          <!-- Phase 14: <datalist> autocomplete with known detectors
+               so operator doesn't have to remember the exact slug. -->
+          <input id="flt-detector" type="text"
+                 placeholder="filter by detector"
+                 list="detector-options"
+                 autocomplete="off" />
+          <datalist id="detector-options">
+            <option value="ssh_bruteforce">ssh_bruteforce</option>
+            <option value="credential_stuffing">credential_stuffing</option>
+            <option value="port_scan">port_scan</option>
+            <option value="web_scan">web_scan</option>
+            <option value="threat_intel">threat_intel</option>
+            <option value="proto_anomaly">proto_anomaly</option>
+            <option value="kill_chain">kill_chain</option>
+            <option value="data_exfil_ebpf">data_exfil_ebpf</option>
+            <option value="data_exfil_cmd">data_exfil_cmd</option>
+            <option value="reverse_shell">reverse_shell</option>
+            <option value="dns_tunneling">dns_tunneling</option>
+            <option value="dns_c2">dns_c2</option>
+            <option value="rootkit">rootkit</option>
+            <option value="sudo_abuse">sudo_abuse</option>
+            <option value="suspicious_execution">suspicious_execution</option>
+            <option value="container_escape">container_escape</option>
+            <option value="crypto_miner">crypto_miner</option>
+            <option value="ransomware">ransomware</option>
+            <option value="fileless">fileless</option>
+            <option value="kernel_module_load">kernel_module_load</option>
+            <option value="process_injection">process_injection</option>
+            <option value="ssh_key_injection">ssh_key_injection</option>
+            <option value="systemd_persistence">systemd_persistence</option>
+            <option value="crontab_persistence">crontab_persistence</option>
+            <option value="user_creation">user_creation</option>
+            <option value="lateral_movement">lateral_movement</option>
+            <option value="log_tampering">log_tampering</option>
+            <option value="outbound_anomaly">outbound_anomaly</option>
+            <option value="packet_flood">packet_flood</option>
+            <option value="web_shell">web_shell</option>
+            <option value="sigma">sigma</option>
+            <option value="yara">yara</option>
+            <option value="mitre_hunt">mitre_hunt</option>
+            <option value="shield">shield</option>
+            <option value="honeypot">honeypot</option>
+          </datalist>
           <button id="flt-apply" class="full" type="button">Apply</button>
         </div>
       </div>
