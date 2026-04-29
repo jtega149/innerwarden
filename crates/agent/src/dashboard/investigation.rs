@@ -2,6 +2,116 @@
 
 use super::*;
 
+/// Spec 037 Threats UX bundle: tells the empty-state renderer WHY
+/// the right panel has nothing to show. Three states the operator
+/// needs to distinguish:
+///   * `has_incidents=false`: no incidents in scope -- nothing wrong,
+///     just a quiet day or a too-narrow filter.
+///   * `has_incidents=true && has_entities=false`: backend has
+///     incidents but couldn't link any IP/User entities, so the IP
+///     pivot is empty even though there are incidents to investigate.
+///     `suggested_pivots: ["detector"]` so the operator can still drill
+///     in via the Detector pivot.
+///   * `scope_mismatch=true`: incidents exist in graph but not on the
+///     requested date -- the front-end should hint at "try previous day".
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ThreatsDiagnostic {
+    pub(super) date: String,
+    pub(super) has_incidents: bool,
+    pub(super) has_entities: bool,
+    pub(super) scope_mismatch: bool,
+    pub(super) suggested_pivots: Vec<String>,
+    pub(super) incidents_in_scope: usize,
+    pub(super) ip_pivot_count: usize,
+    pub(super) user_pivot_count: usize,
+    pub(super) detector_pivot_count: usize,
+}
+
+pub(super) async fn api_threats_diagnostic(
+    State(state): State<DashboardState>,
+    Query(query): Query<EntitiesQuery>,
+) -> Json<ThreatsDiagnostic> {
+    let date = resolve_date(query.date.as_deref());
+    let filters =
+        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
+
+    // Reuse the production builder so the diagnostic agrees by
+    // construction with what /api/entities + /api/pivots returns.
+    let ip_count =
+        build_pivots_from_graph(&state.knowledge_graph, PivotKind::Ip, 500, &filters, &date).len();
+    let user_count = build_pivots_from_graph(
+        &state.knowledge_graph,
+        PivotKind::User,
+        500,
+        &filters,
+        &date,
+    )
+    .len();
+    let det_count = build_pivots_from_graph(
+        &state.knowledge_graph,
+        PivotKind::Detector,
+        500,
+        &filters,
+        &date,
+    )
+    .len();
+    let total_pivot = ip_count + user_count + det_count;
+
+    // "Incidents in scope" = the qualifying-incidents count under the
+    // same filter the pivots use. Pulled from the Detector pivot's
+    // total since that pivot keeps one row per detector, summed.
+    let incidents_in_scope = build_pivots_from_graph(
+        &state.knowledge_graph,
+        PivotKind::Detector,
+        500,
+        &filters,
+        &date,
+    )
+    .iter()
+    .map(|p| p.incident_count)
+    .sum();
+
+    let has_incidents = incidents_in_scope > 0;
+    let has_entities = (ip_count + user_count) > 0;
+
+    // Scope mismatch: graph has Incident nodes overall, but none for
+    // this date. Lets the empty state suggest "try previous day"
+    // instead of generic "nothing here".
+    let scope_mismatch = if has_incidents {
+        false
+    } else {
+        use crate::knowledge_graph::types::NodeType;
+        let graph = state.knowledge_graph.read().unwrap();
+        !graph.nodes_of_type(NodeType::Incident).is_empty()
+    };
+
+    // Suggested pivots: which non-empty pivot the operator could try.
+    // Order is deterministic so the front-end can render the first
+    // suggestion as the primary CTA.
+    let mut suggested_pivots = Vec::new();
+    if ip_count > 0 {
+        suggested_pivots.push("ip".to_string());
+    }
+    if user_count > 0 {
+        suggested_pivots.push("user".to_string());
+    }
+    if det_count > 0 && total_pivot > ip_count + user_count {
+        suggested_pivots.push("detector".to_string());
+    }
+
+    Json(ThreatsDiagnostic {
+        date,
+        has_incidents,
+        has_entities,
+        scope_mismatch,
+        suggested_pivots,
+        incidents_in_scope,
+        ip_pivot_count: ip_count,
+        user_pivot_count: user_count,
+        detector_pivot_count: det_count,
+    })
+}
+
 pub(super) async fn api_entities(
     State(state): State<DashboardState>,
     Query(query): Query<EntitiesQuery>,

@@ -394,6 +394,7 @@ pub async fn serve(
         .route("/api/entities", get(api_entities))
         .route("/api/pivots", get(api_pivots))
         .route("/api/clusters", get(api_clusters))
+        .route("/api/threats/diagnostic", get(api_threats_diagnostic))
         .route("/api/journey", get(api_journey))
         .route("/api/export", get(api_export))
         .route("/api/report", get(api_report))
@@ -1363,6 +1364,9 @@ mod tests {
                 unresolved_count: 1,
                 safely_resolved: 0,
                 handled_ips_today: 0,
+                blocked_count: 0,
+                observing_count: 0,
+                attention_count: 0,
                 severity_breakdown: std::collections::HashMap::new(),
                 allowlisted_count: 0,
                 top_detectors: vec![],

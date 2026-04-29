@@ -160,6 +160,21 @@ pub(crate) struct OverviewResponse {
     /// "54 handled" but counted only ~14 entries on the threats page.
     /// See `NUMBER_CONSISTENCY.md` row "handled count".
     pub(super) handled_ips_today: usize,
+    /// Spec 037 Threats UX bundle: incidents whose decision was a
+    /// terminal containment (`block_ip` or `honeypot`). Drives the
+    /// Threats-tab "Blocked" KPI. Replaces the prior threats.js
+    /// computation that summed pivot-item outcomes, which depended on
+    /// the currently-selected pivot and gave inconsistent counts.
+    pub(super) blocked_count: usize,
+    /// Spec 037 Threats UX bundle: incidents whose decision was
+    /// `monitor` (the AI is watching but not containing). Drives the
+    /// Threats-tab "Observing" KPI.
+    pub(super) observing_count: usize,
+    /// Spec 037 Threats UX bundle: incidents that need operator
+    /// attention -- either no decision was reached, or the decision
+    /// was `request_confirmation`. Drives the Threats-tab "Needs
+    /// attention" KPI.
+    pub(super) attention_count: usize,
     /// Breakdown by severity level: {"critical": N, "high": N, ...}
     pub(super) severity_breakdown: std::collections::HashMap<String, usize>,
     /// Incidents from allowlisted IPs/users (can be hidden in dashboard).

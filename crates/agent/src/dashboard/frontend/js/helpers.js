@@ -325,6 +325,68 @@ function showHomeState() {
   // Deselect active card
   document.querySelectorAll('.attacker-card.active').forEach(c => c.classList.remove('active'));
   state.currentSubject = null;
+  // Spec 037 Threats UX bundle: refresh the empty-state copy from
+  // /api/threats/diagnostic so the operator sees WHY the right panel
+  // is empty instead of a generic "Select a threat to investigate".
+  if (typeof refreshThreatsDiagnostic === 'function') {
+    refreshThreatsDiagnostic();
+  }
+}
+
+// Spec 037 Threats UX bundle: render diagnostic-aware empty state.
+// Fetches /api/threats/diagnostic with the current date filter so the
+// message reflects the same scope the pivots use. Falls back to the
+// generic copy on fetch failure.
+function refreshThreatsDiagnostic() {
+  var msg = document.getElementById('homeStateMessage');
+  var hint = document.getElementById('homeStateHint');
+  var icon = document.getElementById('homeStateIcon');
+  if (!msg || !hint || !icon) {
+    return; // home view (not the threats view); nothing to do
+  }
+  // Spec 037 Threats UX bundle: pull the same filter set the pivots
+  // use so the diagnostic agrees with what the IP/User/Detector
+  // pivots return. `state.filters` is owned by threats.js and may
+  // be undefined on the home view -- defaults are fine.
+  var filters = (typeof state !== 'undefined' && state.filters) ? state.filters : {};
+  var qs = '';
+  if (filters.date) qs += (qs ? '&' : '?') + 'date=' + encodeURIComponent(filters.date);
+  if (filters.severity_min) qs += (qs ? '&' : '?') + 'severity_min=' + encodeURIComponent(filters.severity_min);
+  if (filters.detector) qs += (qs ? '&' : '?') + 'detector=' + encodeURIComponent(filters.detector);
+  loadJson('/api/threats/diagnostic' + qs)
+    .then(function(d) {
+      hint.style.display = 'none';
+      hint.textContent = '';
+      if (!d.has_incidents && !d.scope_mismatch) {
+        icon.textContent = '✨';
+        msg.textContent = 'No threats in scope. Either nothing fired today or the filter is too narrow.';
+        return;
+      }
+      if (!d.has_incidents && d.scope_mismatch) {
+        icon.textContent = '📅';
+        msg.textContent = 'No incidents on this date. The graph has incidents on other days.';
+        hint.textContent = 'Try the previous day in the Date filter.';
+        hint.style.display = '';
+        return;
+      }
+      if (d.has_incidents && !d.has_entities) {
+        icon.textContent = '⚠️';
+        msg.textContent = d.incidents_in_scope + ' incident(s) found, but no IP/User entities linked.';
+        if (d.detector_pivot_count > 0) {
+          hint.textContent = 'Try the Detector pivot to drill in by detection rule.';
+          hint.style.display = '';
+        }
+        return;
+      }
+      icon.textContent = '🔍';
+      msg.textContent = 'Select a threat to investigate';
+    })
+    .catch(function() {
+      // Diagnostic endpoint unavailable: keep the original generic copy.
+      icon.textContent = '🔍';
+      msg.textContent = 'Select a threat to investigate';
+      hint.style.display = 'none';
+    });
 }
 
 function investigateTopThreat() {

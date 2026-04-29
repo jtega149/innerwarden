@@ -83,6 +83,9 @@ pub(super) async fn api_overview(
             unresolved_count: 0,
             safely_resolved: 0,
             handled_ips_today: 0,
+            blocked_count: 0,
+            observing_count: 0,
+            attention_count: 0,
             severity_breakdown: std::collections::HashMap::new(),
             allowlisted_count: 0,
             top_detectors: vec![],
@@ -113,6 +116,12 @@ pub(super) async fn api_overview(
     let mut handled_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut allowlisted_count = 0usize;
+    // Spec 037 Threats UX bundle: global KPI counters so the Threats
+    // tab no longer derives them from `items` of the currently-selected
+    // pivot (which was unstable when switching IP/User/Detector).
+    let mut blocked_count = 0usize;
+    let mut observing_count = 0usize;
+    let mut attention_count = 0usize;
 
     // Operator filter passed via query string. Applied AFTER the canonical
     // internal/research filter so the operator filter narrows what's
@@ -188,6 +197,18 @@ pub(super) async fn api_overview(
             *severity_breakdown
                 .entry(severity.to_lowercase())
                 .or_insert(0) += 1;
+            // Spec 037 Threats UX bundle: classify into the three
+            // operator-visible KPI buckets in the same pass. Mirrors
+            // `outcomeOf` semantics in threats.js so the Threats-tab
+            // numbers match the right-side journey/list outcome.
+            match decision.as_deref() {
+                Some("block_ip") | Some("honeypot") => blocked_count += 1,
+                Some("monitor") => observing_count += 1,
+                Some("request_confirmation") => attention_count += 1,
+                Some("ignore") => {} // dismissed; not in any KPI bucket
+                Some(_) => blocked_count += 1, // any other action == contained
+                None => attention_count += 1, // no decision yet => operator must look
+            }
             if let Some(dec) = decision {
                 decisions_count += 1;
                 let target_is_ip = decision_target.as_ref().is_some_and(|t| t.contains('.'));
@@ -242,6 +263,9 @@ pub(super) async fn api_overview(
         unresolved_count,
         safely_resolved,
         handled_ips_today,
+        blocked_count,
+        observing_count,
+        attention_count,
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -671,6 +695,10 @@ pub(super) fn compute_overview_from_graph(
         std::collections::HashMap::new();
     let mut allowlisted_count = 0usize;
     let mut handled_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Spec 037 Threats UX bundle: same KPI buckets as `api_overview`.
+    let mut blocked_count = 0usize;
+    let mut observing_count = 0usize;
+    let mut attention_count = 0usize;
 
     for &id in &incident_nodes {
         if let Some(Node::Incident {
@@ -715,6 +743,16 @@ pub(super) fn compute_overview_from_graph(
             *severity_breakdown
                 .entry(severity.to_lowercase())
                 .or_insert(0) += 1;
+            // Spec 037 Threats UX bundle: same KPI classification as
+            // the live `api_overview` path.
+            match decision.as_deref() {
+                Some("block_ip") | Some("honeypot") => blocked_count += 1,
+                Some("monitor") => observing_count += 1,
+                Some("request_confirmation") => attention_count += 1,
+                Some("ignore") => {}
+                Some(_) => blocked_count += 1,
+                None => attention_count += 1,
+            }
             if let Some(dec) = decision {
                 decisions_count += 1;
                 let target_is_ip = decision_target.as_ref().is_some_and(|t| t.contains('.'));
@@ -767,6 +805,9 @@ pub(super) fn compute_overview_from_graph(
         unresolved_count,
         safely_resolved,
         handled_ips_today,
+        blocked_count,
+        observing_count,
+        attention_count,
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -824,6 +865,25 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
     // is the canonical path in production.
     let handled_ips_today = ai_responded;
 
+    // Spec 037 Threats UX bundle: same KPI buckets, classified from
+    // the JSONL `decisions` stream.
+    let mut blocked_count = 0usize;
+    let mut observing_count = 0usize;
+    let mut attention_count = 0usize;
+    for d in &decisions {
+        match d.action_type.as_str() {
+            "block_ip" | "honeypot" => blocked_count += 1,
+            "monitor" => observing_count += 1,
+            "request_confirmation" => attention_count += 1,
+            "ignore" => {}
+            _ => blocked_count += 1,
+        }
+    }
+    // Incidents without a matching decision: count as needing attention.
+    if incidents.len() > decisions.len() {
+        attention_count += incidents.len() - decisions.len();
+    }
+
     OverviewResponse {
         date: date.to_string(),
         events_count,
@@ -835,6 +895,9 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
         unresolved_count,
         safely_resolved,
         handled_ips_today,
+        blocked_count,
+        observing_count,
+        attention_count,
         severity_breakdown: std::collections::HashMap::new(),
         allowlisted_count: 0,
         top_detectors,
@@ -1247,5 +1310,144 @@ mod tests {
         assert!(!detectors.contains(&"neural_anomaly"));
         // ai_confirmed should count 3 (2 block + 1 monitor) — not 4.
         assert_eq!(out.ai_confirmed, 3);
+    }
+
+    // ── Spec 037 Threats UX bundle ─────────────────────────────────────
+    //
+    // KPI buckets + diagnostic endpoint anchors. The threats.js KPI
+    // computation moved from front-end pivot-summing to these
+    // backend-derived counts, so a regression that drops the fields
+    // would silently zero the "Blocked / Observing / Needs attention"
+    // tiles -- only the anchors below catch that.
+
+    #[test]
+    fn compute_overview_populates_threats_kpi_buckets() {
+        // make_overview_kg has 2x block_ip + 1x monitor + 1x advisory
+        // (filtered). After classification: blocked=2, observing=1,
+        // attention=0.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let g = make_overview_kg();
+        let out = compute_overview_from_graph(&g, dir.path(), "2026-04-23");
+        assert_eq!(out.blocked_count, 2, "block_ip incidents = 2");
+        assert_eq!(out.observing_count, 1, "monitor incidents = 1");
+        assert_eq!(out.attention_count, 0, "no undecided incidents");
+    }
+
+    #[tokio::test]
+    async fn api_threats_diagnostic_reports_has_entities_when_pivots_populated() {
+        // make_overview_kg seeds two real attacker IPs. The diagnostic
+        // must mark `has_entities=true` and `has_incidents=true`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let g = make_overview_kg();
+        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(g));
+        state.last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let q = EntitiesQuery {
+            limit: None,
+            date: None,
+            severity_min: None,
+            detector: None,
+            group_by: None,
+        };
+        let Json(out) =
+            crate::dashboard::investigation::api_threats_diagnostic(State(state), Query(q)).await;
+        assert!(out.has_incidents, "graph has 3 real-attacker incidents");
+        assert!(out.has_entities, "two IP entities exist in pivot");
+        assert!(!out.scope_mismatch, "today's pivot has matches");
+        assert!(out.ip_pivot_count >= 1, "ip pivot must surface attackers");
+    }
+
+    #[tokio::test]
+    async fn api_threats_diagnostic_reports_empty_when_graph_empty() {
+        // Empty knowledge graph: has_incidents=false, has_entities=false,
+        // scope_mismatch=false, suggested_pivots=[].
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        state.last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let q = EntitiesQuery {
+            limit: None,
+            date: None,
+            severity_min: None,
+            detector: None,
+            group_by: None,
+        };
+        let Json(out) =
+            crate::dashboard::investigation::api_threats_diagnostic(State(state), Query(q)).await;
+        assert!(!out.has_incidents);
+        assert!(!out.has_entities);
+        assert!(
+            !out.scope_mismatch,
+            "no incidents anywhere = not a scope mismatch"
+        );
+        assert!(out.suggested_pivots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_threats_diagnostic_flags_scope_mismatch_for_wrong_date() {
+        // Graph has an incident on 2026-04-26 but the query asks for
+        // 2026-04-28: has_incidents=false (in scope), but
+        // scope_mismatch=true so the front-end can hint "try previous day".
+        use crate::knowledge_graph::types::*;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let day1 = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ip = g.ensure_ip("203.0.113.50", day1);
+        let inc = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:past".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "old SSH brute force".into(),
+            summary: "".into(),
+            ts: day1,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            decision_target: Some("203.0.113.50".into()),
+            confidence: Some(0.9),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, ip, Relation::TriggeredBy, day1));
+        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(g));
+        state.last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let q = EntitiesQuery {
+            limit: None,
+            date: Some("2026-04-28".to_string()),
+            severity_min: None,
+            detector: None,
+            group_by: None,
+        };
+        let Json(out) =
+            crate::dashboard::investigation::api_threats_diagnostic(State(state), Query(q)).await;
+        assert!(!out.has_incidents, "no incidents on 2026-04-28");
+        assert!(
+            out.scope_mismatch,
+            "graph has incidents on a different date"
+        );
     }
 }

@@ -509,34 +509,26 @@ async function refreshLeft(forceRefreshJourney = false) {
     window._lastOverview = ov;
     window._lastEntityItems = items;
 
-    // Outcome-first KPIs: Blocked / Observing / Needs attention
-    var kpiBlocked = 0, kpiObserving = 0, kpiAttention = 0;
-    items.forEach(function(item) {
-      var o = outcomeOf(item);
-      if (o === 'blocked' || o === 'honeypot') kpiBlocked++;
-      else if (o === 'needs_attention') kpiAttention++;
-      else if (o === 'monitoring') kpiObserving++;
-    });
-    // #188 removed four elements from the Threats left panel that this
-    // handler still writes to: kpi-events, kpi-incidents, kpi-attackers
-    // (hidden spans), clusterList + topDetectors divs (dead UI). Without
-    // a null guard the first null.textContent throws and aborts the
-    // whole refreshLeft before attackerList.innerHTML runs — the list
-    // then sticks on "Loading..." forever. Guard every write.
+    // Spec 037 Threats UX bundle: read the three KPIs from the
+    // backend-computed `/api/overview` fields instead of summing
+    // pivot-item outcomes locally. The previous local computation
+    // gave inconsistent counts across IP/User/Detector pivots
+    // because each pivot's `outcome` semantics differed.
+    var kpiBlocked   = ov.blocked_count   != null ? ov.blocked_count   : 0;
+    var kpiObserving = ov.observing_count != null ? ov.observing_count : 0;
+    var kpiAttention = ov.attention_count != null ? ov.attention_count : 0;
     var setText = function(id, value) {
       var el = document.getElementById(id);
       if (el) el.textContent = value;
     };
-    var setHtml = function(id, value) {
-      var el = document.getElementById(id);
-      if (el) el.innerHTML = value;
-    };
     setText('kpi-confirmed', kpiBlocked);
     setText('kpi-responded', kpiObserving);
     setText('kpi-noise', kpiAttention);
-    setText('kpi-events', ov.events_count);
-    setText('kpi-incidents', ov.incidents_count);
-    setText('kpi-attackers', items.length);
+    // Spec 037 Threats UX bundle: the kpi-events / kpi-incidents /
+    // kpi-attackers / clusterList / topDetectors writes that used to
+    // live here targeted DOM nodes that PR #188 already removed. The
+    // dead writes are gone; they were silently no-ops with the null
+    // guard but kept misleading the reader of this file.
 
     const list = document.getElementById('attackerList');
     if (list) {
@@ -549,19 +541,11 @@ async function refreshLeft(forceRefreshJourney = false) {
       }
     }
 
-    if (!state.clusters.length) {
-      setHtml('clusterList', '<div class="empty">No clusters for current filters.</div>');
-    } else {
-      setHtml('clusterList', state.clusters.map(renderClusterCard).join(''));
-    }
-
-    if (ov.top_detectors && ov.top_detectors.length) {
-      setHtml('topDetectors', ov.top_detectors.map(d =>
-        `<div class="det-row"><span>${esc(d.detector)}</span><span class="det-count">${d.count}</span></div>`
-      ).join(''));
-    } else {
-      setHtml('topDetectors', '<div class="empty">No detectors fired.</div>');
-    }
+    // Spec 037 Threats UX bundle: clusterList + topDetectors writes
+    // removed -- those DOM nodes were dropped in PR #188 and the
+    // setHtml() calls were silent no-ops. Cluster data is still
+    // fetched (state.clusters) for the journey panel that consumes
+    // it; only the dead left-panel render is gone.
 
     if (state.selected.value) {
       const stillExists =

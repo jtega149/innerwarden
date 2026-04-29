@@ -420,15 +420,27 @@ async function loadJourney(subjectType, subjectValue) {
       : '';
 
     // Build action buttons if D3 actions are enabled for this subject type.
+    // Spec 037 Threats UX bundle: respect the operator's protection mode.
+    //   * read_only (actionCfg.enabled=false): hide buttons entirely.
+    //   * watch    (actionCfg.enabled=true && actionCfg.dry_run=true):
+    //               render disabled with a tooltip so the operator
+    //               sees what's possible without misclicking a no-op.
+    //   * guard    (actionCfg.enabled=true && actionCfg.dry_run=false):
+    //               render normally.
     let actionBtns = '';
+    const isWatchMode = actionCfg && actionCfg.enabled && actionCfg.dry_run === true;
+    const watchAttrs = isWatchMode
+      ? ' disabled title="Watch mode: actions are dry-run only. Switch to Guard mode to execute."'
+      : '';
+    const watchStyle = isWatchMode ? 'opacity:0.55;cursor:not-allowed' : '';
     if (actionCfg && actionCfg.enabled && subjectType === 'ip') {
       if (j.outcome !== 'blocked') {
-        actionBtns += `<button type="button" class="journey-btn action-block"
+        actionBtns += `<button type="button" class="journey-btn action-block" style="${watchStyle}"${watchAttrs}
           onclick="showActionModal('block_ip','${esc(subjectValue)}',null)">⊘ Block IP</button>`;
       }
     }
     if (actionCfg && actionCfg.enabled && subjectType === 'user') {
-      actionBtns += `<button type="button" class="journey-btn action-suspend"
+      actionBtns += `<button type="button" class="journey-btn action-suspend" style="${watchStyle}"${watchAttrs}
         onclick="showActionModal('suspend_user',null,'${esc(subjectValue)}')">⏸ Suspend sudo</button>`;
     }
 
