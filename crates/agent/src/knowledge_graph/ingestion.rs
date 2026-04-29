@@ -1,8 +1,52 @@
+use innerwarden_core::entities::EntityRef;
 use innerwarden_core::event::Event;
 use innerwarden_core::incident::Incident;
+use std::sync::OnceLock;
 
 use super::graph::KnowledgeGraph;
 use super::types::*;
+
+/// IPv4 address pattern (compiled once). Used by `derive_implicit_entities`
+/// to extract IPs from incident_id / title / summary when the incident
+/// arrives without explicit entities. Each match is validated against
+/// `Ipv4Addr::from_str` because the regex matches numerically out-of-range
+/// strings like "999.999.999.999".
+fn ipv4_pattern() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("ipv4 regex"))
+}
+
+/// Derive entities from `incident_id` / `title` / `summary` when the
+/// incident arrived with `entities: []`. Spec 037 Threats data contract:
+/// previously such incidents created zero graph linkage and never
+/// appeared in the IP/User pivots even though their IP was visible in
+/// the operator-facing strings.
+///
+/// Strict scope: IPv4 only, validated against `std::net::Ipv4Addr` to
+/// reject the regex's loose `999.999.999.999` matches. Returns an
+/// empty Vec when nothing parseable is found.
+pub(crate) fn derive_implicit_entities(incident: &Incident) -> Vec<EntityRef> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let haystacks = [
+        incident.incident_id.as_str(),
+        incident.title.as_str(),
+        incident.summary.as_str(),
+    ];
+
+    for haystack in haystacks {
+        for m in ipv4_pattern().find_iter(haystack) {
+            let candidate = m.as_str();
+            if candidate.parse::<std::net::Ipv4Addr>().is_ok() && seen.insert(candidate.to_string())
+            {
+                out.push(EntityRef::ip(candidate));
+            }
+        }
+    }
+
+    out
+}
 
 /// Helper to extract a string field from event.details JSON.
 ///
@@ -333,8 +377,23 @@ impl KnowledgeGraph {
             research_only,
         });
 
+        // Spec 037 Threats data contract: when an incident arrives
+        // with `entities: []` but carries an IP in its incident_id,
+        // title, or summary, fall back to deriving entities from
+        // those strings. The previous behavior was to create the
+        // Incident node and zero edges, which left the IP/User
+        // pivots empty even though the operator-facing strings
+        // clearly identified the IP.
+        let derived_owned;
+        let entities_to_link: &[EntityRef] = if incident.entities.is_empty() {
+            derived_owned = derive_implicit_entities(incident);
+            &derived_owned
+        } else {
+            &incident.entities
+        };
+
         // Create TriggeredBy edges from Incident to each entity
-        for entity in &incident.entities {
+        for entity in entities_to_link {
             let target = match entity.r#type {
                 innerwarden_core::entities::EntityType::Ip => {
                     sanitized_incident_ip(&entity.value).map(|ip| self.ensure_ip(&ip, incident.ts))

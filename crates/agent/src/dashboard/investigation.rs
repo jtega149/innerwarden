@@ -11,8 +11,10 @@ pub(super) async fn api_entities(
     let filters =
         InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    // Build attackers from knowledge graph (filters applied inline).
-    let attackers = build_attackers_from_graph(&state.knowledge_graph, limit, &filters);
+    // Spec 037 Threats data contract: forward `date` to the builder so
+    // the IP pivot is scoped to the requested day instead of returning
+    // every Incident node accumulated in the in-memory graph.
+    let attackers = build_attackers_from_graph(&state.knowledge_graph, limit, &filters, &date);
     Json(EntitiesResponse { date, attackers })
 }
 
@@ -26,7 +28,11 @@ pub(super) async fn api_pivots(
     let filters =
         InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    let items = build_pivots_from_graph(&state.knowledge_graph, group_by, limit, &filters);
+    // Spec 037 Threats data contract: pass `date` to the builder so all
+    // three pivots (IP / User / Detector) honour the same temporal
+    // scope. Previously the date round-tripped to the response but the
+    // builder iterated the entire knowledge graph regardless.
+    let items = build_pivots_from_graph(&state.knowledge_graph, group_by, limit, &filters, &date);
     Json(PivotResponse {
         date,
         group_by: group_by.as_str().to_string(),
@@ -253,7 +259,7 @@ fn build_export_response(
         let graph = kg.read().unwrap();
         compute_overview_from_graph(&graph, &data_dir, &date)
     };
-    let pivots = build_pivots_from_graph(&kg, group_by, limit, &filters);
+    let pivots = build_pivots_from_graph(&kg, group_by, limit, &filters, &date);
     let clusters = build_cluster_items_from_graph(&kg, limit, window_seconds);
     let journey = subject.as_ref().filter(|s| !s.is_empty()).map(|s| {
         build_journey_from_graph(
@@ -322,11 +328,22 @@ pub(super) fn build_pivots_from_graph(
     group_by: PivotKind,
     limit: usize,
     filters: &InvestigationFilters,
+    date: &str,
 ) -> Vec<PivotItem> {
     use crate::knowledge_graph::types::*;
     let graph = kg.read().unwrap();
     let sev_min_rank = filters.severity_min_rank();
     let detector_substring = filters.detector_lower();
+
+    // Spec 037 Threats data contract: parse the requested date once
+    // and use it as the temporal scope for ALL three pivots. Previously
+    // the builders ignored `date` entirely and iterated the full graph,
+    // so a request for "today" surfaced incidents from any prior date
+    // present in the graph. An unparseable date (resolve_date should
+    // already prevent this) falls back to "no date filter" so the
+    // function never returns spuriously empty results due to caller bug.
+    let date_filter: Option<chrono::NaiveDate> =
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok();
 
     let node_type = match group_by {
         PivotKind::Ip => NodeType::Ip,
@@ -353,127 +370,147 @@ pub(super) fn build_pivots_from_graph(
         })
         .collect();
 
+    // Spec 037 Threats data contract: single pass to identify the
+    // qualifying incidents under the same filter for ALL pivots
+    // (date scope + research_only + internal/self-traffic + severity
+    // + detector substring). The Detector pivot used to skip every
+    // filter except node-type and ended up returning incidents the
+    // IP/User pivots had rejected -- "click Detector see X, click
+    // IP see 0" was the operator-reported contradiction.
+    let qualifying_incidents: Vec<NodeId> = graph
+        .nodes_of_type(NodeType::Incident)
+        .into_iter()
+        .filter(|&inc_id| {
+            let Some(Node::Incident {
+                research_only,
+                detector,
+                title,
+                severity,
+                ts,
+                ..
+            }) = graph.get_node(inc_id)
+            else {
+                return false;
+            };
+            // Date scope: incident's UTC date must equal the requested
+            // date. Only enforced when the caller provided a parseable
+            // date (defensive: skip the filter rather than silently
+            // returning empty if the caller passed garbage).
+            if let Some(target) = date_filter {
+                if ts.naive_utc().date() != target {
+                    return false;
+                }
+            }
+            if *research_only {
+                return false;
+            }
+            // Same filter the public site live-feed applies, so the
+            // Threats tab and the site agree on what counts as a "real"
+            // incident. See NUMBER_CONSISTENCY.md row "blocks today /
+            // IPs blocked".
+            let has_external_ip = graph
+                .outgoing_edges(inc_id)
+                .iter()
+                .filter(|e| e.relation == Relation::TriggeredBy)
+                .any(|e| {
+                    matches!(
+                        graph.get_node(e.to),
+                        Some(Node::Ip {
+                            is_internal: false,
+                            ..
+                        })
+                    )
+                });
+            let internal = crate::dashboard::live_feed::is_internal_incident_fields(
+                detector,
+                title,
+                has_external_ip,
+            );
+            if internal {
+                return false;
+            }
+            if sev_min_rank > 0 && severity_rank(severity) < sev_min_rank {
+                return false;
+            }
+            if let Some(needle) = &detector_substring {
+                if !detector.to_ascii_lowercase().contains(needle) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
     if group_by == PivotKind::Detector {
-        // Group incidents by detector
-        let mut by_det: std::collections::HashMap<String, Vec<&Node>> =
+        // Spec 037 Threats data contract: Detector pivot now uses the
+        // same `qualifying_incidents` slice as IP/User. Outcome derives
+        // from the same decision-field logic (was hardcoded "active").
+        let mut by_det: std::collections::HashMap<String, Vec<NodeId>> =
             std::collections::HashMap::new();
-        for id in graph.nodes_of_type(NodeType::Incident) {
-            if let Some(node @ Node::Incident { detector, .. }) = graph.get_node(id) {
-                by_det.entry(detector.clone()).or_default().push(node);
+        for &inc_id in &qualifying_incidents {
+            if let Some(Node::Incident { detector, .. }) = graph.get_node(inc_id) {
+                by_det.entry(detector.clone()).or_default().push(inc_id);
             }
         }
         let mut items: Vec<PivotItem> = by_det
             .into_iter()
-            .map(|(det, nodes)| {
-                let first = nodes
-                    .iter()
-                    .filter_map(|n| {
-                        if let Node::Incident { ts, .. } = n {
-                            Some(*ts)
-                        } else {
-                            None
+            .map(|(det, inc_ids)| {
+                let mut first: Option<chrono::DateTime<chrono::Utc>> = None;
+                let mut last: Option<chrono::DateTime<chrono::Utc>> = None;
+                let mut max_sev = "low".to_string();
+                let mut outcome = "open".to_string();
+                for &iid in &inc_ids {
+                    if let Some(Node::Incident {
+                        ts,
+                        severity,
+                        decision,
+                        ..
+                    }) = graph.get_node(iid)
+                    {
+                        first = Some(first.map_or(*ts, |f| f.min(*ts)));
+                        last = Some(last.map_or(*ts, |l| l.max(*ts)));
+                        if severity_rank(severity) > severity_rank(&max_sev) {
+                            max_sev = severity.to_lowercase();
                         }
-                    })
-                    .min();
-                let last = nodes
-                    .iter()
-                    .filter_map(|n| {
-                        if let Node::Incident { ts, .. } = n {
-                            Some(*ts)
-                        } else {
-                            None
+                        if let Some(dec) = decision {
+                            outcome = match dec.as_str() {
+                                "block_ip" => "blocked",
+                                "honeypot" => "honeypot",
+                                "monitor" => "monitoring",
+                                "ignore" => outcome.as_str(),
+                                _ => "resolved",
+                            }
+                            .to_string();
                         }
-                    })
-                    .max();
-                let max_sev = nodes
-                    .iter()
-                    .filter_map(|n| {
-                        if let Node::Incident { severity, .. } = n {
-                            Some(severity.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .max_by_key(|s| severity_rank(s))
-                    .unwrap_or("low")
-                    .to_string();
+                    }
+                }
                 PivotItem {
                     group_by: "detector".to_string(),
                     value: det.clone(),
                     first_seen: first.unwrap_or_else(chrono::Utc::now),
                     last_seen: last.unwrap_or_else(chrono::Utc::now),
                     max_severity: max_sev,
-                    incident_count: nodes.len(),
+                    incident_count: inc_ids.len(),
                     event_count: 0,
-                    outcome: "active".to_string(),
+                    outcome,
                     detectors: vec![det],
                 }
             })
             .collect();
-        items.sort_by(|a, b| b.incident_count.cmp(&a.incident_count));
+        items.sort_by(|a, b| {
+            b.incident_count
+                .cmp(&a.incident_count)
+                .then(b.last_seen.cmp(&a.last_seen))
+        });
         items.truncate(limit);
         return items;
     }
 
-    // Group by IP or User: find which have TriggeredBy edges from incidents
+    // Group by IP or User: find which have TriggeredBy edges from incidents.
     let mut pivot_data: std::collections::HashMap<NodeId, (String, Vec<NodeId>)> =
         std::collections::HashMap::new();
 
-    for inc_id in graph.nodes_of_type(NodeType::Incident) {
-        // Apply the SAME filter the public site live-feed applies, so the
-        // Threats tab and the site agree on what counts as a "real"
-        // incident. Pre-2026-04-23 the threats tab applied only
-        // `research_only` + `internal_ips` + `self_traffic_ips`, but the
-        // site additionally rejects advisory-only detectors
-        // (`neural_anomaly`, `host_drift`, `network_sniffing`,
-        // `discovery_burst`) and IW system processes via title-prefix
-        // (`(en-agent)`, `(en-sensor)`, `(systemd)`, etc.). The filter is
-        // canonicalised in `live_feed::is_internal_incident_fields`; both
-        // surfaces call it via the same code path so any future change
-        // updates both at once. See `NUMBER_CONSISTENCY.md` row
-        // "blocks today / IPs blocked".
-        let skip = if let Some(Node::Incident {
-            research_only,
-            detector,
-            title,
-            severity,
-            ..
-        }) = graph.get_node(inc_id)
-        {
-            if *research_only {
-                true
-            } else {
-                let has_external_ip = graph
-                    .outgoing_edges(inc_id)
-                    .iter()
-                    .filter(|e| e.relation == Relation::TriggeredBy)
-                    .any(|e| {
-                        matches!(
-                            graph.get_node(e.to),
-                            Some(Node::Ip {
-                                is_internal: false,
-                                ..
-                            })
-                        )
-                    });
-                let internal = crate::dashboard::live_feed::is_internal_incident_fields(
-                    detector,
-                    title,
-                    has_external_ip,
-                );
-                let below_severity = sev_min_rank > 0 && severity_rank(severity) < sev_min_rank;
-                let detector_mismatch = match &detector_substring {
-                    Some(needle) => !detector.to_ascii_lowercase().contains(needle),
-                    None => false,
-                };
-                internal || below_severity || detector_mismatch
-            }
-        } else {
-            false
-        };
-        if skip {
-            continue;
-        }
+    for &inc_id in &qualifying_incidents {
         for edge in graph.outgoing_edges(inc_id) {
             if edge.relation != Relation::TriggeredBy {
                 continue;
@@ -577,8 +614,9 @@ pub(super) fn build_attackers_from_graph(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     limit: usize,
     filters: &InvestigationFilters,
+    date: &str,
 ) -> Vec<AttackerSummary> {
-    build_pivots_from_graph(kg, PivotKind::Ip, limit, filters)
+    build_pivots_from_graph(kg, PivotKind::Ip, limit, filters, date)
         .into_iter()
         .map(|p| AttackerSummary {
             ip: p.value,
@@ -3224,7 +3262,7 @@ mod tests {
     #[test]
     fn build_pivots_from_graph_excludes_advisory_only_detectors() {
         let kg = make_kg_with_attackers();
-        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default());
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), "");
         // 2 attackers should remain (ssh + port_scan). neural_anomaly is filtered.
         let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
         assert!(ips.contains("203.0.113.10"));
@@ -3239,7 +3277,7 @@ mod tests {
     fn build_pivots_from_graph_severity_min_filter_narrows_results() {
         let kg = make_kg_with_attackers();
         let high_only = InvestigationFilters::from_query(Some("high"), None);
-        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &high_only);
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &high_only, "");
         let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
         assert!(
             ips.contains("203.0.113.10"),
@@ -3255,7 +3293,7 @@ mod tests {
     fn build_pivots_from_graph_detector_filter_narrows_results() {
         let kg = make_kg_with_attackers();
         let ssh_only = InvestigationFilters::from_query(None, Some("ssh"));
-        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &ssh_only);
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &ssh_only, "");
         let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
         assert!(
             ips.contains("203.0.113.10"),
@@ -3271,7 +3309,7 @@ mod tests {
     fn build_pivots_from_graph_combined_filters_intersect() {
         let kg = make_kg_with_attackers();
         let critical_ssh = InvestigationFilters::from_query(Some("critical"), Some("ssh"));
-        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &critical_ssh);
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &critical_ssh, "");
         // No ssh incident is critical-severity → empty.
         assert!(items.is_empty());
     }
@@ -3326,10 +3364,190 @@ mod tests {
     fn build_attackers_from_graph_forwards_filters() {
         let kg = make_kg_with_attackers();
         let high = InvestigationFilters::from_query(Some("high"), None);
-        let attackers = build_attackers_from_graph(&kg, 100, &high);
+        let attackers = build_attackers_from_graph(&kg, 100, &high, "");
         let ips: std::collections::HashSet<&str> =
             attackers.iter().map(|a| a.ip.as_str()).collect();
         assert!(ips.contains("203.0.113.10"));
         assert!(!ips.contains("198.51.100.20"));
+    }
+
+    // ── Spec 037 Threats data contract ─────────────────────────────────
+    //
+    // Three regression anchors for the bundle (date scoping + entity
+    // backfill + detector-pivot semantic alignment). Each test seeds a
+    // graph with a known shape, calls the production code path, and
+    // asserts on observable behavior from the operator's perspective.
+
+    fn make_kg_with_two_dates(
+    ) -> std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>> {
+        // Two ssh_bruteforce incidents on different days. The pivot
+        // builders MUST honour the requested date and only return the
+        // matching one.
+        use crate::knowledge_graph::types::*;
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let day1 = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let day2 = chrono::DateTime::parse_from_rfc3339("2026-04-28T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let ip_old = g.ensure_ip("203.0.113.99", day1);
+        let inc_old = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:old".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "SSH brute force from 203.0.113.99".into(),
+            summary: "".into(),
+            ts: day1,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            decision_target: Some("203.0.113.99".into()),
+            confidence: Some(0.9),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_old, ip_old, Relation::TriggeredBy, day1));
+
+        let ip_new = g.ensure_ip("198.51.100.77", day2);
+        let inc_new = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:new".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "SSH brute force from 198.51.100.77".into(),
+            summary: "".into(),
+            ts: day2,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            decision_target: Some("198.51.100.77".into()),
+            confidence: Some(0.9),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_new, ip_new, Relation::TriggeredBy, day2));
+
+        std::sync::Arc::new(std::sync::RwLock::new(g))
+    }
+
+    #[test]
+    fn build_pivots_from_graph_scopes_to_requested_date_only() {
+        // Anchor for: "prod path with date errado não retorna incidentes
+        // fora do dia". Graph has incidents on 2026-04-26 and 2026-04-28.
+        // Asking for 2026-04-28 must return ONLY the 198.51.100.77 IP.
+        let kg = make_kg_with_two_dates();
+        let items =
+            build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), "2026-04-28");
+        let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
+        assert!(
+            ips.contains("198.51.100.77"),
+            "today's incident must appear, got: {ips:?}"
+        );
+        assert!(
+            !ips.contains("203.0.113.99"),
+            "yesterday's incident must NOT appear when date=2026-04-28, got: {ips:?}"
+        );
+    }
+
+    #[test]
+    fn ingest_incident_derives_implicit_entities_when_entities_empty() {
+        // Anchor for: "incident sem entities mas com IP no incident_id/
+        // title/summary cria IP node + edge". Driving the production
+        // ingest path with an entities-empty incident must still
+        // produce graph linkage so the IP pivot surfaces it.
+        use crate::knowledge_graph::types::{Node, NodeType};
+        use innerwarden_core::incident::Incident;
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-04-28T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let incident = Incident {
+            incident_id: "port_scan:198.51.100.123:2026-04-28T12:00Z".to_string(),
+            host: "h".to_string(),
+            severity: innerwarden_core::event::Severity::High,
+            title: "Port scan detected".to_string(),
+            summary: "Source IP 198.51.100.123 scanned 50 ports".to_string(),
+            ts,
+            entities: vec![],
+            tags: vec![],
+            evidence: serde_json::Value::Null,
+            recommended_checks: vec![],
+        };
+        g.ingest_incident(&incident);
+
+        // The IP node must have been created.
+        let ip_label_present = g.nodes_of_type(NodeType::Ip).iter().any(
+            |&id| matches!(g.get_node(id), Some(Node::Ip { addr, .. }) if addr == "198.51.100.123"),
+        );
+        assert!(
+            ip_label_present,
+            "expected derived IP node 198.51.100.123 to exist after ingest"
+        );
+
+        // The TriggeredBy edge from Incident to IP must exist so the
+        // IP pivot can find it.
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
+        let items =
+            build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), "2026-04-28");
+        let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
+        assert!(
+            ips.contains("198.51.100.123"),
+            "derived IP must surface in IP pivot, got: {ips:?}"
+        );
+    }
+
+    #[test]
+    fn detector_pivot_and_ip_pivot_share_same_date_filter_subset() {
+        // Anchor for: "detector pivot e IP pivot respeitam o mesmo
+        // date/filter subset". Both pivots must agree on which
+        // incidents qualify; the contradiction reported by the
+        // operator was the Detector pivot listing items that the IP
+        // pivot had filtered out.
+        let kg = make_kg_with_two_dates();
+        let ip_items =
+            build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), "2026-04-28");
+        let det_items = build_pivots_from_graph(
+            &kg,
+            PivotKind::Detector,
+            100,
+            &Default::default(),
+            "2026-04-28",
+        );
+        // Both pivots are scoped to 2026-04-28 only. The two-date
+        // fixture has exactly one incident per day, so both pivots
+        // must report incident_count == 1 for the same single day.
+        let total_ip_incidents: usize = ip_items.iter().map(|p| p.incident_count).sum();
+        let total_det_incidents: usize = det_items.iter().map(|p| p.incident_count).sum();
+        assert_eq!(
+            total_ip_incidents, total_det_incidents,
+            "Detector and IP pivots must agree on the qualifying-incident count for the same date+filter; got IP={total_ip_incidents}, Detector={total_det_incidents}"
+        );
+        assert_eq!(
+            total_ip_incidents, 1,
+            "fixture has exactly one incident on 2026-04-28; got {total_ip_incidents}"
+        );
+        // Detector pivot must derive outcome from decisions, not
+        // hardcode "active". The 2026-04-28 incident has decision=block_ip.
+        assert_eq!(
+            det_items
+                .iter()
+                .find(|p| p.value == "ssh_bruteforce")
+                .map(|p| p.outcome.as_str()),
+            Some("blocked"),
+            "Detector pivot outcome must reflect the underlying decision, got: {:?}",
+            det_items
+                .iter()
+                .map(|p| (p.value.clone(), p.outcome.clone()))
+                .collect::<Vec<_>>()
+        );
     }
 }
