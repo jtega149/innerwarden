@@ -65,23 +65,36 @@ pub(super) fn explain_system_prompt(personality: &str) -> String {
         format!("{}\n\n{simplifier}", personality.trim_end())
     }
 }
-/// 2026-04-29 (audit Phase 5 / RC-2 deeper close): aggregated counters
-/// the Home tiles display. The pre-Phase-5 path computed these by
-/// iterating the in-memory knowledge graph, which is lossy: the slow
-/// loop's TTL eviction culls nodes older than ~12h, so today's
-/// 06:00-UTC incidents disappear from the graph by 18:00 UTC even
-/// though they are still in `incidents-YYYY-MM-DD.jsonl` and the
-/// SQLite `incidents` table. The operator saw this as the Home tile
-/// "Handled Today" decaying from N to 0 over the course of a day
-/// while the durable storage held all N incidents intact.
+/// Phase 5 (audit RC-2 / 2026-04-29) introduced a SQLite-backed
+/// counter aggregation to replace the lossy in-memory KG iteration.
+/// Phase 7 (this commit) generalises that into a single-pass producer
+/// of *both* the legacy flat fields (for backwards-compat clients
+/// like the Telegram bot) and the new typed `OverviewSnapshot` (for
+/// the redesigned Home tile UX). One SQL walk, two output shapes,
+/// no recomputation.
 ///
-/// PR #335 (Phase 3) and PR #336 (Phase 4) closed RC-4. RC-2
-/// ("three-place writes") was *partially* closed by PR #333 (decision
-/// → outcome contract) but the count-source-of-truth half stayed
-/// open: tiles read the lossy KG, list endpoints read the lossy KG,
-/// nobody read the durable SQLite. Phase 5 makes SQLite the source
-/// of truth for `/api/overview` counts so the Home tile reflects
-/// what is actually on disk.
+/// Top-level invariants this function holds:
+///
+/// 1. **Date scoping**: only incidents whose `ts` starts with `date`
+///    are counted. No leakage from previous/next day.
+/// 2. **Internal-traffic filter**: applies the same
+///    `is_internal_incident_fields` predicate the Threats list and
+///    Live Feed use, so all surfaces agree on which incidents are
+///    "real attacks" vs. system noise.
+/// 3. **Allowlist segregation**: incidents flagged
+///    `is_allowlisted=1` (column written by the agent's fast loop in
+///    the SkipAllowlisted branch) go into the `allowlisted` bucket
+///    and do NOT inflate `attention`. This is the operator-visible
+///    bug the Phase 7 redesign closes.
+/// 4. **Pending categorisation**: incidents with no decision are
+///    bucketed by reason — in-flight (<5min), declined, cooldown'd,
+///    stuck (>1h, no cooldown). The "stuck" category is the
+///    SystemHealth signal.
+/// 5. **Unique-attacker count**: the per-bucket `unique_attackers`
+///    field is built from a deduplicated set of external IPs
+///    extracted from each incident's `entities`. RFC 1918 addresses
+///    are excluded so a misconfigured outbound-NAT host doesn't show
+///    up as an attacker against itself.
 #[derive(Default)]
 pub(super) struct OverviewCounts {
     pub incidents_count: usize,
@@ -95,85 +108,133 @@ pub(super) struct OverviewCounts {
     pub blocked_count: usize,
     pub observing_count: usize,
     pub attention_count: usize,
+    pub allowlisted_count: usize,
     pub severity_breakdown: std::collections::HashMap<String, usize>,
     pub by_detector: BTreeMap<String, usize>,
+    /// Phase 7: the typed snapshot built alongside the flat counts.
+    /// `None` only on default-constructed instances (test fixtures
+    /// before population); populated by
+    /// `compute_overview_counts_from_sqlite` on every successful read.
+    pub snapshot: Option<super::types::OverviewSnapshot>,
+}
+
+/// One row from the incidents+latest-decision JOIN, post-decoding,
+/// post-filter-eligibility check. Keeps the inner loop small.
+struct OverviewRow {
+    detector: String,
+    severity: String,
+    is_allowlisted: bool,
+    ts_ms: i64,
+    action_type: Option<String>,
+    target_ip: Option<String>,
+    external_ips: std::collections::BTreeSet<String>,
 }
 
 /// Read all of `date`'s incidents from SQLite (the durable source of
-/// truth, unaffected by KG TTL eviction), join each with its latest
-/// decision, and aggregate into the Home counters.
+/// truth, unaffected by KG TTL eviction), join with each one's latest
+/// decision, and produce both the legacy flat counters and the
+/// Phase 7 typed snapshot.
 ///
-/// Returns `None` when the SQLite store is not configured (test
-/// fixtures, transitional state). Callers must fall back to the
-/// in-memory KG iteration in that case so tests without a Store keep
-/// working.
+/// Returns `None` when the SQLite store is unreachable. Callers fall
+/// back to the in-memory KG iteration in that case so test fixtures
+/// without a Store keep working.
 pub(super) fn compute_overview_counts_from_sqlite(
     store: &innerwarden_store::Store,
     date: &str,
     sev_min_rank: u8,
     detector_substring: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Option<OverviewCounts> {
+    use super::types::{BucketStats, OutcomeBuckets, OverviewSnapshot, PendingBreakdown};
+
     let conn = store.conn().ok()?;
-    let mut counts = OverviewCounts::default();
-    let mut handled_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Prefix-match on the ISO timestamp string ("2026-04-29..."). The
-    // `idx_incidents_ts` index is on the same column so this is cheap.
     let pattern = format!("{date}%");
     let mut stmt = conn
         .prepare_cached(
-            "SELECT i.detector, i.title, i.severity, i.data, \
-                    d.action_type, d.target_ip, d.auto_executed \
+            "SELECT i.incident_id, i.detector, i.title, i.severity, i.ts, \
+                    i.is_allowlisted, i.data, \
+                    d.action_type, d.target_ip \
              FROM incidents i \
              LEFT JOIN ( \
-                 SELECT incident_id, action_type, target_ip, auto_executed, \
+                 SELECT incident_id, action_type, target_ip, \
                         ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY id DESC) AS rn \
                  FROM decisions \
              ) d ON d.incident_id = i.incident_id AND d.rn = 1 \
              WHERE i.ts LIKE ?1",
         )
         .ok()?;
-    let rows = stmt
+    let raw_rows = stmt
         .query_map([&pattern], |row| {
             Ok((
-                row.get::<_, String>(0)?,         // detector
-                row.get::<_, String>(1)?,         // title
-                row.get::<_, String>(2)?,         // severity
-                row.get::<_, String>(3)?,         // data (JSON)
-                row.get::<_, Option<String>>(4)?, // action_type
-                row.get::<_, Option<String>>(5)?, // target_ip
-                row.get::<_, Option<i64>>(6)?,    // auto_executed
+                row.get::<_, String>(0)?,         // incident_id
+                row.get::<_, String>(1)?,         // detector
+                row.get::<_, String>(2)?,         // title
+                row.get::<_, String>(3)?,         // severity
+                row.get::<_, String>(4)?,         // ts iso
+                row.get::<_, i64>(5)?,            // is_allowlisted (0/1)
+                row.get::<_, String>(6)?,         // data JSON
+                row.get::<_, Option<String>>(7)?, // action_type
+                row.get::<_, Option<String>>(8)?, // target_ip
             ))
         })
         .ok()?;
-    for row in rows {
-        let Ok((detector, title, severity, data, action_type, target_ip, _auto_executed)) = row
+
+    let mut decoded: Vec<OverviewRow> = Vec::new();
+    for raw in raw_rows {
+        let Ok((
+            incident_id,
+            detector,
+            title,
+            severity,
+            ts_iso,
+            is_allowlisted_flag,
+            data,
+            action_type,
+            target_ip,
+        )) = raw
         else {
             continue;
         };
-        // Apply the same internal/system-noise filter the live-feed
-        // and threats tab use, so the Home tile counts match what the
-        // operator sees in the lists.
         let parsed: serde_json::Value = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let has_external_ip = parsed
+        // Skip research-only incidents (spec 015) — invisible to the
+        // operator-facing counts by design.
+        if parsed
+            .get("research_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        // Extract the external IPs once, share between the
+        // is_internal check and the unique-attacker dedup set.
+        let external_ips: std::collections::BTreeSet<String> = parsed
             .get("entities")
             .and_then(|v| v.as_array())
             .map(|arr| {
-                arr.iter().any(|e| {
-                    let is_ip = e
-                        .get("type")
-                        .and_then(|t| t.as_str())
-                        .map(|t| t.eq_ignore_ascii_case("ip"))
-                        .unwrap_or(false);
-                    let value = e.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                    is_ip
-                        && !value.is_empty()
-                        && !crate::incident_auto_rules::is_internal_ip_pub(value)
-                })
+                arr.iter()
+                    .filter_map(|e| {
+                        let is_ip = e
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t.eq_ignore_ascii_case("ip"))
+                            .unwrap_or(false);
+                        if !is_ip {
+                            return None;
+                        }
+                        let value = e.get("value").and_then(|v| v.as_str())?;
+                        if value.is_empty() || crate::incident_auto_rules::is_internal_ip_pub(value)
+                        {
+                            return None;
+                        }
+                        Some(value.to_string())
+                    })
+                    .collect()
             })
-            .unwrap_or(false);
+            .unwrap_or_default();
+        let has_external_ip = !external_ips.is_empty();
         if crate::dashboard::live_feed::is_internal_incident_fields(
             &detector,
             &title,
@@ -191,38 +252,143 @@ pub(super) fn compute_overview_counts_from_sqlite(
                 continue;
             }
         }
-        // Skip research-only incidents (spec 015). These are stored
-        // in the JSON `data` blob; the column doesn't promote it.
-        if parsed
-            .get("research_only")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            continue;
-        }
+        let ts_ms = chrono::DateTime::parse_from_rfc3339(&ts_iso)
+            .map(|t| t.with_timezone(&chrono::Utc).timestamp_millis())
+            .unwrap_or_else(|_| now.timestamp_millis());
+        // (Phase 7 Slice A scope: cooldown-suppressed pending detection
+        // is age-heuristic only. A future slice can plumb the cooldown
+        // store in to distinguish "<1h, AI deliberately suppressed" from
+        // "<1h, AI hasn't run yet" — neither is operator-actionable so
+        // both bucket as in_flight for now. The "stuck" signal that
+        // matters most is age-only, which we have.)
+        let _ = incident_id; // not needed beyond the cooldown plumbing
+        decoded.push(OverviewRow {
+            detector,
+            severity: severity.to_lowercase(),
+            is_allowlisted: is_allowlisted_flag != 0,
+            ts_ms,
+            action_type,
+            target_ip,
+            external_ips,
+        });
+    }
+
+    let mut counts = OverviewCounts::default();
+    let mut handled_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut buckets = OutcomeBuckets::default();
+    let mut bucket_attackers_blocked: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut bucket_attackers_observing: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut bucket_attackers_honeypot: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut bucket_attackers_dismissed: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut bucket_attackers_allowlisted: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut bucket_attackers_attention: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut pending = PendingBreakdown::default();
+    let now_ms = now.timestamp_millis();
+    let in_flight_threshold_ms = 5 * 60 * 1000; // 5 minutes
+    let stuck_threshold_ms = 60 * 60 * 1000; // 1 hour
+
+    for row in &decoded {
         counts.incidents_count += 1;
-        *counts.by_detector.entry(detector.clone()).or_insert(0) += 1;
+        *counts.by_detector.entry(row.detector.clone()).or_insert(0) += 1;
         *counts
             .severity_breakdown
-            .entry(severity.to_lowercase())
+            .entry(row.severity.clone())
             .or_insert(0) += 1;
-        let outcome = super::threat_contract::classify_decision(action_type.as_deref(), Some("ok"));
+
+        // Allowlisted incidents go into the allowlisted bucket and
+        // never count toward the operator-action buckets, regardless
+        // of whether they happened to receive a decision (typically
+        // they don't — the SkipAllowlisted branch short-circuits the
+        // AI router).
+        if row.is_allowlisted {
+            counts.allowlisted_count += 1;
+            buckets.allowlisted.incidents += 1;
+            *buckets
+                .allowlisted
+                .severities
+                .entry(row.severity.clone())
+                .or_insert(0) += 1;
+            for ip in &row.external_ips {
+                bucket_attackers_allowlisted.insert(ip.clone());
+            }
+            continue;
+        }
+
+        let outcome =
+            super::threat_contract::classify_decision(row.action_type.as_deref(), Some("ok"));
         match super::threat_contract::kpi_bucket(outcome) {
             super::threat_contract::KpiBucket::Blocked => counts.blocked_count += 1,
             super::threat_contract::KpiBucket::Observing => counts.observing_count += 1,
             super::threat_contract::KpiBucket::Attention => counts.attention_count += 1,
             super::threat_contract::KpiBucket::None => {}
         }
-        if let Some(action) = action_type {
+
+        // Bucket-level severity histogram + unique attacker set.
+        let (bucket, attackers_set): (&mut BucketStats, &mut std::collections::HashSet<String>) =
+            match outcome {
+                super::threat_contract::OUTCOME_BLOCKED => {
+                    (&mut buckets.blocked, &mut bucket_attackers_blocked)
+                }
+                super::threat_contract::OUTCOME_HONEYPOT => {
+                    (&mut buckets.honeypot, &mut bucket_attackers_honeypot)
+                }
+                super::threat_contract::OUTCOME_MONITORING => {
+                    (&mut buckets.observing, &mut bucket_attackers_observing)
+                }
+                super::threat_contract::OUTCOME_DISMISSED => {
+                    (&mut buckets.dismissed, &mut bucket_attackers_dismissed)
+                }
+                _ => (&mut buckets.attention, &mut bucket_attackers_attention),
+            };
+        bucket.incidents += 1;
+        *bucket.severities.entry(row.severity.clone()).or_insert(0) += 1;
+        for ip in &row.external_ips {
+            attackers_set.insert(ip.clone());
+        }
+
+        // Pending breakdown: only applies to the "attention" bucket
+        // (no decision yet, or escalate/request_confirmation).
+        if outcome == super::threat_contract::OUTCOME_OPEN {
+            let age_ms = now_ms - row.ts_ms;
+            match row.action_type.as_deref() {
+                Some("escalate") | Some("request_confirmation") => {
+                    pending.declined_by_ai += 1;
+                }
+                _ => {
+                    if age_ms < in_flight_threshold_ms {
+                        pending.in_flight += 1;
+                    } else if age_ms >= stuck_threshold_ms {
+                        pending.stuck += 1;
+                    } else {
+                        // Between 5min and 1h, no decision. Treat as
+                        // in-flight: the AI processing pipeline runs
+                        // every few seconds, and a 5-60min gap typically
+                        // means budget-saturation or cooldown-suppression
+                        // — both AI-deliberate, not operator-actionable.
+                        // The "stuck" signal kicks in at >1h which is the
+                        // threshold where operator must look.
+                        pending.in_flight += 1;
+                    }
+                }
+            }
+        }
+
+        if let Some(action) = &row.action_type {
             counts.decisions_count += 1;
-            let target_is_ip = target_ip.as_ref().is_some_and(|t| t.contains('.'));
+            let target_is_ip = row.target_ip.as_ref().is_some_and(|t| t.contains('.'));
             match action.as_str() {
                 "ignore" | "dismiss" => counts.ai_ignored += 1,
                 "monitor" => {
                     counts.ai_confirmed += 1;
                     counts.safely_resolved += 1;
                     if target_is_ip {
-                        if let Some(ip) = &target_ip {
+                        if let Some(ip) = &row.target_ip {
                             handled_ips.insert(ip.clone());
                         }
                     }
@@ -235,7 +401,7 @@ pub(super) fn compute_overview_counts_from_sqlite(
                     counts.ai_confirmed += 1;
                     if target_is_ip {
                         counts.ai_responded += 1;
-                        if let Some(ip) = &target_ip {
+                        if let Some(ip) = &row.target_ip {
                             handled_ips.insert(ip.clone());
                         }
                     }
@@ -245,7 +411,66 @@ pub(super) fn compute_overview_counts_from_sqlite(
         }
     }
     counts.handled_ips_today = handled_ips.len();
+
+    // Finalise per-bucket unique-attacker counts.
+    buckets.blocked.unique_attackers = bucket_attackers_blocked.len();
+    buckets.observing.unique_attackers = bucket_attackers_observing.len();
+    buckets.honeypot.unique_attackers = bucket_attackers_honeypot.len();
+    buckets.dismissed.unique_attackers = bucket_attackers_dismissed.len();
+    buckets.allowlisted.unique_attackers = bucket_attackers_allowlisted.len();
+    buckets.attention.unique_attackers = bucket_attackers_attention.len();
+
+    // Top detectors built from the same `by_detector` accumulator the
+    // legacy flat path uses, so both shapes agree by construction.
+    let mut top_detectors: Vec<crate::dashboard::types::DetectorCount> = counts
+        .by_detector
+        .iter()
+        .map(|(detector, count)| crate::dashboard::types::DetectorCount {
+            detector: detector.clone(),
+            count: *count,
+        })
+        .collect();
+    top_detectors.sort_by(|a, b| b.count.cmp(&a.count).then(a.detector.cmp(&b.detector)));
+    top_detectors.truncate(6);
+
+    let health = derive_system_health(&pending);
+
+    let events_today = 0; // backfilled below from telemetry by the caller
+    counts.snapshot = Some(OverviewSnapshot {
+        date: date.to_string(),
+        generated_at: now,
+        health,
+        buckets,
+        pending,
+        events_today,
+        top_detectors,
+    });
     Some(counts)
+}
+
+/// Derive the operator-visible health verb from the pending
+/// breakdown. Thresholds documented here in one place so a future UX
+/// tune (e.g. raising "backed up" from 50 to 100) doesn't require
+/// hunting through frontend code.
+pub(super) fn derive_system_health(
+    pending: &super::types::PendingBreakdown,
+) -> super::types::SystemHealth {
+    use super::types::SystemHealth;
+    if pending.stuck > 0 {
+        return SystemHealth::AiNotResponding {
+            stuck_count: pending.stuck,
+        };
+    }
+    // "Backed up" = significantly more in-flight than the steady
+    // state. 50 is an empirical threshold; on prod 2026-04-29 with
+    // ~290 incidents/day this corresponds to ~1 hour of bursty
+    // activity. Adjust if operator feedback says it's too sensitive.
+    if pending.in_flight > 50 {
+        return SystemHealth::BackedUp {
+            pending_in_flight: pending.in_flight,
+        };
+    }
+    SystemHealth::OperatingNormally
 }
 
 pub(super) async fn api_overview(
@@ -273,6 +498,7 @@ pub(super) async fn api_overview(
             allowlisted_count: 0,
             top_detectors: vec![],
             latest_telemetry: crate::telemetry::read_latest_snapshot(&state.data_dir, &date),
+            snapshot: None,
         });
     }
 
@@ -312,26 +538,55 @@ pub(super) async fn api_overview(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_ascii_lowercase());
+    let now = chrono::Utc::now();
     let sqlite_counts = state.sqlite_store.as_ref().and_then(|store| {
         compute_overview_counts_from_sqlite(
             store,
             &date,
             sev_min_rank_filter,
             detector_substring_filter.as_deref(),
+            now,
         )
     });
     if let Some(c) = sqlite_counts {
         let telemetry = crate::telemetry::read_latest_snapshot(&state.data_dir, &date);
         let mut top_detectors: Vec<DetectorCount> = c
             .by_detector
-            .into_iter()
-            .map(|(detector, count)| DetectorCount { detector, count })
+            .iter()
+            .map(|(detector, count)| DetectorCount {
+                detector: detector.clone(),
+                count: *count,
+            })
             .collect();
         top_detectors.sort_by(|a, b| b.count.cmp(&a.count).then(a.detector.cmp(&b.detector)));
         top_detectors.truncate(6);
+        // Phase 7: events_today on the snapshot reads from telemetry
+        // (sensor counter) when available, falling back to the lossy
+        // KG edge count. Telemetry snapshot is what the operator
+        // actually wants on the "Events Scanned" tile.
+        let events_today = telemetry
+            .as_ref()
+            .map(|t| t.events_by_collector.values().copied().sum::<u64>() as usize)
+            .unwrap_or(metrics.edge_count);
+        let mut snapshot = c.snapshot.clone().unwrap_or_else(|| {
+            // Defensive default: should never hit because
+            // compute_overview_counts_from_sqlite always populates,
+            // but if it ever returns None we serve a sensible empty
+            // snapshot rather than erroring the whole response.
+            super::types::OverviewSnapshot {
+                date: date.clone(),
+                generated_at: now,
+                health: super::types::SystemHealth::OperatingNormally,
+                buckets: super::types::OutcomeBuckets::default(),
+                pending: super::types::PendingBreakdown::default(),
+                events_today: 0,
+                top_detectors: Vec::new(),
+            }
+        });
+        snapshot.events_today = events_today;
         return Json(OverviewResponse {
             date,
-            events_count: metrics.edge_count, // graph metric — not date-filtered, separate concern
+            events_count: metrics.edge_count, // legacy field — kept for backwards-compat
             incidents_count: c.incidents_count,
             decisions_count: c.decisions_count,
             ai_confirmed: c.ai_confirmed,
@@ -344,12 +599,13 @@ pub(super) async fn api_overview(
             observing_count: c.observing_count,
             attention_count: c.attention_count,
             severity_breakdown: c.severity_breakdown,
-            // SQLite path doesn't carry the dynamic-rule allowlist
-            // flag (lives only on the graph node post-ingestion).
-            // Frontend doesn't render this field; safe to leave 0.
-            allowlisted_count: 0,
+            // Phase 7: now populated from the persisted is_allowlisted
+            // column. Pre-Phase-7 returned 0 because the flag only
+            // lived on the KG node.
+            allowlisted_count: c.allowlisted_count,
             top_detectors,
             latest_telemetry: telemetry,
+            snapshot: Some(snapshot),
         });
     }
 
@@ -539,6 +795,10 @@ pub(super) async fn api_overview(
         allowlisted_count,
         top_detectors,
         latest_telemetry: telemetry,
+        // KG fallback path doesn't build the typed snapshot — only
+        // exercised by tests without a SQLite store. Frontend treats
+        // `snapshot: None` as "render legacy flat-field tiles".
+        snapshot: None,
     })
 }
 
@@ -1106,6 +1366,7 @@ pub(super) fn compute_overview_from_graph(
         allowlisted_count,
         top_detectors,
         latest_telemetry: crate::telemetry::read_latest_snapshot(data_dir, date),
+        snapshot: None,
     }
 }
 
@@ -1197,6 +1458,7 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
         allowlisted_count: 0,
         top_detectors,
         latest_telemetry: crate::telemetry::read_latest_snapshot(data_dir, date),
+        snapshot: None,
     }
 }
 
@@ -1702,8 +1964,8 @@ mod tests {
             Some("203.0.113.99"),
         );
 
-        let counts =
-            compute_overview_counts_from_sqlite(&store, date, 0, None).expect("counts returned");
+        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
+            .expect("counts returned");
         assert_eq!(counts.incidents_count, 4, "today only, not yesterday");
         assert_eq!(counts.blocked_count, 1, "ssh:bf:1");
         assert_eq!(counts.observing_count, 1, "ssh:bf:2");
@@ -1741,8 +2003,8 @@ mod tests {
             "ssh brute",
             Some("203.0.113.10"),
         );
-        let counts =
-            compute_overview_counts_from_sqlite(&store, date, 0, None).expect("counts returned");
+        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
+            .expect("counts returned");
         assert_eq!(
             counts.incidents_count, 1,
             "internal IP must be filtered out"
@@ -1773,8 +2035,210 @@ mod tests {
         );
         let high_only = crate::dashboard::investigation::severity_rank("high");
         let counts =
-            compute_overview_counts_from_sqlite(&store, date, high_only, None).expect("counts");
+            compute_overview_counts_from_sqlite(&store, date, high_only, None, chrono::Utc::now())
+                .expect("counts");
         assert_eq!(counts.incidents_count, 1);
+    }
+
+    // ── Phase 7 anchors: snapshot shape + bucket consistency ──────────
+    //
+    // These pin the new contract the front-end migrated to. If a
+    // future refactor "simplifies" the snapshot back to a flat shape,
+    // or drops the unique-attacker dedup, these tests fail loudly
+    // instead of silently regressing the operator-visible "21 vs 10"
+    // confusion that motivated Phase 7.
+
+    #[test]
+    fn sqlite_overview_snapshot_buckets_pair_incidents_and_unique_attackers() {
+        // 4 incidents from 2 IPs. Buckets must report
+        // incidents=4-by-outcome and unique_attackers=2-by-outcome.
+        let store = make_overview_test_store();
+        let date = "2026-04-29";
+        // IP A: 2 blocked incidents (block_ip decisions).
+        for (suffix, hr) in [("1", "01"), ("2", "05")] {
+            insert_test_incident(
+                &store,
+                &format!("ssh:bf:{suffix}"),
+                &format!("2026-04-29T{hr}:00:00Z"),
+                "ssh_bruteforce",
+                "high",
+                "brute",
+                Some("203.0.113.10"),
+            );
+            insert_test_decision(
+                &store,
+                &format!("ssh:bf:{suffix}"),
+                &format!("2026-04-29T{hr}:00:01Z"),
+                "block_ip",
+                Some("203.0.113.10"),
+            );
+        }
+        // IP B: 2 blocked incidents.
+        for (suffix, hr) in [("3", "06"), ("4", "07")] {
+            insert_test_incident(
+                &store,
+                &format!("ssh:bf:{suffix}"),
+                &format!("2026-04-29T{hr}:00:00Z"),
+                "ssh_bruteforce",
+                "high",
+                "brute",
+                Some("203.0.113.20"),
+            );
+            insert_test_decision(
+                &store,
+                &format!("ssh:bf:{suffix}"),
+                &format!("2026-04-29T{hr}:00:01Z"),
+                "block_ip",
+                Some("203.0.113.20"),
+            );
+        }
+
+        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
+            .expect("counts");
+        let snap = counts.snapshot.expect("snapshot populated");
+        // The exact two-number pair the operator was confused by.
+        // Pre-Phase-7 the Home tile showed 4 (incidents) while the
+        // Threats list showed 2 (attackers). Post-Phase-7 both
+        // numbers come from the same struct.
+        assert_eq!(
+            snap.buckets.blocked.incidents, 4,
+            "4 block_ip decisions today"
+        );
+        assert_eq!(
+            snap.buckets.blocked.unique_attackers, 2,
+            "across 2 unique IPs"
+        );
+        // Severity histogram for the bucket.
+        assert_eq!(snap.buckets.blocked.severities.get("high"), Some(&4));
+    }
+
+    #[test]
+    fn sqlite_overview_snapshot_routes_allowlisted_to_dedicated_bucket() {
+        // Allowlisted incidents must NOT inflate `attention` —
+        // the operator-visible bug that surfaced post-Phase-5.
+        let store = make_overview_test_store();
+        let date = "2026-04-29";
+        insert_test_incident(
+            &store,
+            "ssh:trusted",
+            "2026-04-29T01:00:00Z",
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.10"),
+        );
+        insert_test_incident(
+            &store,
+            "ssh:open",
+            "2026-04-29T02:00:00Z",
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.20"),
+        );
+        // Flag the first as allowlisted (mirrors what the agent fast
+        // loop does in the SkipAllowlisted branch).
+        store
+            .set_incident_allowlisted("ssh:trusted")
+            .expect("set allowlisted");
+
+        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
+            .expect("counts");
+        let snap = counts.snapshot.expect("snapshot populated");
+        assert_eq!(snap.buckets.allowlisted.incidents, 1);
+        assert_eq!(snap.buckets.allowlisted.unique_attackers, 1);
+        assert_eq!(
+            snap.buckets.attention.incidents, 1,
+            "only the un-allowlisted IP needs attention"
+        );
+        assert_eq!(snap.buckets.attention.unique_attackers, 1);
+        // Legacy allowlisted_count flat field also populated for
+        // backwards-compat clients.
+        assert_eq!(counts.allowlisted_count, 1);
+    }
+
+    #[test]
+    fn sqlite_overview_snapshot_pending_breakdown_categorises_by_age() {
+        // 1 fresh incident (in-flight), 1 old (stuck), 1 escalated
+        // (declined_by_ai). All today, all without final block decision.
+        let store = make_overview_test_store();
+        let date = chrono::Utc::now().date_naive().to_string();
+        let now = chrono::Utc::now();
+        let fresh_ts = (now - chrono::Duration::seconds(120))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let stuck_ts =
+            (now - chrono::Duration::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let escalated_ts = (now - chrono::Duration::seconds(60))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        insert_test_incident(
+            &store,
+            "fresh:1",
+            &fresh_ts,
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.10"),
+        );
+        insert_test_incident(
+            &store,
+            "stuck:1",
+            &stuck_ts,
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.20"),
+        );
+        insert_test_incident(
+            &store,
+            "escalated:1",
+            &escalated_ts,
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.30"),
+        );
+        insert_test_decision(
+            &store,
+            "escalated:1",
+            &escalated_ts,
+            "escalate",
+            Some("203.0.113.30"),
+        );
+
+        let counts =
+            compute_overview_counts_from_sqlite(&store, &date, 0, None, now).expect("counts");
+        let snap = counts.snapshot.expect("snapshot populated");
+        assert_eq!(snap.pending.in_flight, 1, "fresh:1 (<5min)");
+        assert_eq!(snap.pending.stuck, 1, "stuck:1 (>1h)");
+        assert_eq!(
+            snap.pending.declined_by_ai, 1,
+            "escalated:1 has escalate decision"
+        );
+        // Health verb derived from breakdown.
+        match snap.health {
+            super::super::types::SystemHealth::AiNotResponding { stuck_count } => {
+                assert_eq!(stuck_count, 1);
+            }
+            other => panic!("expected AiNotResponding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sqlite_overview_snapshot_health_operating_normally_default() {
+        // Empty store -> no incidents -> all pending counts zero ->
+        // health is OperatingNormally. The hero verb reads as the
+        // "all good" default.
+        let store = make_overview_test_store();
+        let date = "2026-04-29";
+        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
+            .expect("counts");
+        let snap = counts.snapshot.expect("snapshot");
+        match snap.health {
+            super::super::types::SystemHealth::OperatingNormally => {}
+            other => panic!("expected OperatingNormally on empty store, got {other:?}"),
+        }
+        assert_eq!(snap.pending.stuck, 0);
+        assert_eq!(snap.pending.in_flight, 0);
     }
 
     #[tokio::test]

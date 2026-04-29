@@ -1169,6 +1169,73 @@
        "kernel block has expired" (badge-kernel-expired). */
     .badge-kernel-active  { background: rgba(58,194,126,0.20);  color: var(--ok);     border: 1px solid rgba(58,194,126,0.40); }
     .badge-kernel-expired { background: rgba(255,193,7,0.10);   color: #f4d35e;       border: 1px solid rgba(255,193,7,0.25); }
+
+    /* Phase 7 (audit RC-2 / 2026-04-29): paired-unit KPI tile and
+       pending breakdown panel. The kpi-pair-line sits between the
+       primary number and the window label and shows the secondary
+       unit (e.g. "21 actions" under a "10" Handled tile, so the
+       operator sees both unique-attacker count and total decision
+       count without doing math). */
+    .kpi-pair-line {
+      font-size: 0.62rem;
+      color: var(--muted);
+      margin-top: 2px;
+      letter-spacing: 0.02em;
+    }
+    .home-section-sub {
+      font-size: 0.62rem;
+      color: var(--muted);
+      font-weight: 400;
+      margin-left: 8px;
+    }
+    .pending-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-top: 8px;
+    }
+    @media (max-width: 720px) {
+      .pending-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    .pending-cell {
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(120, 229, 255, 0.04);
+      border: 1px solid var(--line);
+    }
+    .pending-cell-warn { /* Stuck: red border so the operator's eye lands here. */
+      background: rgba(244, 63, 94, 0.06);
+      border-color: rgba(244, 63, 94, 0.25);
+    }
+    .pending-num {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.0;
+    }
+    .pending-label {
+      font-size: 0.7rem;
+      color: var(--muted);
+      margin-top: 4px;
+      font-weight: 600;
+    }
+    .pending-hint {
+      font-size: 0.6rem;
+      color: var(--dim);
+      margin-top: 2px;
+    }
+
+    /* Phase 7: allowlist outcome group on the Threats list. Distinct
+       colour from the operator-action groups so the operator can
+       audit silenced trust at a glance. Same visual weight as
+       blocked/observing — allowlist is not "less important", it's
+       "different concern". */
+    .threat-group.outcome-allowlisted {
+      border-color: rgba(168, 124, 240, 0.25);
+    }
+    .threat-group.outcome-allowlisted .threat-group-header {
+      background: rgba(168, 124, 240, 0.06);
+    }
     .pulse-dot.contained { background: var(--ok); animation: none; }
     .responsive-table { display:block; overflow-x:auto; -webkit-overflow-scrolling:touch; }
     .responsive-table table { min-width:600px; }

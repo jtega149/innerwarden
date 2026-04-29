@@ -442,11 +442,25 @@ mod tests {
         assert_eq!(schema_version(&conn).unwrap(), 1);
 
         ensure_schema(&conn).unwrap();
+        // The migration loop runs all pending versions to CURRENT_VERSION.
+        // Phase 7 added v3 (incidents.is_allowlisted column), so a v1
+        // database now ends up at v3. The v2 step still runs and is what
+        // this test cares about (its version row is recorded), but the
+        // final schema_version reflects the full run, not just v2.
         assert_eq!(
             schema_version(&conn).unwrap(),
-            2,
-            "v2 migration must record its version even though backfill is deferred"
+            crate::schema::CURRENT_VERSION,
+            "all migrations must record their version even though v2 backfill is deferred"
         );
+        // Verify v2's row specifically exists (not just the latest).
+        let has_v2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_version WHERE version = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_v2, 1, "v2 migration must record its own row");
 
         // Both rows still have NULL src_ip — backfill has not run.
         let null_count: i64 = conn

@@ -982,13 +982,19 @@ pub(super) fn build_attackers_from_sqlite(
         detectors: BTreeSet<String>,
         incident_outcomes: Vec<&'static str>,
         incident_count: usize,
+        // Phase 7: when ANY incident on this IP was allowlisted, the
+        // aggregate outcome is "allowlisted" (precedence-overrides
+        // even blocked, because the operator's trust rule explicitly
+        // silenced them). The dashboard renders allowlisted attackers
+        // in their own group so the operator can audit silenced trust.
+        any_allowlisted: bool,
     }
     let conn = store.conn().ok()?;
     let pattern = format!("{date}%");
     let mut stmt = conn
         .prepare_cached(
             "SELECT i.incident_id, i.ts, i.detector, i.severity, i.title, i.data, \
-                    d.action_type \
+                    i.is_allowlisted, d.action_type \
              FROM incidents i \
              LEFT JOIN ( \
                  SELECT incident_id, action_type, \
@@ -1007,15 +1013,19 @@ pub(super) fn build_attackers_from_sqlite(
                 row.get::<_, String>(3)?,         // severity
                 row.get::<_, String>(4)?,         // title
                 row.get::<_, String>(5)?,         // data (JSON)
-                row.get::<_, Option<String>>(6)?, // action_type
+                row.get::<_, i64>(6)?,            // is_allowlisted (0/1)
+                row.get::<_, Option<String>>(7)?, // action_type
             ))
         })
         .ok()?;
     let mut by_ip: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
     for row in rows {
-        let Ok((_iid, ts_iso, detector, severity, title, data, action_type)) = row else {
+        let Ok((_iid, ts_iso, detector, severity, title, data, is_allowlisted_flag, action_type)) =
+            row
+        else {
             continue;
         };
+        let is_allowlisted = is_allowlisted_flag != 0;
         // Parse JSON to extract IPs + research_only.
         let parsed: serde_json::Value = match serde_json::from_str(&data) {
             Ok(v) => v,
@@ -1094,6 +1104,9 @@ pub(super) fn build_attackers_from_sqlite(
             entry.incident_count += 1;
             entry.detectors.insert(detector_label.clone());
             entry.incident_outcomes.push(outcome);
+            if is_allowlisted {
+                entry.any_allowlisted = true;
+            }
             match entry.first_seen {
                 Some(prev) if prev <= ts => {}
                 _ => entry.first_seen = Some(ts),
@@ -1112,7 +1125,19 @@ pub(super) fn build_attackers_from_sqlite(
     let mut summaries: Vec<AttackerSummary> = by_ip
         .into_iter()
         .map(|(ip, acc)| {
-            let aggregate = threat_contract::aggregate_outcomes(acc.incident_outcomes);
+            // Phase 7: when the operator's trust rule silenced this
+            // IP on at least one of today's incidents, surface it as
+            // outcome="allowlisted". This overrides the per-incident
+            // aggregate because the operator's intent was clear and
+            // we want the audit-friendly group on the Threats list.
+            // The rest of the metadata (first_seen, max_severity,
+            // detectors) still reflects what *would* have fired,
+            // so the operator can audit what their trust silenced.
+            let aggregate = if acc.any_allowlisted {
+                "allowlisted"
+            } else {
+                threat_contract::aggregate_outcomes(acc.incident_outcomes)
+            };
             AttackerSummary {
                 block_state: Some(threat_contract::block_state_for_ip(Some(store), &ip, now)),
                 ip,
@@ -1126,7 +1151,7 @@ pub(super) fn build_attackers_from_sqlite(
                 detectors: acc.detectors.into_iter().collect(),
                 outcome: aggregate.to_string(),
                 incident_count: acc.incident_count,
-                event_count: 0, // Phase 6 scope: incidents only; events come later
+                event_count: 0,
             }
         })
         .collect();
@@ -4133,6 +4158,69 @@ mod tests {
             .expect("sqlite path returns Some");
         let ips: Vec<&str> = attackers.iter().map(|a| a.ip.as_str()).collect();
         assert_eq!(ips, vec!["203.0.113.10"]);
+    }
+
+    #[test]
+    fn build_attackers_from_sqlite_routes_allowlisted_to_own_outcome() {
+        // Phase 7 anchor: when at least one of an IP's incidents is
+        // flagged is_allowlisted=1, the aggregate outcome MUST be
+        // "allowlisted" so the Threats list renders the dedicated
+        // group instead of inflating "needs_attention". Pre-Phase-7
+        // the IP would have shown up under "needs_attention" because
+        // the allowlist branch never wrote a decision.
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let date = "2026-04-29";
+        insert_attacker_test_incident(
+            &store,
+            "ssh:trusted",
+            "2026-04-29T01:00:00Z",
+            "high",
+            "ssh brute",
+            "203.0.113.10",
+        );
+        // Simulate the agent fast loop's SkipAllowlisted branch.
+        store
+            .set_incident_allowlisted("ssh:trusted")
+            .expect("set allowlisted");
+        // A second IP, NOT allowlisted, with a real block decision —
+        // must coexist as a "blocked" attacker without contaminating
+        // the allowlisted bucket.
+        insert_attacker_test_incident(
+            &store,
+            "ssh:hostile",
+            "2026-04-29T02:00:00Z",
+            "high",
+            "ssh brute",
+            "203.0.113.20",
+        );
+        insert_attacker_test_decision(
+            &store,
+            "ssh:hostile",
+            "2026-04-29T02:00:01Z",
+            "block_ip",
+            "203.0.113.20",
+        );
+
+        let filters = InvestigationFilters::from_query(None, None);
+        let attackers = build_attackers_from_sqlite(&store, date, &filters, 100)
+            .expect("sqlite path returns Some");
+        let trusted = attackers
+            .iter()
+            .find(|a| a.ip == "203.0.113.10")
+            .expect("trusted IP present");
+        assert_eq!(
+            trusted.outcome, "allowlisted",
+            "IP whose incident was allowlisted must surface as outcome=allowlisted"
+        );
+        let hostile = attackers
+            .iter()
+            .find(|a| a.ip == "203.0.113.20")
+            .expect("hostile IP present");
+        assert_eq!(
+            hostile.outcome, "blocked",
+            "non-allowlisted IP keeps its real outcome"
+        );
     }
 
     #[tokio::test]

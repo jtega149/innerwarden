@@ -94,6 +94,25 @@ impl Store {
         })?;
         Ok(max)
     }
+
+    /// Phase 7 (audit RC-2): mark an incident as allowlisted by an
+    /// operator's trust rule. Called from the agent fast loop's
+    /// SkipAllowlisted branch in `process/incidents.rs`. Persists the
+    /// match outcome at write-time so the dashboard's overview path
+    /// can render allowlisted attackers in their own group instead of
+    /// inflating "Needs attention" by counting decision-less rows.
+    ///
+    /// Idempotent: if the row is already flagged the UPDATE is a noop.
+    /// Returns the number of rows affected (0 if the incident_id does
+    /// not exist, 1 on success).
+    pub fn set_incident_allowlisted(&self, incident_id: &str) -> Result<usize> {
+        let conn = self.conn()?;
+        let n = conn.execute(
+            "UPDATE incidents SET is_allowlisted = 1 WHERE incident_id = ?1",
+            params![incident_id],
+        )?;
+        Ok(n)
+    }
 }
 
 /// Extension trait for optional query results.
@@ -160,6 +179,49 @@ mod tests {
 
         let not_found = store.get_incident("nonexistent").unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn set_incident_allowlisted_flips_column() {
+        let store = Store::open_memory().unwrap();
+        let id = store
+            .insert_incident(&sample_incident("ssh:bf:2026-04-12"))
+            .unwrap();
+
+        // Default: not allowlisted. Drop conn before calling other
+        // store methods so the r2d2 pool doesn't deadlock.
+        let initial: i64 = {
+            let conn = store.conn().unwrap();
+            conn.query_row(
+                "SELECT is_allowlisted FROM incidents WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(initial, 0);
+
+        let n = store.set_incident_allowlisted("ssh:bf:2026-04-12").unwrap();
+        assert_eq!(n, 1);
+
+        let after: i64 = {
+            let conn = store.conn().unwrap();
+            conn.query_row(
+                "SELECT is_allowlisted FROM incidents WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(after, 1);
+
+        // Idempotent — setting twice is fine.
+        let n2 = store.set_incident_allowlisted("ssh:bf:2026-04-12").unwrap();
+        assert_eq!(n2, 1);
+
+        // Unknown incident_id returns 0 rows affected.
+        let n3 = store.set_incident_allowlisted("nonexistent").unwrap();
+        assert_eq!(n3, 0);
     }
 
     #[test]

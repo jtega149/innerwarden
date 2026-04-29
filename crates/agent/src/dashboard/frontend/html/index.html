@@ -84,21 +84,61 @@
         <li id="homeNowDid"></li>
       </ul>
     </section>
+    <!-- Phase 7 (audit RC-2 / 2026-04-29): each tile is a *pair* of
+         numbers (incidents, attackers) so the operator never has to
+         do mental math like "21 blocks - 10 attackers = 11 repeat
+         offenders". The pair is the unit; one number is incomplete.
+         The pending-breakdown drill-down sits next to the Handled
+         tile so the operator sees what's *not* getting decided. -->
     <div class="home-kpi-row">
       <div class="home-kpi-big" onclick="viewActivity()">
         <div class="kpi-value" id="homeKpiThreats" style="color:var(--ok)">0</div>
         <div class="kpi-label">Handled</div>
+        <div class="kpi-pair-line" id="homeKpiThreatsPair"></div>
         <div class="kpi-window" id="homeKpiThreatsWindow">Today</div>
       </div>
       <div class="home-kpi-big" onclick="viewActivity()">
         <div class="kpi-value" id="homeKpiResponded" style="color:var(--accent)">0</div>
         <div class="kpi-label">Detections</div>
+        <div class="kpi-pair-line" id="homeKpiRespondedPair"></div>
         <div class="kpi-window" id="homeKpiRespondedWindow">Today</div>
       </div>
       <div class="home-kpi-big" onclick="showView('sensors')">
         <div class="kpi-value" id="homeKpiEvents" style="color:var(--accent)">0</div>
         <div class="kpi-label">Events Scanned</div>
+        <div class="kpi-pair-line" id="homeKpiEventsPair"></div>
         <div class="kpi-window" id="homeKpiEventsWindow">Today</div>
+      </div>
+    </div>
+    <!-- Phase 7: pending breakdown panel. Hidden when snapshot
+         reports zero pending overall (default operator-friendly
+         state — no clutter when there's nothing to look at). -->
+    <div class="home-section" id="homePendingPanel" style="display:none">
+      <div class="home-section-title">
+        Pending decisions
+        <span class="home-section-sub" id="homePendingHint"></span>
+      </div>
+      <div class="pending-grid">
+        <div class="pending-cell">
+          <div class="pending-num" id="homePendingInFlight">0</div>
+          <div class="pending-label">In flight</div>
+          <div class="pending-hint">&lt;5 min, AI processing</div>
+        </div>
+        <div class="pending-cell">
+          <div class="pending-num" id="homePendingDeclined">0</div>
+          <div class="pending-label">Declined by AI</div>
+          <div class="pending-hint">Escalated for review</div>
+        </div>
+        <div class="pending-cell">
+          <div class="pending-num" id="homePendingCooldown">0</div>
+          <div class="pending-label">Cooldown'd</div>
+          <div class="pending-hint">Recent decision in effect</div>
+        </div>
+        <div class="pending-cell pending-cell-warn" id="homePendingStuckCell">
+          <div class="pending-num" id="homePendingStuck" style="color:var(--danger)">0</div>
+          <div class="pending-label">Stuck</div>
+          <div class="pending-hint">&gt;1h, AI may be down</div>
+        </div>
       </div>
     </div>
     <div class="home-section" id="briefingSection" style="display:none">

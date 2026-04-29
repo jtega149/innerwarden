@@ -13,12 +13,17 @@ var DETECTOR_PRIORITY = {
 // Threats is NOT a triage queue — the AI decides and acts. The operator
 // reads outcomes, not work items. Grouping by outcome answers "what did
 // the AI do?" instead of "what detector fired?".
-var OUTCOME_ORDER = ['needs_attention', 'blocked', 'honeypot', 'monitoring', 'dismissed'];
+// Phase 7 (audit RC-2): "allowlisted" is now its own group, between
+// Observing and Dismissed. The operator-relevant audit question
+// "what did my trust rules silence today?" gets a dedicated answer
+// instead of being hidden behind the "Hide allowlisted" toggle.
+var OUTCOME_ORDER = ['needs_attention', 'blocked', 'honeypot', 'monitoring', 'allowlisted', 'dismissed'];
 var OUTCOME_META = {
   blocked:         { icon: '\uD83D\uDEE1\uFE0F', label: 'Blocked',          cls: 'outcome-blocked' },
   honeypot:        { icon: '\uD83C\uDF6F',       label: 'Honeypot',          cls: 'outcome-honeypot' },
   monitoring:      { icon: '\uD83D\uDC41\uFE0F', label: 'Observing',         cls: 'outcome-observing' },
   needs_attention: { icon: '\u26A0\uFE0F',       label: 'Needs your attention', cls: 'outcome-attention' },
+  allowlisted:     { icon: '\uD83E\uDD1D',       label: 'Allowlisted (silenced)', cls: 'outcome-allowlisted' },
   dismissed:       { icon: '\u2713',              label: 'Dismissed',         cls: 'outcome-dismissed' },
 };
 
@@ -36,6 +41,12 @@ function outcomeOf(item) {
   if (o === 'blocked') return 'blocked';
   if (o === 'honeypot') return 'honeypot';
   if (o === 'monitoring' || o === 'monitored') return 'monitoring';
+  // Phase 7 (audit RC-2): backend emits outcome="allowlisted" for
+  // attackers whose incidents were silenced by the operator's trust
+  // rule. Treat as a first-class outcome — distinct from dismissed
+  // (AI noise gate) and from monitoring (AI explicitly chose to
+  // watch). The dedicated group makes the silenced trust auditable.
+  if (o === 'allowlisted') return 'allowlisted';
   if (o === 'open') {
     // Operator-centric: open means "no decision yet".
     var modeOpen = (window._agentMode || 'guard');

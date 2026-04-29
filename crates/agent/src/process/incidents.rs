@@ -413,6 +413,24 @@ pub(crate) async fn process_incidents(
                 let mut graph = state.knowledge_graph.write().unwrap();
                 graph.set_allowlisted(&incident.incident_id, true);
                 drop(graph);
+                // Phase 7 (audit RC-2): also persist the allowlisted
+                // flag on the SQLite incident row so the dashboard's
+                // /api/overview snapshot can group allowlisted
+                // attackers separately from "needs attention" without
+                // re-running the dynamic allowlist match per request.
+                // Best-effort: a SQLite write failure here only loses
+                // the dashboard's allowlist visibility for this row,
+                // not the actual allowlist enforcement (which already
+                // happened via the SkipAllowlisted decision above).
+                if let Some(store) = state.sqlite_store.as_ref() {
+                    if let Err(e) = store.set_incident_allowlisted(&incident.incident_id) {
+                        tracing::warn!(
+                            incident_id = %incident.incident_id,
+                            error = %e,
+                            "failed to persist is_allowlisted flag on incident row"
+                        );
+                    }
+                }
                 handled += 1;
                 continue;
             }

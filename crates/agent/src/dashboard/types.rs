@@ -135,6 +135,123 @@ pub(crate) struct ReportQuery {
 // Response structs - existing
 // ---------------------------------------------------------------------------
 
+/// Phase 7 (audit RC-2 / 2026-04-29): the operator-facing snapshot.
+/// This is the structured replacement for the flat OverviewResponse
+/// fields. It exists so the Home tile, Threats list, and any future
+/// surface render from a *single* shape — no more "tile counts
+/// incidents, list counts IPs, two unrelated truths in one screen".
+///
+/// Top-level shape (one of three discriminants the front-end keys on):
+///
+/// * `health` — verbal status the hero tile renders ("Operating",
+///   "Backed up", "AI not responding"). Derived from the buckets and
+///   pending breakdown so a future change to one of those propagates
+///   into the verb without front-end edits.
+/// * `buckets` — for each operator-relevant outcome (blocked, observing,
+///   honeypot, dismissed, allowlisted, attention) we expose BOTH the
+///   incident count *and* the unique-attacker-IP count. The two
+///   numbers tell different stories (volume of action vs. distinct
+///   threats neutralised) and a Principal-level UX rejects the
+///   "single-number-with-implicit-unit" pattern that caused the
+///   2026-04-29 confusion.
+/// * `pending` — incidents without a final decision, broken out by
+///   the *reason* they're pending (in_flight, declined, cooldown,
+///   stuck). The "stuck" sub-bucket is the operator-visible health
+///   signal: if it's non-zero for more than a tick, the AI pipeline
+///   is wedged.
+///
+/// `OverviewResponse` keeps its flat fields populated from this
+/// snapshot so existing clients (Telegram bot's status command, etc)
+/// don't break. The frontend has migrated to read `snapshot.*`.
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct OverviewSnapshot {
+    pub(super) date: String,
+    pub(super) generated_at: chrono::DateTime<Utc>,
+    pub(super) health: SystemHealth,
+    pub(super) buckets: OutcomeBuckets,
+    pub(super) pending: PendingBreakdown,
+    /// Total events scanned today (sensor counter, not date-filtered
+    /// in the lossy KG sense — comes from telemetry snapshot which
+    /// the sensor maintains independently of the agent's KG).
+    pub(super) events_today: usize,
+    pub(super) top_detectors: Vec<DetectorCount>,
+}
+
+/// Operator-readable verb. The front-end maps each variant to a
+/// colour and a one-line headline. Derived in the backend so the
+/// thresholds for "Backed up" / "Not responding" are testable in one
+/// place and not duplicated across UI surfaces.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum SystemHealth {
+    /// AI is processing decisions in normal cadence; pending count
+    /// stays bounded; no stuck incidents over the threshold.
+    OperatingNormally,
+    /// Pending incidents are accumulating but the AI is still
+    /// answering — likely a burst of activity. Yellow.
+    BackedUp { pending_in_flight: usize },
+    /// One or more incidents have been pending more than 1h with no
+    /// decision and no cooldown row covering them. Either the AI
+    /// provider is down, the classifier failed to load, or the
+    /// pipeline is wedged on a config error. Red — operator must
+    /// look. Carries the count for the headline.
+    AiNotResponding { stuck_count: usize },
+}
+
+/// One pair of counters per outcome. The pair (`incidents`,
+/// `unique_attackers`) is what unblocks the "21 vs 10" confusion that
+/// motivated Phase 7. `severities` is a small breakdown so the front
+/// end can render a critical/high/medium/low strip without a
+/// follow-up request.
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct BucketStats {
+    /// Number of *incidents* in this bucket today.
+    pub(super) incidents: usize,
+    /// Number of *distinct attacker IPs* in this bucket today. Always
+    /// `<= incidents` (one attacker can fire many incidents).
+    pub(super) unique_attackers: usize,
+    /// Severity histogram — ordered map keyed by the canonical
+    /// severity string ("critical", "high", "medium", "low", "info").
+    pub(super) severities: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct OutcomeBuckets {
+    pub(super) blocked: BucketStats,
+    pub(super) observing: BucketStats,
+    pub(super) honeypot: BucketStats,
+    pub(super) dismissed: BucketStats,
+    /// Incidents that matched the operator's allowlist (static config
+    /// or dynamic /etc/innerwarden/allowlist.toml). Pre-Phase-7 these
+    /// silently inflated `attention` because they had no decision; now
+    /// they have a dedicated bucket the operator can audit.
+    pub(super) allowlisted: BucketStats,
+    /// Incidents that *do* need attention — see `pending` for the
+    /// reason-by-reason breakdown.
+    pub(super) attention: BucketStats,
+}
+
+/// Why a "needs attention" incident is sitting without a final
+/// decision. The categorisation drives both the Home tile drill-down
+/// and the SystemHealth verb above.
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct PendingBreakdown {
+    /// Incident fired in the last 5 minutes; AI is about to run.
+    /// Normal in-flight state — operator should not be alarmed.
+    pub(super) in_flight: usize,
+    /// AI ran and explicitly declined to decide
+    /// (`escalate` / `request_confirmation`). Operator must triage.
+    pub(super) declined_by_ai: usize,
+    /// Same (action, detector, entity) tuple was decided <1h ago, so
+    /// this incident inherits that decision via the cooldown table.
+    /// Functionally handled, no operator action needed.
+    pub(super) cooldown_suppressed: usize,
+    /// Incident is more than 1 hour old, has no decision, and has no
+    /// cooldown row covering it. AI pipeline is wedged. **This is
+    /// the watchdog signal.**
+    pub(super) stuck: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct OverviewResponse {
     pub(super) date: String,
@@ -181,9 +298,16 @@ pub(crate) struct OverviewResponse {
     pub(super) allowlisted_count: usize,
     pub(super) top_detectors: Vec<DetectorCount>,
     pub(super) latest_telemetry: Option<TelemetrySnapshot>,
+    /// Phase 7 (audit RC-2): the typed snapshot the front-end
+    /// migrated to. The flat fields above stay populated from this
+    /// snapshot so existing API clients (Telegram bot, exporters)
+    /// keep working unchanged. `None` only when the snapshot path is
+    /// unavailable (sleep mode / no SQLite store).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snapshot: Option<OverviewSnapshot>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub(crate) struct DetectorCount {
     pub(super) detector: String,
     pub(super) count: usize,

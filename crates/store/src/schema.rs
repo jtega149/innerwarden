@@ -13,7 +13,15 @@ use crate::error::{Result, StoreError};
 ///   `events_for_training` with an indexed column lookup
 ///   (`RECURRING_BUGS.md` "events_for_training reparses full JSON to
 ///   extract src_ip"). Includes a one-time backfill of existing rows.
-pub const CURRENT_VERSION: i64 = 2;
+/// - v3: incidents.is_allowlisted column. Persists the dynamic
+///   allowlist match outcome at incident-write time so the dashboard
+///   can render allowlisted attackers in their own group instead of
+///   inflating "Needs attention" by counter-without-decision (audit
+///   RC-2 manifestation surfaced 2026-04-29 / Phase 7).
+///   Existing rows default to 0 (not allowlisted) — the dashboard
+///   treats those as the operator never had an explicit trust rule
+///   for them, which matches pre-v3 behaviour.
+pub const CURRENT_VERSION: i64 = 3;
 
 /// Initial DDL for schema v1.
 const SCHEMA_V1: &str = r#"
@@ -43,19 +51,22 @@ CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
 CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity);
 
 CREATE TABLE IF NOT EXISTS incidents (
-    id          INTEGER PRIMARY KEY,
-    ts          TEXT NOT NULL,
-    host        TEXT NOT NULL,
-    incident_id TEXT NOT NULL UNIQUE,
-    severity    TEXT NOT NULL,
-    detector    TEXT NOT NULL,
-    title       TEXT NOT NULL,
-    summary     TEXT,
-    data        TEXT NOT NULL
+    id              INTEGER PRIMARY KEY,
+    ts              TEXT NOT NULL,
+    host            TEXT NOT NULL,
+    incident_id     TEXT NOT NULL UNIQUE,
+    severity        TEXT NOT NULL,
+    detector        TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    summary         TEXT,
+    data            TEXT NOT NULL,
+    is_allowlisted  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_ts ON incidents(ts);
 CREATE INDEX IF NOT EXISTS idx_incidents_incident_id ON incidents(incident_id);
 CREATE INDEX IF NOT EXISTS idx_incidents_severity ON incidents(severity);
+CREATE INDEX IF NOT EXISTS idx_incidents_allowlisted
+    ON incidents(is_allowlisted) WHERE is_allowlisted = 1;
 
 CREATE TABLE IF NOT EXISTS decisions (
     id              INTEGER PRIMARY KEY,
@@ -188,6 +199,9 @@ fn run_migrations(conn: &Connection, from_version: i64) -> Result<()> {
     if from_version < 2 {
         apply_v2(conn)?;
     }
+    if from_version < 3 {
+        apply_v3(conn)?;
+    }
 
     info!(
         from = from_version,
@@ -251,6 +265,54 @@ fn apply_v2(conn: &Connection) -> Result<()> {
             2_i64,
             chrono::Utc::now().to_rfc3339(),
             "events.src_ip column + index (backfill runs separately)"
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// v3 migration: add `incidents.is_allowlisted` column. Default 0
+/// (not allowlisted) so existing rows preserve their pre-v3 behaviour
+/// in the dashboard. The agent fast loop calls
+/// `Store::set_incident_allowlisted` when the pre-AI guard's
+/// SkipAllowlisted branch fires (`process/incidents.rs`); reads
+/// happen in `compute_overview_snapshot_from_sqlite` so the Home tile
+/// can break "needs attention" out from "allowlisted" without
+/// recomputing the dynamic allowlist match per request.
+///
+/// Idempotent: if the column already exists from a partial migration,
+/// the ALTER is skipped via the `pragma_table_info` check.
+fn apply_v3(conn: &Connection) -> Result<()> {
+    let already_present: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('incidents') WHERE name = 'is_allowlisted'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    if !already_present {
+        conn.execute(
+            "ALTER TABLE incidents ADD COLUMN is_allowlisted INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    // Partial index — only the small minority of allowlisted rows is
+    // indexed, so the index stays cheap to maintain on the write path
+    // (90%+ of incidents are non-allowlisted) while reads filtering on
+    // is_allowlisted=1 stay fast.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_incidents_allowlisted \
+         ON incidents(is_allowlisted) WHERE is_allowlisted = 1",
+        [],
+    )?;
+
+    conn.execute(
+        "INSERT INTO schema_version (version, migrated_at, notes) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            3_i64,
+            chrono::Utc::now().to_rfc3339(),
+            "incidents.is_allowlisted column + partial index (audit RC-2 / Phase 7)"
         ],
     )?;
 

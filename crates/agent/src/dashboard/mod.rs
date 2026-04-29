@@ -883,6 +883,91 @@ mod tests {
         assert!(APP_CSS.contains(".badge-kernel-expired"));
     }
 
+    // ── Phase 7 (audit RC-2) bundle anchors ────────────────────────────
+    //
+    // Each anchor pins a specific consumption of the new
+    // OverviewSnapshot contract. Together they guarantee that the
+    // backend's typed shape, the CSS classes, the HTML tile structure
+    // and the home.js render path don't drift independently — exactly
+    // the fan-out problem the audit's "Three-place writes" RC-2
+    // describes, generalised to the front-end bundle.
+
+    #[test]
+    fn home_js_reads_overview_snapshot() {
+        // The new tile-rendering path reads `overview.snapshot`.
+        // Pre-Phase-7 home.js had no such path; if a future cleanup
+        // strips it, this anchor fails before the operator notices
+        // the regression.
+        assert!(JS_HOME.contains("overview.snapshot"));
+        assert!(JS_HOME.contains("snap.buckets.blocked.unique_attackers"));
+        assert!(JS_HOME.contains("snap.buckets.blocked.incidents"));
+        assert!(JS_HOME.contains("snap.pending"));
+    }
+
+    #[test]
+    fn home_js_renders_pending_breakdown_panel() {
+        // The 4 pending categories must each be rendered by id.
+        // Future drop of any category requires updating both ends.
+        assert!(JS_HOME.contains("homePendingInFlight"));
+        assert!(JS_HOME.contains("homePendingDeclined"));
+        assert!(JS_HOME.contains("homePendingCooldown"));
+        assert!(JS_HOME.contains("homePendingStuck"));
+    }
+
+    #[test]
+    fn home_js_routes_ai_not_responding_health_to_alert_reasons() {
+        // The 'ai_not_responding' health verb must surface as a
+        // user-visible reason. If a refactor drops the kind check,
+        // operator loses the loudest "AI is wedged" signal.
+        assert!(JS_HOME.contains("ai_not_responding"));
+        assert!(JS_HOME.contains("backed_up"));
+    }
+
+    #[test]
+    fn index_html_carries_pending_breakdown_panel() {
+        // HTML element IDs the panel renderer keys on. The panel is
+        // hidden by default (display:none) but must exist in the
+        // bundled binary for the JS to populate it.
+        assert!(INDEX_HTML.contains("homePendingPanel"));
+        assert!(INDEX_HTML.contains("homePendingInFlight"));
+        assert!(INDEX_HTML.contains("homePendingStuck"));
+    }
+
+    #[test]
+    fn index_html_carries_kpi_pair_lines_for_paired_unit_rendering() {
+        // The Phase 7 redesign: three KPI tiles each gain a sub-line
+        // showing the secondary unit (incidents under a unique-IP
+        // count, etc). Anchor the new IDs so a future tile rework
+        // doesn't silently drop them.
+        assert!(INDEX_HTML.contains("homeKpiThreatsPair"));
+        assert!(INDEX_HTML.contains("homeKpiRespondedPair"));
+        assert!(INDEX_HTML.contains("homeKpiEventsPair"));
+    }
+
+    #[test]
+    fn app_css_defines_pending_panel_and_allowlisted_outcome() {
+        assert!(APP_CSS.contains(".pending-grid"));
+        assert!(APP_CSS.contains(".pending-cell-warn"));
+        assert!(APP_CSS.contains(".kpi-pair-line"));
+        assert!(APP_CSS.contains(".outcome-allowlisted"));
+    }
+
+    #[test]
+    fn threats_js_lists_allowlisted_in_outcome_order() {
+        // The new "allowlisted" outcome must appear in the group
+        // ordering and have a label entry. Pre-Phase-7 there was
+        // no such entry; allowlisted attackers fell into "needs
+        // attention" or were hidden by the toggle.
+        assert!(
+            JS_THREATS.contains("'allowlisted'"),
+            "OUTCOME_ORDER must include 'allowlisted' for the dedicated group"
+        );
+        assert!(
+            JS_THREATS.contains("Allowlisted (silenced)"),
+            "label so the operator knows what the group means"
+        );
+    }
+
     #[test]
     fn normalize_limit_is_bounded() {
         assert_eq!(normalize_limit(None), 50);
@@ -1438,6 +1523,7 @@ mod tests {
                 allowlisted_count: 0,
                 top_detectors: vec![],
                 latest_telemetry: None,
+                snapshot: None,
             },
             pivots: vec![PivotItem {
                 group_by: "ip".to_string(),

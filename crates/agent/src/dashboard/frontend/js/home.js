@@ -105,6 +105,21 @@ function computeHomeState(payload) {
     reasons.push(recentOrphans + ' response' + (recentOrphans === 1 ? '' : 's') + ' orphaned in the last 24 hours. AI gave up retrying.');
   }
 
+  // Phase 7 (audit RC-2): T4 — backend SystemHealth verb says
+  // AiNotResponding (>=1 incident pending with no decision >1h, no
+  // cooldown row covering it). This is the loudest "AI is wedged"
+  // signal we have. Goes at the top of `reasons` so it dominates
+  // any pre-existing T1-T3 reason.
+  var phase7Health = overview && overview.snapshot && overview.snapshot.health;
+  if (phase7Health && phase7Health.kind === 'ai_not_responding') {
+    var stuckN = phase7Health.stuck_count || 0;
+    reasons.unshift(
+      stuckN + ' incident' + (stuckN === 1 ? '' : 's') +
+      ' pending >1h with no decision. AI pipeline may be wedged — ' +
+      'investigate provider/classifier health.'
+    );
+  }
+
   if (reasons.length > 0) {
     return {
       state: 'health_alert',
@@ -114,6 +129,26 @@ function computeHomeState(payload) {
       heroTitle: 'System Health Alert',
       heroSub: reasons[0],
       healthAlertReasons: reasons
+    };
+  }
+
+  // Phase 7 (audit RC-2): the backend ships an explicit SystemHealth
+  // verb on `overview.snapshot.health`. When it says AiNotResponding
+  // (stuck > 0), the health_alert branch above already surfaced it
+  // via `reasons`. Here we handle the medium-severity "backed_up"
+  // verb that doesn't qualify as health_alert but isn't steady
+  // protection_active either.
+  var healthVerb = overview && overview.snapshot && overview.snapshot.health;
+  if (healthVerb && healthVerb.kind === 'backed_up') {
+    return {
+      state: 'backed_up',
+      maxSeverity: 'medium',
+      heroClass: 'status-hero alert-medium',
+      heroIcon: '⏳',
+      heroTitle: 'AI catching up',
+      heroSub: (healthVerb.pending_in_flight || 0) +
+        ' incidents in flight. Decisions arriving with delay.',
+      healthAlertReasons: []
     };
   }
 
@@ -247,31 +282,142 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
 }
 
 // ── KPIs with fixed temporal sub-labels ──────────────────────────────
+//
+// Phase 7 (audit RC-2): when `overview.snapshot` is populated (the
+// SQLite-backed path is wired), the tiles render the *attacker* count
+// as the hero number and the *incident* count as the secondary line.
+// The two together tell the operator both "how many distinct threats"
+// and "how active the system was" without forcing mental math —
+// previously the same tile said "21 Blocked" while the list said
+// "Blocked 10", and the unit ambiguity made the dashboard read like
+// a bug.
+//
+// When `snapshot` is missing (legacy KG fallback path or sleep mode)
+// we render the old single-number layout from the flat fields, so
+// existing tests and pre-Phase-7 deployments don't crash.
 function updateHomeKpis(overview, totalEventsScanned) {
-  // "Handled" = every decision today that was NOT "ignore" (block, monitor,
-  // honeypot, kill, suspend). Uses overview.safely_resolved — same field
-  // consumed by the hero sub (updateHomeNow) and computeHomeState, and
-  // produced by the same graph walk the briefing uses. Prior revision
-  // read ai_responded which excluded Monitor actions, so the KPI
-  // reported a smaller number than the briefing for the same window.
-  var el = document.getElementById('homeKpiThreats');
-  if (el) el.textContent = overview.safely_resolved || 0;
+  var snap = overview && overview.snapshot;
+  var threatsEl = document.getElementById('homeKpiThreats');
+  var respondedEl = document.getElementById('homeKpiResponded');
+  var eventsEl = document.getElementById('homeKpiEvents');
+  var threatsPair = document.getElementById('homeKpiThreatsPair');
+  var respondedPair = document.getElementById('homeKpiRespondedPair');
+  var eventsPair = document.getElementById('homeKpiEventsPair');
 
-  el = document.getElementById('homeKpiResponded');
-  if (el) el.textContent = overview.incidents_count || 0;
+  if (snap) {
+    // Handled = blocked + observing + honeypot (operator-action buckets).
+    // Render attackers (unique IPs) as the hero number; incidents as
+    // the supporting line.
+    var handledAttackers =
+      (snap.buckets.blocked.unique_attackers || 0) +
+      (snap.buckets.observing.unique_attackers || 0) +
+      (snap.buckets.honeypot.unique_attackers || 0);
+    var handledIncidents =
+      (snap.buckets.blocked.incidents || 0) +
+      (snap.buckets.observing.incidents || 0) +
+      (snap.buckets.honeypot.incidents || 0);
+    if (threatsEl) threatsEl.textContent = handledAttackers;
+    if (threatsPair) threatsPair.textContent = handledIncidents + (handledIncidents === 1 ? ' action' : ' actions');
 
-  el = document.getElementById('homeKpiEvents');
-  var total = totalEventsScanned || overview.events_count || 0;
-  if (el) el.textContent = total >= 1000000
-    ? (total / 1000000).toFixed(1) + 'M'
-    : total >= 1000
-      ? (total / 1000).toFixed(0) + 'K'
-      : total.toLocaleString();
+    // Detections = total qualifying incidents today (sum across all
+    // operator-relevant buckets except dismissed). Hero number is the
+    // unique-attacker count to match the Threats list group counts.
+    var detectionAttackers =
+      handledAttackers +
+      (snap.buckets.attention.unique_attackers || 0) +
+      (snap.buckets.allowlisted.unique_attackers || 0);
+    var detectionIncidents =
+      handledIncidents +
+      (snap.buckets.attention.incidents || 0) +
+      (snap.buckets.allowlisted.incidents || 0);
+    if (respondedEl) respondedEl.textContent = detectionAttackers;
+    if (respondedPair) respondedPair.textContent =
+      detectionIncidents + (detectionIncidents === 1 ? ' incident' : ' incidents');
+
+    // Events Scanned: comes from telemetry (sensor counter), date-
+    // filtered. No secondary unit — it's already operator-clear.
+    var evTotal = snap.events_today || totalEventsScanned || overview.events_count || 0;
+    if (eventsEl) eventsEl.textContent = formatBigNumber(evTotal);
+    if (eventsPair) eventsPair.textContent = '';
+  } else {
+    // Legacy path: single-number tiles, no secondary line.
+    if (threatsEl) threatsEl.textContent = overview.safely_resolved || 0;
+    if (respondedEl) respondedEl.textContent = overview.incidents_count || 0;
+    var fallbackTotal = totalEventsScanned || overview.events_count || 0;
+    if (eventsEl) eventsEl.textContent = formatBigNumber(fallbackTotal);
+    if (threatsPair) threatsPair.textContent = '';
+    if (respondedPair) respondedPair.textContent = '';
+    if (eventsPair) eventsPair.textContent = '';
+  }
 
   // Fixed sub-labels: Today / Today / Live (today)
   setKpiWindow('homeKpiThreatsWindow',   formatWindow('today'));
   setKpiWindow('homeKpiRespondedWindow', formatWindow('today'));
   setKpiWindow('homeKpiEventsWindow',    'Live (today)');
+
+  // Phase 7: pending breakdown panel — visible only when there is
+  // pending work to look at. Hidden in the steady state so the Home
+  // view stays clean.
+  updatePendingPanel(snap);
+}
+
+function formatBigNumber(total) {
+  if (total >= 1000000) return (total / 1000000).toFixed(1) + 'M';
+  if (total >= 1000) return (total / 1000).toFixed(0) + 'K';
+  return total.toLocaleString();
+}
+
+function updatePendingPanel(snap) {
+  var panel = document.getElementById('homePendingPanel');
+  if (!panel) return;
+  var pending = snap && snap.pending;
+  if (!pending) {
+    panel.style.display = 'none';
+    return;
+  }
+  var total =
+    (pending.in_flight || 0) +
+    (pending.declined_by_ai || 0) +
+    (pending.cooldown_suppressed || 0) +
+    (pending.stuck || 0);
+  if (total === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+  setText('homePendingInFlight', pending.in_flight || 0);
+  setText('homePendingDeclined', pending.declined_by_ai || 0);
+  setText('homePendingCooldown', pending.cooldown_suppressed || 0);
+  setText('homePendingStuck', pending.stuck || 0);
+
+  // Hint line summarises the concern in one sentence so the
+  // operator doesn't have to interpret 4 numbers themselves.
+  var hint = '';
+  if (pending.stuck > 0) {
+    hint = pending.stuck + ' incident' + (pending.stuck === 1 ? '' : 's') +
+      ' stuck >1h with no decision — AI pipeline may be wedged.';
+  } else if (pending.declined_by_ai > 0) {
+    hint = pending.declined_by_ai + ' incident' +
+      (pending.declined_by_ai === 1 ? '' : 's') +
+      ' need operator triage (AI declined to decide).';
+  } else if (pending.in_flight > 50) {
+    hint = pending.in_flight + ' incidents in flight — AI is catching up.';
+  }
+  var hintEl = document.getElementById('homePendingHint');
+  if (hintEl) hintEl.textContent = hint;
+
+  // Stuck cell: hide the warn styling when stuck=0 so the operator
+  // doesn't see permanent red noise.
+  var stuckCell = document.getElementById('homePendingStuckCell');
+  if (stuckCell) {
+    if (pending.stuck > 0) stuckCell.classList.add('pending-cell-warn');
+    else stuckCell.classList.remove('pending-cell-warn');
+  }
+}
+
+function setText(id, value) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = value;
 }
 
 function setKpiWindow(id, text) {
