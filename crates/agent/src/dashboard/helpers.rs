@@ -12,6 +12,62 @@
 
 use super::*;
 
+fn canonical_date_component(date: &str) -> Option<String> {
+    use chrono::Datelike;
+
+    let bytes = date.as_bytes();
+    if bytes.len() != 10
+        || !bytes.iter().enumerate().all(|(i, &b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+    {
+        return None;
+    }
+    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        parsed.year(),
+        parsed.month(),
+        parsed.day()
+    ))
+}
+
+fn safe_jsonl_prefix(prefix: &str) -> Option<&'static str> {
+    match prefix {
+        "events" => Some("events"),
+        "incidents" => Some("incidents"),
+        "decisions" => Some("decisions"),
+        "telemetry" => Some("telemetry"),
+        "admin-actions" => Some("admin-actions"),
+        _ => None,
+    }
+}
+
+fn safe_jsonl_filename(prefix: &str, date: &str) -> Option<String> {
+    let prefix = safe_jsonl_prefix(prefix)?;
+    let date = canonical_date_component(date)?;
+    Some(format!("{prefix}-{date}.jsonl"))
+}
+
+fn safe_jsonl_path(path: &Path) -> Option<PathBuf> {
+    let filename = path.file_name()?.to_str()?;
+    let stem = filename.strip_suffix(".jsonl")?;
+    let date_start = stem.len().checked_sub(10)?;
+    let separator = date_start.checked_sub(1)?;
+    if stem.as_bytes().get(separator) != Some(&b'-') {
+        return None;
+    }
+    let prefix = stem.get(..separator)?;
+    let date = stem.get(date_start..)?;
+    let safe_filename = safe_jsonl_filename(prefix, date)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    Some(parent.join(safe_filename))
+}
+
 pub(super) fn safe_read_data_file(data_dir: &Path, filename: &str) -> Option<String> {
     let base = data_dir.canonicalize().ok()?;
     let target = data_dir.join(filename);
@@ -389,7 +445,7 @@ pub(super) fn resolve_date(raw: Option<&str>) -> String {
         return today;
     }
     if chrono::NaiveDate::parse_from_str(candidate, "%Y-%m-%d").is_ok() {
-        return candidate.to_string();
+        return canonical_date_component(candidate).unwrap_or(today);
     }
     today
 }
@@ -409,7 +465,7 @@ pub(super) fn resolve_date_local(raw: Option<&str>) -> String {
         return today;
     }
     if chrono::NaiveDate::parse_from_str(candidate, "%Y-%m-%d").is_ok() {
-        return candidate.to_string();
+        return canonical_date_component(candidate).unwrap_or(today);
     }
     today
 }
@@ -418,21 +474,10 @@ pub(super) fn normalize_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(50).clamp(1, 500)
 }
 
-/// Build a dated JSONL path, rejecting any path-traversal attempts.
-/// Only allows YYYY-MM-DD date strings (already validated by resolve_date).
+/// Build a dated JSONL path from bounded components.
 pub(super) fn dated_path(data_dir: &Path, prefix: &str, date: &str) -> PathBuf {
-    // Defense-in-depth: strip any path separators or dots from date
-    let safe_date: String = date
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '-')
-        .collect();
-    let filename = format!("{prefix}-{safe_date}.jsonl");
-    // Ensure filename has no path components
-    let safe_filename = Path::new(&filename)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let safe_filename = safe_jsonl_filename(prefix, date)
+        .unwrap_or_else(|| "invalid-invalid-date.jsonl".to_string());
     data_dir.join(safe_filename)
 }
 
@@ -452,10 +497,13 @@ pub(super) static JSONL_CACHE: LazyLock<Mutex<HashMap<String, FileCache>>> =
 pub(super) const JSONL_CACHE_TTL_SECS: u64 = 5;
 
 pub(super) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
+    let Some(path) = safe_jsonl_path(path) else {
+        return Vec::new();
+    };
     let key = path.to_string_lossy().to_string();
 
     // Check cache first
-    let meta = std::fs::metadata(path).ok();
+    let meta = std::fs::metadata(&path).ok();
     let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let file_modified = meta
         .as_ref()
@@ -489,7 +537,7 @@ pub(super) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
     // Dashboard lists show max 50-100 items; reading the full file wastes memory.
     pub(super) const MAX_READ_BYTES: u64 = 256 * 1024;
     let content = if file_size > MAX_READ_BYTES {
-        match std::fs::File::open(path) {
+        match std::fs::File::open(&path) {
             Ok(mut f) => {
                 use std::io::{Read, Seek, SeekFrom};
                 // Spec 037 I-13 PR-7 (K-class): pre-checked by the
@@ -507,7 +555,7 @@ pub(super) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
                 // The empty-buf fall-through is preserved exactly —
                 // the helper just records the failure.
                 if let Err(e) = f.read_to_string(&mut buf) {
-                    record_tail_read_failure(path, &e);
+                    record_tail_read_failure(&path, &e);
                 }
                 // Drop the first (possibly partial) line
                 if let Some(pos) = buf.find('\n') {
@@ -516,15 +564,15 @@ pub(super) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
                 buf
             }
             Err(e) => {
-                record_tail_read_failure(path, &e);
+                record_tail_read_failure(&path, &e);
                 return Vec::new();
             }
         }
     } else {
-        match std::fs::read_to_string(path) {
+        match std::fs::read_to_string(&path) {
             Ok(v) => v,
             Err(e) => {
-                record_tail_read_failure(path, &e);
+                record_tail_read_failure(&path, &e);
                 return Vec::new();
             }
         }
@@ -773,7 +821,16 @@ mod tests {
         );
         assert_eq!(
             dated_path(&pb, "incidents", "../etc/passwd").to_string_lossy(),
-            "/var/data/incidents-.jsonl" // Letters and dots removed, leaving only valid chars via filter
+            "/var/data/invalid-invalid-date.jsonl"
+        );
+    }
+
+    #[test]
+    fn test_dated_path_rejects_unknown_prefix() {
+        let pb = PathBuf::from("/var/data");
+        assert_eq!(
+            dated_path(&pb, "../incidents", "2024-05-15").to_string_lossy(),
+            "/var/data/invalid-invalid-date.jsonl"
         );
     }
 

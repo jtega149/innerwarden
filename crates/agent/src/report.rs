@@ -4,14 +4,50 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-/// Sanitize a date string to prevent path injection.
-/// Only allows digits and hyphens (YYYY-MM-DD format).
-fn safe_dated_file(dir: &Path, prefix: &str, date: &str, ext: &str) -> PathBuf {
-    let safe: String = date
+fn safe_date_component(date: &str) -> Option<String> {
+    use chrono::Datelike;
+
+    let bytes = date.as_bytes();
+    if bytes.len() != 10
+        || !bytes.iter().enumerate().all(|(i, &b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+    {
+        return None;
+    }
+    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        parsed.year(),
+        parsed.month(),
+        parsed.day()
+    ))
+}
+
+fn safe_name_component(value: &str, fallback: &str) -> String {
+    let safe: String = value
         .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '-')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    dir.join(format!("{prefix}-{safe}.{ext}"))
+    if safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe
+    }
+}
+
+/// Build a dated file path from bounded components.
+///
+/// Dates are parsed and re-formatted from `NaiveDate` primitives rather than
+/// filtered from the original string. That gives CodeQL and humans the same
+/// guarantee: the final path component is freshly constructed, not a cleaned-up
+/// slice of request input.
+fn safe_dated_file(dir: &Path, prefix: &str, date: &str, ext: &str) -> PathBuf {
+    let prefix = safe_name_component(prefix, "file");
+    let ext = safe_name_component(ext, "dat");
+    let date = safe_date_component(date).unwrap_or_else(|| "invalid-date".to_string());
+    dir.join(format!("{prefix}-{date}.{ext}"))
 }
 use std::time::SystemTime;
 
@@ -26,6 +62,32 @@ use tracing::warn;
 use crate::decisions::DecisionEntry;
 use crate::telemetry;
 
+fn safe_kpi_filename(path: &Path) -> Option<String> {
+    let filename = path.file_name()?.to_str()?;
+    let stem = filename.strip_suffix(".jsonl")?;
+    let date_start = stem.len().checked_sub(10)?;
+    let date = &stem[date_start..];
+    let separator = date_start.checked_sub(1)?;
+    if stem.as_bytes().get(separator) != Some(&b'-') {
+        return None;
+    }
+    let prefix = stem.get(..separator)?;
+    if !matches!(prefix, "events" | "incidents" | "decisions") {
+        return None;
+    }
+    let safe_date = safe_date_component(date)?;
+    Some(format!("{prefix}-{safe_date}.jsonl"))
+}
+
+fn warn_kpi_open_failure(kind: &str, path: &Path, error: &std::io::Error) {
+    warn!(
+        kind,
+        path = %path.display(),
+        error = %error,
+        "report KPI file open failed (per-day count for this kind dropped)"
+    );
+}
+
 /// Open a per-day KPI JSONL file (events / incidents / decisions),
 /// surfacing genuine I/O failure via `warn!` while staying silent on
 /// the steady-state `NotFound` case (most days have no JSONL on disk
@@ -39,16 +101,31 @@ use crate::telemetry;
 /// either the file did not exist (normal) or the open failed and the
 /// warn already fired.
 fn open_kpi_file_or_warn(path: &Path, kind: &str) -> Option<File> {
-    match File::open(path) {
+    let safe_filename = safe_kpi_filename(path)?;
+    let parent = path.parent()?;
+    let base = match parent.canonicalize() {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn_kpi_open_failure(kind, parent, &e);
+            return None;
+        }
+    };
+    let target = base.join(safe_filename);
+    let path = match target.canonicalize() {
+        Ok(v) if v.starts_with(&base) => v,
+        Ok(_) => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn_kpi_open_failure(kind, &target, &e);
+            return None;
+        }
+    };
+    match File::open(&path) {
         Ok(f) => Some(f),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            warn!(
-                kind,
-                path = %path.display(),
-                error = %e,
-                "report KPI file open failed (per-day count for this kind dropped)"
-            );
+            warn_kpi_open_failure(kind, &path, &e);
             None
         }
     }
@@ -2673,6 +2750,17 @@ mod tests {
     fn safe_dated_file_sanitizes_date_component() {
         let dir = TempDir::new().unwrap();
         let path = safe_dated_file(dir.path(), "events", "../2026-03-16::malicious", "jsonl");
+
+        assert_eq!(
+            path.file_name().and_then(|v| v.to_str()),
+            Some("events-invalid-date.jsonl")
+        );
+    }
+
+    #[test]
+    fn safe_dated_file_reformats_valid_date_component() {
+        let dir = TempDir::new().unwrap();
+        let path = safe_dated_file(dir.path(), "events", "2026-03-16", "jsonl");
 
         assert_eq!(
             path.file_name().and_then(|v| v.to_str()),

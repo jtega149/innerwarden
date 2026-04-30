@@ -2186,7 +2186,7 @@ mod tests {
     #[test]
     fn jsonl_cache_returns_same_data_on_cache_hit() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test-cache.jsonl");
+        let path = dir.path().join("events-2026-01-01.jsonl");
         std::fs::write(
             &path,
             "{\"ts\":\"2026-01-01T00:00:00Z\",\"host\":\"test\",\"source\":\"test\",\"kind\":\"ssh.login_failed\",\"severity\":\"info\",\"summary\":\"test\",\"details\":{},\"tags\":[],\"entities\":[]}\n",
@@ -2205,7 +2205,7 @@ mod tests {
     #[test]
     fn jsonl_cache_invalidates_on_file_change() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test-invalidate.jsonl");
+        let path = dir.path().join("events-2026-01-02.jsonl");
         let line = "{\"ts\":\"2026-01-01T00:00:00Z\",\"host\":\"test\",\"source\":\"test\",\"kind\":\"ssh.login_failed\",\"severity\":\"info\",\"summary\":\"test\",\"details\":{},\"tags\":[],\"entities\":[]}\n";
 
         std::fs::write(&path, line).unwrap();

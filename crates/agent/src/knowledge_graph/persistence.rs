@@ -129,6 +129,58 @@ pub(crate) fn safe_date_string(date: &str) -> Option<String> {
     ))
 }
 
+fn safe_snapshot_file_name(name: &str) -> Option<String> {
+    let (base, backup_suffix) = match name.rsplit_once(".json.") {
+        Some((base, suffix)) if matches!(suffix, "1" | "2" | "3") => {
+            (format!("{base}.json"), Some(suffix))
+        }
+        _ => (name.to_string(), None),
+    };
+
+    let safe_base = if base == "graph-snapshot.json" {
+        "graph-snapshot.json".to_string()
+    } else {
+        match base
+            .strip_prefix("graph-snapshot-")
+            .and_then(|value| value.strip_suffix(".json"))
+        {
+            Some(date) => safe_snapshot_filename(date)?,
+            None => safe_simple_snapshot_file_name(&base)?,
+        }
+    };
+
+    Some(match backup_suffix {
+        Some(suffix) => format!("{safe_base}.{suffix}"),
+        None => safe_base,
+    })
+}
+
+fn safe_simple_snapshot_file_name(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".json")?;
+    if stem.is_empty() || stem.starts_with('.') || name.contains("..") {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn read_snapshot_bytes(path: &Path) -> Option<Vec<u8>> {
+    let safe_name = safe_snapshot_file_name(path.file_name()?.to_str()?)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let base = parent.canonicalize().ok()?;
+    let target = base.join(safe_name);
+    let canonical = target.canonicalize().ok()?;
+    if !canonical.starts_with(&base) {
+        return None;
+    }
+    std::fs::read(canonical).ok()
+}
+
 /// Decompress a snapshot blob if it carries the gzip magic header,
 /// otherwise return the bytes unchanged. Pre-2026-04-23 snapshots were
 /// stored as raw JSON starting with `{`; the magic-byte check makes the
@@ -388,10 +440,7 @@ impl KnowledgeGraph {
     }
 
     fn try_load_snapshot(path: &Path) -> Option<Self> {
-        let raw = match std::fs::read(path) {
-            Ok(d) => d,
-            Err(_) => return None,
-        };
+        let raw = read_snapshot_bytes(path)?;
 
         let data = match maybe_decompress(&raw) {
             Some(d) => d,
