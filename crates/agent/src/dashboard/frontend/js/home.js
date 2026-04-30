@@ -52,22 +52,288 @@ async function loadHome() {
       && telemetrySecs > HOME_TELEMETRY_STALE_SOFT_SECS
       && telemetrySecs <= HOME_TELEMETRY_STALL_SECS);
 
-    updateHomeBanner(status, homeState);
+    updateHomeHero(homeState);
     // Total events scanned from sensors (trust signal: "3.3M scanned → 2 blocked")
     var totalEventsScanned = 0;
     (sensors.sources || []).forEach(function(s) { totalEventsScanned += s.count || 0; });
     window._totalEventsScanned = totalEventsScanned;
 
-    updateHomeNow(overview, activeHighCriticalList.length, softStale, totalEventsScanned);
-    updateHomeKpis(overview, totalEventsScanned);
+    // 2026-04-30 redesign: render the new attention-first home.
+    // Order matches reading priority: critical alert (if any) →
+    // review queue (if any) → activity strip → briefing → health
+    // line → details (collapsed).
+    var topCritical = findTopOpenCritical(items);
+    window._lastTopCritical = topCritical;
+    renderCriticalBanner(topCritical);
+    renderReviewBanner(overview);
+    renderActivityStrip(overview, totalEventsScanned);
+    renderHealthLine(status, sensors, overview, softStale);
+    renderDetailsPanel(overview, status, sensors);
+
     // Phase 12 (QA fix #1): keep the persistent header pill in sync
     // with runtime SystemHealth. Without this, the green "PROTECTED"
     // pill stayed up while the hero said "System Health Alert" — a
     // contradictory state on one screen.
     syncModeBadgeFromHealth(overview, actionCfg);
-    updateCollectorStrip(sensors);
     loadBriefing();
   } catch(e) { console.warn('loadHome error:', e); }
+}
+
+// ── Critical incident banner ────────────────────────────────────────
+// Returns the top open critical/high incident the operator should act on,
+// or null when none. Open = no decision yet (the AI did not autodismiss
+// or autodecide). Filters out incidents already trusted/allowlisted.
+function findTopOpenCritical(items) {
+  var sevRank = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+  var open = (items || []).filter(function(i) {
+    var sev = (i.effective_severity || i.severity || '').toLowerCase();
+    if (i.outcome !== 'open') return false;
+    if (sevRank[sev] < 3) return false;
+    if (typeof isIncidentTrusted === 'function' && isIncidentTrusted(i)) return false;
+    return true;
+  });
+  open.sort(function(a, b) {
+    var ra = sevRank[(a.effective_severity || a.severity || '').toLowerCase()] || 0;
+    var rb = sevRank[(b.effective_severity || b.severity || '').toLowerCase()] || 0;
+    if (rb !== ra) return rb - ra;
+    return (b.ts || '') > (a.ts || '') ? 1 : -1;
+  });
+  return open[0] || null;
+}
+
+function renderCriticalBanner(top) {
+  var banner = document.getElementById('homeCriticalBanner');
+  if (!banner) return;
+  if (!top) {
+    banner.style.display = 'none';
+    return;
+  }
+  banner.style.display = '';
+  var titleEl = document.getElementById('homeCriticalTitle');
+  var subEl = document.getElementById('homeCriticalSub');
+  var sev = ((top.effective_severity || top.severity || '').toUpperCase()) || 'CRITICAL';
+  // Title: severity + short description. The operator should be able
+  // to tell what kind of attack this is without clicking through.
+  var detector = (top.incident_id || '').split(':')[0] || '';
+  var label = (typeof humanLabel === 'function' && detector)
+    ? humanLabel(detector) : (detector || 'Active threat');
+  if (titleEl) {
+    titleEl.textContent = sev + ': ' + label;
+  }
+  if (subEl) {
+    var ipEntity = (top.entities || []).find(function(e) {
+      return e && (e.type === 'Ip' || e.type === 'ip');
+    });
+    var ip = ipEntity ? ipEntity.value : '';
+    var ageSec = top.ts ? Math.max(0, Math.floor((Date.now() - new Date(top.ts).getTime()) / 1000)) : null;
+    var ageText = ageSec == null
+      ? ''
+      : (ageSec < 60 ? ageSec + 's ago'
+        : ageSec < 3600 ? Math.floor(ageSec / 60) + 'm ago'
+        : ageSec < 86400 ? Math.floor(ageSec / 3600) + 'h ago'
+        : Math.floor(ageSec / 86400) + 'd ago');
+    var parts = [];
+    if (ip) parts.push(ip);
+    if (ageText) parts.push(ageText);
+    if (top.title) parts.push(top.title);
+    subEl.textContent = parts.join(' · ');
+  }
+}
+
+// CTA on the critical banner: deep-link to Threats with the IP
+// preselected so the operator lands directly on the journey.
+function openTopCritical(event) {
+  if (event && event.preventDefault) event.preventDefault();
+  var top = window._lastTopCritical;
+  if (!top) {
+    showView('investigate');
+    return false;
+  }
+  var ipEntity = (top.entities || []).find(function(e) {
+    return e && (e.type === 'Ip' || e.type === 'ip');
+  });
+  showView('investigate');
+  if (ipEntity && typeof loadJourney === 'function') {
+    setTimeout(function() { loadJourney('ip', ipEntity.value); }, 30);
+  }
+  return false;
+}
+
+// ── Review-queue banner ─────────────────────────────────────────────
+function renderReviewBanner(overview) {
+  var banner = document.getElementById('homeReviewBanner');
+  if (!banner) return;
+  var snap = overview && overview.snapshot;
+  var awaiting = snap
+    ? (snap.buckets.attention.unique_attackers || 0)
+    : (overview.attention_count || 0);
+  if (awaiting <= 0) {
+    banner.style.display = 'none';
+    return;
+  }
+  banner.style.display = '';
+  var countEl = document.getElementById('homeReviewCount');
+  if (countEl) {
+    countEl.textContent = awaiting + ' attacker' + (awaiting === 1 ? '' : 's');
+  }
+}
+
+// ── Activity strip ──────────────────────────────────────────────────
+// 4 numbers in one row: events watched / flagged / stopped / awaiting.
+// Replaces both the 7-row "summary pyramid" and the standalone "Now"
+// section — same data, single line, scannable in 2 seconds.
+function renderActivityStrip(overview, totalEventsScanned) {
+  var snap = overview && overview.snapshot;
+
+  // Watched.
+  var watched = snap
+    ? (snap.events_today || totalEventsScanned || overview.events_count || 0)
+    : (totalEventsScanned || overview.events_count || 0);
+  setText('homeActWatched', formatBigNumber(watched));
+
+  // Flagged = total unique attackers across all buckets (matches the
+  // unified attacker-count contract from Phase 10).
+  var flagged = 0;
+  if (snap) {
+    flagged =
+      (snap.buckets.blocked.unique_attackers || 0) +
+      (snap.buckets.observing.unique_attackers || 0) +
+      (snap.buckets.honeypot.unique_attackers || 0) +
+      (snap.buckets.attention.unique_attackers || 0) +
+      (snap.buckets.allowlisted.unique_attackers || 0);
+  } else {
+    flagged = overview.handled_ips_today || 0;
+  }
+  setText('homeActFlagged', flagged);
+
+  // Stopped automatically = blocked + observing + honeypot.
+  var stopped = 0;
+  if (snap) {
+    stopped =
+      (snap.buckets.blocked.unique_attackers || 0) +
+      (snap.buckets.observing.unique_attackers || 0) +
+      (snap.buckets.honeypot.unique_attackers || 0);
+  } else {
+    stopped = overview.handled_ips_today || 0;
+  }
+  setText('homeActStopped', stopped);
+
+  // Awaiting review = attention bucket. Cell gets a warning tint
+  // when > 0 so it stands out without being a separate banner copy.
+  var awaiting = snap
+    ? (snap.buckets.attention.unique_attackers || 0)
+    : (overview.attention_count || 0);
+  setText('homeActAwaiting', awaiting);
+  var awaitingCell = document.querySelector('.activity-cell-attention');
+  if (awaitingCell) {
+    awaitingCell.classList.toggle('activity-cell-attention-active', awaiting > 0);
+  }
+
+  // Window label: "since midnight UTC · last Nh".
+  var elapsed = computeElapsedHoursUtc();
+  var elapsedText = elapsed >= 1
+    ? 'since midnight UTC · last ' + elapsed + 'h'
+    : 'since midnight UTC';
+  setText('homeActivityWindow', elapsedText);
+}
+
+// ── System health line ──────────────────────────────────────────────
+// One row, three states. Green check + summary when everything is OK.
+// Amber when telemetry is soft-stale. Red when sensor stalled.
+function renderHealthLine(status, sensors, overview, softStale) {
+  var line = document.getElementById('homeHealthLine');
+  var iconEl = document.getElementById('homeHealthIcon');
+  var summaryEl = document.getElementById('homeHealthSummary');
+  if (!line || !iconEl || !summaryEl) return;
+  var sources = (sensors && sensors.sources) || [];
+  var active = sources.filter(function(s) { return s.count > 0; }).length;
+  var total = sources.length;
+  var telemetrySecs = (typeof status.last_telemetry_secs === 'number')
+    ? status.last_telemetry_secs : null;
+  var snap = overview && overview.snapshot;
+  var unhealthy = (snap && snap.health && snap.health.kind === 'ai_not_responding') ||
+    (telemetrySecs != null && telemetrySecs > HOME_TELEMETRY_STALL_SECS);
+  // Class + icon by state.
+  line.classList.remove('home-health-warn', 'home-health-bad');
+  var iconName = 'check';
+  if (unhealthy) {
+    line.classList.add('home-health-bad');
+    iconName = 'alert-triangle';
+  } else if (softStale || (total > 0 && active < total)) {
+    line.classList.add('home-health-warn');
+    iconName = 'alert-circle';
+  }
+  iconEl.innerHTML = lucideIcon(iconName, { size: 14 });
+  // Summary copy.
+  var parts = [];
+  if (unhealthy) {
+    if (snap && snap.health && snap.health.kind === 'ai_not_responding') {
+      parts.push('AI not responding');
+    } else if (telemetrySecs != null && telemetrySecs > HOME_TELEMETRY_STALL_SECS) {
+      parts.push('Sensor stalled (' + Math.floor(telemetrySecs / 60) + 'm since last data)');
+    } else {
+      parts.push('System health alert');
+    }
+  } else {
+    parts.push('All systems operational');
+  }
+  if (total > 0) {
+    parts.push(active + ' of ' + total + ' data sources active');
+  }
+  if (telemetrySecs != null && !unhealthy) {
+    parts.push('last data ' + (telemetrySecs < 60 ? telemetrySecs + 's ago'
+      : Math.floor(telemetrySecs / 60) + 'm ago'));
+  }
+  summaryEl.textContent = parts.join(' · ');
+}
+
+// ── Details panel (collapsed by default) ────────────────────────────
+function renderDetailsPanel(overview, status, sensors) {
+  // Pending breakdown — only renders cells with count > 0 so the
+  // operator never sees "0 / 0 / 0 / 0" engineer-debug noise.
+  var snap = overview && overview.snapshot;
+  updatePendingPanel(snap);
+  // Sensor list.
+  updateCollectorStrip(sensors);
+  // Mode + heartbeat metadata.
+  var modeEl = document.getElementById('homeMetaMode');
+  if (modeEl) modeEl.textContent = (status.mode || 'read_only').replace('_', '-').toUpperCase();
+  var hbEl = document.getElementById('homeMetaHeartbeat');
+  var hbItem = document.getElementById('homeMetaHeartbeatItem');
+  var telemetrySecs = (typeof status.last_telemetry_secs === 'number')
+    ? status.last_telemetry_secs : null;
+  if (hbEl) {
+    if (telemetrySecs == null) {
+      hbEl.textContent = 'unknown';
+      if (hbItem) hbItem.classList.add('home-stale-strong');
+    } else {
+      hbEl.textContent = telemetrySecs < 60
+        ? telemetrySecs + 's ago'
+        : Math.floor(telemetrySecs / 60) + 'm ago';
+      if (hbItem) {
+        hbItem.classList.toggle('home-stale-strong', telemetrySecs > HOME_TELEMETRY_STALL_SECS);
+        hbItem.classList.toggle('home-stale-soft',
+          telemetrySecs > HOME_TELEMETRY_STALE_SOFT_SECS &&
+          telemetrySecs <= HOME_TELEMETRY_STALL_SECS);
+      }
+    }
+  }
+}
+
+function toggleHomeDetails() {
+  var panel = document.getElementById('homeDetailsPanel');
+  var btn = document.getElementById('homeDetailsToggle');
+  if (!panel || !btn) return;
+  var isHidden = panel.hasAttribute('hidden');
+  if (isHidden) {
+    panel.removeAttribute('hidden');
+    btn.textContent = 'Hide details';
+    btn.setAttribute('aria-expanded', 'true');
+  } else {
+    panel.setAttribute('hidden', '');
+    btn.textContent = 'Show details';
+    btn.setAttribute('aria-expanded', 'false');
+  }
 }
 
 // ── State machine ────────────────────────────────────────────────────
@@ -250,227 +516,23 @@ function computeHomeState(payload) {
 }
 
 // ── Hero ─────────────────────────────────────────────────────────────
-function updateHomeBanner(status, homeState) {
+// 2026-04-30 redesign: renamed from updateHomeBanner. The hero now
+// states ONE thing — the verb that answers "am I safe?" in plain
+// English. MODE/heartbeat metadata moved to the collapsed details
+// panel (renderDetailsPanel) so the 95% 5-second-visit persona never
+// sees it on the first read.
+function updateHomeHero(homeState) {
   var hero  = document.getElementById('homeHero');
   var icon  = document.getElementById('homeHeroIcon');
   var title = document.getElementById('homeHeroTitle');
   var sub   = document.getElementById('homeHeroSub');
-  var meta  = document.getElementById('homeStatusMeta');
   if (!hero || !icon || !title || !sub) return;
-
   hero.className  = homeState.heroClass;
-  // 2026-04-30: heroIcon is now an SVG string (lucide), not a single
-  // emoji codepoint. Use innerHTML so the markup renders.
   icon.innerHTML    = homeState.heroIcon;
   title.textContent = homeState.heroTitle;
   sub.textContent   = homeState.heroSub;
-
-  if (meta) {
-    var mode = (status.mode || 'read_only').replace('_', '-').toUpperCase();
-    var telemetrySecs = status.last_telemetry_secs;
-    var telemetryHtml;
-    if (typeof telemetrySecs !== 'number') {
-      telemetryHtml = '<span class="home-meta-item">\u2764 n/a</span>';
-    } else if (telemetrySecs > HOME_TELEMETRY_STALL_SECS) {
-      var m = Math.floor(telemetrySecs / 60);
-      telemetryHtml = '<span class="home-meta-item home-stale-strong">Data stalled \u00B7 ' + m + 'm since last telemetry</span>';
-    } else if (telemetrySecs > HOME_TELEMETRY_STALE_SOFT_SECS) {
-      telemetryHtml = '<span class="home-meta-item home-stale-soft">Data may be delayed \u00B7 ' + telemetrySecs + 's since last telemetry</span>';
-    } else {
-      telemetryHtml = '<span class="home-meta-item">\u2764 ' + telemetrySecs + 's ago</span>';
-    }
-
-    // Phase 12 (QA fix #5, 2026-04-29): real navigable anchors
-    // (href="#threats" / "#health") instead of javascript:void(0)
-    // — Cmd/Ctrl+click opens in new tab, screen readers announce
-    // them as actual links.
-    var links = '<a href="#threats" class="home-link" onclick="event.preventDefault(); viewActivity()">View activity \u2192</a>';
-    if (homeState.state === 'health_alert') {
-      links += ' <a href="#health" class="home-link" onclick="event.preventDefault(); viewSystemHealth()">View system health \u2192</a>';
-    }
-
-    meta.innerHTML =
-      '<span class="home-meta-item">MODE: ' + mode + '</span>' +
-      telemetryHtml +
-      '<span class="home-meta-links">' + links + '</span>';
-  }
 }
 
-// ── Now section (2 lines, always observational) ─────────────────────
-function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
-  var whatEl = document.getElementById('homeNowWhat');
-  var didEl  = document.getElementById('homeNowDid');
-  if (!whatEl || !didEl) return;
-
-  // Use unique-IP-handled count so it matches the Threats tab entry
-  // count (which dedupes by attacker IP). Falls back to safely_resolved
-  // if backend hasn't been upgraded yet.
-  var handled = (overview.handled_ips_today != null ? overview.handled_ips_today : (overview.safely_resolved || 0));
-  var total = totalEventsScanned || overview.events_count || 0;
-
-  // Line 1 — Trust signal: volume scanned
-  var line1;
-  if (total === 0) {
-    line1 = 'No events detected in the last 24 hours.';
-  } else {
-    line1 = total.toLocaleString() + ' events monitored today.';
-  }
-  if (softStale) {
-    line1 = 'Telemetry is a few minutes behind. ' + line1;
-  }
-  whatEl.textContent = line1;
-
-  // Line 2 — Outcome summary
-  var line2;
-  if (handled === 0) {
-    line2 = 'Nothing suspicious found. All systems operating normally.';
-  } else {
-    var word = handled === 1 ? 'attacker' : 'attackers';
-    line2 = 'Handled ' + handled + ' ' + word + ' today. AI is on shift.';
-  }
-  didEl.textContent = line2;
-}
-
-// ── KPIs with fixed temporal sub-labels ──────────────────────────────
-//
-// Phase 7 (audit RC-2): when `overview.snapshot` is populated (the
-// SQLite-backed path is wired), the tiles render the *attacker* count
-// as the hero number and the *incident* count as the secondary line.
-// The two together tell the operator both "how many distinct threats"
-// and "how active the system was" without forcing mental math —
-// previously the same tile said "21 Blocked" while the list said
-// "Blocked 10", and the unit ambiguity made the dashboard read like
-// a bug.
-//
-// When `snapshot` is missing (legacy KG fallback path or sleep mode)
-// we render the old single-number layout from the flat fields, so
-// existing tests and pre-Phase-7 deployments don't crash.
-// Phase 9 (2026-04-29 UX redesign): renamed to make intent obvious.
-// The Home page no longer has 3 KPI tiles — it has a narrative
-// summary pyramid that answers "what happened today?" in 4 lines
-// from raw activity volume down to the only thing operator action
-// is required on. Plain English on every line; SOC jargon
-// ("Detections", "Handled") replaced with verbs anyone reads.
-function updateHomeKpis(overview, totalEventsScanned) {
-  updateHomeSummary(overview, totalEventsScanned);
-}
-
-// Render the summary pyramid: 4 main lines (watched / flagged /
-// acted / awaiting) plus 4 sub-rows breaking down the action types.
-// Each line is operator-readable in isolation; the pyramid as a
-// whole tells the funnel story (13K events -> 29 incidents -> 26
-// attackers acted on -> 0 awaiting) without forcing the operator
-// to do mental math across separate tiles.
-function updateHomeSummary(overview, totalEventsScanned) {
-  var snap = overview && overview.snapshot;
-
-  // Line 1 — Watched.
-  var watched = 0;
-  if (snap) {
-    watched = snap.events_today || totalEventsScanned || overview.events_count || 0;
-  } else {
-    watched = totalEventsScanned || overview.events_count || 0;
-  }
-  setText('homeSummaryWatched', formatBigNumber(watched));
-
-  // Line 2 — Flagged.
-  var flaggedAttackers = 0;
-  var flaggedIncidents = 0;
-  if (snap) {
-    flaggedAttackers =
-      (snap.buckets.blocked.unique_attackers || 0) +
-      (snap.buckets.observing.unique_attackers || 0) +
-      (snap.buckets.honeypot.unique_attackers || 0) +
-      (snap.buckets.attention.unique_attackers || 0) +
-      (snap.buckets.allowlisted.unique_attackers || 0);
-    flaggedIncidents =
-      (snap.buckets.blocked.incidents || 0) +
-      (snap.buckets.observing.incidents || 0) +
-      (snap.buckets.honeypot.incidents || 0) +
-      (snap.buckets.attention.incidents || 0) +
-      (snap.buckets.allowlisted.incidents || 0);
-  } else {
-    flaggedAttackers = overview.handled_ips_today || 0;
-    flaggedIncidents = overview.incidents_count || 0;
-  }
-  setText('homeSummaryFlagged', flaggedAttackers);
-  setText(
-    'homeSummaryFlaggedUnit',
-    flaggedAttackers === 1 ? 'attacker' : 'attackers'
-  );
-  var flaggedHint = '';
-  if (flaggedAttackers > 0) {
-    flaggedHint = 'Across ' + flaggedIncidents + ' separate ' +
-      (flaggedIncidents === 1 ? 'incident' : 'incidents') + '.';
-  } else {
-    flaggedHint = 'Nothing suspicious today.';
-  }
-  setText('homeSummaryFlaggedHint', flaggedHint);
-
-  // Line 3 — Acted.
-  var actedAttackers = 0;
-  var blockedAttackers = 0;
-  var watchingAttackers = 0;
-  var honeypotAttackers = 0;
-  var allowlistedAttackers = 0;
-  if (snap) {
-    actedAttackers =
-      (snap.buckets.blocked.unique_attackers || 0) +
-      (snap.buckets.observing.unique_attackers || 0) +
-      (snap.buckets.honeypot.unique_attackers || 0);
-    blockedAttackers = snap.buckets.blocked.unique_attackers || 0;
-    watchingAttackers = snap.buckets.observing.unique_attackers || 0;
-    honeypotAttackers = snap.buckets.honeypot.unique_attackers || 0;
-    allowlistedAttackers = snap.buckets.allowlisted.unique_attackers || 0;
-  } else {
-    actedAttackers = overview.handled_ips_today || 0;
-  }
-  setText('homeSummaryActed', actedAttackers);
-  setText('homeSummaryBlocked', blockedAttackers);
-  setText('homeSummaryWatching', watchingAttackers);
-  setText('homeSummaryHoneypot', honeypotAttackers);
-  setText('homeSummaryTrusted', allowlistedAttackers);
-  var actedHint = '';
-  if (actedAttackers > 0 && flaggedAttackers > 0) {
-    var pct = Math.round((actedAttackers / flaggedAttackers) * 100);
-    actedHint = pct + '% of suspicious activity was handled automatically.';
-  }
-  setText('homeSummaryActedHint', actedHint);
-
-  // Line 4 — Awaiting.
-  var awaiting = 0;
-  if (snap) {
-    awaiting = snap.buckets.attention.unique_attackers || 0;
-  } else {
-    awaiting = overview.attention_count || 0;
-  }
-  setText('homeSummaryAwaiting', awaiting);
-  var awaitingHint = '';
-  var attentionRow = document.getElementById('homeSummaryAttentionRow');
-  if (awaiting > 0) {
-    awaitingHint = (awaiting === 1 ? 'This attacker' : 'These attackers') +
-      ' need your judgement — open Threats to review.';
-    if (attentionRow) attentionRow.classList.add('summary-row-needs-review');
-  } else {
-    awaitingHint = 'Nothing right now.';
-    if (attentionRow) attentionRow.classList.remove('summary-row-needs-review');
-  }
-  setText('homeSummaryAwaitingHint', awaitingHint);
-
-  // Time scope: "since midnight UTC (last 14h)" — shows both the
-  // anchor (UTC midnight, since that's what the backend filters by)
-  // and the elapsed time so the operator knows how much of the day
-  // has been observed. Ambiguous "Today" was the audit feedback.
-  var elapsed = computeElapsedHoursUtc();
-  var elapsedText = elapsed >= 1
-    ? 'since midnight UTC · last ' + elapsed + 'h'
-    : 'since midnight UTC';
-  setText('homeSummaryWindow', elapsedText);
-
-  // Phase 9: pending breakdown panel still appears when total>0,
-  // but with plain-English labels rendered from the snapshot.
-  updatePendingPanel(snap);
-}
 
 function computeElapsedHoursUtc() {
   var now = new Date();
@@ -487,39 +549,68 @@ function formatBigNumber(total) {
   return total.toLocaleString();
 }
 
+// 2026-04-30 redesign: pending grid now renders DYNAMICALLY — only
+// cells with count > 0 are emitted. The previous version always
+// rendered all four cells even when every count was zero ("0 / 0 /
+// 0 / 0"), which the operator legitimately read as engineer-debug
+// noise. Steady state is now: panel hidden entirely.
 function updatePendingPanel(snap) {
   var panel = document.getElementById('homePendingPanel');
-  if (!panel) return;
+  var grid = document.getElementById('homePendingGrid');
+  if (!panel || !grid) return;
   var pending = snap && snap.pending;
   if (!pending) {
     panel.style.display = 'none';
+    grid.innerHTML = '';
     return;
   }
-  var total =
-    (pending.in_flight || 0) +
-    (pending.declined_by_ai || 0) +
-    (pending.cooldown_suppressed || 0) +
-    (pending.stuck || 0);
-  if (total === 0) {
+  var cells = [
+    {
+      id: 'in_flight',
+      n: pending.in_flight || 0,
+      label: 'Being analyzed now',
+      hint: 'Less than 5 minutes old',
+      warn: false,
+    },
+    {
+      id: 'declined_by_ai',
+      n: pending.declined_by_ai || 0,
+      label: 'AI escalated to you',
+      hint: 'Needs your judgement',
+      warn: false,
+    },
+    {
+      id: 'cooldown_suppressed',
+      n: pending.cooldown_suppressed || 0,
+      label: 'Same threat already decided',
+      hint: 'Silenced for 1 hour',
+      warn: false,
+    },
+    {
+      id: 'stuck',
+      n: pending.stuck || 0,
+      label: 'No decision after 1 hour',
+      hint: 'System will auto-clean',
+      warn: true,
+    },
+  ];
+  var visible = cells.filter(function(c) { return c.n > 0; });
+  if (visible.length === 0) {
     panel.style.display = 'none';
+    grid.innerHTML = '';
     return;
   }
   panel.style.display = '';
-  setText('homePendingInFlight', pending.in_flight || 0);
-  setText('homePendingDeclined', pending.declined_by_ai || 0);
-  setText('homePendingCooldown', pending.cooldown_suppressed || 0);
-  setText('homePendingStuck', pending.stuck || 0);
+  grid.innerHTML = visible.map(function(c) {
+    var cls = 'pending-cell' + (c.warn ? ' pending-cell-warn' : '');
+    return '<div class="' + cls + '">' +
+      '<div class="pending-num"' + (c.warn ? ' style="color:var(--danger)"' : '') + '>' + c.n + '</div>' +
+      '<div class="pending-label">' + c.label + '</div>' +
+      '<div class="pending-hint">' + c.hint + '</div>' +
+      '</div>';
+  }).join('');
 
-  // Phase 7B hint line. Branches on the snapshot's health verb so
-  // the copy reflects whether the AI is actually wedged or whether
-  // it's just earlier-day backlog (which the orphan-recovery pass
-  // will clear). Pre-7B this said "AI pipeline may be wedged" any
-  // time stuck>0, which gave false alarms whenever the AI was
-  // healthily processing the steady stream.
   var hint = '';
-  // Phase 9: hint copy in plain English. The variant identifies the
-  // ONE thing the operator should know — not all four numbers in
-  // SOC-jargon prose.
   var hintHealth = snap && snap.health;
   if (hintHealth && hintHealth.kind === 'ai_not_responding') {
     var hintLast = hintHealth.last_decision_secs_ago;
@@ -539,14 +630,6 @@ function updatePendingPanel(snap) {
   }
   var hintEl = document.getElementById('homePendingHint');
   if (hintEl) hintEl.textContent = hint;
-
-  // Stuck cell: hide the warn styling when stuck=0 so the operator
-  // doesn't see permanent red noise.
-  var stuckCell = document.getElementById('homePendingStuckCell');
-  if (stuckCell) {
-    if (pending.stuck > 0) stuckCell.classList.add('pending-cell-warn');
-    else stuckCell.classList.remove('pending-cell-warn');
-  }
 }
 
 function setText(id, value) {
@@ -560,18 +643,22 @@ function setKpiWindow(id, text) {
 }
 
 // ── AI Intelligence Briefing ────────────────────────────────────────
+// 2026-04-30 redesign: per operator request the briefing card is
+// ALWAYS visible — it's the single piece of narrative context worth
+// reading on every visit. The previous version hid the section on
+// fetch errors which dropped the most-trusted card from the page
+// silently. Now every state has a visible message:
+//   data.available=true  → render summary + "Regenerate" button
+//   data.available=false → "No briefing yet" empty state + "Generate"
+//   fetch error          → "Briefing unavailable" with manual retry
 async function loadBriefing() {
   var section = document.getElementById('briefingSection');
   if (!section) return;
+  section.style.display = '';
+  var content = document.getElementById('briefingContent');
+  var btn = document.getElementById('briefingBtn');
   try {
     var data = await loadJson('/api/briefing');
-    section.style.display = '';
-    var content = document.getElementById('briefingContent');
-    var btn = document.getElementById('briefingBtn');
-    // SSE can fire refresh while the Home view is hidden; children may
-    // briefly be null during markup rerender. Guard each write so the
-    // whole loadHome pipeline does not throw on null.textContent /
-    // null.innerHTML.
     if (data.available) {
       var age = data.generated_at ? new Date(data.generated_at).toLocaleTimeString() : '';
       if (content) {
@@ -580,13 +667,16 @@ async function loadBriefing() {
       }
       if (btn) btn.textContent = 'Regenerate';
     } else if (content) {
-      // Spec 017 Change 7 exact approved English copy.
       content.innerHTML = '<div class="briefing-empty">' +
         esc("No briefing yet. You're protected, and we are still monitoring. Generate a briefing now for a quick summary.") +
         '</div>';
     }
   } catch(e) {
-    section.style.display = 'none';
+    if (content) {
+      content.innerHTML = '<div class="briefing-empty" style="color:var(--warn)">' +
+        esc("Briefing temporarily unavailable. Click Regenerate to retry.") +
+        '</div>';
+    }
   }
 }
 
@@ -625,18 +715,14 @@ function updateCollectorStrip(sensors) {
   else if (ratio < 1) summaryClass += ' alert-low';
   else summaryClass += ' alert-info';
 
+  // 2026-04-30 redesign: this lives inside the home details panel
+  // which is itself collapsible. The previous inline "Show details"
+  // toggle inside the strip is now redundant — the entire strip
+  // is already opt-in.
   var html = '<div class="' + summaryClass + '">' +
     active.length + ' of ' + total + ' data sources active' +
-    // Phase 14 (QA polish, 2026-04-29): the wrapper section has
-    // onclick="showView('sensors')" so clicking anywhere on the card
-    // navigates away. Without stopPropagation, clicking "Show details"
-    // also fired the wrapper's onclick — so the inline expand never
-    // worked, the operator just landed on the Sensors view. Stop the
-    // bubble before invoking the toggle.
-    ' <button type="button" class="collector-details-toggle" onclick="event.stopPropagation();toggleCollectorDetails()">Show details</button>' +
     '</div>';
-
-  html += '<div id="homeCollectorDetails" class="collector-details" style="display:none">';
+  html += '<div class="collector-details">';
   active.forEach(function(s) {
     var color = sensorColor(s.name);
     var label = typeof collectorLabel === 'function' ? collectorLabel(s.name) : s.name;

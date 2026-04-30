@@ -1274,6 +1274,211 @@
        types (blocked / watching / honeypot / trusted). The "awaiting"
        row turns amber when count > 0 to draw the eye to the only
        line that may need operator action. */
+    /* 2026-04-30 redesign — Home attention-first layout.
+       Replaces the summary-pyramid (kept below for any orphan refs
+       but no longer rendered). New components in reading order:
+         .home-alert-banner   — critical + review-queue banners
+         .activity-strip      — 4-number row (events / flagged /
+                                stopped / awaiting)
+         .home-health-line    — 1-row system health summary
+         .home-details        — collapsed-by-default detail pane */
+    .home-alert-banner {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 14px 18px;
+      margin: 10px 0;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--card);
+    }
+    .home-alert-banner .home-alert-icon {
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+    }
+    .home-alert-banner .home-alert-icon svg {
+      width: 22px;
+      height: 22px;
+      stroke: currentColor;
+    }
+    .home-alert-banner .home-alert-body { flex: 1; min-width: 0; }
+    .home-alert-banner .home-alert-title {
+      font-size: 0.92rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .home-alert-banner .home-alert-sub {
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-top: 3px;
+    }
+    .home-alert-banner .home-alert-cta {
+      flex-shrink: 0;
+      padding: 6px 14px;
+      border-radius: 8px;
+      border: 1px solid currentColor;
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-decoration: none;
+      letter-spacing: 0.04em;
+    }
+    .home-alert-critical {
+      border-color: rgba(244, 63, 94, 0.45);
+      background: rgba(244, 63, 94, 0.07);
+    }
+    .home-alert-critical .home-alert-icon {
+      background: rgba(244, 63, 94, 0.18);
+      color: var(--danger);
+    }
+    .home-alert-critical .home-alert-cta {
+      color: var(--danger);
+      background: rgba(244, 63, 94, 0.10);
+    }
+    .home-alert-warn {
+      border-color: rgba(255, 184, 77, 0.4);
+      background: rgba(255, 184, 77, 0.06);
+    }
+    .home-alert-warn .home-alert-icon {
+      background: rgba(255, 184, 77, 0.18);
+      color: var(--warn);
+    }
+    .home-alert-warn .home-alert-cta {
+      color: var(--warn);
+      background: rgba(255, 184, 77, 0.10);
+    }
+
+    /* Activity strip: 4-number row, single line on desktop, wraps
+       on narrow screens. */
+    .activity-strip {
+      display: flex;
+      align-items: stretch;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .activity-strip .activity-cell {
+      flex: 1 1 140px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--card);
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .activity-strip .activity-cell:hover {
+      border-color: rgba(120, 229, 255, 0.4);
+      background: var(--card-hov);
+    }
+    .activity-strip .activity-cell:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .activity-strip .activity-num {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1;
+    }
+    .activity-strip .activity-num-ok { color: var(--ok); }
+    .activity-strip .activity-label {
+      font-size: 0.68rem;
+      color: var(--muted);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-top: 6px;
+    }
+    .activity-strip .activity-sep {
+      align-self: center;
+      color: var(--dim);
+      font-size: 1.2rem;
+      flex-shrink: 0;
+    }
+    .activity-strip .activity-cell-attention .activity-num { color: var(--muted); }
+    .activity-strip .activity-cell-attention.activity-cell-attention-active {
+      border-color: rgba(244, 63, 94, 0.45);
+      background: rgba(244, 63, 94, 0.06);
+    }
+    .activity-strip .activity-cell-attention.activity-cell-attention-active .activity-num {
+      color: var(--danger);
+    }
+    @media (max-width: 720px) {
+      .activity-strip .activity-sep { display: none; }
+      .activity-strip .activity-cell { flex-basis: calc(50% - 5px); }
+    }
+
+    /* System health line: 1 row when good, expands when bad. */
+    .home-health-line {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      margin: 12px 0;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: var(--card);
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .home-health-line .home-health-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--ok);
+    }
+    .home-health-line .home-health-icon svg {
+      width: 14px; height: 14px; stroke: currentColor;
+    }
+    .home-health-line .home-health-toggle {
+      margin-left: auto;
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.7rem;
+      cursor: pointer;
+    }
+    .home-health-line .home-health-toggle:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .home-health-line.home-health-warn { border-color: rgba(255, 184, 77, 0.4); }
+    .home-health-line.home-health-warn .home-health-icon { color: var(--warn); }
+    .home-health-line.home-health-bad {
+      border-color: rgba(244, 63, 94, 0.45);
+      background: rgba(244, 63, 94, 0.06);
+    }
+    .home-health-line.home-health-bad .home-health-icon { color: var(--danger); }
+
+    /* Details panel: collapsed by default, holds metadata + per-detector
+       breakdowns + sensor list for the routine-scan persona. */
+    .home-details { margin-top: 8px; }
+    .home-meta-row {
+      display: flex;
+      gap: 18px;
+      flex-wrap: wrap;
+      align-items: center;
+      padding: 10px 14px;
+      margin-top: 10px;
+      border-radius: 10px;
+      border: 1px dashed var(--line);
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+    .home-meta-row .home-meta-item strong {
+      color: var(--text);
+      font-weight: 700;
+    }
+    .home-meta-row .home-stale-soft strong { color: var(--warn); }
+    .home-meta-row .home-stale-strong strong { color: var(--danger); }
+
+    /* Old pyramid styles kept for backward-compat with any orphan
+       refs; the home view no longer renders them. */
     .summary-pyramid {
       list-style: none;
       padding: 0;

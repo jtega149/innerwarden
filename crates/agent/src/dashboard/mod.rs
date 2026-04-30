@@ -897,24 +897,32 @@ mod tests {
 
     #[test]
     fn home_js_reads_overview_snapshot() {
-        // The new tile-rendering path reads `overview.snapshot`.
-        // Pre-Phase-7 home.js had no such path; if a future cleanup
-        // strips it, this anchor fails before the operator notices
-        // the regression.
+        // The render path reads `overview.snapshot.buckets.*.unique_attackers`
+        // (Phase 7 typed snapshot contract). 2026-04-30 redesign drops
+        // the `incidents` field from the home — unique-attacker is the
+        // only count rendered, matching the unified attacker semantic
+        // from Phase 10. The pending pipeline still reads `snap.pending`.
         assert!(JS_HOME.contains("overview.snapshot"));
         assert!(JS_HOME.contains("snap.buckets.blocked.unique_attackers"));
-        assert!(JS_HOME.contains("snap.buckets.blocked.incidents"));
         assert!(JS_HOME.contains("snap.pending"));
     }
 
     #[test]
     fn home_js_renders_pending_breakdown_panel() {
-        // The 4 pending categories must each be rendered by id.
-        // Future drop of any category requires updating both ends.
-        assert!(JS_HOME.contains("homePendingInFlight"));
-        assert!(JS_HOME.contains("homePendingDeclined"));
-        assert!(JS_HOME.contains("homePendingCooldown"));
-        assert!(JS_HOME.contains("homePendingStuck"));
+        // 2026-04-30 redesign: pending grid now renders dynamically —
+        // cells with count > 0 are emitted by name, no static DOM IDs.
+        // Anchor pins the keys updatePendingPanel reads from snapshot
+        // so a future schema change on `pending.*` is caught.
+        assert!(JS_HOME.contains("pending.in_flight"));
+        assert!(JS_HOME.contains("pending.declined_by_ai"));
+        assert!(JS_HOME.contains("pending.cooldown_suppressed"));
+        assert!(JS_HOME.contains("pending.stuck"));
+        // Plain-English labels rendered into each cell. Operator sees
+        // these strings, not SOC jargon.
+        assert!(JS_HOME.contains("Being analyzed now"));
+        assert!(JS_HOME.contains("AI escalated to you"));
+        assert!(JS_HOME.contains("Same threat already decided"));
+        assert!(JS_HOME.contains("No decision after 1 hour"));
     }
 
     #[test]
@@ -928,101 +936,216 @@ mod tests {
 
     #[test]
     fn index_html_carries_pending_breakdown_panel() {
-        // HTML element IDs the panel renderer keys on. The panel is
-        // hidden by default (display:none) but must exist in the
-        // bundled binary for the JS to populate it.
-        assert!(INDEX_HTML.contains("homePendingPanel"));
-        assert!(INDEX_HTML.contains("homePendingInFlight"));
-        assert!(INDEX_HTML.contains("homePendingStuck"));
+        // 2026-04-30 redesign: pending grid is now dynamic — only the
+        // panel container + grid mount-point ship in HTML, the cells
+        // are rendered from JS only when count > 0. The previous
+        // anchor required the 4 static cell IDs which no longer exist.
+        assert!(INDEX_HTML.contains("id=\"homePendingPanel\""));
+        assert!(INDEX_HTML.contains("id=\"homePendingGrid\""));
+        // The legacy IDs MUST NOT come back — that signals someone
+        // re-introduced the always-render-zero-cells regression.
+        assert!(!INDEX_HTML.contains("id=\"homePendingInFlight\""));
+        assert!(!INDEX_HTML.contains("id=\"homePendingStuck\""));
     }
 
     #[test]
-    fn index_html_carries_summary_pyramid_for_layperson_ux() {
-        // Phase 9 (2026-04-29 redesign): the 3-tile/6-number KPI row
-        // was replaced with a narrative summary pyramid. The pyramid
-        // has 4 main rows (watched / flagged / acted / awaiting) and
-        // 4 action sub-rows (blocked / watching / honeypot / trusted).
-        // Anchor the new IDs so a future redesign doesn't silently
-        // drop the layperson-readable surface.
-        assert!(INDEX_HTML.contains("homeSummaryWatched"));
-        assert!(INDEX_HTML.contains("homeSummaryFlagged"));
-        assert!(INDEX_HTML.contains("homeSummaryActed"));
-        assert!(INDEX_HTML.contains("homeSummaryAwaiting"));
-        assert!(INDEX_HTML.contains("homeSummaryBlocked"));
-        assert!(INDEX_HTML.contains("homeSummaryWatching"));
-        assert!(INDEX_HTML.contains("homeSummaryHoneypot"));
-        assert!(INDEX_HTML.contains("homeSummaryTrusted"));
-        // The time-scope label must show the elapsed window so the
-        // ambiguous "Today" doesn't reappear.
-        assert!(INDEX_HTML.contains("homeSummaryWindow"));
+    fn index_html_attention_first_home_layout() {
+        // 2026-04-30 redesign: the Home was rebuilt for the 95%
+        // 5-second-visit operator. Reading order: hero verb → critical
+        // banner (only when needed) → review queue banner (only when
+        // needed) → 4-number activity strip → AI briefing (always
+        // visible) → system health line → details (collapsed). This
+        // anchor pins the structural IDs so a future "improvement"
+        // cannot silently drop them. See loadHome() for the
+        // orchestration this anchors against.
+        for id in [
+            "homeHero",
+            "homeCriticalBanner",
+            "homeCriticalTitle",
+            "homeCriticalSub",
+            "homeCriticalCta",
+            "homeReviewBanner",
+            "homeReviewCount",
+            "homeActivitySection",
+            "homeActWatched",
+            "homeActFlagged",
+            "homeActStopped",
+            "homeActAwaiting",
+            "briefingSection",
+            "briefingContent",
+            "briefingBtn",
+            "homeHealthLine",
+            "homeHealthIcon",
+            "homeHealthSummary",
+            "homeDetailsToggle",
+            "homeDetailsPanel",
+            "homePendingPanel",
+            "homePendingGrid",
+            "homeCollectorStrip",
+            "homeMetaMode",
+            "homeMetaHeartbeat",
+        ] {
+            assert!(
+                INDEX_HTML.contains(id),
+                "Home redesign requires id={id} — operator-visible block missing"
+            );
+        }
+        // Hero icon SVG path must be inlined so the page renders
+        // before JS hydrates (lucide shield-check inner shapes).
+        assert!(INDEX_HTML.contains("M20 13c0 5-3.5 7.5-7.66 8.95"));
     }
 
     #[test]
-    fn home_js_renders_summary_pyramid_with_plain_english() {
-        // The new updateHomeSummary function must populate the four
-        // main lines + four sub-rows. Anchor to detect any silent
-        // refactor that drops one of the lines.
-        assert!(JS_HOME.contains("homeSummaryWatched"));
-        assert!(JS_HOME.contains("homeSummaryFlagged"));
-        assert!(JS_HOME.contains("homeSummaryActed"));
-        assert!(JS_HOME.contains("homeSummaryAwaiting"));
-        assert!(JS_HOME.contains("computeElapsedHoursUtc"));
-        // Plain-English copy strings must be present so a future
-        // refactor that "fixes" them to jargon fails the test.
+    fn home_js_renders_attention_first_layout() {
+        // The render orchestration must call each block's renderer
+        // explicitly. A future refactor that drops one renderer
+        // produces an empty block on screen — anchor catches it.
+        for fn_name in [
+            "updateHomeHero",
+            "renderCriticalBanner",
+            "renderReviewBanner",
+            "renderActivityStrip",
+            "renderHealthLine",
+            "renderDetailsPanel",
+            "loadBriefing",
+            "toggleHomeDetails",
+            "openTopCritical",
+            "findTopOpenCritical",
+        ] {
+            assert!(
+                JS_HOME.contains(fn_name),
+                "home.js must define {fn_name} (attention-first redesign)"
+            );
+        }
+        // Plain-English copy strings — verb identity for the hero.
         assert!(JS_HOME.contains("All clear"));
         assert!(JS_HOME.contains("You are protected"));
+        // Briefing must always be visible — section.style.display set
+        // to '' unconditionally, NOT inside a try/catch fallback.
+        // This stops the "fetch fails -> hide section silently" bug.
+        let briefing_start = JS_HOME.find("loadBriefing").expect("loadBriefing");
+        let briefing_end = JS_HOME[briefing_start..]
+            .find("\nasync function generateBriefing")
+            .expect("end of loadBriefing")
+            + briefing_start;
+        let body = &JS_HOME[briefing_start..briefing_end];
+        assert!(
+            body.contains("section.style.display = '';"),
+            "loadBriefing must show section unconditionally (always-visible contract)"
+        );
+        assert!(
+            !body.contains("section.style.display = 'none';"),
+            "loadBriefing must NOT hide section on error (always-visible contract)"
+        );
     }
 
     #[test]
-    fn index_html_pending_panel_uses_plain_english_labels() {
-        // Phase 9: the pending panel labels were renamed from SOC
-        // jargon ("In flight", "Cooldown'd") to operator-readable
-        // English. Anchor the new strings.
-        assert!(INDEX_HTML.contains("Being analyzed now"));
-        assert!(INDEX_HTML.contains("AI escalated to you"));
-        assert!(INDEX_HTML.contains("Same threat already decided"));
-        assert!(INDEX_HTML.contains("No decision after 1 hour"));
+    fn home_pending_panel_renders_only_nonzero_cells() {
+        // 2026-04-30 redesign: the pending grid used to render all 4
+        // cells with "0" placeholders even when every count was zero,
+        // which the operator legitimately read as engineer-debug
+        // noise. Steady state must be: panel hidden entirely. Anchor
+        // pins the pattern by requiring the dynamic-render code path
+        // (cells.filter(c => c.n > 0)) to be present.
+        assert!(
+            JS_HOME.contains("var visible = cells.filter(function(c) { return c.n > 0; });"),
+            "updatePendingPanel must filter to non-zero cells before rendering"
+        );
+        assert!(
+            JS_HOME.contains("if (visible.length === 0) {"),
+            "updatePendingPanel must hide the panel when no cell is non-zero"
+        );
     }
 
     #[test]
-    fn index_html_uses_lucide_svg_icons_not_emoji() {
-        // Phase 11B (2026-04-29): the Home pyramid icons match the
-        // marketing site's lucide-react set. Anchor that the inline
-        // SVG paths are bundled so a future "simplification" back to
-        // emoji is caught at build time.
-        // Activity icon (📡 watched): unique polyline points string.
-        assert!(INDEX_HTML.contains("polyline points=\"22 12 18 12 15 21 9 3 6 12 2 12\""));
-        // ShieldCheck icon (🛡️ acted): the inner check mark path.
-        assert!(INDEX_HTML.contains("m9 12 2 2 4-4"));
-        // Eye icon (👁️ watching).
-        assert!(INDEX_HTML.contains("M2.062 12.348"));
-        // Bug icon (🍯 honeypot).
-        assert!(INDEX_HTML.contains("M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"));
-        // Handshake icon (🤝 trusted).
-        assert!(INDEX_HTML.contains("m11 17 2 2a1 1 0 1 0 3-3"));
-        // Emojis must NOT remain in the summary pyramid block.
-        // (They may appear elsewhere in the file — search inside
-        // the pyramid block specifically.)
-        let pyramid_start = INDEX_HTML.find("summary-pyramid").expect("pyramid present");
-        let pyramid_end = INDEX_HTML[pyramid_start..]
-            .find("homePendingPanel")
-            .expect("panel after pyramid")
-            + pyramid_start;
-        let pyramid = &INDEX_HTML[pyramid_start..pyramid_end];
-        for emoji in ["📡", "🎯", "🛡️", "⛔", "👁️", "🍯", "🤝", "⚠️"] {
+    fn home_critical_banner_only_renders_open_critical_high() {
+        // The critical banner must (a) show only for open + critical/
+        // high, (b) hide when no such incident exists, (c) deep-link
+        // to the journey view via openTopCritical. Pin the predicates
+        // so a future "improvement" doesn't widen the trigger and
+        // make the banner fire on routine traffic.
+        assert!(JS_HOME.contains("if (i.outcome !== 'open') return false;"));
+        assert!(JS_HOME.contains("if (sevRank[sev] < 3) return false;"));
+        // Hide path when no top critical.
+        assert!(JS_HOME.contains("banner.style.display = 'none';"));
+    }
+
+    #[test]
+    fn home_no_summary_pyramid_or_homenow_dom_ids_remain() {
+        // 2026-04-30: enforce the redesign's removal of the old
+        // pyramid + standalone "Now" section. If a regression
+        // re-introduces them, the page will have BOTH the new strip
+        // and the old pyramid (data drift visible to operator). The
+        // CSS class .summary-pyramid is intentionally kept (legacy
+        // safety) but no element should reference it any more.
+        for orphan in [
+            "id=\"homeNowWhat\"",
+            "id=\"homeNowDid\"",
+            "id=\"homeSummary\"",
+            "id=\"homeSummaryWatched\"",
+            "id=\"homeSummaryFlagged\"",
+            "id=\"homeSummaryActed\"",
+            "id=\"homeSummaryAwaiting\"",
+            "id=\"homeSummaryBlocked\"",
+            "id=\"homeSummaryHoneypot\"",
+            "id=\"homeSummaryTrusted\"",
+            "id=\"homeSummaryWatching\"",
+            "id=\"homeStatusMeta\"",
+            "class=\"summary-pyramid\"",
+        ] {
             assert!(
-                !pyramid.contains(emoji),
-                "emoji {emoji} still in summary pyramid after Phase 11B"
+                !INDEX_HTML.contains(orphan),
+                "old pre-redesign anchor {orphan} should be gone — check for stale Home markup"
             );
         }
     }
 
     #[test]
-    fn app_css_defines_summary_pyramid_styles() {
-        assert!(APP_CSS.contains(".summary-pyramid"));
-        assert!(APP_CSS.contains(".summary-row"));
-        assert!(APP_CSS.contains(".summary-row-needs-review"));
-        assert!(APP_CSS.contains(".summary-sub-row"));
+    fn home_view_has_no_emoji_icons() {
+        // Phase 11B + 2026-04-30 redesign: the entire home view uses
+        // inline lucide SVGs. Walk the home view block specifically
+        // (avoid false positives from other pages) and assert no
+        // emoji codepoints we previously rendered there.
+        let home_start = INDEX_HTML
+            .find("<!-- ── Home view ──")
+            .or_else(|| INDEX_HTML.find("id=\"viewHome\""))
+            .expect("home view block present");
+        let home_end = INDEX_HTML[home_start..]
+            .find("<!-- ── Sensors view ──")
+            .expect("sensors view marks the end of home block")
+            + home_start;
+        let home = &INDEX_HTML[home_start..home_end];
+        for emoji in ["📡", "🎯", "🛡️", "⛔", "👁️", "🍯", "🤝", "⚠️", "🤖"]
+        {
+            assert!(
+                !home.contains(emoji),
+                "emoji {emoji} still in Home view — should be inline lucide SVG"
+            );
+        }
+        // The hero shield-check SVG must remain so the page renders
+        // the verb icon before JS hydrates.
+        assert!(home.contains("M20 13c0 5-3.5 7.5-7.66 8.95"));
+    }
+
+    #[test]
+    fn app_css_defines_attention_first_home_styles() {
+        for selector in [
+            ".home-alert-banner",
+            ".home-alert-critical",
+            ".home-alert-warn",
+            ".activity-strip",
+            ".activity-cell",
+            ".activity-cell-attention-active",
+            ".home-health-line",
+            ".home-health-bad",
+            ".home-details",
+            ".home-meta-row",
+        ] {
+            assert!(
+                APP_CSS.contains(selector),
+                "redesign CSS must define {selector}"
+            );
+        }
     }
 
     #[test]
@@ -1055,14 +1178,15 @@ mod tests {
             );
         }
 
-        // 3. Show-details stopPropagation: the inner button used to
-        //    bubble its click up to the wrapper's showView('sensors'),
-        //    so the operator landed on Sensors instead of expanding
-        //    the inline list.
-        assert!(
-            JS_HOME.contains("event.stopPropagation();toggleCollectorDetails()"),
-            "Show details button must stop the click from bubbling to the wrapper"
-        );
+        // 3. Show-details stopPropagation was needed when the home
+        //    Data Collection card had `onclick="showView('sensors')"`
+        //    on its wrapper. The 2026-04-30 home redesign moved the
+        //    collector strip INSIDE the (already opt-in) details
+        //    panel, so the wrapper onclick is gone and the inline
+        //    Show-details button was removed too. The stopPropagation
+        //    contract this assert pinned no longer applies — there is
+        //    no clickable wrapper to bubble into. Anchor retained as a
+        //    breadcrumb pointing to the redesign rationale.
 
         // 4. Hide "0 evt" tail when event_count is zero. Both render
         //    paths (initial render and SSE refresh) must respect it.
