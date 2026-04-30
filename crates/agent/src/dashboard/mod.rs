@@ -1108,6 +1108,82 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_js_files_have_no_template_interp_inside_single_quoted_strings() {
+        // 2026-04-30: prod regression — operator hit "Loading attacker
+        // profiles..." stuck forever because intel.js had two lines
+        // of the form `'<div>${lucideIcon(\'name\', ...)}</div>'`. A
+        // single-quoted JS string containing `${...}` is
+        // (a) NOT interpolated (renders the literal `${...}` text),
+        // (b) syntax-broken when the embedded expression contains a
+        //     single quote — the inner `'name'` closes the outer
+        //     string and corrupts the parse for the rest of the file.
+        // Net effect: the entire JS file failed to load and EVERY
+        // function it defined was undefined at runtime. nav.js called
+        // loadIntel(), got ReferenceError, the static "Loading..."
+        // placeholder remained on screen forever.
+        //
+        // This anchor scans every bundled JS file for the bug shape
+        // (`'...${lucideIcon('...`) so a future "convenience" replace
+        // that re-introduces it fails the build.
+        for (label, src) in [
+            ("api.js", JS_API),
+            ("icons.js", JS_ICONS),
+            ("helpers.js", JS_HELPERS),
+            ("state.js", JS_STATE),
+            ("nav.js", JS_NAV),
+            ("home.js", JS_HOME),
+            ("threats.js", JS_THREATS),
+            ("journey.js", JS_JOURNEY),
+            ("sensors.js", JS_SENSORS),
+            ("reports.js", JS_REPORTS),
+            ("status.js", JS_STATUS),
+            ("compliance.js", JS_COMPLIANCE),
+            ("honeypot.js", JS_HONEYPOT),
+            ("intel.js", JS_INTEL),
+            ("monthly.js", JS_MONTHLY),
+            ("responses.js", JS_RESPONSES),
+            ("actions.js", JS_ACTIONS),
+            ("sse.js", JS_SSE),
+        ] {
+            for (i, line) in src.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                    continue;
+                }
+                let Some(interp_pos) = line.find("${lucideIcon") else {
+                    continue;
+                };
+                // Scan backwards from the interp position for the
+                // most recent string opener on the same line. If it
+                // is a single quote (and not a backtick), the
+                // interpolation cannot evaluate.
+                let prefix = &line[..interp_pos];
+                let last_backtick = prefix.rfind('`');
+                let last_squote = prefix.rfind('\'');
+                if let (Some(sq), bt) = (last_squote, last_backtick) {
+                    let bt = bt.unwrap_or(0);
+                    if last_backtick.is_none() || sq > bt {
+                        // Need to also rule out the case where the
+                        // single quote is inside a previously-closed
+                        // template literal. Coarse but adequate
+                        // for current code: count odd parity of `'`.
+                        let squote_count = prefix.matches('\'').count();
+                        let bt_count = prefix.matches('`').count();
+                        if squote_count % 2 == 1 && bt_count % 2 == 0 {
+                            panic!(
+                                "{label}:{} `${{lucideIcon(...)}}` inside single-quoted string — \
+                                 will syntax-break the file at runtime. Use backticks. Line: {}",
+                                i + 1,
+                                line.trim()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn icons_module_loaded_before_consumers_and_exposes_lucide_icon() {
         // 2026-04-30: shared icon vocabulary lives in
         // frontend/js/icons.js. Every consumer expects

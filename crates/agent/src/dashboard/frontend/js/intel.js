@@ -259,7 +259,12 @@ async function loadChains() {
   try {
     const data = await loadJson('/api/correlation-chains');
     if (!data?.chains?.length) {
-      content.innerHTML = '<div style="text-align:center;padding:40px;"><div>${lucideIcon('link',{size:32})}</div><p style="color:var(--dim);">No attack chains detected yet.</p><p style="font-size:0.8rem;color:var(--dim);">Chains are multi-stage attacks that span multiple security layers (firmware, kernel, network, userspace).</p></div>';
+      // 2026-04-30: Fix — was a single-quoted string with ${lucideIcon('link',...)}
+      // inside it. The single quote in 'link' closed the outer string and
+      // syntax-broke the entire intel.js file, leaving loadIntel() undefined
+      // (operator saw "Loading attacker profiles..." stuck forever). Backtick
+      // template literal evaluates ${} interpolation correctly.
+      content.innerHTML = `<div style="text-align:center;padding:40px;"><div>${lucideIcon('link',{size:32})}</div><p style="color:var(--dim);">No attack chains detected yet.</p><p style="font-size:0.8rem;color:var(--dim);">Chains are multi-stage attacks that span multiple security layers (firmware, kernel, network, userspace).</p></div>`;
       if (status) status.textContent = '0 chains';
       return;
     }
@@ -352,7 +357,10 @@ async function loadPlaybooks() {
   try {
     const data = await loadJson('/api/playbook-log');
     if (!data?.executions?.length) {
-      content.innerHTML = '<div style="text-align:center;padding:40px;"><div>${lucideIcon('clipboard-list',{size:32})}</div><p style="color:var(--dim);">No playbook executions yet.</p><p style="font-size:0.8rem;color:var(--dim);">Playbooks trigger automatically when incidents match predefined patterns (ransomware, reverse shell, data exfil, etc.).</p></div>';
+      // 2026-04-30: same fix as the chains empty-state path above —
+      // single-quoted JS string with embedded ${lucideIcon('clipboard-list',...)}
+      // syntax-broke the file. Backtick template literal.
+      content.innerHTML = `<div style="text-align:center;padding:40px;"><div>${lucideIcon('clipboard-list',{size:32})}</div><p style="color:var(--dim);">No playbook executions yet.</p><p style="font-size:0.8rem;color:var(--dim);">Playbooks trigger automatically when incidents match predefined patterns (ransomware, reverse shell, data exfil, etc.).</p></div>`;
       if (status) status.textContent = '0 executions';
       return;
     }
