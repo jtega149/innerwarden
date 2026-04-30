@@ -209,11 +209,54 @@ impl DataExfilEbpfDetector {
                 // NOT NSS init and STILL fire Critical alerts. A real
                 // exfil of shadow hashes or SSH keys by a renamed-to-wget
                 // attacker is caught unchanged.
+                // 2026-04-30: added `ssh` after operator hit FP on
+                // `git fetch origin` -> ssh git@github.com (the
+                // github.com SSH endpoint resolves to Azure 20.x).
+                // ssh client always reads /etc/passwd at startup for
+                // NSS uid->name resolution then opens the outbound
+                // connection — exact NSS-init signature.
+                //
+                // Why this is safe (the analysis the operator
+                // explicitly asked for):
+                //
+                //   1. The suppression triggers ONLY when:
+                //      a) sensitive_file == "/etc/passwd" (exact)
+                //      b) read.comm starts with one of these prefixes
+                //
+                //   2. /etc/passwd is world-readable, contains no
+                //      secrets — only `username:x:uid:gid:gecos:home:shell`.
+                //      An attacker exfiltrating it gets nothing they
+                //      cannot already learn via `id`, `who`, `last`.
+                //
+                //   3. Real exfil paths still fire Critical alerts:
+                //      ssh reading /etc/shadow, ~/.ssh/id_*, .env,
+                //      .kube/config, /credentials, GPG keyrings. The
+                //      filename match is `==`, not prefix, so
+                //      anything other than the literal /etc/passwd
+                //      path is not covered.
+                //
+                //   4. Attacker bypass requires BOTH (a) renaming
+                //      their malicious binary's comm to start with
+                //      "ssh" / "git" / etc, AND (b) only reading
+                //      /etc/passwd before connecting out. Real
+                //      exfil that wants to send anything useful
+                //      reads secrets — those still fire.
+                //
+                // Did NOT whitelist by destination IP / hostname (no
+                // 20.x range trust, no github.com hostname trust).
+                // That class of whitelist is the dangerous one
+                // because attackers rent Azure VMs ($1/day, instant
+                // 20.x IP) and use github.com as legitimate-looking
+                // C2 (Octopus Scanner, GitHub C2 TTPs).
                 const NSS_INIT_CLI_TOOLS: &[&str] = &[
                     "wget",
                     "curl",
                     "git",
                     "git-remote",
+                    "ssh",
+                    "scp",
+                    "sftp",
+                    "rsync",
                     "apt",
                     "apt-get",
                     "apt-check",
@@ -395,6 +438,125 @@ mod tests {
             entities: vec![],
         };
         assert!(det.process(&iw_connect).is_none());
+    }
+
+    fn read_event_with_comm(pid: u32, filename: &str, comm: &str, ts: DateTime<Utc>) -> Event {
+        Event {
+            ts,
+            host: "test".into(),
+            source: "ebpf".into(),
+            kind: "file.read_access".into(),
+            severity: Severity::Medium,
+            summary: format!("read {filename}"),
+            details: serde_json::json!({
+                "pid": pid, "uid": 1001, "comm": comm,
+                "filename": filename,
+            }),
+            tags: vec!["ebpf".into()],
+            entities: vec![],
+        }
+    }
+
+    fn connect_event_with_comm(
+        pid: u32,
+        dst_ip: &str,
+        dst_port: u16,
+        comm: &str,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        Event {
+            ts,
+            host: "test".into(),
+            source: "ebpf".into(),
+            kind: "network.outbound_connect".into(),
+            severity: Severity::Info,
+            summary: format!("connect {dst_ip}:{dst_port}"),
+            details: serde_json::json!({
+                "pid": pid, "uid": 1001, "comm": comm,
+                "dst_ip": dst_ip, "dst_port": dst_port,
+            }),
+            tags: vec!["ebpf".into()],
+            entities: vec![EntityRef::ip(dst_ip)],
+        }
+    }
+
+    #[test]
+    fn ssh_reading_passwd_then_connecting_outbound_does_not_alert() {
+        // 2026-04-30: Operator hit a Critical FP on `git fetch`
+        // because the github.com SSH endpoint resolves to Azure
+        // 20.x.156.215. The ssh client always reads /etc/passwd
+        // for NSS uid->name lookup and then opens the outbound
+        // connection — exact NSS-init signature. Adding `ssh` to
+        // NSS_INIT_CLI_TOOLS suppresses that exact shape.
+        //
+        // Anchor: this test reproduces the prod incident as
+        // captured by the eBPF evidence (comm=ssh, file=/etc/passwd,
+        // dst_port=22, uid=1001) and asserts NO incident is
+        // emitted. Pre-fix this returned Some(Critical Incident).
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(7000, "/etc/passwd", "ssh", now));
+        let inc = det.process(&connect_event_with_comm(
+            7000,
+            "20.26.156.215",
+            22,
+            "ssh",
+            now + Duration::milliseconds(3),
+        ));
+        assert!(
+            inc.is_none(),
+            "ssh + /etc/passwd + outbound :22 must be suppressed (NSS-init pattern)"
+        );
+    }
+
+    #[test]
+    fn ssh_reading_shadow_still_alerts_critical() {
+        // Counterpart to the test above — the suppression is
+        // INTENTIONALLY narrow. ssh reading /etc/shadow (or any
+        // file other than the literal /etc/passwd) is real exfil
+        // territory and MUST still fire Critical. If a future
+        // refactor accidentally widens the suppression to "any
+        // sensitive file" this test catches it.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(7001, "/etc/shadow", "ssh", now));
+        let inc = det.process(&connect_event_with_comm(
+            7001,
+            "20.26.156.215",
+            22,
+            "ssh",
+            now + Duration::milliseconds(3),
+        ));
+        let inc = inc.expect("ssh reading /etc/shadow MUST still fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("/etc/shadow"));
+    }
+
+    #[test]
+    fn ssh_reading_ssh_keys_still_alerts_critical() {
+        // Same shape as the shadow test: ssh reading
+        // ~/.ssh/id_ed25519 then connecting outbound is the
+        // canonical SSH-key exfil pattern. The NSS-init exception
+        // does NOT cover it because the filename is not exactly
+        // /etc/passwd.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            7002,
+            "/home/ubuntu/.ssh/id_ed25519",
+            "ssh",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            7002,
+            "8.8.8.8",
+            22,
+            "ssh",
+            now + Duration::milliseconds(3),
+        ));
+        let inc = inc.expect("ssh reading id_ed25519 MUST still fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("id_ed25519"));
     }
 
     #[test]

@@ -18,13 +18,35 @@ var DETECTOR_PRIORITY = {
 // "what did my trust rules silence today?" gets a dedicated answer
 // instead of being hidden behind the "Hide allowlisted" toggle.
 var OUTCOME_ORDER = ['needs_attention', 'blocked', 'honeypot', 'monitoring', 'allowlisted', 'dismissed'];
+
+// 2026-04-30: replaced emoji icons with inline lucide SVGs to match
+// the home pyramid (Phase 11B) and the marketing site. Same icon
+// vocabulary across all dashboard surfaces — no more emoji/SVG mix.
+//
+// Icon source: lucide.dev — Ban (blocked), Bug (honeypot),
+// Eye (monitoring/observing), AlertCircle (needs_attention),
+// Handshake (allowlisted), Check (dismissed). All inherit
+// `currentColor` so CSS controls per-row tint.
+//
+// Group label: "Blocked" was renamed to "Blocked attackers" so the
+// list-section count (unique IPs) does not visually collide with the
+// KPI tile labelled "Blocks" (action count). Two different answers,
+// two different labels.
+var SVG_ATTRS = 'xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
+var ICON_BAN          = '<svg ' + SVG_ATTRS + '><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></svg>';
+var ICON_BUG          = '<svg ' + SVG_ATTRS + '><path d="m8 2 1.88 1.88"/><path d="M14.12 3.88 16 2"/><path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"/><path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6"/><path d="M12 20v-9"/><path d="M6.53 9C4.6 8.8 3 7.1 3 5"/><path d="M6 13H2"/><path d="M3 21c0-2.1 1.7-3.9 3.8-4"/><path d="M20.97 5c0 2.1-1.6 3.8-3.5 4"/><path d="M22 13h-4"/><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/></svg>';
+var ICON_EYE          = '<svg ' + SVG_ATTRS + '><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>';
+var ICON_ALERT_CIRCLE = '<svg ' + SVG_ATTRS + '><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg>';
+var ICON_HANDSHAKE    = '<svg ' + SVG_ATTRS + '><path d="m11 17 2 2a1 1 0 1 0 3-3"/><path d="m14 14 2.5 2.5a1 1 0 1 0 3-3l-3.88-3.88a3 3 0 0 0-4.24 0l-.88.88a1 1 0 1 1-3-3l2.81-2.81a5.79 5.79 0 0 1 7.06-.87l.47.28a2 2 0 0 0 1.42.25L21 4"/><path d="m21 3 1 11h-2"/><path d="M3 3 2 14l6.5 6.5a1 1 0 1 0 3-3"/><path d="M3 4h8"/></svg>';
+var ICON_CHECK        = '<svg ' + SVG_ATTRS + '><path d="M20 6 9 17l-5-5"/></svg>';
+
 var OUTCOME_META = {
-  blocked:         { icon: '\uD83D\uDEE1\uFE0F', label: 'Blocked',          cls: 'outcome-blocked' },
-  honeypot:        { icon: '\uD83C\uDF6F',       label: 'Honeypot',          cls: 'outcome-honeypot' },
-  monitoring:      { icon: '\uD83D\uDC41\uFE0F', label: 'Observing',         cls: 'outcome-observing' },
-  needs_attention: { icon: '\u26A0\uFE0F',       label: 'Needs your attention', cls: 'outcome-attention' },
-  allowlisted:     { icon: '\uD83E\uDD1D',       label: 'Allowlisted (silenced)', cls: 'outcome-allowlisted' },
-  dismissed:       { icon: '\u2713',              label: 'Dismissed',         cls: 'outcome-dismissed' },
+  blocked:         { icon: ICON_BAN,          label: 'Blocked attackers',      cls: 'outcome-blocked' },
+  honeypot:        { icon: ICON_BUG,          label: 'Honeypot',               cls: 'outcome-honeypot' },
+  monitoring:      { icon: ICON_EYE,          label: 'Observing',              cls: 'outcome-observing' },
+  needs_attention: { icon: ICON_ALERT_CIRCLE, label: 'Needs your attention',   cls: 'outcome-attention' },
+  allowlisted:     { icon: ICON_HANDSHAKE,    label: 'Allowlisted (silenced)', cls: 'outcome-allowlisted' },
+  dismissed:       { icon: ICON_CHECK,        label: 'Dismissed',              cls: 'outcome-dismissed' },
 };
 
 function outcomeOf(item) {
@@ -149,7 +171,7 @@ function buildGroupedList(items) {
     html += '<div class="threat-group ' + meta.cls + '">' +
       '<div class="threat-group-header" onclick="toggleThreatGroup(this)">' +
       '<span class="threat-group-chevron' + (startOpen ? ' open' : '') + '">\u25B8</span>' +
-      '<span class="threat-group-label">' + meta.icon + ' ' + meta.label + '</span>' +
+      '<span class="threat-group-label">' + meta.icon + '<span>' + meta.label + '</span></span>' +
       '<span class="threat-group-meta">' + countLabel + '</span>' +
       '</div>' +
       '<div class="threat-group-body' + (startOpen ? ' open' : '') + '">' +

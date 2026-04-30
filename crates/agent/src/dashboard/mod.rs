@@ -1105,6 +1105,88 @@ mod tests {
     }
 
     #[test]
+    fn threats_kpi_tile_label_is_blocks_not_blocked() {
+        // 2026-04-30: the KPI tile counts BLOCK ACTIONS (per-decision
+        // increment in compute_overview_counts_from_sqlite) while the
+        // list-section group below counts UNIQUE ATTACKERS. Operator
+        // saw "Blocked 41" on top and "Blocked 24" right below for
+        // the same date and could not tell why. Renamed the KPI tile
+        // to "Blocks" so the unit (events not unique IPs) is clear.
+        // Anchor pins the rename — a future "consolidation" PR that
+        // re-aligns them to the same string brings the confusion back.
+        assert!(
+            INDEX_HTML.contains("<div class=\"kpi-label\">Blocks</div>"),
+            "KPI tile must read 'Blocks' to disambiguate from list 'Blocked attackers'"
+        );
+        assert!(
+            JS_THREATS.contains("label: 'Blocked attackers'"),
+            "list group header must read 'Blocked attackers' to disambiguate from KPI 'Blocks'"
+        );
+    }
+
+    #[test]
+    fn threats_js_uses_lucide_svg_icons_not_emoji() {
+        // 2026-04-30: outcome group icons match the home pyramid
+        // lucide SVG vocabulary (Phase 11B). Anchor that the unique
+        // path strings of each lucide icon are present and that the
+        // old emoji icons are NOT in OUTCOME_META anymore. A future
+        // refactor that re-introduces the emojis fails this test.
+        // (Same anchor pattern as `index_html_uses_lucide_svg_icons_
+        // not_emoji` for the home pyramid.)
+        // Ban (blocked).
+        assert!(JS_THREATS.contains("m4.9 4.9 14.2 14.2"));
+        // Bug (honeypot).
+        assert!(JS_THREATS.contains("M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"));
+        // Eye (monitoring).
+        assert!(JS_THREATS.contains("M2.062 12.348"));
+        // AlertCircle (needs_attention) — distinguishable from
+        // AlertTriangle by the circle radius signature.
+        assert!(JS_THREATS.contains("<line x1=\"12\" x2=\"12\" y1=\"8\" y2=\"12\"/>"));
+        // Handshake (allowlisted).
+        assert!(JS_THREATS.contains("m11 17 2 2a1 1 0 1 0 3-3"));
+        // Check (dismissed).
+        assert!(JS_THREATS.contains("M20 6 9 17l-5-5"));
+        // Old emojis must be gone from the OUTCOME_META block.
+        let outcome_block_start = JS_THREATS
+            .find("var OUTCOME_META = {")
+            .expect("OUTCOME_META present");
+        let outcome_block_end = JS_THREATS[outcome_block_start..]
+            .find("};\n")
+            .expect("end of OUTCOME_META")
+            + outcome_block_start;
+        let block = &JS_THREATS[outcome_block_start..outcome_block_end];
+        for emoji_escape in [
+            "\\uD83D\\uDEE1", // 🛡️
+            "\\uD83C\\uDF6F", // 🍯
+            "\\uD83D\\uDC41", // 👁️
+            "\\u26A0",        // ⚠️
+            "\\uD83E\\uDD1D", // 🤝
+        ] {
+            assert!(
+                !block.contains(emoji_escape),
+                "emoji escape {emoji_escape} still in OUTCOME_META — should be lucide SVG constant"
+            );
+        }
+    }
+
+    #[test]
+    fn data_exfil_ebpf_suppresses_ssh_passwd_nss_init() {
+        // Sensor anchor: the NSS_INIT_CLI_TOOLS list now includes
+        // "ssh" so `git fetch` -> `ssh git@github.com` (or any
+        // direct ssh + outbound) does not fire DATA_EXFIL on the
+        // /etc/passwd NSS-lookup pattern. The actual sensor test
+        // is in data_exfil_ebpf.rs::ssh_reading_passwd_then_
+        // connecting_outbound_does_not_alert; this anchor mirrors
+        // it from the agent test surface so the cross-crate
+        // contract is visible during agent CI.
+        let detector_src = include_str!("../../../sensor/src/detectors/data_exfil_ebpf.rs");
+        assert!(
+            detector_src.contains("\"ssh\","),
+            "ssh must be in NSS_INIT_CLI_TOOLS to suppress git+github FP"
+        );
+    }
+
+    #[test]
     fn threats_js_lists_allowlisted_in_outcome_order() {
         // The new "allowlisted" outcome must appear in the group
         // ordering and have a label entry. Pre-Phase-7 there was
