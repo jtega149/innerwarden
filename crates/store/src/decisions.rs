@@ -10,6 +10,28 @@ use sha2::{Digest, Sha256};
 use crate::error::{Result, StoreError};
 use crate::Store;
 
+/// One row of the audit-trail view (paginated decision history with
+/// hash-chain pointers). Returned by `Store::audit_trail`. Field
+/// names mirror the SQLite columns so the dashboard JSON shape is
+/// stable and the consumer (compliance.rs) does not need a second
+/// translation layer. `prev_hash` is `None` for the first row in the
+/// chain (genesis) and for rows immediately after a documented
+/// chain break (where the verifier intentionally re-anchors).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DecisionAuditRecord {
+    pub id: i64,
+    pub ts: String,
+    pub incident_id: String,
+    pub action_type: String,
+    pub target_ip: Option<String>,
+    pub target_user: Option<String>,
+    pub confidence: Option<f64>,
+    pub auto_executed: bool,
+    pub reason: Option<String>,
+    pub prev_hash: Option<String>,
+    pub row_hash: String,
+}
+
 /// Result of hash chain verification.
 #[derive(Debug, Clone)]
 pub struct HashChainResult {
@@ -282,6 +304,81 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Paginated audit-trail view: latest-first decision rows with
+    /// the structured columns the dashboard needs (action_type,
+    /// target, confidence, auto_executed flag, hash chain pointers).
+    ///
+    /// 2026-05-01 (audit-ui spec): the prior accessors expose only
+    /// `(id, data_json)` — fine for cross-checking but the dashboard
+    /// needs the typed columns broken out so it can filter / sort /
+    /// render without parsing every JSON blob client-side. The query
+    /// is bounded by `limit` (default 50, max 500) to keep payloads
+    /// small for the operator's primary use case (browse the most
+    /// recent N decisions). Older history is reachable by paging
+    /// with `before_id` cursor.
+    ///
+    /// `before_id`: when `Some(id)`, return rows with id < before_id;
+    /// when `None`, return the most recent rows. This is a cursor
+    /// rather than offset because new rows arriving between pages
+    /// would otherwise shift the offset and skip records.
+    pub fn audit_trail(
+        &self,
+        before_id: Option<i64>,
+        limit: usize,
+        action_filter: Option<&str>,
+    ) -> Result<Vec<DecisionAuditRecord>> {
+        let conn = self.conn()?;
+        let limit = limit.clamp(1, 500) as i64;
+        let before = before_id.unwrap_or(i64::MAX);
+        let action_pat = action_filter
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
+        let sql = if action_pat.is_some() {
+            "SELECT id, ts, incident_id, action_type, target_ip, target_user, \
+             confidence, auto_executed, reason, prev_hash, row_hash \
+             FROM decisions \
+             WHERE id < ?1 AND action_type = ?3 \
+             ORDER BY id DESC \
+             LIMIT ?2"
+        } else {
+            "SELECT id, ts, incident_id, action_type, target_ip, target_user, \
+             confidence, auto_executed, reason, prev_hash, row_hash \
+             FROM decisions \
+             WHERE id < ?1 \
+             ORDER BY id DESC \
+             LIMIT ?2"
+        };
+        let mut stmt = conn.prepare_cached(sql)?;
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<DecisionAuditRecord> {
+            Ok(DecisionAuditRecord {
+                id: row.get(0)?,
+                ts: row.get(1)?,
+                incident_id: row.get(2)?,
+                action_type: row.get(3)?,
+                target_ip: row.get(4)?,
+                target_user: row.get(5)?,
+                confidence: row.get(6)?,
+                auto_executed: row.get::<_, i64>(7)? != 0,
+                reason: row.get(8)?,
+                prev_hash: row.get(9)?,
+                row_hash: row.get(10)?,
+            })
+        };
+        let mut results = Vec::new();
+        if let Some(action) = action_pat {
+            let rows = stmt.query_map(params![before, limit, action], map_row)?;
+            for row in rows {
+                results.push(row?);
+            }
+        } else {
+            let rows = stmt.query_map(params![before, limit], map_row)?;
+            for row in rows {
+                results.push(row?);
+            }
+        }
+        Ok(results)
     }
 
     /// Read decisions with id > `after_id`, up to `limit`.
@@ -631,6 +728,130 @@ mod tests {
         assert_eq!(records[0].rowid_end, 200);
         assert_eq!(records[1].reason, "second sweep");
         assert_eq!(records[1].prev_chain_end_hash.as_deref(), Some("hash-x"));
+    }
+
+    #[test]
+    fn test_audit_trail_returns_latest_first_with_hash_pointers() {
+        // Anchors the dashboard audit-trail viewer (audit finding 5.7).
+        // The viewer's primary use case is "operator wants to see
+        // the most recent N decisions with hash chain pointers";
+        // this test pins:
+        //   - default ordering is latest-first (by id desc)
+        //   - the typed columns are returned (action_type, target_ip,
+        //     auto_executed, confidence) and not just the JSON blob
+        //   - prev_hash and row_hash are populated and chain
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_decision(&sample_decision("inc-1", "block_ip"))
+            .unwrap();
+        store
+            .insert_decision(&sample_decision("inc-2", "monitor"))
+            .unwrap();
+        store
+            .insert_decision(&sample_decision("inc-3", "dismiss"))
+            .unwrap();
+
+        let rows = store.audit_trail(None, 50, None).unwrap();
+        assert_eq!(rows.len(), 3, "all three decisions returned");
+        // Latest-first: dismiss (id=3) before monitor (id=2) before block_ip (id=1)
+        assert_eq!(rows[0].action_type, "dismiss");
+        assert_eq!(rows[1].action_type, "monitor");
+        assert_eq!(rows[2].action_type, "block_ip");
+        // Typed columns surface, not just JSON blob.
+        assert_eq!(rows[0].target_ip.as_deref(), Some("1.2.3.4"));
+        assert!(rows[0].auto_executed);
+        assert_eq!(rows[0].confidence, Some(0.95));
+        // Hash chain populated: row N's prev_hash == row N+1's row_hash
+        // (rows are returned latest-first, so the chain links go
+        // "older row's row_hash" == "newer row's prev_hash").
+        assert!(!rows[0].row_hash.is_empty());
+        assert_eq!(
+            rows[0].prev_hash.as_deref(),
+            Some(rows[1].row_hash.as_str())
+        );
+        assert_eq!(
+            rows[1].prev_hash.as_deref(),
+            Some(rows[2].row_hash.as_str())
+        );
+        // First-ever row has no predecessor (genesis).
+        assert!(rows[2].prev_hash.is_none());
+    }
+
+    #[test]
+    fn test_audit_trail_paginates_via_before_id_cursor() {
+        // Cursor pagination invariant: a "next page" request with
+        // the last-seen id returns ONLY rows older than that id.
+        // Anchored separately so a refactor that switches to offset
+        // pagination is caught (offsets shift if new rows arrive
+        // between page loads, the failure mode this test prevents).
+        let store = Store::open_memory().unwrap();
+        for i in 0..7 {
+            store
+                .insert_decision(&sample_decision(&format!("inc-{i}"), "block_ip"))
+                .unwrap();
+        }
+        let page1 = store.audit_trail(None, 3, None).unwrap();
+        assert_eq!(page1.len(), 3);
+        assert_eq!(page1[0].id, 7); // latest
+        let cursor = page1.last().unwrap().id;
+        let page2 = store.audit_trail(Some(cursor), 3, None).unwrap();
+        assert_eq!(page2.len(), 3);
+        // page2[0] must be id=4 (cursor was 5; we want ids < 5)
+        assert_eq!(page2[0].id, 4);
+        assert!(
+            page2.iter().all(|r| r.id < cursor),
+            "cursor invariant: every page-2 row has id < cursor"
+        );
+    }
+
+    #[test]
+    fn test_audit_trail_filters_by_action_type() {
+        // The viewer's filter dropdown must produce a server-side
+        // restriction, not a client-side filter on already-fetched
+        // rows (the latter would skip relevant matches in older
+        // pages). Anchor the SQL filter path.
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_decision(&sample_decision("inc-1", "block_ip"))
+            .unwrap();
+        store
+            .insert_decision(&sample_decision("inc-2", "monitor"))
+            .unwrap();
+        store
+            .insert_decision(&sample_decision("inc-3", "block_ip"))
+            .unwrap();
+        store
+            .insert_decision(&sample_decision("inc-4", "dismiss"))
+            .unwrap();
+        let blocks = store.audit_trail(None, 50, Some("block_ip")).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|r| r.action_type == "block_ip"));
+        let dismisses = store.audit_trail(None, 50, Some("dismiss")).unwrap();
+        assert_eq!(dismisses.len(), 1);
+        // Empty filter is treated as no filter (matches the
+        // dashboard's "all actions" option which sends "").
+        let all = store.audit_trail(None, 50, Some("")).unwrap();
+        assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn test_audit_trail_clamps_limit() {
+        // Defensive: a misconfigured client must not be able to
+        // pull the whole table on a refresh loop. limit clamps at
+        // 500 even if the caller passes a huge value (and at 1
+        // even if 0).
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_decision(&sample_decision("inc-1", "block_ip"))
+            .unwrap();
+        // Lower bound: limit=0 should not panic; min is 1.
+        let zero = store.audit_trail(None, 0, None).unwrap();
+        assert_eq!(zero.len(), 1, "limit=0 clamped to 1");
+        // Upper bound: limit=10000 should clamp to 500. With only 1
+        // row inserted we cannot directly observe the cap, but the
+        // call must not error.
+        let huge = store.audit_trail(None, 10_000, None).unwrap();
+        assert_eq!(huge.len(), 1);
     }
 
     #[test]

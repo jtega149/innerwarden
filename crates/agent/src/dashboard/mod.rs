@@ -441,6 +441,7 @@ pub async fn serve(
         .route("/api/admin-actions", get(api_admin_actions))
         .route("/api/advisory-cache", get(api_advisory_cache))
         .route("/api/compliance", get(api_compliance))
+        .route("/api/compliance/audit-trail", get(api_audit_trail))
         // Attacker Intelligence & Monthly Reports
         .route("/api/attacker-profiles", get(api_attacker_profiles))
         .route(

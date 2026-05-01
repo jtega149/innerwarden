@@ -89,6 +89,14 @@ async function loadCompliance() {
         '</div>';
     }
 
+    // 2026-05-01 (audit-ui spec): decision audit-trail records.
+    // The hash-chain summary above tells operator the chain is
+    // intact + how many entries; this section lets them actually
+    // INSPECT the entries. Lazy-loaded (separate fetch from
+    // /api/compliance) so the main view stays fast when the
+    // operator does not need the trail.
+    loadAuditTrail();
+
     // Retention config
     const ret = compliance.retention || {};
     const retEl = document.getElementById('comp-retention');
@@ -219,5 +227,129 @@ async function loadCompliance() {
     console.error('Failed to load compliance data:', e);
     if (status) status.textContent = 'Error';
   }
+}
+
+// ── Decision audit trail (paginated viewer) ─────────────────────────
+//
+// State + functions are intentionally module-scoped (window) rather
+// than enclosed so the "Load more" button's onclick can reach them
+// without inline closures (the rest of the dashboard uses the same
+// pattern). Cursor-based pagination keeps the viewer correct when
+// new decisions arrive between page loads.
+window._auditTrailState = { rows: [], beforeId: null, hasMore: true, action: '' };
+
+async function loadAuditTrail() {
+  const el = document.getElementById('comp-audit-trail');
+  if (!el) return;
+  // Reset on every refresh of the parent compliance view.
+  window._auditTrailState = { rows: [], beforeId: null, hasMore: true, action: '' };
+  el.innerHTML = '<div class="muted">Loading audit trail...</div>';
+  await fetchAuditTrailPage(true);
+}
+
+async function fetchAuditTrailPage(replace) {
+  const el = document.getElementById('comp-audit-trail');
+  if (!el) return;
+  const st = window._auditTrailState;
+  const qs = new URLSearchParams();
+  qs.set('limit', '50');
+  if (st.beforeId) qs.set('before_id', String(st.beforeId));
+  if (st.action) qs.set('action', st.action);
+  let data;
+  try {
+    data = await loadJson('/api/compliance/audit-trail?' + qs.toString());
+  } catch (e) {
+    el.innerHTML = '<div style="color:var(--danger);font-size:0.8rem">Failed to load audit trail: ' + esc(e.message) + '</div>';
+    return;
+  }
+  if (!data.available) {
+    el.innerHTML = '<div class="muted">SQLite store unavailable. Audit trail not persisted on this host.</div>';
+    return;
+  }
+  const incoming = data.items || [];
+  if (replace) {
+    st.rows = incoming;
+  } else {
+    st.rows = st.rows.concat(incoming);
+  }
+  st.beforeId = data.next_before_id || null;
+  st.hasMore = incoming.length >= 50 && st.beforeId != null;
+  renderAuditTrail();
+}
+
+function renderAuditTrail() {
+  const el = document.getElementById('comp-audit-trail');
+  if (!el) return;
+  const st = window._auditTrailState;
+  if (st.rows.length === 0) {
+    el.innerHTML = '<div class="muted">No decisions recorded' +
+      (st.action ? ' for action "' + esc(st.action) + '"' : '') + '.</div>';
+    return;
+  }
+  // Filter toolbar: action_type select. Mirrors the values
+  // emitted by the agent (see incident_post_decision +
+  // incident_untouchable for the override path that injects
+  // "request_confirmation").
+  let html = '<div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;font-size:0.78rem">' +
+    '<span style="color:var(--muted)">Filter:</span>' +
+    '<select id="audit-action-filter" onchange="onAuditActionChange(this.value)" ' +
+    'style="background:var(--line);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:4px;font-size:0.75rem">' +
+    '<option value="">all actions</option>' +
+    '<option value="block_ip">block_ip</option>' +
+    '<option value="dismiss">dismiss</option>' +
+    '<option value="ignore">ignore</option>' +
+    '<option value="monitor">monitor</option>' +
+    '<option value="request_confirmation">request_confirmation</option>' +
+    '<option value="kill_chain_response">kill_chain_response</option>' +
+    '</select>' +
+    '<span style="color:var(--muted);margin-left:auto">' + st.rows.length + ' record' + (st.rows.length === 1 ? '' : 's') + ' shown</span>' +
+    '</div>';
+  // Table.
+  html += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.72rem">' +
+    '<thead><tr style="text-align:left;color:var(--muted);border-bottom:1px solid var(--border)">' +
+    '<th style="padding:6px 6px;font-weight:700">id</th>' +
+    '<th style="padding:6px 6px;font-weight:700">timestamp (UTC)</th>' +
+    '<th style="padding:6px 6px;font-weight:700">action</th>' +
+    '<th style="padding:6px 6px;font-weight:700">target</th>' +
+    '<th style="padding:6px 6px;font-weight:700">conf</th>' +
+    '<th style="padding:6px 6px;font-weight:700">auto?</th>' +
+    '<th style="padding:6px 6px;font-weight:700">reason</th>' +
+    '<th style="padding:6px 6px;font-weight:700" title="SHA-256 row_hash (first 12 chars). Each row also stores prev_hash; the chain is verifiable via the hash-chain status above.">hash</th>' +
+    '</tr></thead><tbody>';
+  for (const r of st.rows) {
+    const target = r.target_ip || (r.target_user ? 'user:' + r.target_user : '');
+    const conf = (r.confidence == null) ? '' : (r.confidence * 100).toFixed(0) + '%';
+    const auto = r.auto_executed ? '✓' : '';
+    const reasonShort = (r.reason || '').length > 70 ? (r.reason.substring(0, 70) + '…') : (r.reason || '');
+    const hashShort = (r.row_hash || '').substring(0, 12);
+    const hashTitle = 'row_hash=' + (r.row_hash || '') + (r.prev_hash ? '\\nprev_hash=' + r.prev_hash : '\\nprev_hash=null (genesis or post-break re-anchor)');
+    html += '<tr style="border-bottom:1px solid rgba(255,255,255,0.04)">' +
+      '<td style="padding:5px 6px;color:var(--muted)">' + r.id + '</td>' +
+      '<td style="padding:5px 6px;color:var(--text)">' + esc(r.ts || '') + '</td>' +
+      '<td style="padding:5px 6px"><code style="color:var(--accent);font-size:0.7rem">' + esc(r.action_type || '') + '</code></td>' +
+      '<td style="padding:5px 6px">' + esc(target) + '</td>' +
+      '<td style="padding:5px 6px;color:var(--accent)">' + conf + '</td>' +
+      '<td style="padding:5px 6px;text-align:center">' + auto + '</td>' +
+      '<td style="padding:5px 6px;color:var(--muted)" title="' + esc(r.reason || '') + '">' + esc(reasonShort) + '</td>' +
+      '<td style="padding:5px 6px"><code style="color:var(--dim);font-size:0.65rem" title="' + esc(hashTitle) + '">' + esc(hashShort) + '…</code></td>' +
+      '</tr>';
+  }
+  html += '</tbody></table></div>';
+  if (st.hasMore) {
+    html += '<div style="margin-top:10px;text-align:center">' +
+      '<button type="button" onclick="fetchAuditTrailPage(false)" ' +
+      'style="background:transparent;border:1px solid var(--border);color:var(--accent);padding:5px 14px;border-radius:4px;font-size:0.75rem;cursor:pointer">' +
+      'Load 50 more (older)</button>' +
+      '</div>';
+  }
+  el.innerHTML = html;
+  // Restore selected action in dropdown after re-render.
+  const sel = document.getElementById('audit-action-filter');
+  if (sel) sel.value = st.action || '';
+}
+
+function onAuditActionChange(value) {
+  window._auditTrailState = { rows: [], beforeId: null, hasMore: true, action: value || '' };
+  fetchAuditTrailPage(true);
 }
 

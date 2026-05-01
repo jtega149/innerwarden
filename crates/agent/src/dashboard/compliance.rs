@@ -335,6 +335,88 @@ pub(super) async fn api_compliance(State(state): State<DashboardState>) -> Json<
     }))
 }
 
+/// GET /api/compliance/audit-trail — paginated decision audit
+/// trail with hash-chain pointers.
+///
+/// Origin: 2026-05-01 dashboard QA audit finding 5.7. The
+/// Compliance tab claimed "147 hash chain entries" but had no way
+/// for the operator to inspect WHAT those entries were. The hash
+/// chain backend (PRs #357–#360) gives tamper-detection and the
+/// chain_break_audit registration; this endpoint surfaces the
+/// underlying decision rows so an operator can see "the system
+/// blocked IP X at TS Y because Z, with hash H pointing back to
+/// hash H-1".
+///
+/// Query params:
+/// - `before_id` (optional, i64): cursor for pagination. When
+///   absent, returns the most recent rows. When set, returns rows
+///   with `id < before_id` (i.e., older). Cursor rather than
+///   offset because new decisions arriving between pages would
+///   shift offsets and skip rows.
+/// - `limit` (optional, usize, default 50, clamped 1..=500): page
+///   size. Capped at 500 so a misconfigured client cannot pull the
+///   whole table on a refresh loop.
+/// - `action` (optional, string): filter to rows where
+///   `action_type = <value>` (e.g., `block_ip`, `dismiss`,
+///   `request_confirmation`). Empty/whitespace ignored.
+///
+/// Response:
+/// ```json
+/// {
+///   "available": true,
+///   "items": [
+///     {"id": 16229, "ts": "...", "incident_id": "...",
+///      "action_type": "block_ip", "target_ip": "1.2.3.4",
+///      "target_user": null, "confidence": 0.92,
+///      "auto_executed": true, "reason": "...",
+///      "prev_hash": "ab12...", "row_hash": "cd34..."},
+///     ...
+///   ],
+///   "next_before_id": 16180   // pass to next request, or null
+/// }
+/// ```
+///
+/// When the SQLite store is unavailable (test fixtures without
+/// state), returns `{"available": false, "items": [], "next_before_id": null}`.
+pub(super) async fn api_audit_trail(
+    State(state): State<DashboardState>,
+    Query(query): Query<AuditTrailQuery>,
+) -> Json<serde_json::Value> {
+    let store = match state.sqlite_store.clone() {
+        Some(s) => s,
+        None => {
+            return Json(serde_json::json!({
+                "available": false,
+                "items": [],
+                "next_before_id": null,
+            }));
+        }
+    };
+    let before_id = query.before_id;
+    let limit = query.limit.unwrap_or(50);
+    let action = query.action.clone();
+    let result =
+        tokio::task::spawn_blocking(move || store.audit_trail(before_id, limit, action.as_deref()))
+            .await;
+    let items = match result {
+        Ok(Ok(rows)) => rows,
+        _ => Vec::new(),
+    };
+    let next_before_id = items.last().map(|r| r.id);
+    Json(serde_json::json!({
+        "available": true,
+        "items": items,
+        "next_before_id": next_before_id,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct AuditTrailQuery {
+    pub before_id: Option<i64>,
+    pub limit: Option<usize>,
+    pub action: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Pure validation logic
 // ---------------------------------------------------------------------------

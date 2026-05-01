@@ -716,7 +716,18 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("innerwarden_agent=info".parse()?)
-                .add_directive("telegram_audit=info".parse()?),
+                .add_directive("telegram_audit=info".parse()?)
+                // 2026-05-01 (audit-ui spec): the maintenance scheduler
+                // emits `info!` log lines from `innerwarden_store::maintenance`
+                // for the steady-state path ("hash chain intact (documented
+                // breaks tolerated)", "kv expired cleanup", etc.). Without
+                // this directive those drop at the default WARN level,
+                // which means a successful hourly tick is invisible
+                // (operator only sees output when something is broken —
+                // an asymmetry that hid the prod chain-fix verification
+                // for ~1h2026-05-01 03:38 UTC. Same family as the
+                // `telegram_audit` gap PR #357 closed.
+                .add_directive("innerwarden_store=info".parse()?),
         )
         .init();
 
