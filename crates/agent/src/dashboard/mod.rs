@@ -434,6 +434,21 @@ pub async fn serve(
         .route("/api/action/block-ip", post(api_action_block_ip))
         .route("/api/action/suspend-user", post(api_action_suspend_user))
         .route("/api/action/config", get(api_action_config))
+        // 2026-05-01 (`tracked-spec-ai-override`): operator
+        // overrides AI decisions / re-opens dismissed incidents /
+        // labels decisions for retraining. Audit-only for v1.
+        .route(
+            "/api/action/decision/override",
+            post(api_action_override_decision),
+        )
+        .route(
+            "/api/action/incident/reopen",
+            post(api_action_reopen_incident),
+        )
+        .route(
+            "/api/action/decision/label",
+            post(api_action_label_decision),
+        )
         // Honeypot tab
         .route("/api/honeypot/sessions", get(api_honeypot_sessions))
         .route("/api/action/honeypot", post(api_action_honeypot))

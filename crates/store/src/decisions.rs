@@ -381,6 +381,36 @@ impl Store {
         Ok(results)
     }
 
+    /// Fetch a single decision audit record by id. Returns `None`
+    /// when the id does not exist. Used by the operator override
+    /// endpoint to read the original decision (its target,
+    /// confidence, etc.) before chaining a follow-up override row.
+    pub fn decision_by_id(&self, id: i64) -> Result<Option<DecisionAuditRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, ts, incident_id, action_type, target_ip, target_user, \
+             confidence, auto_executed, reason, prev_hash, row_hash \
+             FROM decisions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(DecisionAuditRecord {
+                id: row.get(0)?,
+                ts: row.get(1)?,
+                incident_id: row.get(2)?,
+                action_type: row.get(3)?,
+                target_ip: row.get(4)?,
+                target_user: row.get(5)?,
+                confidence: row.get(6)?,
+                auto_executed: row.get::<_, i64>(7)? != 0,
+                reason: row.get(8)?,
+                prev_hash: row.get(9)?,
+                row_hash: row.get(10)?,
+            }));
+        }
+        Ok(None)
+    }
+
     /// Read decisions with id > `after_id`, up to `limit`.
     pub fn decisions_since(&self, after_id: i64, limit: usize) -> Result<Vec<(i64, String)>> {
         let conn = self.conn()?;
@@ -832,6 +862,28 @@ mod tests {
         // dashboard's "all actions" option which sends "").
         let all = store.audit_trail(None, 50, Some("")).unwrap();
         assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn test_decision_by_id_returns_typed_record_or_none() {
+        // Anchors the operator-override path (`tracked-spec-ai-override`):
+        // the override endpoint reads the original decision via this
+        // accessor before chaining a follow-up row. The accessor must:
+        //   - return a typed DecisionAuditRecord (typed columns, not
+        //     just the JSON blob — the override builder needs
+        //     incident_id, target_ip, action_type, row_hash)
+        //   - return None for unknown ids (operator typo / stale UI)
+        let store = Store::open_memory().unwrap();
+        let id = store
+            .insert_decision(&sample_decision("inc-1", "block_ip"))
+            .unwrap();
+        let r = store.decision_by_id(id).unwrap().expect("found");
+        assert_eq!(r.id, id);
+        assert_eq!(r.incident_id, "inc-1");
+        assert_eq!(r.action_type, "block_ip");
+        assert_eq!(r.target_ip.as_deref(), Some("1.2.3.4"));
+        assert!(!r.row_hash.is_empty());
+        assert!(store.decision_by_id(99_999).unwrap().is_none());
     }
 
     #[test]

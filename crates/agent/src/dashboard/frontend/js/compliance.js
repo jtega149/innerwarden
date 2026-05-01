@@ -315,6 +315,7 @@ function renderAuditTrail() {
     '<th style="padding:6px 6px;font-weight:700">auto?</th>' +
     '<th style="padding:6px 6px;font-weight:700">reason</th>' +
     '<th style="padding:6px 6px;font-weight:700" title="SHA-256 row_hash (first 12 chars). Each row also stores prev_hash; the chain is verifiable via the hash-chain status above.">hash</th>' +
+    '<th style="padding:6px 6px;font-weight:700" title="Operator override / re-open / label actions. Each writes a hash-chained audit row preserving the operator correction.">actions</th>' +
     '</tr></thead><tbody>';
   for (const r of st.rows) {
     const target = r.target_ip || (r.target_user ? 'user:' + r.target_user : '');
@@ -323,6 +324,25 @@ function renderAuditTrail() {
     const reasonShort = (r.reason || '').length > 70 ? (r.reason.substring(0, 70) + '…') : (r.reason || '');
     const hashShort = (r.row_hash || '').substring(0, 12);
     const hashTitle = 'row_hash=' + (r.row_hash || '') + (r.prev_hash ? '\\nprev_hash=' + r.prev_hash : '\\nprev_hash=null (genesis or post-break re-anchor)');
+    // Operator override controls. Skip for rows that are themselves
+    // operator actions (action_type prefix "operator_"), since
+    // overriding an override is rare and would clutter the row.
+    const isOperatorRow = (r.action_type || '').startsWith('operator_');
+    let opsHtml;
+    if (isOperatorRow) {
+      opsHtml = '<span style="color:var(--muted);font-size:0.7rem">—</span>';
+    } else {
+      opsHtml =
+        '<button type="button" onclick="openOverrideModal(' + r.id + ',\'' + esc(r.action_type || '') + '\',\'' + esc((r.reason || '').replace(/'/g, "&#39;").substring(0, 100)) + '\')" ' +
+        'title="Override this AI decision (audit-only)" ' +
+        'style="background:transparent;border:1px solid var(--border);color:var(--warn);padding:2px 6px;border-radius:3px;font-size:0.65rem;cursor:pointer;margin-right:3px">override</button>' +
+        '<button type="button" onclick="labelDecision(' + r.id + ',\'TP\')" ' +
+        'title="Label as True Positive — AI was right" ' +
+        'style="background:transparent;border:1px solid rgba(58,194,126,0.3);color:var(--ok);padding:2px 6px;border-radius:3px;font-size:0.65rem;cursor:pointer;margin-right:3px">✓ TP</button>' +
+        '<button type="button" onclick="labelDecision(' + r.id + ',\'FP\')" ' +
+        'title="Label as False Positive — AI was wrong" ' +
+        'style="background:transparent;border:1px solid rgba(244,63,94,0.3);color:var(--danger);padding:2px 6px;border-radius:3px;font-size:0.65rem;cursor:pointer">✗ FP</button>';
+    }
     html += '<tr style="border-bottom:1px solid rgba(255,255,255,0.04)">' +
       '<td style="padding:5px 6px;color:var(--muted)">' + r.id + '</td>' +
       '<td style="padding:5px 6px;color:var(--text)">' + esc(r.ts || '') + '</td>' +
@@ -332,6 +352,7 @@ function renderAuditTrail() {
       '<td style="padding:5px 6px;text-align:center">' + auto + '</td>' +
       '<td style="padding:5px 6px;color:var(--muted)" title="' + esc(r.reason || '') + '">' + esc(reasonShort) + '</td>' +
       '<td style="padding:5px 6px"><code style="color:var(--dim);font-size:0.65rem" title="' + esc(hashTitle) + '">' + esc(hashShort) + '…</code></td>' +
+      '<td style="padding:5px 6px;white-space:nowrap">' + opsHtml + '</td>' +
       '</tr>';
   }
   html += '</tbody></table></div>';
@@ -351,5 +372,152 @@ function renderAuditTrail() {
 function onAuditActionChange(value) {
   window._auditTrailState = { rows: [], beforeId: null, hasMore: true, action: value || '' };
   fetchAuditTrailPage(true);
+}
+
+// ── Operator override / label workflow (audit-only v1) ──────────────
+//
+// Three audit primitives:
+//   1. Override: operator disagrees with an AI decision → writes a
+//      new hash-chained row pointing back to the original.
+//   2. Label TP/FP: operator marks the AI's decision correct or
+//      not → writes to data_dir/decision-labels.jsonl for future
+//      classifier retraining.
+//   3. (Re-open lives on Threats journey, not here — incident
+//      context, not a decision row context.)
+//
+// All three are audit-only for v1: they record operator intent
+// without mutating the incident state machine. State integration
+// (re-routing reopens through AI triage, retraining the classifier
+// from labels) is a follow-up spec.
+
+function openOverrideModal(decisionId, originalAction, originalReason) {
+  // Inline modal — reusing patterns from existing dashboard
+  // (no shared modal helper today, each page builds its own).
+  // Body construction is plain DOM rather than innerHTML so the
+  // operator's reason can survive < / > characters without a
+  // round of escape mistakes.
+  const existing = document.getElementById('overrideModal');
+  if (existing) existing.remove();
+  const modal = document.createElement('div');
+  modal.id = 'overrideModal';
+  modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML =
+    '<div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:20px;width:520px;max-width:90vw;max-height:85vh;overflow-y:auto">' +
+      '<h3 style="margin:0 0 8px;font-size:0.95rem">Override AI decision #' + decisionId + '</h3>' +
+      '<div style="font-size:0.72rem;color:var(--muted);margin-bottom:12px">' +
+        'Audit-only: writes a new hash-chained row recording the disagreement. Does NOT auto-execute the new action — use the existing block-IP / monitor buttons separately if needed.' +
+      '</div>' +
+      '<div style="font-size:0.72rem;margin-bottom:10px;padding:8px;background:rgba(255,184,77,0.05);border:1px solid rgba(255,184,77,0.18);border-radius:4px">' +
+        '<strong>Original AI action:</strong> <code style="color:var(--accent)">' + esc(originalAction) + '</code><br>' +
+        '<strong>Original reason:</strong> <span style="color:var(--muted)">' + esc(originalReason) + '</span>' +
+      '</div>' +
+      '<label style="display:block;font-size:0.72rem;color:var(--muted);margin-bottom:4px">What the operator would have decided:</label>' +
+      '<select id="overrideNewAction" style="width:100%;padding:6px 8px;background:var(--line);border:1px solid var(--border);color:var(--text);border-radius:4px;font-size:0.78rem;margin-bottom:10px">' +
+        '<option value="block_ip">block_ip</option>' +
+        '<option value="monitor">monitor</option>' +
+        '<option value="dismiss">dismiss</option>' +
+        '<option value="ignore">ignore</option>' +
+        '<option value="request_confirmation">request_confirmation</option>' +
+      '</select>' +
+      '<label style="display:block;font-size:0.72rem;color:var(--muted);margin-bottom:4px">Reason (mandatory):</label>' +
+      '<textarea id="overrideReason" rows="3" placeholder="why did the AI get this wrong?" ' +
+        'style="width:100%;padding:6px 8px;background:var(--line);border:1px solid var(--border);color:var(--text);border-radius:4px;font-size:0.78rem;resize:vertical;font-family:inherit"></textarea>' +
+      '<div id="overrideStatus" style="font-size:0.72rem;color:var(--muted);margin:8px 0;min-height:1em"></div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">' +
+        '<button type="button" onclick="closeOverrideModal()" ' +
+          'style="background:transparent;border:1px solid var(--border);color:var(--text);padding:6px 14px;border-radius:4px;font-size:0.78rem;cursor:pointer">Cancel</button>' +
+        '<button type="button" onclick="submitOverride(' + decisionId + ')" ' +
+          'style="background:var(--warn);border:1px solid var(--warn);color:#1a1a1a;padding:6px 14px;border-radius:4px;font-size:0.78rem;cursor:pointer;font-weight:600">Record override</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+  setTimeout(() => {
+    const reasonEl = document.getElementById('overrideReason');
+    if (reasonEl) reasonEl.focus();
+  }, 50);
+}
+
+function closeOverrideModal() {
+  const m = document.getElementById('overrideModal');
+  if (m) m.remove();
+}
+
+async function submitOverride(decisionId) {
+  const newAction = document.getElementById('overrideNewAction').value;
+  const reason = document.getElementById('overrideReason').value.trim();
+  const statusEl = document.getElementById('overrideStatus');
+  if (!reason) {
+    if (statusEl) {
+      statusEl.style.color = 'var(--danger)';
+      statusEl.textContent = 'Reason is required.';
+    }
+    return;
+  }
+  if (statusEl) {
+    statusEl.style.color = 'var(--muted)';
+    statusEl.textContent = 'Submitting...';
+  }
+  try {
+    const r = await fetch('/api/action/decision/override', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision_id: decisionId, new_action: newAction, reason }),
+    });
+    const data = await r.json();
+    if (data.success) {
+      if (statusEl) {
+        statusEl.style.color = 'var(--ok)';
+        statusEl.textContent = data.message || 'Override recorded.';
+      }
+      // Refresh the audit trail to show the new row.
+      setTimeout(() => {
+        closeOverrideModal();
+        loadAuditTrail();
+      }, 800);
+    } else {
+      if (statusEl) {
+        statusEl.style.color = 'var(--danger)';
+        statusEl.textContent = data.message || 'Failed.';
+      }
+    }
+  } catch (e) {
+    if (statusEl) {
+      statusEl.style.color = 'var(--danger)';
+      statusEl.textContent = 'Network error: ' + (e && e.message);
+    }
+  }
+}
+
+async function labelDecision(decisionId, label) {
+  // Fast-path: no modal for label, just send. Operator has clicked
+  // a TP / FP button; the audit trail records WHO labelled WHEN
+  // (via session token), and a future spec will pull the
+  // `decision-labels.jsonl` file into classifier retraining.
+  try {
+    const r = await fetch('/api/action/decision/label', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision_id: decisionId, label, reason: '' }),
+    });
+    const data = await r.json();
+    // Inline visual confirmation. The compliance status pill (top
+    // right) is the lowest-noise place to surface this — a toast
+    // would compete with the dashboard's existing toast stack.
+    const status = document.getElementById('complianceViewStatus');
+    if (status) {
+      status.style.color = data.success ? 'var(--ok)' : 'var(--danger)';
+      status.textContent = data.message || (data.success ? 'Labelled.' : 'Failed.');
+      // Reset to the default 'Updated ...' message after 3s so
+      // the badge doesn't get stuck on the label confirmation.
+      setTimeout(() => {
+        if (status) {
+          status.style.color = 'var(--muted)';
+          status.textContent = 'Updated ' + new Date().toLocaleTimeString();
+        }
+      }, 3000);
+    }
+  } catch (e) {
+    console.error('label failed:', e);
+  }
 }
 

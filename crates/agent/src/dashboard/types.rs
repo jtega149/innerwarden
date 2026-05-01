@@ -43,6 +43,50 @@ pub(crate) struct SuspendUserRequest {
     pub(super) incident_id: Option<String>,
 }
 
+/// Operator override of an AI decision (audit-only for v1).
+/// 2026-05-01 (`tracked-spec-ai-override`): closes audit findings
+/// 2.4 + 5.4. The original AI decision stays in the chain — the
+/// override is a NEW row that points back via reason text and
+/// `prev_decision_id`. Body fields:
+/// - `decision_id`: the original AI decision being overridden
+/// - `new_action`: what the operator would have decided
+///   (`block_ip` | `monitor` | `dismiss` | `request_confirmation`)
+/// - `reason`: operator's rationale (mandatory; goes into the
+///   audit trail and is rendered in the compliance viewer).
+#[derive(Debug, Deserialize)]
+pub(crate) struct OverrideDecisionRequest {
+    pub(super) decision_id: i64,
+    pub(super) new_action: String,
+    pub(super) reason: String,
+}
+
+/// Operator re-opens a dismissed/closed incident for re-review.
+/// V1 is audit-only: writes a `operator_reopen` decision row to the
+/// hash chain. The incident's `outcome` field in the graph is NOT
+/// mutated yet (out of scope for v1); the audit row records the
+/// operator's intent. A follow-up spec will add the state-machine
+/// integration that re-routes reopened incidents through AI triage.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReopenIncidentRequest {
+    pub(super) incident_id: String,
+    pub(super) reason: String,
+}
+
+/// Operator labels a decision as TP (true positive — the AI got
+/// it right) or FP (false positive — the AI was wrong). Appended
+/// to `data_dir/decision-labels.jsonl` for future classifier
+/// retraining. Body fields:
+/// - `decision_id`: which decision is being labelled
+/// - `label`: `"TP"` or `"FP"`
+/// - `reason`: optional operator note (empty allowed for quick clicks).
+#[derive(Debug, Deserialize)]
+pub(crate) struct LabelDecisionRequest {
+    pub(super) decision_id: i64,
+    pub(super) label: String,
+    #[serde(default)]
+    pub(super) reason: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct HoneypotTestRequest {
     /// Operator-supplied reason (mandatory).

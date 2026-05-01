@@ -745,6 +745,292 @@ pub(super) fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+// ---------------------------------------------------------------------------
+// 2026-05-01 (`tracked-spec-ai-override`): operator-initiated audit
+// events. All three close the AI-decision feedback loop the audit
+// flagged in 2.4 / 5.4 (operator could only "Block IP or do
+// nothing" when AI got it wrong). v1 is **audit-only**: each
+// endpoint writes a hash-chained decision row capturing the
+// operator's correction. State-machine integration (re-routing
+// reopened incidents into AI triage, retraining the classifier
+// from labelled decisions) is deferred to follow-up specs so this
+// PR's blast radius stays bounded.
+// ---------------------------------------------------------------------------
+
+const ALLOWED_OVERRIDE_ACTIONS: &[&str] = &[
+    "block_ip",
+    "monitor",
+    "dismiss",
+    "ignore",
+    "request_confirmation",
+];
+
+const ALLOWED_LABELS: &[&str] = &["TP", "FP"];
+
+/// POST /api/action/decision/override — operator overrides an AI
+/// decision. Writes a new audit row chained to the original via
+/// the SHA-256 hash chain (PR #357). The new row's
+/// `action_type` is `operator_override:<new_action>` so downstream
+/// consumers (compliance viewer, monthly reports) can distinguish
+/// AI-initiated from operator-initiated rows by prefix match.
+///
+/// V1 does NOT auto-execute the new action. If the operator wants
+/// `block_ip`, they trigger it via the existing
+/// `/api/action/block-ip` endpoint. This separation keeps the
+/// override endpoint as a pure audit primitive and avoids
+/// duplicating the block_ip safelist / circuit-breaker apparatus.
+pub(super) async fn api_action_override_decision(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::OverrideDecisionRequest>,
+) -> Json<crate::dashboard::types::ActionResponse> {
+    use crate::dashboard::types::ActionResponse;
+    if state.insecure_http {
+        warn!("override executed over HTTP without TLS — consider a reverse proxy with TLS");
+    }
+    let new_action = body.new_action.trim();
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "reason is required".to_string(),
+            skill_id: String::new(),
+        });
+    }
+    if !ALLOWED_OVERRIDE_ACTIONS.contains(&new_action) {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: format!("new_action must be one of {:?}", ALLOWED_OVERRIDE_ACTIONS),
+            skill_id: String::new(),
+        });
+    }
+    let Some(store) = state.sqlite_store.clone() else {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "SQLite store unavailable; cannot persist override".to_string(),
+            skill_id: String::new(),
+        });
+    };
+    let original = match store.decision_by_id(body.decision_id) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return Json(ActionResponse {
+                success: false,
+                dry_run: state.action_cfg.dry_run,
+                message: format!("decision id {} not found", body.decision_id),
+                skill_id: String::new(),
+            });
+        }
+        Err(e) => {
+            return Json(ActionResponse {
+                success: false,
+                dry_run: state.action_cfg.dry_run,
+                message: format!("store error: {e}"),
+                skill_id: String::new(),
+            });
+        }
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let action_type = format!("operator_override:{new_action}");
+    let original_reason = original.reason.unwrap_or_default();
+    let combined_reason = format!(
+        "operator override of decision #{}: {}. Original AI action: {} (\"{}\")",
+        original.id,
+        reason,
+        original.action_type,
+        truncate(&original_reason, 200),
+    );
+    let data = serde_json::json!({
+        "ts": now,
+        "incident_id": original.incident_id,
+        "action_type": action_type,
+        "target_ip": original.target_ip,
+        "target_user": original.target_user,
+        "confidence": 1.0,
+        "auto_executed": false,
+        "reason": combined_reason,
+        "operator_override": {
+            "original_decision_id": original.id,
+            "original_action": original.action_type,
+            "original_row_hash": original.row_hash,
+            "new_action": new_action,
+        },
+    });
+    let row = innerwarden_store::decisions::DecisionRow {
+        ts: now.clone(),
+        incident_id: original.incident_id.clone(),
+        action_type: action_type.clone(),
+        target_ip: original.target_ip.clone(),
+        target_user: original.target_user.clone(),
+        confidence: 1.0,
+        auto_executed: false,
+        reason: Some(combined_reason.clone()),
+        data: serde_json::to_string(&data).unwrap_or_default(),
+    };
+    match store.insert_decision(&row) {
+        Ok(new_id) => Json(ActionResponse {
+            success: true,
+            dry_run: state.action_cfg.dry_run,
+            message: format!(
+                "override recorded (decision #{new_id}); did not auto-execute. Use /api/action/block-ip etc. to act."
+            ),
+            skill_id: action_type,
+        }),
+        Err(e) => Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: format!("store insert failed: {e}"),
+            skill_id: String::new(),
+        }),
+    }
+}
+
+/// POST /api/action/incident/reopen — operator marks a dismissed
+/// incident for re-review. v1 writes an audit decision row with
+/// `action_type = "operator_reopen"`; does NOT mutate the
+/// incident's `outcome` in the knowledge graph (state-machine
+/// integration deferred to follow-up spec).
+pub(super) async fn api_action_reopen_incident(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::ReopenIncidentRequest>,
+) -> Json<crate::dashboard::types::ActionResponse> {
+    use crate::dashboard::types::ActionResponse;
+    let incident_id = body.incident_id.trim();
+    let reason = body.reason.trim();
+    if incident_id.is_empty() || reason.is_empty() {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "incident_id and reason are required".to_string(),
+            skill_id: String::new(),
+        });
+    }
+    let Some(store) = state.sqlite_store.clone() else {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "SQLite store unavailable; cannot persist reopen".to_string(),
+            skill_id: String::new(),
+        });
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let data = serde_json::json!({
+        "ts": now,
+        "incident_id": incident_id,
+        "action_type": "operator_reopen",
+        "reason": reason,
+        "operator_reopen": true,
+    });
+    let row = innerwarden_store::decisions::DecisionRow {
+        ts: now.clone(),
+        incident_id: incident_id.to_string(),
+        action_type: "operator_reopen".to_string(),
+        target_ip: None,
+        target_user: None,
+        confidence: 1.0,
+        auto_executed: false,
+        reason: Some(reason.to_string()),
+        data: serde_json::to_string(&data).unwrap_or_default(),
+    };
+    match store.insert_decision(&row) {
+        Ok(new_id) => Json(ActionResponse {
+            success: true,
+            dry_run: state.action_cfg.dry_run,
+            message: format!(
+                "reopen recorded (decision #{new_id}). State machine integration in follow-up spec."
+            ),
+            skill_id: "operator_reopen".to_string(),
+        }),
+        Err(e) => Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: format!("store insert failed: {e}"),
+            skill_id: String::new(),
+        }),
+    }
+}
+
+/// POST /api/action/decision/label — operator labels a decision
+/// as TP (true positive) or FP (false positive). v1 appends to
+/// `data_dir/decision-labels.jsonl` for future classifier
+/// retraining; does not mutate the decision row itself (so the
+/// hash chain stays untouched). Each line:
+/// `{ts, decision_id, label, reason, operator_session}`.
+pub(super) async fn api_action_label_decision(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::LabelDecisionRequest>,
+) -> Json<crate::dashboard::types::ActionResponse> {
+    use crate::dashboard::types::ActionResponse;
+    let label = body.label.trim();
+    if !ALLOWED_LABELS.contains(&label) {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: format!("label must be one of {:?}", ALLOWED_LABELS),
+            skill_id: String::new(),
+        });
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = serde_json::json!({
+        "ts": now,
+        "decision_id": body.decision_id,
+        "label": label,
+        "reason": body.reason.trim(),
+    });
+    let path = state.data_dir.join("decision-labels.jsonl");
+    // Best-effort append. Match the precedent used by other audit
+    // sinks (`telegram-sent.jsonl`): a transient I/O hiccup logs a
+    // warning but does not bubble a 500 to the operator — the
+    // decision being labelled is far more important than the
+    // label-aggregation file.
+    let line = format!("{}\n", entry);
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(line.as_bytes()))
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(ActionResponse {
+            success: true,
+            dry_run: state.action_cfg.dry_run,
+            message: format!(
+                "label '{label}' recorded for decision #{} — used by future classifier retraining",
+                body.decision_id
+            ),
+            skill_id: "operator_label".to_string(),
+        }),
+        Ok(Err(e)) => Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: format!("decision-labels.jsonl write failed: {e}"),
+            skill_id: String::new(),
+        }),
+        Err(e) => Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: format!("blocking task panicked: {e}"),
+            skill_id: String::new(),
+        }),
+    }
+}
+
+/// Truncate a string to at most `max_chars` chars, appending an
+/// ellipsis when truncated. Used by override reason to bound the
+/// length of the original AI rationale included in the audit row.
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let trunc: String = s.chars().take(max_chars).collect();
+    format!("{trunc}…")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,5 +1325,255 @@ mod tests {
             Some(2),
             "malformed lines must be skipped, not abort the scan"
         );
+    }
+
+    // ── 2026-05-01 (`tracked-spec-ai-override`) coverage ─────────────
+    //
+    // Each new endpoint has several short-circuit branches plus a
+    // happy path; the tests below pin every error message so a
+    // refactor that drops the validation accidentally surfaces in
+    // CI rather than silently shipping an open endpoint.
+
+    use crate::dashboard::state::test_dashboard_state;
+    use crate::dashboard::types::{
+        LabelDecisionRequest, OverrideDecisionRequest, ReopenIncidentRequest,
+    };
+
+    fn state_with_sqlite(
+        dir: &std::path::Path,
+    ) -> (
+        crate::dashboard::state::DashboardState,
+        std::sync::Arc<innerwarden_store::Store>,
+    ) {
+        let store = std::sync::Arc::new(innerwarden_store::Store::open(dir).unwrap());
+        let mut state = test_dashboard_state(dir);
+        state.sqlite_store = Some(store.clone());
+        (state, store)
+    }
+
+    fn seed_decision(store: &innerwarden_store::Store) -> i64 {
+        let row = innerwarden_store::decisions::DecisionRow {
+            ts: "2026-05-01T12:00:00Z".to_string(),
+            incident_id: "ssh_bruteforce:1.2.3.4:2026-05-01T12Z".to_string(),
+            action_type: "block_ip".to_string(),
+            target_ip: Some("1.2.3.4".to_string()),
+            target_user: None,
+            confidence: 0.92,
+            auto_executed: true,
+            reason: Some("AI proposed block".to_string()),
+            data: r#"{"action_type":"block_ip","target_ip":"1.2.3.4"}"#.to_string(),
+        };
+        store.insert_decision(&row).unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_action_override_decision_rejects_empty_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _store) = state_with_sqlite(dir.path());
+        let body = OverrideDecisionRequest {
+            decision_id: 1,
+            new_action: "block_ip".to_string(),
+            reason: "   ".to_string(),
+        };
+        let resp = api_action_override_decision(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("reason is required"));
+    }
+
+    #[tokio::test]
+    async fn api_action_override_decision_rejects_invalid_new_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _store) = state_with_sqlite(dir.path());
+        let body = OverrideDecisionRequest {
+            decision_id: 1,
+            new_action: "delete_database".to_string(),
+            reason: "trying to break it".to_string(),
+        };
+        let resp = api_action_override_decision(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("new_action must be one of"));
+    }
+
+    #[tokio::test]
+    async fn api_action_override_decision_returns_error_when_no_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_dashboard_state(dir.path()); // no sqlite
+        let body = OverrideDecisionRequest {
+            decision_id: 1,
+            new_action: "monitor".to_string(),
+            reason: "operator disagrees".to_string(),
+        };
+        let resp = api_action_override_decision(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("SQLite store unavailable"));
+    }
+
+    #[tokio::test]
+    async fn api_action_override_decision_returns_error_when_decision_id_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _store) = state_with_sqlite(dir.path());
+        let body = OverrideDecisionRequest {
+            decision_id: 99999,
+            new_action: "monitor".to_string(),
+            reason: "operator disagrees".to_string(),
+        };
+        let resp = api_action_override_decision(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn api_action_override_decision_happy_path_chains_to_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, store) = state_with_sqlite(dir.path());
+        let original_id = seed_decision(&store);
+        let body = OverrideDecisionRequest {
+            decision_id: original_id,
+            new_action: "monitor".to_string(),
+            reason: "operator says monitor instead".to_string(),
+        };
+        let resp = api_action_override_decision(State(state), Json(body)).await;
+        assert!(resp.0.success, "got: {}", resp.0.message);
+        assert!(resp.0.skill_id.starts_with("operator_override:"));
+        // The new row was inserted and chained — verify by reading
+        // the latest two rows and checking prev_hash linkage.
+        let trail = store.audit_trail(None, 5, None).unwrap();
+        assert_eq!(trail.len(), 2);
+        let new_row = &trail[0]; // latest first
+        let original_row = &trail[1];
+        assert_eq!(new_row.action_type, "operator_override:monitor");
+        assert_eq!(
+            new_row.prev_hash.as_deref(),
+            Some(original_row.row_hash.as_str())
+        );
+        assert!(new_row.reason.as_ref().unwrap().contains("monitor"));
+        assert!(new_row
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains(&format!("decision #{original_id}")));
+    }
+
+    #[tokio::test]
+    async fn api_action_reopen_incident_rejects_empty_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _store) = state_with_sqlite(dir.path());
+        let body = ReopenIncidentRequest {
+            incident_id: "".to_string(),
+            reason: "needs review".to_string(),
+        };
+        let resp = api_action_reopen_incident(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("are required"));
+    }
+
+    #[tokio::test]
+    async fn api_action_reopen_incident_returns_error_when_no_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_dashboard_state(dir.path());
+        let body = ReopenIncidentRequest {
+            incident_id: "inc-1".to_string(),
+            reason: "needs review".to_string(),
+        };
+        let resp = api_action_reopen_incident(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("SQLite store unavailable"));
+    }
+
+    #[tokio::test]
+    async fn api_action_reopen_incident_writes_audit_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, store) = state_with_sqlite(dir.path());
+        let body = ReopenIncidentRequest {
+            incident_id: "inc-42".to_string(),
+            reason: "second review".to_string(),
+        };
+        let resp = api_action_reopen_incident(State(state), Json(body)).await;
+        assert!(resp.0.success, "got: {}", resp.0.message);
+        let trail = store.audit_trail(None, 5, None).unwrap();
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail[0].action_type, "operator_reopen");
+        assert_eq!(trail[0].incident_id, "inc-42");
+        assert_eq!(trail[0].reason.as_deref(), Some("second review"));
+    }
+
+    #[tokio::test]
+    async fn api_action_label_decision_rejects_invalid_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_dashboard_state(dir.path());
+        let body = LabelDecisionRequest {
+            decision_id: 1,
+            label: "MAYBE".to_string(),
+            reason: "".to_string(),
+        };
+        let resp = api_action_label_decision(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("label must be one of"));
+    }
+
+    #[tokio::test]
+    async fn api_action_label_decision_appends_to_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_dashboard_state(dir.path());
+        let body = LabelDecisionRequest {
+            decision_id: 7,
+            label: "FP".to_string(),
+            reason: "scanner false positive".to_string(),
+        };
+        let resp = api_action_label_decision(State(state), Json(body)).await;
+        assert!(resp.0.success, "got: {}", resp.0.message);
+        let path = dir.path().join("decision-labels.jsonl");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let line = raw.lines().next().unwrap();
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["decision_id"], 7);
+        assert_eq!(v["label"], "FP");
+        assert_eq!(v["reason"], "scanner false positive");
+    }
+
+    #[tokio::test]
+    async fn api_action_label_decision_appends_multiple_lines() {
+        // Anchors the append-only invariant: a second call must
+        // not overwrite the first. This is what the future
+        // retraining pipeline relies on (it consumes every line).
+        let dir = tempfile::tempdir().unwrap();
+        let state1 = test_dashboard_state(dir.path());
+        let _ = api_action_label_decision(
+            State(state1),
+            Json(LabelDecisionRequest {
+                decision_id: 1,
+                label: "TP".to_string(),
+                reason: String::new(),
+            }),
+        )
+        .await;
+        let state2 = test_dashboard_state(dir.path());
+        let _ = api_action_label_decision(
+            State(state2),
+            Json(LabelDecisionRequest {
+                decision_id: 2,
+                label: "FP".to_string(),
+                reason: String::new(),
+            }),
+        )
+        .await;
+        let raw = std::fs::read_to_string(dir.path().join("decision-labels.jsonl")).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let v1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v1["label"], "TP");
+        assert_eq!(v2["label"], "FP");
+    }
+
+    #[test]
+    fn truncate_handles_short_and_long_strings() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("hello world", 5), "hello…");
+        // Multi-byte chars: must clamp by char count, not byte count,
+        // so a UTF-8 string is never sliced mid-codepoint.
+        let s = "ção da AI";
+        assert_eq!(truncate(s, 3), "ção…");
     }
 }
