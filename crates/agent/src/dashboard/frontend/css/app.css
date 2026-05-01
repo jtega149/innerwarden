@@ -1580,6 +1580,36 @@
       color: var(--accent);
       margin-bottom: 12px;
     }
+    /* Audit 5.11: since-last-visit banner. Soft-purple tone so it
+       reads as "informational diff" rather than "alert". Hidden by
+       default; home.js shows it when localStorage tracks a prior
+       visit and the diff window has new incidents/decisions. */
+    .home-since-last-visit {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 11px 16px;
+      border-radius: 12px;
+      border: 1px dashed rgba(167, 139, 250, 0.32);
+      background: rgba(167, 139, 250, 0.06);
+    }
+    .home-since-last-visit .home-since-icon {
+      color: rgba(167, 139, 250, 0.95);
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+    }
+    .home-since-last-visit .home-since-body { flex: 1; min-width: 0; }
+    .home-since-last-visit .home-since-title {
+      font-size: 0.78rem;
+      color: var(--text);
+      font-weight: 600;
+    }
+    .home-since-last-visit .home-since-sub {
+      font-size: 0.7rem;
+      color: var(--muted);
+      margin-top: 2px;
+    }
     /* Audit 5.10: clean-day onboarding tip. Renders only when the
        day has produced zero attackers AND zero review-queue items.
        Visual tier sits below the activity strip but above the

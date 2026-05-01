@@ -178,8 +178,13 @@ function buildGroupedList(items) {
       ? '<span style="color:var(--ok);font-weight:700">0</span>'
       : count + '';
 
+    // Audit 4.2/4.3/4.4: attach glossary tooltip to the group header
+    // so the operator sees the canonical definition for the bucket
+    // they are reading. `glossaryTitle(o)` falls back to '' when the
+    // bucket key is missing — safe to concatenate unconditionally.
+    var groupTitle = (typeof glossaryTitle === 'function') ? glossaryTitle(o) : '';
     html += '<div class="threat-group ' + meta.cls + '">' +
-      '<div class="threat-group-header" onclick="toggleThreatGroup(this)">' +
+      '<div class="threat-group-header" onclick="toggleThreatGroup(this)"' + groupTitle + '>' +
       '<span class="threat-group-chevron' + (startOpen ? ' open' : '') + '">\u25B8</span>' +
       '<span class="threat-group-label">' + meta.icon + '<span>' + meta.label + '</span></span>' +
       '<span class="threat-group-meta">' + countLabel + '</span>' +

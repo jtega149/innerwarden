@@ -126,12 +126,23 @@ function renderVerdictCard(j) {
       esc(summaryParts.join(' · ')) +
       '</div>'
     : '';
+  // Audit 4.2/4.3/4.4: attach the glossary tooltip to the verdict
+  // status verb so the operator sees the canonical definition of
+  // "Contained / Active / Under review" instead of relying on
+  // page-context guesswork.
+  var verdictTermKey = isContained
+    ? 'contained'
+    : v.containment_status === 'active'
+    ? 'open'
+    : 'unresolved';
+  var statusTitle = (typeof glossaryTitle === 'function') ? glossaryTitle(verdictTermKey) : '';
+  var confTitle = (typeof glossaryTitle === 'function') ? glossaryTitle('confidence') : '';
   return `
     <div class="verdict-card" style="padding:12px 16px">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-        <span style="font-size:0.72rem;font-weight:700;color:${statusColor}">${statusLabel}</span>
+        <span style="font-size:0.72rem;font-weight:700;color:${statusColor}"${statusTitle}>${statusLabel}</span>
         <span style="font-size:0.62rem;color:var(--dim)">·</span>
-        <span style="display:inline-flex;align-items:center;gap:4px;font-size:0.68rem;color:var(--dim)">
+        <span style="display:inline-flex;align-items:center;gap:4px;font-size:0.68rem;color:var(--dim)"${confTitle}>
           <span class="conf-dot" style="background:${confColor}"></span>${esc(v.confidence || 'low')} confidence
         </span>
         ${v.entry_vector && v.entry_vector !== 'unknown' ? '<span style="font-size:0.62rem;color:var(--dim)">·</span><span style="font-size:0.68rem;color:var(--muted)">' + humanLabel(v.entry_vector) + '</span>' : ''}
@@ -319,6 +330,39 @@ function toggleTimeline() {
   if (!el) return;
   var isOpen = el.style.display !== 'none';
   el.style.display = isOpen ? 'none' : 'block';
+}
+
+// Audit 5.2: forensic-timeline filter. Returns the entries list
+// narrowed to system actions (decisions + honeypot sessions) when
+// `window._journeyActionsOnly` is set; returns the input unchanged
+// otherwise. Pure helper for testability.
+function applyForensicFilter(entries) {
+  if (!window._journeyActionsOnly) return entries || [];
+  return (entries || []).filter(function(e) {
+    if (!e || !e.kind) return false;
+    if (e.kind === 'decision') return true;
+    if (e.kind.indexOf('honeypot') === 0) return true;
+    // Incident kind keeps the lead card visible so the operator
+    // still sees what triggered each action — without it the
+    // forensic timeline reads as a stream of decisions with no
+    // context about the threat that was actioned.
+    if (e.kind === 'incident') return true;
+    return false;
+  });
+}
+
+function toggleForensicFilter() {
+  window._journeyActionsOnly = !window._journeyActionsOnly;
+  // Re-render from cached data so the toggle is instant; loadJourney
+  // already stashes the response on window._journeyData (line ~598).
+  var j = window._journeyData;
+  if (!j || typeof state === 'undefined' || !state.selected || !state.selected.value) return;
+  // Easiest re-render: ask loadJourney to redraw. It is idempotent
+  // for the same subject + filters and returns from the network
+  // cache fast enough that the operator perceives it as instant.
+  if (typeof loadJourney === 'function') {
+    loadJourney(state.selected.type, state.selected.value);
+  }
 }
 
 async function askAiExplain(subjectType, subjectValue) {
@@ -770,12 +814,25 @@ async function loadJourney(subjectType, subjectValue) {
     }
 
     // ── Ask AI button ─────────────────────────────────────────────────
+    // Audit 5.2: forensic-timeline filter button next to "technical
+    // entries" toggle. When on, the timeline hides raw events and
+    // shows only system actions (decisions + honeypot sessions),
+    // which is what an operator preparing a client report or audit
+    // wants. State is sticky in `window._journeyActionsOnly` so the
+    // toggle survives re-renders driven by SSE refreshes.
+    var actionsOnly = !!window._journeyActionsOnly;
+    var actionsLabel = actionsOnly
+      ? 'Show all entries'
+      : 'Show actions only';
     html += '<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">' +
       '<button type="button" class="journey-btn" style="background:rgba(120,229,255,0.08);border-color:var(--accent);color:var(--accent)" ' +
         'onclick="askAiExplain(\'' + esc(subjectType) + '\',\'' + esc(subjectValue) + '\')">' +
         lucideIcon('bot',{size:14}) + ' Ask AI to explain</button>' +
       '<button type="button" class="journey-btn" onclick="toggleTimeline()">' +
         lucideIcon('clipboard-list',{size:14}) + ' Show ' + j.entries.length + ' technical entries</button>' +
+      '<button type="button" id="forensicFilterBtn" class="journey-btn" onclick="toggleForensicFilter()" ' +
+        'title="Hide raw events; show only block/dismiss/escalate/honeypot actions">' +
+        lucideIcon('shield-check',{size:14}) + ' ' + actionsLabel + '</button>' +
     '</div>';
     html += '<div id="aiExplainResult" style="display:none;padding:14px 16px;margin-bottom:12px;border-radius:10px;background:rgba(120,229,255,0.04);border:1px solid rgba(120,229,255,0.12)"></div>';
 
@@ -785,8 +842,14 @@ async function loadJourney(subjectType, subjectValue) {
 
     html += '<div class="timeline">';
 
-    if (j.entries.length === 0) {
-      html += '<div class="empty">No entries found for this selection on the chosen filters.</div>';
+    var visibleEntries = applyForensicFilter(j.entries);
+    if (visibleEntries.length === 0) {
+      var emptyMsg = j.entries.length === 0
+        ? 'No entries found for this selection on the chosen filters.'
+        : (actionsOnly
+            ? 'No system actions taken for this subject yet. Toggle off "Show actions only" to see raw events.'
+            : 'No entries found for this selection on the chosen filters.');
+      html += '<div class="empty">' + esc(emptyMsg) + '</div>';
     } else {
       // 2026-05-01 (audit finding 2.3, `tracked-spec-investigation-ux`):
       // group entries by incident_id and render each group as one
@@ -797,7 +860,7 @@ async function loadJourney(subjectType, subjectValue) {
       // times across raw eBPF events, AI dismiss decisions, and
       // human-readable summaries — operator preparing a client
       // report had to manually de-duplicate.
-      const grouped = groupEntriesByIncident(j.entries);
+      const grouped = groupEntriesByIncident(visibleEntries);
       grouped.forEach((group, gi) => { html += renderEntryGroup(group, gi); });
     }
 

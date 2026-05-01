@@ -153,6 +153,22 @@
       </div>
     </div>
 
+    <!-- 4a. SINCE-LAST-VISIT BANNER (audit 5.11): only renders when
+         localStorage has a `iw_last_visit_ts` from a prior visit AND
+         at least one new incident or decision landed in the
+         meantime. Quietly gives the operator a "what changed" cue
+         for the MSSP morning-rounds use case — no dismiss button,
+         the banner self-resets when the visit timestamp updates. -->
+    <div class="home-section home-since-last-visit" id="homeSinceLastVisit" style="display:none">
+      <div class="home-since-icon" aria-hidden="true">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="10"/></svg>
+      </div>
+      <div class="home-since-body">
+        <div class="home-since-title" id="homeSinceTitle">Since your last visit</div>
+        <div class="home-since-sub" id="homeSinceSub"></div>
+      </div>
+    </div>
+
     <!-- 4b. ONBOARDING / CLEAN-DAY TIP (audit 5.10): only renders
          when the day has produced zero attackers AND zero items in
          the review queue. Gives the operator context that the agent

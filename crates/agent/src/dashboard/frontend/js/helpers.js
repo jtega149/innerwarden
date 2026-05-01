@@ -1,15 +1,53 @@
-// ── Canonical UI glossary (spec 017 shared foundation) ────────────────
-// Single source of truth for user-facing UI term definitions. Consumed
-// by page specs for title= tooltips and copy review.
+// ── Canonical UI glossary (spec 017 + audit 4.2/4.3/4.4) ──────────────
+// Single source of truth for user-facing UI term definitions. The
+// audit caught terminology drift across views (incident / event /
+// attacker / threat / alert / break-in / flagged / suspicious used
+// interchangeably). The fix is: every operator-visible mention of
+// these terms attaches a `title=` tooltip rendered from this map,
+// so the canonical definition follows the term wherever it lands.
 var GLOSSARY = {
-  threat:     'A detected security event that may pose risk.',
-  incident:   'A threat recorded by the backend (same concept, internal name).',
-  unresolved: 'A threat that has not been handled automatically and awaits your review.',
-  contained:  'A threat that has been blocked, killed, monitored, or suspended automatically.',
-  open:       'A threat with no containment action taken yet.',
-  resolved:   'A threat that has been closed — either contained or dismissed.',
-  noise:      'A low-signal detection the system chose not to act on.'
+  threat:           'A detected security event that may pose risk.',
+  incident:         'A threat recorded by the backend (same concept, internal name).',
+  unresolved:       'A threat that has not been handled automatically and awaits your review.',
+  contained:        'A threat that has been blocked, killed, monitored, or suspended automatically.',
+  open:             'A threat with no containment action taken yet.',
+  resolved:         'A threat that has been closed — either contained or dismissed.',
+  noise:            'A low-signal detection the system chose not to act on.',
+  // Operator-visible severity labels.
+  severity:         'How dangerous the detection signal is. Critical / High / Medium / Low / Info, ranked highest to lowest.',
+  critical:         'Highest-severity detection. Active compromise indicators (kill chain, reverse shell, ransomware).',
+  high:             'Imminent risk. Requires action soon (port scan from known-bad IP, suspicious sudo, persistence attempt).',
+  medium:           'Suspicious but not immediately dangerous. Worth reviewing but rarely emergency.',
+  low:              'Background noise that fits the threat model. Logged for forensics, no action expected.',
+  info:             'Informational signal, kept for context.',
+  // Confidence + risk score (separate axes from severity).
+  confidence:       'How sure the AI is about its decision. High / Medium / Low. Independent of severity.',
+  risk_score:       'Composite 0-100 risk for an attacker (severity history, recurrence, IOC overlap, geo). Independent of any single incident severity.',
+  // Outcome buckets the dashboard groups attackers by.
+  outcome:          'What the system did about a threat. One of: blocked / observing / honeypot / needs attention / dismissed / allowlisted.',
+  blocked:          'A firewall rule was installed (UFW / iptables / nftables / XDP / pf) so the attacker IP cannot reach the host. Reverts after the configured TTL.',
+  observing:        'Watching the attacker without active blocking. Used when severity is below the action threshold or the operator wants more context first.',
+  honeypot:         'Attacker is being redirected to a fake-shell honeypot listener. Activity is recorded as forensic intel.',
+  needs_attention:  'AI declined to act and escalated to the operator. The system is waiting for your judgement.',
+  dismissed:        'The system or operator marked this as a false positive. No action recorded; pattern saved as a label for future classifier retraining.',
+  allowlisted:      'A trusted entity (operator IP, admin user, etc.) — the AI silenced incidents about it because they are operationally expected, not malicious.',
+  // Common verbs the dashboard renders.
+  attacker:         'A unique IP that produced at least one incident. Counts dedupe by IP, not by event count.',
+  alert:            'A real-time notification surface (toast / Telegram / Slack). Drives operator attention; does not change incident state.',
+  flagged:          'The detector decided the event matches its threat model. Synonym for "incident raised".',
+  suspicious:       'A signal worth investigating but below confirmed-malicious. The AI may auto-decide or escalate.'
 };
+
+// Returns a `title="..."` attribute fragment for a given GLOSSARY
+// term so renderers can attach the canonical tooltip without
+// re-typing the definition. Empty string when the term is unknown
+// so callers can safely concatenate without producing `title=""`.
+function glossaryTitle(term) {
+  if (!term) return '';
+  var def = GLOSSARY[String(term).toLowerCase()];
+  if (!def) return '';
+  return ' title="' + def.replace(/"/g, '&quot;') + '"';
+}
 
 // ── Confidence system helpers ─────────────────────────────────────────
 function getUnresolved() {

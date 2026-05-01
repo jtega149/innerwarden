@@ -3132,6 +3132,77 @@ mod tests {
     }
 
     #[test]
+    fn journey_js_supports_forensic_filter() {
+        // Audit 5.2: "Actions only" toggle on the journey timeline so
+        // the operator can hide raw events and see just the system's
+        // block / dismiss / escalate / honeypot actions. Anchor pins
+        // the helper, the toggle wrapper, and the button HTML.
+        assert!(
+            JS_JOURNEY.contains("function applyForensicFilter"),
+            "applyForensicFilter helper missing — operator can't strip raw events from the journey timeline (audit 5.2)"
+        );
+        assert!(JS_JOURNEY.contains("function toggleForensicFilter"));
+        assert!(JS_JOURNEY.contains("id=\"forensicFilterBtn\""));
+        // The filter must keep `incident` entries so the lead card
+        // stays visible — without it the timeline reads as a stream
+        // of decisions with no threat context.
+        assert!(JS_JOURNEY.contains("e.kind === 'incident'"));
+    }
+
+    #[test]
+    fn home_js_renders_since_last_visit_diff() {
+        // Audit 5.11: localStorage-tracked last visit timestamp drives
+        // a "Since your last visit" diff banner so the MSSP morning-
+        // rounds operator sees what changed in their absence. Anchor
+        // pins the storage key + the pure compute helper + the
+        // renderer hook.
+        assert!(JS_HOME.contains("SINCE_LAST_VISIT_KEY = 'iw_last_visit_ts'"));
+        assert!(JS_HOME.contains("function computeSinceLastVisitCounts"));
+        assert!(JS_HOME.contains("function renderSinceLastVisitBanner"));
+        assert!(
+            JS_HOME.contains("renderSinceLastVisitBanner(items, responsesData)"),
+            "loadHome must call renderSinceLastVisitBanner — without the wire-up the banner never updates (audit 5.11)"
+        );
+        // The HTML container has to exist or the renderer no-ops.
+        assert!(INDEX_HTML.contains("id=\"homeSinceLastVisit\""));
+    }
+
+    #[test]
+    fn helpers_glossary_carries_required_audit_terms() {
+        // Audit 4.2/4.3/4.4: the canonical GLOSSARY must define every
+        // term the operator reads on the dashboard so a `title=`
+        // tooltip can ship the definition wherever the term lands.
+        // Anchor lists the terms the audit specifically called out.
+        for term in [
+            "severity:",
+            "confidence:",
+            "risk_score:",
+            "outcome:",
+            "blocked:",
+            "observing:",
+            "honeypot:",
+            "needs_attention:",
+            "dismissed:",
+            "allowlisted:",
+            "attacker:",
+            "alert:",
+            "flagged:",
+            "suspicious:",
+        ] {
+            assert!(
+                JS_HELPERS.contains(term),
+                "GLOSSARY missing key '{term}' (audit 4.2/4.3/4.4)"
+            );
+        }
+        // The helper that emits the title= attribute must exist + be
+        // consumed by at least one render path so the glossary is
+        // visible to the operator, not just defined in source.
+        assert!(JS_HELPERS.contains("function glossaryTitle"));
+        assert!(JS_THREATS.contains("glossaryTitle("));
+        assert!(JS_JOURNEY.contains("glossaryTitle("));
+    }
+
+    #[test]
     fn nav_promotes_responses_to_top_level() {
         // Audit 4.6: Responses moved out of the More dropdown into a
         // top-level button between Threats and Health. The dropdown

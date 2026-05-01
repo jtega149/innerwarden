@@ -67,6 +67,7 @@ async function loadHome() {
     renderCriticalBanner(topCritical);
     renderReviewBanner(overview);
     renderActivityStrip(overview, totalEventsScanned);
+    renderSinceLastVisitBanner(items, responsesData);
     renderOnboardingTip(overview);
     renderHealthLine(status, sensors, overview, softStale);
     renderDetailsPanel(overview, status, sensors);
@@ -412,6 +413,107 @@ function toggleHomeDetails() {
     panel.setAttribute('hidden', '');
     btn.textContent = 'Show details';
     btn.setAttribute('aria-expanded', 'false');
+  }
+}
+
+// Audit 5.11: "Since your last visit" diff banner. Tracks visit
+// timestamp in localStorage so the operator coming back later
+// sees the count of incidents / decisions that arrived in their
+// absence. No backend change needed — incidents already carry
+// `ts`, responses-history entries carry `reverted_at`. Pure
+// frontend feature, no privacy crossing the dashboard boundary.
+//
+// The localStorage key is written on every home load so the diff
+// window is "since I was last on this page", not "since I last
+// opened this browser session".
+var SINCE_LAST_VISIT_KEY = 'iw_last_visit_ts';
+var SINCE_LAST_VISIT_GRACE_MS = 60 * 1000; // ignore visits less than 1 min ago
+
+function _humanAgo(ms) {
+  var s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  var m = Math.floor(s / 60);
+  if (m < 60) return m + 'm';
+  var h = Math.floor(m / 60);
+  if (h < 24) return h + 'h';
+  return Math.floor(h / 24) + 'd';
+}
+
+// Pure helper: given a previous-visit timestamp (ms), the incident
+// list and responses data, produce {newIncidents, newDecisions,
+// newBlocked, sinceMs}. Returns null when no previous visit exists
+// or the visit is so recent the diff is meaningless.
+function computeSinceLastVisitCounts(prevTs, incidents, responsesHistory, blocked) {
+  if (!prevTs) return null;
+  var nowMs = Date.now();
+  if (nowMs - prevTs < SINCE_LAST_VISIT_GRACE_MS) return null;
+  var newIncidents = (incidents || []).filter(function(i) {
+    if (!i || !i.ts) return false;
+    return new Date(i.ts).getTime() > prevTs;
+  }).length;
+  var newDecisions = (responsesHistory || []).filter(function(h) {
+    if (!h || !h.reverted_at) return false;
+    return new Date(h.reverted_at).getTime() > prevTs;
+  }).length;
+  var nowBlocked = (blocked || []).filter(function(b) {
+    if (!b || !b.activated_at) return false;
+    return new Date(b.activated_at).getTime() > prevTs;
+  }).length;
+  return {
+    newIncidents: newIncidents,
+    newDecisions: newDecisions,
+    newBlocked: nowBlocked,
+    sinceMs: nowMs - prevTs,
+  };
+}
+
+function renderSinceLastVisitBanner(incidents, responsesData) {
+  var banner = document.getElementById('homeSinceLastVisit');
+  if (!banner) return;
+  var prev = null;
+  try {
+    var raw = window.localStorage && window.localStorage.getItem(SINCE_LAST_VISIT_KEY);
+    if (raw) prev = parseInt(raw, 10);
+  } catch (_) {
+    // localStorage may be denied — banner stays hidden, no error
+    // surfaces because the feature degrades cleanly.
+  }
+  var counts = computeSinceLastVisitCounts(
+    prev,
+    incidents,
+    (responsesData && responsesData.history) || [],
+    (responsesData && responsesData.active) || []
+  );
+  // Update the timestamp regardless of whether we render — every
+  // home load resets the diff window to "right now".
+  try {
+    if (window.localStorage) {
+      window.localStorage.setItem(SINCE_LAST_VISIT_KEY, String(Date.now()));
+    }
+  } catch (_) {}
+
+  if (!counts || (counts.newIncidents === 0 && counts.newDecisions === 0 && counts.newBlocked === 0)) {
+    banner.style.display = 'none';
+    return;
+  }
+  banner.style.display = '';
+  var titleEl = document.getElementById('homeSinceTitle');
+  var subEl = document.getElementById('homeSinceSub');
+  if (titleEl) {
+    titleEl.textContent = 'Since your last visit (' + _humanAgo(counts.sinceMs) + ' ago)';
+  }
+  if (subEl) {
+    var parts = [];
+    if (counts.newIncidents > 0) {
+      parts.push(counts.newIncidents + ' new incident' + (counts.newIncidents === 1 ? '' : 's'));
+    }
+    if (counts.newBlocked > 0) {
+      parts.push(counts.newBlocked + ' blocked');
+    }
+    if (counts.newDecisions > 0) {
+      parts.push(counts.newDecisions + ' resolved');
+    }
+    subEl.textContent = parts.join(' · ');
   }
 }
 
