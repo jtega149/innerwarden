@@ -347,6 +347,131 @@ function renderEntry(entry, idx) {
     </div>`;
 }
 
+// 2026-05-01 (`tracked-spec-investigation-ux`): timeline grouping
+// helpers. The journey API returns a flat list of entries
+// (`event` / `incident` / `decision` / `honeypot_*`); the audit
+// caught that an operator looking at a single attack saw it
+// rendered 5+ times across these kinds. Grouping by incident_id
+// collapses the chatter into one expandable card per incident
+// while keeping ungrouped raw events visible inline.
+
+/// Extract the grouping key from an entry. Returns `null` for
+/// entries that should remain ungrouped (raw events with no
+/// incident context, honeypot sessions, etc.). When grouping by
+/// incident_id, every entry whose `data.incident_id` matches goes
+/// in the same group regardless of `kind`.
+function entryGroupKey(entry) {
+  const d = (entry && entry.data) || {};
+  if (entry.kind === 'incident' || entry.kind === 'decision') {
+    const id = d.incident_id || '';
+    return id ? id : null;
+  }
+  // Some event entries are tagged with the incident_id they
+  // belong to (e.g. tcp_stream events that fed a kill_chain
+  // detection). When present, fold them into the same group;
+  // otherwise leave ungrouped.
+  if (entry.kind === 'event' && d.incident_id) {
+    return d.incident_id;
+  }
+  return null;
+}
+
+/// Walk `entries` in order and produce a list of groups. Each
+/// group is `{key, lead, members}` where `lead` is the most
+/// informative entry (incident kind preferred over decision over
+/// event) and `members` are the rest in original order. Ungrouped
+/// entries are emitted as singleton groups so the renderer can
+/// treat groups uniformly.
+function groupEntriesByIncident(entries) {
+  const order = []; // group keys in first-seen order
+  const groups = new Map(); // key → {key, lead, members, kindRank}
+  // Lead-rank: lower is preferred. Incident is the canonical
+  // "this is what happened" header, decision is "what we did",
+  // events are evidence. The lead surfaces the title that the
+  // operator scans first.
+  const leadRank = (kind) => {
+    if (kind === 'incident') return 0;
+    if (kind === 'decision') return 1;
+    if (kind === 'event') return 2;
+    return 3;
+  };
+  entries.forEach((e, idx) => {
+    const k = entryGroupKey(e);
+    if (k === null) {
+      const ungroupedKey = '__ungrouped_' + idx;
+      order.push(ungroupedKey);
+      groups.set(ungroupedKey, { key: ungroupedKey, lead: e, members: [], idx });
+      return;
+    }
+    if (!groups.has(k)) {
+      order.push(k);
+      groups.set(k, { key: k, lead: e, members: [], idx, leadKind: e.kind });
+      return;
+    }
+    const g = groups.get(k);
+    if (leadRank(e.kind) < leadRank(g.lead.kind)) {
+      // Demote the previous lead into members and replace.
+      g.members.push(g.lead);
+      g.lead = e;
+      g.leadKind = e.kind;
+    } else {
+      g.members.push(e);
+    }
+  });
+  return order.map((k) => groups.get(k));
+}
+
+/// Render one group: the lead entry full-size plus a collapsed
+/// "show N more" expander when there are members. Group index is
+/// stable across re-renders so the expander toggle keeps working.
+function renderEntryGroup(group, gIdx) {
+  // Singleton (no incident dedup) — render exactly the legacy way.
+  // Preserves the operator-visible appearance for events that don't
+  // belong to any incident.
+  if (!group.members || group.members.length === 0) {
+    return renderEntry(group.lead, gIdx);
+  }
+  const memberCount = group.members.length;
+  const memberHtml = group.members
+    .map((m, mi) => renderEntry(m, gIdx * 100 + mi + 1))
+    .join('');
+  const dot = dotCls(group.lead);
+  const expanderId = 'group-members-' + gIdx;
+  return `
+    <div class="tl-item tl-group" data-group-key="${esc(group.key || '')}">
+      <div class="tl-spine">
+        <div class="tl-dot ${esc(dot)}"></div>
+        <div class="tl-connector"></div>
+      </div>
+      <div class="tl-body">
+        ${renderEvidenceCard(group.lead, gIdx)}
+        <div style="margin-top:6px;font-size:0.72rem">
+          <button type="button" class="tl-group-toggle"
+            onclick="toggleGroupMembers('${esc(expanderId)}', this)"
+            style="background:transparent;border:1px solid var(--border);color:var(--accent);padding:3px 10px;border-radius:4px;cursor:pointer;font-size:0.7rem">
+            Show ${memberCount} related ${memberCount === 1 ? 'entry' : 'entries'} ▾
+          </button>
+        </div>
+        <div id="${esc(expanderId)}" style="display:none;margin-top:8px;padding-left:8px;border-left:2px solid rgba(255,255,255,0.06)">
+          ${memberHtml}
+        </div>
+      </div>
+    </div>`;
+}
+
+function toggleGroupMembers(id, btn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const showing = el.style.display !== 'none';
+  el.style.display = showing ? 'none' : 'block';
+  if (btn) {
+    const text = btn.textContent || '';
+    btn.textContent = showing
+      ? text.replace('▴', '▾').replace('Hide', 'Show')
+      : text.replace('▾', '▴').replace('Show', 'Hide');
+  }
+}
+
 function toggleEntry(idx) {
   // Legacy: kept for compatibility; D5 uses toggleRaw instead.
   toggleRaw(idx);
@@ -646,7 +771,17 @@ async function loadJourney(subjectType, subjectValue) {
     if (j.entries.length === 0) {
       html += '<div class="empty">No entries found for this selection on the chosen filters.</div>';
     } else {
-      j.entries.forEach((e, i) => { html += renderEntry(e, i); });
+      // 2026-05-01 (audit finding 2.3, `tracked-spec-investigation-ux`):
+      // group entries by incident_id and render each group as one
+      // lead card + a collapsed "show N more" expander for the
+      // remaining members. The pre-fix render flattened every
+      // event / incident / decision into its own row, producing
+      // the audit's complaint that the same incident appeared 5+
+      // times across raw eBPF events, AI dismiss decisions, and
+      // human-readable summaries — operator preparing a client
+      // report had to manually de-duplicate.
+      const grouped = groupEntriesByIncident(j.entries);
+      grouped.forEach((group, gi) => { html += renderEntryGroup(group, gi); });
     }
 
     html += '</div></div>';
