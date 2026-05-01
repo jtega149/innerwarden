@@ -7,18 +7,41 @@
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 use crate::Store;
 
 /// Result of hash chain verification.
 #[derive(Debug, Clone)]
 pub struct HashChainResult {
-    /// Number of rows verified.
+    /// Number of rows verified (excludes documented-break rows, which
+    /// are skipped not verified).
     pub verified: u64,
-    /// If the chain is broken, the seq at which it broke.
+    /// If the chain has an UNDOCUMENTED break, the seq at which it
+    /// broke. `None` means either the chain is intact OR every
+    /// break is registered in `chain_break_audit`.
     pub broken_at: Option<i64>,
-    /// True if the entire chain is intact.
+    /// True iff there are no undocumented breaks. Documented breaks
+    /// (rows in `chain_break_audit`) do not flip this to false —
+    /// they are operationally tolerated by design.
     pub intact: bool,
+    /// Count of documented breaks encountered during this scan.
+    /// Purely informational. The hourly maintenance log includes
+    /// this so the operator sees the audit trail's true state:
+    /// "1234 verified, 0 undocumented, 4702 documented breaks".
+    pub documented_breaks: u64,
+}
+
+/// One registered chain break. Returned by `Store::list_chain_breaks`
+/// for audit display. Order is the order the breaks were registered.
+#[derive(Debug, Clone)]
+pub struct ChainBreakRecord {
+    pub id: i64,
+    pub rowid_start: i64,
+    pub rowid_end: i64,
+    pub registered_at: String,
+    pub operator: String,
+    pub reason: String,
+    pub prev_chain_end_hash: Option<String>,
 }
 
 /// A decision entry for insertion. The store computes the hash chain
@@ -95,9 +118,40 @@ impl Store {
         Ok(result)
     }
 
-    /// Verify the entire hash chain. Returns verification result.
+    /// Verify the entire hash chain.
+    ///
+    /// 2026-05-01 update: rows whose id falls inside a registered
+    /// `chain_break_audit` range are treated as documented breaks —
+    /// the SHA mismatch is logged as a "documented break" count and
+    /// the verifier continues from the row's stored hash as the new
+    /// chain anchor (so post-range rows verify cleanly).
+    ///
+    /// `intact = false` ONLY for undocumented breaks. Documented
+    /// breaks are operationally tolerated: an operator who ran a
+    /// manual recovery sweep, registered the rowid range with a
+    /// reason, gets no permanent hourly Telegram alert.
+    ///
+    /// On the first UNDOCUMENTED break the verifier returns early
+    /// (existing semantics — `broken_at` is the first such row).
+    /// Documented breaks before that point are still counted in
+    /// `documented_breaks` so the operator can see the audit trail
+    /// state at a glance.
     pub fn verify_hash_chain(&self) -> Result<HashChainResult> {
         let conn = self.conn()?;
+        // Load all documented break ranges up-front. The table is
+        // tiny in practice (one row per recovery sweep, expected to
+        // be < 100 entries even for long-lived deployments) so an
+        // in-memory Vec is the right shape.
+        let mut break_stmt = conn
+            .prepare("SELECT rowid_start, rowid_end FROM chain_break_audit ORDER BY rowid_start")?;
+        let break_rows =
+            break_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut breaks: Vec<(i64, i64)> = Vec::new();
+        for r in break_rows {
+            breaks.push(r?);
+        }
+        let in_break = |id: i64| breaks.iter().any(|(s, e)| id >= *s && id <= *e);
+
         let mut stmt =
             conn.prepare("SELECT id, prev_hash, row_hash, data FROM decisions ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
@@ -111,9 +165,19 @@ impl Store {
 
         let mut prev_computed: Option<String> = None;
         let mut verified: u64 = 0;
+        let mut documented_breaks: u64 = 0;
 
         for row in rows {
             let (seq, stored_prev, stored_hash, data) = row?;
+
+            if in_break(seq) {
+                // Documented break — skip SHA verification, advance
+                // the chain anchor to whatever this row stores so
+                // the next legit row's prev_hash check works.
+                documented_breaks += 1;
+                prev_computed = Some(stored_hash);
+                continue;
+            }
 
             // Check prev_hash matches our running state
             if stored_prev != prev_computed {
@@ -121,6 +185,7 @@ impl Store {
                     verified,
                     broken_at: Some(seq),
                     intact: false,
+                    documented_breaks,
                 });
             }
 
@@ -131,6 +196,7 @@ impl Store {
                     verified,
                     broken_at: Some(seq),
                     intact: false,
+                    documented_breaks,
                 });
             }
 
@@ -142,7 +208,80 @@ impl Store {
             verified,
             broken_at: None,
             intact: true,
+            documented_breaks,
         })
+    }
+
+    /// Register an intentional break in the decisions hash chain.
+    ///
+    /// Used after manual SQL recovery, bulk import, schema rewrite —
+    /// any operation that inserts decision rows without going
+    /// through `insert_decision` (which computes the chain hash).
+    /// Future calls to `verify_hash_chain` skip the SHA check for
+    /// rows in `[rowid_start, rowid_end]` and report them in the
+    /// `documented_breaks` count instead of triggering an undocumented
+    /// `broken_at` alert.
+    ///
+    /// Idempotent on overlapping ranges? Not by design — duplicate
+    /// registrations are stored separately so the audit trail keeps
+    /// each registration event. Verifier only cares whether ANY
+    /// registration covers a row.
+    pub fn register_chain_break(
+        &self,
+        rowid_start: i64,
+        rowid_end: i64,
+        operator: &str,
+        reason: &str,
+        prev_chain_end_hash: Option<&str>,
+    ) -> Result<i64> {
+        if rowid_end < rowid_start {
+            return Err(StoreError::Other(format!(
+                "invalid range: rowid_end={rowid_end} < rowid_start={rowid_start}"
+            )));
+        }
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO chain_break_audit \
+             (rowid_start, rowid_end, registered_at, operator, reason, prev_chain_end_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                rowid_start,
+                rowid_end,
+                chrono::Utc::now().to_rfc3339(),
+                operator,
+                reason,
+                prev_chain_end_hash,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// List every registered chain break. Used by audit dashboards
+    /// and the integrity report so the operator can see "yes the
+    /// chain has gaps but here's why each one exists".
+    pub fn list_chain_breaks(&self) -> Result<Vec<ChainBreakRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, rowid_start, rowid_end, registered_at, operator, reason, \
+                    prev_chain_end_hash \
+             FROM chain_break_audit ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ChainBreakRecord {
+                id: r.get(0)?,
+                rowid_start: r.get(1)?,
+                rowid_end: r.get(2)?,
+                registered_at: r.get(3)?,
+                operator: r.get(4)?,
+                reason: r.get(5)?,
+                prev_chain_end_hash: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// Read decisions with id > `after_id`, up to `limit`.
@@ -316,6 +455,182 @@ mod tests {
         let hash = store.last_decision_hash().unwrap();
         assert!(hash.is_some());
         assert_eq!(hash.unwrap().len(), 64); // SHA-256 hex
+    }
+
+    // Helper: simulate a manual SQL break by inserting a decision
+    // row directly with a non-canonical row_hash (mirrors the
+    // `manual-orphan-recovery-2026-04-29` operation that prompted
+    // this whole feature).
+    fn insert_manual_decision(store: &Store, incident: &str, sentinel_hash: &str) -> i64 {
+        let conn = store.conn().unwrap();
+        let data = serde_json::json!({
+            "ai_provider": "manual-test",
+            "incident_id": incident,
+            "action_type": "dismiss",
+            "ts": chrono::Utc::now().to_rfc3339(),
+        });
+        conn.execute(
+            "INSERT INTO decisions \
+             (ts, incident_id, action_type, target_ip, target_user, confidence, \
+              auto_executed, reason, prev_hash, row_hash, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                chrono::Utc::now().to_rfc3339(),
+                incident,
+                "dismiss",
+                Option::<String>::None,
+                Option::<String>::None,
+                1.0,
+                1,
+                "test manual",
+                Option::<String>::None,
+                sentinel_hash,
+                data.to_string(),
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn verify_hash_chain_flags_undocumented_break_as_intact_false() {
+        // Pre-existing semantic: a row with mismatched row_hash that
+        // is NOT in chain_break_audit must produce `intact=false`
+        // and `broken_at=Some(rowid)`.
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_decision(&sample_decision("inc-clean", "block_ip"))
+            .unwrap();
+        let bad_id = insert_manual_decision(&store, "inc-bad", "sentinel-bad");
+        let chain = store.verify_hash_chain().unwrap();
+        assert!(
+            !chain.intact,
+            "undocumented manual insert must mark chain not-intact"
+        );
+        assert_eq!(chain.broken_at, Some(bad_id));
+        assert_eq!(chain.documented_breaks, 0);
+    }
+
+    #[test]
+    fn verify_hash_chain_skips_documented_break_range() {
+        // After registering the broken rowid range in
+        // chain_break_audit, the verifier reports `intact=true` and
+        // counts the break in `documented_breaks` instead of firing
+        // an `intact=false` alert. This is the exact prod scenario
+        // that prompted the feature: 4702 rows of manual orphan
+        // recovery sweep on 2026-04-29 17:26 UTC.
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_decision(&sample_decision("inc-clean", "block_ip"))
+            .unwrap();
+        let bad_id = insert_manual_decision(&store, "inc-bad", "sentinel-bad");
+        let extra_bad = insert_manual_decision(&store, "inc-bad-2", "sentinel-bad-2");
+        store
+            .register_chain_break(
+                bad_id,
+                extra_bad,
+                "test-operator",
+                "manual recovery sweep — verifier should skip these rows",
+                Some("last-good-hash"),
+            )
+            .unwrap();
+        let chain = store.verify_hash_chain().unwrap();
+        assert!(
+            chain.intact,
+            "documented breaks must NOT mark the chain as not-intact"
+        );
+        assert_eq!(chain.broken_at, None);
+        assert_eq!(chain.documented_breaks, 2);
+    }
+
+    #[test]
+    fn verify_hash_chain_resumes_after_documented_break() {
+        // The verifier must continue verifying rows AFTER a
+        // documented break range. A new legit insert post-range goes
+        // through `insert_decision` which reads the LAST row's
+        // row_hash as prev_hash — so its chain link points back to
+        // the sentinel. The verifier, when it skips the documented
+        // break, sets `prev_computed = stored_hash` (the sentinel)
+        // so the next legit row's prev_hash check succeeds.
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_decision(&sample_decision("inc-clean", "block_ip"))
+            .unwrap();
+        let bad_id = insert_manual_decision(&store, "inc-bad", "sentinel-bad");
+        store
+            .register_chain_break(
+                bad_id,
+                bad_id,
+                "test-operator",
+                "single-row manual insert",
+                None,
+            )
+            .unwrap();
+        // Now a legit insert: should chain off the sentinel hash.
+        store
+            .insert_decision(&sample_decision("inc-clean-2", "monitor"))
+            .unwrap();
+        let chain = store.verify_hash_chain().unwrap();
+        assert!(chain.intact);
+        assert_eq!(chain.documented_breaks, 1);
+        // 2 legit rows verified (the first and the third); the
+        // middle is documented.
+        assert_eq!(chain.verified, 2);
+    }
+
+    #[test]
+    fn verify_hash_chain_undocumented_break_after_documented_still_alerts() {
+        // Documented break covers rows 2..3. Row 4 is ALSO a
+        // manual insert but not registered. Verifier must report
+        // `broken_at=4`, NOT swallow it because earlier breaks
+        // were documented.
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_decision(&sample_decision("inc-clean", "block_ip"))
+            .unwrap();
+        let bad_id = insert_manual_decision(&store, "inc-bad", "sentinel-1");
+        let _bad_id2 = insert_manual_decision(&store, "inc-bad", "sentinel-2");
+        let undoc = insert_manual_decision(&store, "inc-undoc", "sentinel-undoc");
+        store
+            .register_chain_break(bad_id, bad_id + 1, "test-op", "documented", None)
+            .unwrap();
+        let chain = store.verify_hash_chain().unwrap();
+        assert!(
+            !chain.intact,
+            "undocumented break after documented must alert"
+        );
+        assert_eq!(chain.broken_at, Some(undoc));
+        assert_eq!(chain.documented_breaks, 2);
+    }
+
+    #[test]
+    fn register_chain_break_rejects_inverted_range() {
+        let store = Store::open_memory().unwrap();
+        let err = store
+            .register_chain_break(100, 50, "op", "test", None)
+            .unwrap_err();
+        match err {
+            StoreError::Other(msg) => assert!(msg.contains("invalid range")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_chain_breaks_returns_registered_records() {
+        let store = Store::open_memory().unwrap();
+        store
+            .register_chain_break(100, 200, "op-a", "first sweep", None)
+            .unwrap();
+        store
+            .register_chain_break(500, 502, "op-b", "second sweep", Some("hash-x"))
+            .unwrap();
+        let records = store.list_chain_breaks().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].operator, "op-a");
+        assert_eq!(records[0].rowid_start, 100);
+        assert_eq!(records[0].rowid_end, 200);
+        assert_eq!(records[1].reason, "second sweep");
+        assert_eq!(records[1].prev_chain_end_hash.as_deref(), Some("hash-x"));
     }
 
     #[test]

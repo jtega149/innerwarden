@@ -2387,9 +2387,20 @@ mod tests {
     fn sqlite_overview_snapshot_pending_breakdown_categorises_by_age() {
         // 1 fresh incident (in-flight), 1 old (stuck), 1 escalated
         // (declined_by_ai). All today, all without final block decision.
+        //
+        // 2026-05-01 (PR #357): use a deterministic `now` at noon UTC
+        // instead of `Utc::now()`. The pre-fix version generated
+        // `stuck_ts = now - 2h`, which crosses the UTC midnight when
+        // the test runs in the first ~2h of a UTC day → stuck_ts
+        // falls on YESTERDAY's date string and the date-filtered query
+        // returns 0 stuck incidents. CI hit this on 2026-05-01 at
+        // 01:29 UTC. compute_overview_counts_from_sqlite already
+        // accepts `now` as a parameter, so making it deterministic
+        // keeps the test independent of wall-clock time.
         let store = make_overview_test_store();
-        let date = chrono::Utc::now().date_naive().to_string();
-        let now = chrono::Utc::now();
+        let today = chrono::Utc::now().date_naive();
+        let now = today.and_hms_opt(12, 0, 0).unwrap().and_utc();
+        let date = today.to_string();
         let fresh_ts = (now - chrono::Duration::seconds(120))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let stuck_ts =
@@ -2467,9 +2478,14 @@ mod tests {
         // pipeline may be wedged" whenever any incident from earlier
         // in the day failed to get a decision, even though the AI was
         // actively processing the steady stream.
+        // 2026-05-01 (PR #357): deterministic `now` at noon UTC so
+        // `now - 2h` always lands on today (CI was failing at 01:29
+        // UTC because stuck_ts crossed midnight into yesterday's
+        // date string).
         let store = make_overview_test_store();
-        let now = chrono::Utc::now();
-        let date = now.date_naive().to_string();
+        let today = chrono::Utc::now().date_naive();
+        let now = today.and_hms_opt(12, 0, 0).unwrap().and_utc();
+        let date = today.to_string();
 
         // 1 stuck incident from 2 hours ago.
         let stuck_ts =

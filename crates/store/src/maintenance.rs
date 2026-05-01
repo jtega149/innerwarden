@@ -344,15 +344,34 @@ impl MaintenanceScheduler {
             Err(e) => warn!("maintenance: integrity_check failed: {e:#}"),
         }
 
-        // Decision hash chain verification
+        // Decision hash chain verification.
+        //
+        // 2026-05-01: documented breaks (rows registered in
+        // `chain_break_audit`) are surfaced in the steady-state INFO
+        // log so the operator sees they exist, but they DO NOT fire
+        // an alert — they are operationally tolerated by design.
+        // The previous behaviour spammed Telegram every hour because
+        // a manual orphan recovery sweep on 2026-04-29 broke the
+        // chain at 4702 rows; fix is in PR #357 (this change).
         match store.verify_hash_chain() {
             Ok(result) => {
                 if result.intact {
-                    info!(verified = result.verified, "maintenance: hash chain intact");
+                    if result.documented_breaks > 0 {
+                        info!(
+                            verified = result.verified,
+                            documented_breaks = result.documented_breaks,
+                            "maintenance: hash chain intact (documented breaks tolerated)"
+                        );
+                    } else {
+                        info!(verified = result.verified, "maintenance: hash chain intact");
+                    }
                 } else {
                     let msg = format!(
-                        "HASH CHAIN BROKEN — audit trail tampered. {} verified, broken at: {:?}",
-                        result.verified, result.broken_at,
+                        "HASH CHAIN BROKEN at row {:?} — undocumented modification. \
+                         {} rows verified, {} documented breaks tolerated. If this break \
+                         was an intentional operator action, register it via \
+                         Store::register_chain_break to silence this alert.",
+                        result.broken_at, result.verified, result.documented_breaks,
                     );
                     warn!("{msg}");
                     alerts.push(msg);
@@ -766,5 +785,95 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sched = MaintenanceScheduler::new();
         sched.tick_daily(&store);
+    }
+
+    /// 2026-05-01: regression for the prod alert spam where a manual
+    /// orphan-recovery sweep on 2026-04-29 17:26 UTC inserted 4702
+    /// rows with non-canonical hashes. The hourly maintenance tick
+    /// kept firing "DATABASE SECURITY ALERT" via Telegram every hour
+    /// because verify_hash_chain returned `intact=false`. After
+    /// registering the rowid range in `chain_break_audit`, the alert
+    /// must NOT fire — the breaks are documented operational state.
+    #[test]
+    fn tick_hourly_does_not_alert_when_break_is_documented() {
+        use crate::decisions::DecisionRow;
+
+        let store = Store::open_memory().unwrap();
+
+        // Row 1: legit insert through the chained API.
+        store
+            .insert_decision(&DecisionRow {
+                ts: Utc::now().to_rfc3339(),
+                incident_id: "inc-clean".into(),
+                action_type: "block_ip".into(),
+                target_ip: Some("1.1.1.1".into()),
+                target_user: None,
+                confidence: 0.9,
+                auto_executed: true,
+                reason: Some("legit".into()),
+                data: r#"{"x":1}"#.into(),
+            })
+            .unwrap();
+
+        // Row 2: simulate the manual SQL recovery sweep — direct
+        // insert with sentinel `row_hash` like the prod incident.
+        let conn = store.conn().unwrap();
+        conn.execute(
+            "INSERT INTO decisions \
+             (ts, incident_id, action_type, target_ip, target_user, confidence, \
+              auto_executed, reason, prev_hash, row_hash, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                Utc::now().to_rfc3339(),
+                "inc-manual",
+                "dismiss",
+                Option::<String>::None,
+                Option::<String>::None,
+                1.0,
+                1,
+                "manual sweep",
+                Option::<String>::None,
+                "manual-sentinel-hash",
+                r#"{"manual":"yes"}"#,
+            ],
+        )
+        .unwrap();
+        let bad_id = conn.last_insert_rowid();
+        drop(conn);
+
+        // Pre-registration: the hourly tick MUST emit an alert.
+        let mut sched_pre = MaintenanceScheduler::new();
+        // Force the hourly bucket to run by zero-ing last_hourly.
+        sched_pre.last_hourly = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(7200))
+            .unwrap();
+        let alerts_pre = sched_pre.tick(&store);
+        assert!(
+            alerts_pre.iter().any(|a| a.contains("HASH CHAIN BROKEN")),
+            "undocumented break MUST trigger an alert"
+        );
+
+        // Register the break.
+        store
+            .register_chain_break(
+                bad_id,
+                bad_id,
+                "test-operator",
+                "manual recovery — test scenario",
+                None,
+            )
+            .unwrap();
+
+        // Post-registration: the hourly tick must be quiet.
+        let mut sched_post = MaintenanceScheduler::new();
+        sched_post.last_hourly = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(7200))
+            .unwrap();
+        let alerts_post = sched_post.tick(&store);
+        assert!(
+            !alerts_post.iter().any(|a| a.contains("HASH CHAIN BROKEN")),
+            "documented break MUST NOT trigger the spam alert; got: {:?}",
+            alerts_post
+        );
     }
 }

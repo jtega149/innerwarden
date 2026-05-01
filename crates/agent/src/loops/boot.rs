@@ -587,11 +587,25 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             match telegram::TelegramClient::new(token, chat_id, dashboard_url) {
                 Ok(mut c) => {
                     c.set_telegram_sent_counter(telemetry_telegram_sent_counter.clone());
+                    // 2026-05-01: persistent audit trail for every
+                    // outgoing telegram message. See
+                    // `client.rs::post_json_with_response` writer +
+                    // the operator question that prompted this:
+                    // "auditar o que funciona" had no usable answer
+                    // because daily-digest / menu / callback sends
+                    // were invisible (env_filter dropped them and
+                    // notification-feedback.jsonl only logs
+                    // incident-driven sends).
+                    let audit_path = cli.data_dir.join("telegram-sent.jsonl");
+                    c.set_audit_jsonl_path(audit_path.clone());
                     if cfg.telegram.dev_mode {
                         c.dev_mode = true;
                         info!("Telegram dev mode ON — FP review button on every notification");
                     }
-                    info!("Telegram client initialised (T.1 notifications enabled)");
+                    info!(
+                        audit_path = %audit_path.display(),
+                        "Telegram client initialised (T.1 notifications enabled)"
+                    );
                     Some(Arc::new(c))
                 }
                 Err(e) => {

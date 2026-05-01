@@ -701,10 +701,21 @@ async fn main() -> Result<()> {
         Err(e) => warn!("could not parse .env file: {e}"),
     }
 
+    // 2026-05-01: include `telegram_audit=info` so the
+    // `info!(target: "telegram_audit", ...)` lines from
+    // `crates/agent/src/telegram/client.rs::post_json_with_response`
+    // reach journald. Pre-fix the audit target sat outside the
+    // `innerwarden_agent` namespace and was filtered out — operator
+    // had no journald visibility into outgoing Telegram traffic
+    // (daily digests, menu callbacks, manual approvals all silent).
+    // The persistent audit lives in `data_dir/telegram-sent.jsonl`
+    // (see `telegram::client::write_audit_jsonl`) so journald log
+    // rotation does not lose the trail.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("innerwarden_agent=info".parse()?),
+                .add_directive("innerwarden_agent=info".parse()?)
+                .add_directive("telegram_audit=info".parse()?),
         )
         .init();
 

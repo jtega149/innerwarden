@@ -1485,6 +1485,74 @@ mod tests {
     }
 
     #[test]
+    fn telegram_audit_target_is_in_main_env_filter() {
+        // 2026-05-01: the telegram audit log uses
+        // `target: "telegram_audit"` (see telegram/client.rs), but
+        // the env_filter in main.rs only allowed
+        // `innerwarden_agent=info`. Result: ALL outgoing telegram
+        // traffic was invisible in journald — daily digests, menu
+        // callbacks, manual approvals, integrity alerts. Operator's
+        // question "auditar o que funciona" had no answer.
+        //
+        // This anchor pins the env_filter directive so a future
+        // refactor of the logging setup cannot silently drop the
+        // audit target again.
+        let main_src = include_str!("../main.rs");
+        assert!(
+            main_src.contains("telegram_audit=info"),
+            "main.rs env_filter must include `telegram_audit=info` so the audit log reaches journald"
+        );
+    }
+
+    #[test]
+    fn telegram_audit_jsonl_path_is_wired_in_boot() {
+        // The persistent JSONL audit (data_dir/telegram-sent.jsonl)
+        // is the durable trail that survives log rotation. Boot must
+        // call set_audit_jsonl_path on the TelegramClient — without
+        // it the persistent file never exists.
+        let boot_src = include_str!("../loops/boot.rs");
+        assert!(
+            boot_src.contains("set_audit_jsonl_path"),
+            "boot.rs must wire the audit jsonl path on the TelegramClient"
+        );
+        assert!(
+            boot_src.contains("telegram-sent.jsonl"),
+            "boot.rs must use telegram-sent.jsonl as the audit filename"
+        );
+    }
+
+    #[test]
+    fn chain_break_audit_table_is_in_schema_v4() {
+        // Schema migration v4 adds the chain_break_audit table.
+        // Anchor pins the v4 SQL so a future migration renumber or
+        // squash does not silently drop the documented-break tracking.
+        let schema_src = include_str!("../../../store/src/schema.rs");
+        assert!(
+            schema_src.contains("CURRENT_VERSION: i64 = 4"),
+            "store schema must be at version 4"
+        );
+        assert!(
+            schema_src.contains("CREATE TABLE IF NOT EXISTS chain_break_audit"),
+            "v4 must create chain_break_audit table"
+        );
+        assert!(
+            schema_src.contains("rowid_start"),
+            "chain_break_audit must have rowid_start column"
+        );
+        assert!(
+            schema_src.contains("rowid_end"),
+            "chain_break_audit must have rowid_end column"
+        );
+        // Verify integration: maintenance.rs hourly tick uses the
+        // documented_breaks field added to HashChainResult.
+        let maint_src = include_str!("../../../store/src/maintenance.rs");
+        assert!(
+            maint_src.contains("documented_breaks"),
+            "maintenance hourly alert must surface documented_breaks count"
+        );
+    }
+
+    #[test]
     fn data_exfil_ebpf_suppresses_ssh_passwd_nss_init() {
         // Sensor anchor: the NSS_INIT_CLI_TOOLS list now includes
         // "ssh" so `git fetch` -> `ssh git@github.com` (or any

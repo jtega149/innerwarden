@@ -21,7 +21,17 @@ use crate::error::{Result, StoreError};
 ///   Existing rows default to 0 (not allowlisted) — the dashboard
 ///   treats those as the operator never had an explicit trust rule
 ///   for them, which matches pre-v3 behaviour.
-pub const CURRENT_VERSION: i64 = 3;
+/// - v4: chain_break_audit table. Documents intentional breaks in
+///   the decisions hash chain (manual SQL recovery, bulk imports,
+///   etc.) so the hourly verifier can distinguish documented
+///   operational breaks from real tampering. Without this, every
+///   manual sweep triggers a permanent hourly Telegram "DATABASE
+///   SECURITY ALERT" — exactly what happened with the 4701-row
+///   manual orphan recovery on 2026-04-29 17:26 UTC. The table is
+///   append-only and consulted by `verify_hash_chain` before
+///   reporting an undocumented break. ISO 27001 audit principle:
+///   intentional breaks must be loggable, never silently rebuilt.
+pub const CURRENT_VERSION: i64 = 4;
 
 /// Initial DDL for schema v1.
 const SCHEMA_V1: &str = r#"
@@ -202,6 +212,9 @@ fn run_migrations(conn: &Connection, from_version: i64) -> Result<()> {
     if from_version < 3 {
         apply_v3(conn)?;
     }
+    if from_version < 4 {
+        apply_v4(conn)?;
+    }
 
     info!(
         from = from_version,
@@ -313,6 +326,53 @@ fn apply_v3(conn: &Connection) -> Result<()> {
             3_i64,
             chrono::Utc::now().to_rfc3339(),
             "incidents.is_allowlisted column + partial index (audit RC-2 / Phase 7)"
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// v4 migration: add `chain_break_audit` table.
+///
+/// Records intentional gaps in the decisions hash chain (operator
+/// recovery sweeps, bulk migrations, schema rewrites) so the verifier
+/// can distinguish documented operational breaks from undocumented
+/// tampering. The table is consulted by `Store::verify_hash_chain`
+/// BEFORE reporting an undocumented `broken_at` row.
+///
+/// Range semantics: a single registration covers `[rowid_start,
+/// rowid_end]` inclusive. Bulk inserts that drop 4000+ rows with
+/// non-canonical hashes get one row in this table, not 4000.
+///
+/// Idempotent: re-running this migration on a DB where the table
+/// already exists is a no-op (CREATE TABLE IF NOT EXISTS).
+fn apply_v4(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chain_break_audit (
+            id                  INTEGER PRIMARY KEY,
+            rowid_start         INTEGER NOT NULL,
+            rowid_end           INTEGER NOT NULL,
+            registered_at       TEXT NOT NULL,
+            operator            TEXT NOT NULL,
+            reason              TEXT NOT NULL,
+            prev_chain_end_hash TEXT,
+            CHECK (rowid_end >= rowid_start)
+        )",
+        [],
+    )?;
+    // Index by start so verify_hash_chain can binary-probe whether a
+    // given rowid is in any documented range.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chain_break_start \
+         ON chain_break_audit(rowid_start, rowid_end)",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO schema_version (version, migrated_at, notes) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            4_i64,
+            chrono::Utc::now().to_rfc3339(),
+            "chain_break_audit table — documents intentional decisions hash chain breaks"
         ],
     )?;
 

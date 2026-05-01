@@ -42,6 +42,36 @@ pub struct TelegramClient {
     /// Cumulative count of successful sendMessage calls in real API mode.
     /// This is wired to telemetry snapshots for spec-024 drift metrics.
     telegram_sent_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// 2026-05-01: persistent JSONL audit of every outbound Telegram
+    /// message — incident alerts, daily digests, menu callbacks,
+    /// manual approvals, integrity alerts. The JSONL file lives in
+    /// `data_dir/telegram-sent.jsonl` and survives log rotation
+    /// (unlike journald). Each line: `{ts, method, text, chat_id,
+    /// has_keyboard}`. The journald `target: "telegram_audit"`
+    /// stream still fires when env_filter allows it, but this file
+    /// is the durable record the operator can grep / point an audit
+    /// tool at without relying on journalctl retention. Set via
+    /// `set_audit_jsonl_path` from the boot wiring.
+    audit_jsonl: Option<PathBuf>,
+}
+
+/// 2026-05-01: append a single JSON record as one line to `path`.
+/// Used by the persistent telegram audit trail. Creates the parent
+/// directory + file as needed. Caller must already hold the actor's
+/// guarantee that concurrent writes are safe (the underlying OS
+/// `O_APPEND` is atomic per write on Linux for lines < PIPE_BUF, and
+/// our records are under 64KiB by construction).
+fn append_jsonl_line(path: &std::path::Path, record: &serde_json::Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    use std::io::Write;
+    writeln!(f, "{}", record)?;
+    Ok(())
 }
 
 /// Returns the mock outbox path iff the process is running in mock telegram
@@ -95,7 +125,16 @@ impl TelegramClient {
             )),
             mock_outbox,
             telegram_sent_counter: None,
+            audit_jsonl: None,
         })
+    }
+
+    /// Wire the persistent JSONL audit path (typically
+    /// `data_dir/telegram-sent.jsonl`). Called once at boot from the
+    /// agent wiring after the data_dir is known. When unset, the
+    /// audit is journald-only.
+    pub fn set_audit_jsonl_path(&mut self, path: PathBuf) {
+        self.audit_jsonl = Some(path);
     }
 
     /// Returns true when this client is intercepting outbound HTTP to a mock
@@ -1443,7 +1482,14 @@ impl TelegramClient {
         method: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        // Audit log: record every outgoing Telegram message for debugging notification noise.
+        // Audit log: record every outgoing Telegram message for
+        // debugging notification noise. Two sinks:
+        //   1. journald via `target: "telegram_audit"` (env_filter
+        //      includes this target as of 2026-05-01).
+        //   2. persistent JSONL at `data_dir/telegram-sent.jsonl` so
+        //      the trail survives log rotation. Append-only, fail-
+        //      open: a write failure logs a warn but does NOT abort
+        //      the actual send.
         if method == "sendMessage" {
             let text_preview = body["text"]
                 .as_str()
@@ -1458,6 +1504,26 @@ impl TelegramClient {
                 text_preview = %text_preview,
                 "Telegram outgoing message"
             );
+            if let Some(path) = &self.audit_jsonl {
+                let record = serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "method": method,
+                    "chat_id": self.chat_id,
+                    "text_preview": text_preview,
+                    // The full text is captured too. The dashboard
+                    // audit view truncates display; consumers that
+                    // need length stats read from this field.
+                    "text": body["text"].as_str().unwrap_or(""),
+                    "has_keyboard": body.get("reply_markup").is_some(),
+                });
+                if let Err(e) = append_jsonl_line(path, &record) {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "telegram audit jsonl write failed (non-fatal — send proceeds)"
+                    );
+                }
+            }
         }
 
         // Enforce message length limit on outgoing text
@@ -1774,6 +1840,7 @@ mod tests {
             alert_counter_hour: Arc::new(AtomicU32::new(current_hour)),
             mock_outbox: None,
             telegram_sent_counter: None,
+            audit_jsonl: None,
         })
     }
 
@@ -2926,5 +2993,68 @@ mod tests {
                 .contains("spec-024"));
             Ok(())
         }
+    }
+
+    /// 2026-05-01: persistent audit jsonl regression. The operator's
+    /// question "auditar o que funciona" had no usable answer
+    /// because env_filter dropped the journald audit and there was
+    /// no durable file. This test pins:
+    ///   1. `set_audit_jsonl_path` records the path
+    ///   2. every send appends a JSON record with required fields
+    ///   3. fail-open: a write failure does not abort the send path
+    #[tokio::test]
+    async fn telegram_audit_jsonl_appends_one_line_per_send() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mock_path = dir.path().join("mock-outbox.jsonl");
+        std::env::set_var("INNERWARDEN_MOCK_TELEGRAM", "1");
+        std::env::set_var("INNERWARDEN_MOCK_TELEGRAM_PATH", &mock_path);
+        let mut client = TelegramClient::new("dummy-token", "dummy-chat", None)?;
+        let audit_path = dir.path().join("telegram-sent.jsonl");
+        client.set_audit_jsonl_path(audit_path.clone());
+
+        client.send_text_message("hello operator").await?;
+        client.send_text_message("second send").await?;
+
+        let content = std::fs::read_to_string(&audit_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "two sends → two audit lines");
+        let first: serde_json::Value = serde_json::from_str(lines[0])?;
+        for field in [
+            "ts",
+            "method",
+            "chat_id",
+            "text_preview",
+            "text",
+            "has_keyboard",
+        ] {
+            assert!(
+                first.get(field).is_some(),
+                "audit record missing required field {field}"
+            );
+        }
+        assert_eq!(first["method"], "sendMessage");
+        assert_eq!(first["text"], "hello operator");
+        assert_eq!(first["has_keyboard"], false);
+        std::env::remove_var("INNERWARDEN_MOCK_TELEGRAM");
+        std::env::remove_var("INNERWARDEN_MOCK_TELEGRAM_PATH");
+        Ok(())
+    }
+
+    #[test]
+    fn append_jsonl_line_creates_parent_directory_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        // Path nested in a not-yet-existing subdir.
+        let path = dir.path().join("nested/deep/audit.jsonl");
+        let r1 = serde_json::json!({"a": 1});
+        let r2 = serde_json::json!({"a": 2});
+        append_jsonl_line(&path, &r1).unwrap();
+        append_jsonl_line(&path, &r2).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let parsed1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let parsed2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(parsed1["a"], 1);
+        assert_eq!(parsed2["a"], 2);
     }
 }
