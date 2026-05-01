@@ -110,6 +110,22 @@ function renderVerdictCard(j) {
   const statusColor = isContained ? 'var(--ok)' : v.containment_status === 'active' ? 'var(--danger)' : 'var(--muted)';
   const statusLabel = isContained ? 'Contained' : v.containment_status === 'active' ? 'Active — needs attention' : 'Under review';
   const confColor = v.confidence === 'high' ? 'var(--ok)' : v.confidence === 'medium' ? 'var(--warn)' : 'var(--muted)';
+  // Audit 2.3 phase 2: surface a "what's in this journey" scale line
+  // immediately below the verdict verb. The operator sees decision /
+  // event counts before scrolling. JourneySummary always carries
+  // these fields so the helper renders empty parts gracefully when
+  // any are zero (skips the segment instead of "0 events").
+  const s = j.summary || {};
+  const summaryParts = [];
+  if (s.events_count) summaryParts.push(s.events_count + ' event' + (s.events_count === 1 ? '' : 's') + ' analysed');
+  if (s.incidents_count) summaryParts.push(s.incidents_count + ' incident' + (s.incidents_count === 1 ? '' : 's'));
+  if (s.decisions_count) summaryParts.push(s.decisions_count + ' decision' + (s.decisions_count === 1 ? '' : 's') + ' taken');
+  if (s.honeypot_count) summaryParts.push(s.honeypot_count + ' honeypot session' + (s.honeypot_count === 1 ? '' : 's'));
+  const summaryLine = summaryParts.length
+    ? '<div class="verdict-scale" style="margin-top:6px;font-size:0.66rem;color:var(--muted);letter-spacing:0.02em">' +
+      esc(summaryParts.join(' · ')) +
+      '</div>'
+    : '';
   return `
     <div class="verdict-card" style="padding:12px 16px">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -120,6 +136,7 @@ function renderVerdictCard(j) {
         </span>
         ${v.entry_vector && v.entry_vector !== 'unknown' ? '<span style="font-size:0.62rem;color:var(--dim)">·</span><span style="font-size:0.68rem;color:var(--muted)">' + humanLabel(v.entry_vector) + '</span>' : ''}
       </div>
+      ${summaryLine}
     </div>`;
 }
 

@@ -125,6 +125,16 @@ function buildGroupedList(items) {
   } else {
     if (titleEl) titleEl.textContent = 'AI Defense Log';
   }
+  // Audit 2.6 partial: status dropdown filter. Restricts the
+  // grouped list to a single outcome bucket. Country / campaign /
+  // playbook-outcome / AI confidence band require backend extension
+  // and ship in their own spec.
+  var statusFilter = (state.filters && state.filters.status) || '';
+  if (statusFilter) {
+    items = items.filter(function(item) {
+      return outcomeOf(item) === statusFilter;
+    });
+  }
 
   // Group by outcome (what the AI did), not by detector (what was found).
   var seen = {};

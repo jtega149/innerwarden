@@ -7,7 +7,11 @@ const state = {
     compare_date: '',
     severity_min: '',
     detector: '',
-    window_seconds: ''
+    window_seconds: '',
+    // Audit 2.6 partial: outcome bucket filter (blocked / monitoring /
+    // honeypot / needs_attention / dismissed / allowlisted). Empty
+    // string keeps every bucket visible (default).
+    status: ''
   },
   clusters: [],
   knownItemValues: new Set(),  // D7: tracks rendered entity values for diff
@@ -62,6 +66,7 @@ function syncFiltersFromUi() {
   state.filters.severity_min = document.getElementById('flt-severity').value || '';
   state.filters.detector = (document.getElementById('flt-detector').value || '').trim();
   state.filters.window_seconds = document.getElementById('flt-window').value || '';
+  state.filters.status = document.getElementById('flt-status').value || '';
 }
 
 function hydrateStateFromQuery() {
@@ -83,6 +88,7 @@ function hydrateStateFromQuery() {
   state.filters.severity_min = (qs.get('severity_min') || '').trim();
   state.filters.detector = (qs.get('detector') || '').trim();
   state.filters.window_seconds = (qs.get('window_seconds') || '').trim();
+  state.filters.status = (qs.get('status') || '').trim();
 
   const subjectType = (qs.get('subject_type') || '').trim();
   const subject = (qs.get('subject') || '').trim();
@@ -99,6 +105,7 @@ function syncUrl() {
     severity_min: state.filters.severity_min,
     detector: state.filters.detector,
     window_seconds: state.filters.window_seconds,
+    status: state.filters.status,
     subject_type: state.selected.value ? state.selected.type : '',
     subject: state.selected.value ? state.selected.value : '',
   });

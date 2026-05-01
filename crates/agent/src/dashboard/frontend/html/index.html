@@ -47,9 +47,16 @@
       <input type="checkbox" id="hideAllowlisted" checked style="display:none">
     </div>
     <span id="refreshStatus"></span>
+    <!-- Audit 4.6: Responses promoted to top-level (between Threats
+         and Health). It's the operator's action panel; hiding it
+         under More was a UX bug. Reading order matches operator
+         workflow: Home → Threats → Responses → Health → Intel.
+         Sensors / Report / Honeypot / Compliance / Monthly stay in
+         More since they are review surfaces, not action surfaces. -->
     <div class="main-nav">
       <button type="button" class="main-nav-btn active" id="navHome" onclick="showView('home')" aria-label="Home overview">Home</button>
       <button type="button" class="main-nav-btn" id="navInvestigate" onclick="showView('investigate')" aria-label="Threat investigation">Threats</button>
+      <button type="button" class="main-nav-btn" id="navResponses" onclick="showView('responses')" aria-label="Active responses">Responses</button>
       <button type="button" class="main-nav-btn" id="navStatus" onclick="showView('status')" aria-label="System health">Health</button>
       <button type="button" class="main-nav-btn" id="navIntel" onclick="showView('intel')" aria-label="Intelligence profiles">Intel</button>
       <div class="nav-more-wrap">
@@ -60,7 +67,6 @@
           <button type="button" class="nav-more-item" id="navHoneypot" onclick="showView('honeypot')">Honeypot</button>
           <button type="button" class="nav-more-item" id="navCompliance" onclick="showView('compliance')">Compliance</button>
           <button type="button" class="nav-more-item" id="navMonthly" onclick="showView('monthly')">Monthly</button>
-          <button type="button" class="nav-more-item" id="navResponses" onclick="showView('responses')">Responses</button>
         </div>
       </div>
     </div>
@@ -291,6 +297,21 @@
             <option value="critical">critical+</option>
             <option value="high">high+</option>
             <option value="medium">medium+</option>
+          </select>
+          <!-- Audit 2.6 partial: status filter on outcome buckets so the
+               operator can narrow the threats list to "Blocked",
+               "Observing", "Needs attention", "Dismissed", "Allowlisted",
+               or "Honeypot" without scrolling each group. Country,
+               campaign, playbook outcome, AI confidence band defer to
+               their own backend extension spec. -->
+          <select id="flt-status" title="Show only attackers in this outcome bucket">
+            <option value="">status: any</option>
+            <option value="needs_attention">needs attention</option>
+            <option value="blocked">blocked</option>
+            <option value="monitoring">observing</option>
+            <option value="honeypot">honeypot</option>
+            <option value="dismissed">dismissed</option>
+            <option value="allowlisted">allowlisted</option>
           </select>
           <!-- Phase 14: <datalist> autocomplete with known detectors
                so operator doesn't have to remember the exact slug. -->

@@ -267,6 +267,7 @@ document.getElementById('flt-compare-date').value = state.filters.compare_date |
 document.getElementById('flt-severity').value = state.filters.severity_min || '';
 document.getElementById('flt-detector').value = state.filters.detector || '';
 document.getElementById('flt-window').value = state.filters.window_seconds || '';
+document.getElementById('flt-status').value = state.filters.status || '';
 updatePivotUi();
 loadActionConfig();
 loadReportDates();
@@ -319,6 +320,7 @@ document.getElementById('flt-compare-date').addEventListener('change', () => {
   refreshLeft(false);
 });
 document.getElementById('flt-window').addEventListener('change', () => refreshLeft(true));
+document.getElementById('flt-status').addEventListener('change', () => refreshLeft(true));
 document.getElementById('entitySearch').addEventListener('input', applyEntitySearch);
 
 // Initial data load — route first, then load data for visible view

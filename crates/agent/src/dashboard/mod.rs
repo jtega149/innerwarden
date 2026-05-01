@@ -3132,6 +3132,130 @@ mod tests {
     }
 
     #[test]
+    fn nav_promotes_responses_to_top_level() {
+        // Audit 4.6: Responses moved out of the More dropdown into a
+        // top-level button between Threats and Health. The dropdown
+        // must no longer carry navResponses; the top-level row must.
+        let html = INDEX_HTML;
+        let main_nav_start = html
+            .find("class=\"main-nav\"")
+            .expect("main-nav block must exist");
+        let nav_more_start = html[main_nav_start..]
+            .find("class=\"nav-more-menu\"")
+            .map(|p| main_nav_start + p)
+            .expect("nav-more-menu block must exist");
+        let main_row = &html[main_nav_start..nav_more_start];
+        let more_block_end = html[nav_more_start..]
+            .find("</div>")
+            .map(|p| nav_more_start + p)
+            .expect("more menu close tag");
+        let more_block = &html[nav_more_start..more_block_end];
+
+        assert!(
+            main_row.contains("id=\"navResponses\""),
+            "navResponses must live in the top-level main-nav row (audit 4.6)"
+        );
+        assert!(
+            !more_block.contains("id=\"navResponses\""),
+            "navResponses must NOT remain in the More dropdown (audit 4.6)"
+        );
+        // The other secondary tabs must still be inside the dropdown
+        // — the refactor only promotes Responses, not the rest.
+        for id in [
+            "navSensors",
+            "navReport",
+            "navHoneypot",
+            "navCompliance",
+            "navMonthly",
+        ] {
+            assert!(
+                more_block.contains(id),
+                "{id} must remain in the More dropdown — only Responses was promoted"
+            );
+        }
+        // nav.js drops `responses` from the secondaryTabs list so the
+        // showView dispatcher does not still treat it as a More item.
+        // Other `'responses'` mentions (the views/btns id maps,
+        // loadResponses dispatch) must stay — only the secondary-tab
+        // membership is wrong after the promotion.
+        let nav = JS_NAV;
+        let secondary_start = nav
+            .find("_secondaryTabs = [")
+            .expect("_secondaryTabs declaration");
+        let secondary_end = nav[secondary_start..]
+            .find("];")
+            .map(|p| secondary_start + p)
+            .expect("_secondaryTabs end");
+        let secondary_block = &nav[secondary_start..secondary_end];
+        assert!(
+            !secondary_block.contains("'responses'"),
+            "nav.js _secondaryTabs must drop 'responses' after the promotion (audit 4.6)"
+        );
+    }
+
+    #[test]
+    fn threats_status_filter_dropdown_wired_end_to_end() {
+        // Audit 2.6 partial: outcome bucket filter shipped client-side.
+        // The HTML control, state field, sync helper, and grouped-list
+        // filter must agree on the field name `status` so selecting a
+        // bucket actually narrows the rendered list.
+        assert!(
+            INDEX_HTML.contains("id=\"flt-status\""),
+            "flt-status dropdown missing from advanced filters (audit 2.6 partial)"
+        );
+        assert!(
+            JS_STATE.contains("status: ''"),
+            "state.filters.status default missing — operator picks an outcome and the filter is lost on refresh"
+        );
+        assert!(
+            JS_STATE.contains("state.filters.status = document.getElementById('flt-status').value")
+        );
+        assert!(
+            JS_THREATS.contains("state.filters && state.filters.status"),
+            "buildGroupedList must read state.filters.status (audit 2.6 partial)"
+        );
+        // The status options the dropdown exposes must exist in the
+        // outcomeOf domain so the filter is non-empty for every choice.
+        for outcome in [
+            "needs_attention",
+            "blocked",
+            "monitoring",
+            "honeypot",
+            "dismissed",
+            "allowlisted",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("value=\"{outcome}\"")),
+                "flt-status must expose '{outcome}' option (audit 2.6 partial)"
+            );
+        }
+    }
+
+    #[test]
+    fn journey_verdict_card_includes_scale_summary() {
+        // Audit 2.3 phase 2: verdict card now surfaces a one-line
+        // "X events analysed · Y incidents · Z decisions taken" sub-row
+        // so the operator sees the journey's scale before scrolling.
+        // The renderer reads `j.summary.*` which JourneySummary
+        // always populates — anchor pins the field reads.
+        for field in [
+            "s.events_count",
+            "s.incidents_count",
+            "s.decisions_count",
+            "s.honeypot_count",
+        ] {
+            assert!(
+                JS_JOURNEY.contains(field),
+                "renderVerdictCard must read {field} for the scale line (audit 2.3 phase 2)"
+            );
+        }
+        assert!(
+            JS_JOURNEY.contains("verdict-scale"),
+            "verdict-scale CSS class missing — the scale line cannot be styled (audit 2.3 phase 2)"
+        );
+    }
+
+    #[test]
     fn honeypot_js_separates_engaged_from_listener_only_sessions() {
         // Audit 2.9: honeypot tab USED to display 178 sessions all
         // with 0 commands / 0 auth attempts and read like "honeypot

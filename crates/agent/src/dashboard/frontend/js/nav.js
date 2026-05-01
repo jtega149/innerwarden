@@ -24,8 +24,11 @@ function toggleLeftPanel() {
 }
 
 // ── D10 - View switcher ──────────────────────────────────────────────────
-const _secondaryTabs = ['sensors','report','honeypot','compliance','monthly','responses','graph'];
-const _secondaryLabels = { sensors:'Sensors', report:'Report', honeypot:'Honeypot', compliance:'Compliance', monthly:'Monthly', responses:'Responses', graph:'Graph' };
+// Audit 4.6: `responses` is now a top-level nav button, so it no
+// longer needs to live in the More dropdown's secondary list. The
+// dropdown only carries review surfaces (no operator-action surfaces).
+const _secondaryTabs = ['sensors','report','honeypot','compliance','monthly','graph'];
+const _secondaryLabels = { sensors:'Sensors', report:'Report', honeypot:'Honeypot', compliance:'Compliance', monthly:'Monthly', graph:'Graph' };
 
 function toggleMoreMenu() {
   const m = document.getElementById('moreMenu');
