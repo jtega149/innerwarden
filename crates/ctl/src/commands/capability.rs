@@ -137,11 +137,22 @@ pub(crate) fn cmd_disable(
     id: &str,
     yes: bool,
 ) -> Result<()> {
+    cmd_disable_with_deferred_restart(cli, registry, id, yes, false)
+}
+
+pub(crate) fn cmd_disable_with_deferred_restart(
+    cli: &Cli,
+    registry: &CapabilityRegistry,
+    id: &str,
+    yes: bool,
+    defer_restarts: bool,
+) -> Result<()> {
     if !cli.dry_run {
         require_sudo(cli);
     }
     let cap = registry.get(id).ok_or_else(|| unknown_cap_error(id))?;
-    let opts = make_opts(cli, HashMap::new(), yes);
+    let mut opts = make_opts(cli, HashMap::new(), yes);
+    opts.defer_restarts = defer_restarts;
 
     if !cap.is_enabled(&opts) {
         println!("Capability '{}' is not enabled. Nothing to do.", cap.id());
@@ -204,6 +215,27 @@ pub(crate) fn cmd_disable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use tempfile::TempDir;
+
+    fn test_cli(temp: &TempDir, dry_run: bool) -> Cli {
+        let mut cli = Cli::parse_from(["innerwarden", "replay"]);
+        cli.sensor_config = temp.path().join("sensor.toml");
+        cli.agent_config = temp.path().join("agent.toml");
+        cli.data_dir = temp.path().join("data");
+        cli.dry_run = dry_run;
+        std::fs::create_dir_all(&cli.data_dir).expect("test should create data dir");
+        std::fs::write(&cli.sensor_config, "").expect("test should create sensor config");
+        std::fs::write(&cli.agent_config, "").expect("test should create agent config");
+        cli
+    }
+
+    fn ollama_params() -> HashMap<String, String> {
+        HashMap::from([
+            ("provider".to_string(), "ollama".to_string()),
+            ("model".to_string(), "mistral".to_string()),
+        ])
+    }
 
     #[test]
     fn confirmation_accepted_allows_empty_response() {
@@ -269,6 +301,183 @@ mod tests {
         ];
         let parsed = parse_params(&raw).expect("duplicate keys should still parse");
         assert_eq!(parsed.get("level").expect("level key"), "critical");
+    }
+
+    #[test]
+    fn cmd_enable_unknown_capability_returns_helpful_error() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, true);
+        let registry = CapabilityRegistry::default_all();
+
+        let err = cmd_enable(&cli, &registry, "not-a-cap", HashMap::new(), true)
+            .expect_err("unknown capability should error");
+
+        assert!(err.to_string().contains("not-a-cap"));
+        assert!(err.to_string().contains("innerwarden list"));
+    }
+
+    #[test]
+    fn cmd_enable_preflight_failure_stops_before_changes() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, true);
+        let registry = CapabilityRegistry::default_all();
+        let params = HashMap::from([("provider".to_string(), "unknown-provider".to_string())]);
+
+        let err = cmd_enable(&cli, &registry, "ai", params, true)
+            .expect_err("failed preflight should stop enable");
+
+        assert!(err.to_string().contains("preflight checks failed"));
+        assert!(!crate::config_editor::read_bool(
+            &cli.agent_config,
+            "ai",
+            "enabled"
+        ));
+    }
+
+    #[test]
+    fn cmd_enable_dry_run_leaves_config_unchanged() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, true);
+        let registry = CapabilityRegistry::default_all();
+
+        cmd_enable(&cli, &registry, "ai", ollama_params(), true)
+            .expect("dry-run enable should succeed");
+
+        assert!(!crate::config_editor::read_bool(
+            &cli.agent_config,
+            "ai",
+            "enabled"
+        ));
+    }
+
+    #[test]
+    fn cmd_enable_with_deferred_restart_applies_ai_config_and_audit() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, false);
+        let registry = CapabilityRegistry::default_all();
+
+        cmd_enable_with_deferred_restart(&cli, &registry, "ai", ollama_params(), true, true)
+            .expect("enable should apply with deferred restart");
+
+        let config = std::fs::read_to_string(&cli.agent_config).expect("test should read config");
+        config
+            .parse::<toml_edit::DocumentMut>()
+            .expect("command should write valid TOML");
+        assert!(crate::config_editor::read_bool(
+            &cli.agent_config,
+            "ai",
+            "enabled"
+        ));
+        assert_eq!(
+            crate::config_editor::read_str(&cli.agent_config, "ai", "provider"),
+            "ollama"
+        );
+        assert_eq!(
+            crate::config_editor::read_str(&cli.agent_config, "ai", "model"),
+            "mistral"
+        );
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let audit_path = cli.data_dir.join(format!("admin-actions-{today}.jsonl"));
+        let audit = std::fs::read_to_string(audit_path).expect("enable should write audit entry");
+        assert!(audit.contains("\"action\":\"enable\""));
+        assert!(audit.contains("\"target\":\"ai\""));
+    }
+
+    #[test]
+    fn cmd_enable_returns_ok_when_capability_already_enabled() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, false);
+        let registry = CapabilityRegistry::default_all();
+        std::fs::write(
+            &cli.agent_config,
+            "[ai]\nenabled = true\nprovider = \"ollama\"\nmodel = \"mistral\"\n",
+        )
+        .expect("test should write enabled config");
+
+        cmd_enable(&cli, &registry, "ai", ollama_params(), true)
+            .expect("already-enabled capability should be a no-op");
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(!cli
+            .data_dir
+            .join(format!("admin-actions-{today}.jsonl"))
+            .exists());
+    }
+
+    #[test]
+    fn cmd_disable_unknown_capability_returns_helpful_error() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, true);
+        let registry = CapabilityRegistry::default_all();
+
+        let err = cmd_disable(&cli, &registry, "not-a-cap", true)
+            .expect_err("unknown capability should error");
+
+        assert!(err.to_string().contains("not-a-cap"));
+        assert!(err.to_string().contains("innerwarden list"));
+    }
+
+    #[test]
+    fn cmd_disable_dry_run_for_enabled_capability_returns_ok() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, true);
+        let registry = CapabilityRegistry::default_all();
+        std::fs::write(
+            &cli.agent_config,
+            "[ai]\nenabled = true\nprovider = \"ollama\"\n",
+        )
+        .expect("test should write enabled config");
+
+        cmd_disable(&cli, &registry, "ai", true).expect("dry-run disable should succeed");
+
+        assert!(crate::config_editor::read_bool(
+            &cli.agent_config,
+            "ai",
+            "enabled"
+        ));
+    }
+
+    #[test]
+    fn cmd_disable_with_deferred_restart_applies_ai_config_and_audit() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, false);
+        let registry = CapabilityRegistry::default_all();
+        std::fs::write(
+            &cli.agent_config,
+            "[ai]\nenabled = true\nprovider = \"ollama\"\n",
+        )
+        .expect("test should write enabled config");
+
+        cmd_disable_with_deferred_restart(&cli, &registry, "ai", true, true)
+            .expect("disable should apply with deferred restart");
+
+        assert!(!crate::config_editor::read_bool(
+            &cli.agent_config,
+            "ai",
+            "enabled"
+        ));
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let audit_path = cli.data_dir.join(format!("admin-actions-{today}.jsonl"));
+        let audit = std::fs::read_to_string(audit_path).expect("disable should write audit entry");
+        assert!(audit.contains("\"action\":\"disable\""));
+        assert!(audit.contains("\"target\":\"ai\""));
+    }
+
+    #[test]
+    fn cmd_disable_returns_ok_when_capability_already_disabled() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp, false);
+        let registry = CapabilityRegistry::default_all();
+
+        cmd_disable(&cli, &registry, "ai", true)
+            .expect("already-disabled capability should be a no-op");
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(!cli
+            .data_dir
+            .join(format!("admin-actions-{today}.jsonl"))
+            .exists());
     }
 
     // ---- Toggle state-transition tests (Issue #141) ----
