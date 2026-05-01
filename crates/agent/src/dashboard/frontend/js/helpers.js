@@ -184,6 +184,23 @@ function syncModeBadgeFromHealth(overview, modeCfg) {
     );
     return;
   }
+  // 2026-05-01 audit fix (1.2): "Operating normally with maintenance
+  // debt" badge so the persistent header pill stops claiming
+  // PROTECTED while the hero shows orphaned/revert-failure/no-
+  // executor reasons. First reason is appended to the title so an
+  // operator hovering sees the headline without leaving the page.
+  if (health && health.kind === 'degraded') {
+    var degReasons = Array.isArray(health.reasons) ? health.reasons : [];
+    var hover = 'Chronic drift requires operator attention. ' +
+      (degReasons[0] || 'See system health for the full list.');
+    setBadgeWithIcon(
+      'alert-circle',
+      'OPERATIONAL DEBT',
+      'status-badge-medium',
+      hover
+    );
+    return;
+  }
   // Steady state: restore the mode badge from cached actionCfg.
   // Source of truth is actions.js — we mirror it here.
   if (modeCfg) {

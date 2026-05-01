@@ -435,6 +435,29 @@ function computeHomeState(payload) {
     };
   }
 
+  // 2026-05-01 audit fix (1.2): the backend now emits a `degraded`
+  // verb when chronic drift exists (historical orphaned responses,
+  // accumulated revert failures, playbook engine without an
+  // executor). None of those is an immediate emergency, but
+  // showing a green PROTECTED banner over them is the silent-
+  // failure mode the audit caught. Yellow signal with the backend's
+  // reason list as both headline and drill-down.
+  if (healthVerb && healthVerb.kind === 'degraded') {
+    var degReasons = Array.isArray(healthVerb.reasons) ? healthVerb.reasons : [];
+    var degHead = degReasons[0] || 'System has chronic maintenance debt';
+    return {
+      state: 'degraded',
+      maxSeverity: 'medium',
+      heroClass: 'status-hero alert-medium',
+      heroIcon: lucideIcon('alert-circle', { size: 28 }),
+      heroTitle: 'Operational with maintenance debt',
+      heroSub: degHead,
+      // Backward-compat: home.js already renders this list when present.
+      // Reuse it instead of inventing a new field.
+      healthAlertReasons: degReasons
+    };
+  }
+
   // Phase 9: "Abandoned backlog" — plain-English copy. Operator
   // sees "Cleaning up" verb instead of jargon. Yellow signal stays
   // because something IS happening (sweep) but it's not a real

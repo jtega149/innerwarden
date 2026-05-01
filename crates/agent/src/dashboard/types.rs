@@ -190,7 +190,7 @@ pub(crate) struct OverviewSnapshot {
 /// which generated false-positive system-health alerts whenever a
 /// past hour had any decisionless incident even though the AI was
 /// processing normally.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SystemHealth {
     /// AI is processing decisions in normal cadence; pending count
@@ -217,6 +217,17 @@ pub(crate) enum SystemHealth {
         stuck_count: usize,
         last_decision_secs_ago: Option<i64>,
     },
+    /// 2026-05-01 dashboard QA audit finding 1.2: the green PROTECTED
+    /// banner was sitting on top of 17 orphaned + 111 revert
+    /// failures + 1393 expired responses + a playbook engine that
+    /// records intent but never executes any step. None of those is
+    /// an "AI is down right now" emergency, so they did not trip the
+    /// existing red verbs. They are a chronic cumulative drift —
+    /// silent failures that the banner must not conceal. `Degraded`
+    /// turns the badge yellow with operator-readable reasons. The
+    /// reason strings are user-facing and appear on the banner; keep
+    /// them short, specific, and actionable (e.g. include numbers).
+    Degraded { reasons: Vec<String> },
 }
 
 /// One pair of counters per outcome. The pair (`incidents`,

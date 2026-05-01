@@ -144,6 +144,7 @@ pub(super) fn compute_overview_counts_from_sqlite(
     sev_min_rank: u8,
     detector_substring: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
+    degraded: &DegradedSignals,
 ) -> Option<OverviewCounts> {
     use super::types::{BucketStats, OutcomeBuckets, OverviewSnapshot, PendingBreakdown};
 
@@ -525,7 +526,7 @@ pub(super) fn compute_overview_counts_from_sqlite(
     top_detectors.sort_by(|a, b| b.count.cmp(&a.count).then(a.detector.cmp(&b.detector)));
     top_detectors.truncate(6);
 
-    let health = derive_system_health(&pending, last_decision_secs_ago);
+    let health = derive_system_health(&pending, last_decision_secs_ago, degraded);
 
     let events_today = 0; // backfilled below from telemetry by the caller
     counts.snapshot = Some(OverviewSnapshot {
@@ -540,6 +541,88 @@ pub(super) fn compute_overview_counts_from_sqlite(
     Some(counts)
 }
 
+/// Read totals from the response lifecycle JSON (SQLite blob first,
+/// then `data_dir/responses.json` fallback — same precedence as the
+/// `/api/responses` handler) and stitch in the playbook-executor
+/// constant. The function is best-effort: any read or parse failure
+/// returns `Default::default()` so a transient I/O hiccup never
+/// flips the banner red on its own. The caller (api_overview) treats
+/// this as a snapshot input, not a critical-path read.
+pub(super) fn read_degraded_signals(state: &super::state::DashboardState) -> DegradedSignals {
+    let raw = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| sq.get_blob("responses").ok().flatten())
+        .or_else(|| {
+            let canonical = std::fs::canonicalize(&state.data_dir).ok()?;
+            let target = canonical.join("responses.json");
+            if !target.starts_with(&canonical) {
+                return None;
+            }
+            std::fs::read_to_string(target).ok()
+        });
+    let mut signals = DegradedSignals::default();
+    if let Some(text) = raw {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            let totals = v.get("totals");
+            signals.orphaned_total = totals
+                .and_then(|t| t.get("orphaned"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            signals.revert_failures_total = totals
+                .and_then(|t| t.get("revert_failures"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+        }
+    }
+    // Playbook executor constant (true = missing). The flag flips to
+    // false when `tracked-spec-playbook-execution` lands an actual
+    // step runner; until then every PlaybookExecution stays
+    // `pending` forever. Documented in
+    // `.claude-local/AUDIT_2026-05-01_dashboard.md` finding 1.5.
+    signals.playbook_executor_missing = true;
+    signals
+}
+
+/// Inputs to `derive_system_health` that surface chronic drift
+/// rather than acute pipeline emergencies. None of these tip the
+/// system into a red verb on their own — they accumulate from
+/// historical orphaned/failed responses and from architectural gaps
+/// (playbook engine recording intent without an executor). Their
+/// purpose is to block the green PROTECTED banner from sitting over
+/// silent failures (2026-05-01 dashboard QA audit finding 1.2).
+///
+/// Numbers are operator-visible — they get embedded in the reason
+/// strings on the banner. Keep them honest. Zero is the only value
+/// that is allowed to disappear from the UI.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DegradedSignals {
+    /// Cumulative orphaned-response count from `responses.json`
+    /// totals (`response_lifecycle::total_orphaned`). An "orphaned"
+    /// response is one where the agent gave up retrying revert; the
+    /// rule may still be live in kernel/firewall and is now invisible
+    /// to the lifecycle. Any non-zero value is a real maintenance
+    /// debt the operator should see.
+    pub(super) orphaned_total: u64,
+    /// Cumulative revert-failure count (`response_lifecycle::total_revert_failures`).
+    /// Distinct from `orphaned`: a single response can rack up many
+    /// revert failures before the retry budget is exhausted and it
+    /// gets orphaned. Tracks the rate of "tried to undo, kernel/firewall
+    /// rejected" — a non-zero total indicates either a config drift
+    /// (rule was rewritten by an external tool) or a backend bug.
+    pub(super) revert_failures_total: u64,
+    /// True when the playbook engine has no step executor wired (it
+    /// builds `PlaybookExecution` records with every step `pending`
+    /// and persists them, but no code transitions them to
+    /// `running/success/failed`). 2026-05-01 audit finding 1.5
+    /// (verified via `playbook-log.json` — 19 intents, all 100%
+    /// pending). Track here so the banner does not lie about an
+    /// automated-response chain that genuinely does not exist yet.
+    /// Spec `tracked-spec-playbook-execution` will land the
+    /// executor; until then this stays `true`.
+    pub(super) playbook_executor_missing: bool,
+}
+
 /// Derive the operator-visible health verb from the pending
 /// breakdown plus the freshness of the most recent decision.
 ///
@@ -552,6 +635,13 @@ pub(super) fn compute_overview_counts_from_sqlite(
 /// trigger recovery); only when the latest decision is also stale
 /// do we escalate to `AiNotResponding` red.
 ///
+/// 2026-05-01 (audit 1.2 fix): `DegradedSignals` introduces a
+/// fourth yellow verb that catches chronic drift the existing red
+/// verbs cannot represent (historical orphaned and revert-failure
+/// totals above zero, playbook executor missing). Acute red verbs
+/// still take priority; Degraded is the catch-all just before
+/// `OperatingNormally` so a clean system stays green.
+///
 /// Thresholds:
 /// - `STUCK_AGE_THRESHOLD_MS = 1h` (incidents older than this with
 ///   no decision count as stuck — see compute_overview_counts_*)
@@ -561,6 +651,7 @@ pub(super) fn compute_overview_counts_from_sqlite(
 pub(super) fn derive_system_health(
     pending: &super::types::PendingBreakdown,
     last_decision_secs_ago: Option<i64>,
+    degraded: &DegradedSignals,
 ) -> super::types::SystemHealth {
     use super::types::SystemHealth;
     const AI_DOWN_THRESHOLD_SECS: i64 = 300;
@@ -592,7 +683,42 @@ pub(super) fn derive_system_health(
             pending_in_flight: pending.in_flight,
         };
     }
+    let degraded_reasons = collect_degraded_reasons(degraded);
+    if !degraded_reasons.is_empty() {
+        return SystemHealth::Degraded {
+            reasons: degraded_reasons,
+        };
+    }
     SystemHealth::OperatingNormally
+}
+
+/// Build the operator-readable reason list for the `Degraded` verb.
+/// Reasons are appended in priority order (most actionable first)
+/// so the banner can render `reasons[0]` as the headline. Empty
+/// list means no degradation signal — caller falls through to
+/// `OperatingNormally`.
+fn collect_degraded_reasons(degraded: &DegradedSignals) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if degraded.orphaned_total > 0 {
+        reasons.push(format!(
+            "{} orphaned response{} (rule may still be active in kernel/firewall, lifecycle gave up retrying revert)",
+            degraded.orphaned_total,
+            if degraded.orphaned_total == 1 { "" } else { "s" },
+        ));
+    }
+    if degraded.revert_failures_total > 0 {
+        reasons.push(format!(
+            "{} revert failure{} on responses — backend rejected the undo (config drift or external mutation)",
+            degraded.revert_failures_total,
+            if degraded.revert_failures_total == 1 { "" } else { "s" },
+        ));
+    }
+    if degraded.playbook_executor_missing {
+        reasons.push(
+            "Playbook engine records intent but executes no steps — automated response chain is not yet wired (tracked-spec-playbook-execution)".to_string(),
+        );
+    }
+    reasons
 }
 
 pub(super) async fn api_overview(
@@ -661,6 +787,7 @@ pub(super) async fn api_overview(
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_ascii_lowercase());
     let now = chrono::Utc::now();
+    let degraded = read_degraded_signals(&state);
     let sqlite_counts = state.sqlite_store.as_ref().and_then(|store| {
         compute_overview_counts_from_sqlite(
             store,
@@ -668,6 +795,7 @@ pub(super) async fn api_overview(
             sev_min_rank_filter,
             detector_substring_filter.as_deref(),
             now,
+            &degraded,
         )
     });
     if let Some(c) = sqlite_counts {
@@ -2086,8 +2214,15 @@ mod tests {
             Some("203.0.113.99"),
         );
 
-        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
-            .expect("counts returned");
+        let counts = compute_overview_counts_from_sqlite(
+            &store,
+            date,
+            0,
+            None,
+            chrono::Utc::now(),
+            &super::data_api::DegradedSignals::default(),
+        )
+        .expect("counts returned");
         assert_eq!(counts.incidents_count, 4, "today only, not yesterday");
         assert_eq!(counts.blocked_count, 1, "ssh:bf:1");
         assert_eq!(counts.observing_count, 1, "ssh:bf:2");
@@ -2125,8 +2260,15 @@ mod tests {
             "ssh brute",
             Some("203.0.113.10"),
         );
-        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
-            .expect("counts returned");
+        let counts = compute_overview_counts_from_sqlite(
+            &store,
+            date,
+            0,
+            None,
+            chrono::Utc::now(),
+            &super::data_api::DegradedSignals::default(),
+        )
+        .expect("counts returned");
         assert_eq!(
             counts.incidents_count, 1,
             "internal IP must be filtered out"
@@ -2156,9 +2298,15 @@ mod tests {
             Some("203.0.113.20"),
         );
         let high_only = crate::dashboard::investigation::severity_rank("high");
-        let counts =
-            compute_overview_counts_from_sqlite(&store, date, high_only, None, chrono::Utc::now())
-                .expect("counts");
+        let counts = compute_overview_counts_from_sqlite(
+            &store,
+            date,
+            high_only,
+            None,
+            chrono::Utc::now(),
+            &super::data_api::DegradedSignals::default(),
+        )
+        .expect("counts");
         assert_eq!(counts.incidents_count, 1);
     }
 
@@ -2215,8 +2363,15 @@ mod tests {
             );
         }
 
-        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
-            .expect("counts");
+        let counts = compute_overview_counts_from_sqlite(
+            &store,
+            date,
+            0,
+            None,
+            chrono::Utc::now(),
+            &super::data_api::DegradedSignals::default(),
+        )
+        .expect("counts");
         let snap = counts.snapshot.expect("snapshot populated");
         // The exact two-number pair the operator was confused by.
         // Pre-Phase-7 the Home tile showed 4 (incidents) while the
@@ -2305,8 +2460,15 @@ mod tests {
             );
         }
 
-        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
-            .expect("counts");
+        let counts = compute_overview_counts_from_sqlite(
+            &store,
+            date,
+            0,
+            None,
+            chrono::Utc::now(),
+            &super::data_api::DegradedSignals::default(),
+        )
+        .expect("counts");
         let snap = counts.snapshot.expect("snap");
         // IP A is in blocked (precedence override), NOT in dismissed.
         // IP B is in observing.
@@ -2368,8 +2530,15 @@ mod tests {
             .set_incident_allowlisted("ssh:trusted")
             .expect("set allowlisted");
 
-        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
-            .expect("counts");
+        let counts = compute_overview_counts_from_sqlite(
+            &store,
+            date,
+            0,
+            None,
+            chrono::Utc::now(),
+            &super::data_api::DegradedSignals::default(),
+        )
+        .expect("counts");
         let snap = counts.snapshot.expect("snapshot populated");
         assert_eq!(snap.buckets.allowlisted.incidents, 1);
         assert_eq!(snap.buckets.allowlisted.unique_attackers, 1);
@@ -2442,8 +2611,15 @@ mod tests {
             Some("203.0.113.30"),
         );
 
-        let counts =
-            compute_overview_counts_from_sqlite(&store, &date, 0, None, now).expect("counts");
+        let counts = compute_overview_counts_from_sqlite(
+            &store,
+            &date,
+            0,
+            None,
+            now,
+            &super::data_api::DegradedSignals::default(),
+        )
+        .expect("counts");
         let snap = counts.snapshot.expect("snapshot populated");
         assert_eq!(snap.pending.in_flight, 1, "fresh:1 (<5min)");
         assert_eq!(snap.pending.stuck, 1, "stuck:1 (>1h)");
@@ -2522,8 +2698,15 @@ mod tests {
             Some("203.0.113.20"),
         );
 
-        let counts =
-            compute_overview_counts_from_sqlite(&store, &date, 0, None, now).expect("counts");
+        let counts = compute_overview_counts_from_sqlite(
+            &store,
+            &date,
+            0,
+            None,
+            now,
+            &super::data_api::DegradedSignals::default(),
+        )
+        .expect("counts");
         let snap = counts.snapshot.expect("snapshot");
         assert_eq!(snap.pending.stuck, 1);
         match snap.health {
@@ -2548,8 +2731,15 @@ mod tests {
         // "all good" default.
         let store = make_overview_test_store();
         let date = "2026-04-29";
-        let counts = compute_overview_counts_from_sqlite(&store, date, 0, None, chrono::Utc::now())
-            .expect("counts");
+        let counts = compute_overview_counts_from_sqlite(
+            &store,
+            date,
+            0,
+            None,
+            chrono::Utc::now(),
+            &super::data_api::DegradedSignals::default(),
+        )
+        .expect("counts");
         let snap = counts.snapshot.expect("snapshot");
         match snap.health {
             super::super::types::SystemHealth::OperatingNormally => {}
@@ -2802,5 +2992,134 @@ mod tests {
             out.scope_mismatch,
             "graph has incidents on a different date"
         );
+    }
+
+    // ── Degraded health verb (audit 1.2) ─────────────────────────
+    //
+    // Anchor for the recurring audit complaint: green PROTECTED
+    // banner sitting on top of historical orphaned responses,
+    // accumulated revert failures, and a playbook engine that
+    // records intent without ever executing a step. Each test pins
+    // one signal so a future regression that drops a signal from
+    // the derivation is caught immediately.
+
+    use super::super::types::{PendingBreakdown, SystemHealth};
+
+    fn fresh_pending() -> PendingBreakdown {
+        PendingBreakdown::default()
+    }
+
+    #[test]
+    fn degraded_when_orphaned_responses_exist() {
+        let degraded = super::DegradedSignals {
+            orphaned_total: 17,
+            ..Default::default()
+        };
+        let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
+        match h {
+            SystemHealth::Degraded { reasons } => {
+                assert!(reasons.iter().any(|r| r.contains("17 orphaned")));
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn degraded_when_revert_failures_exist() {
+        let degraded = super::DegradedSignals {
+            revert_failures_total: 111,
+            ..Default::default()
+        };
+        let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
+        match h {
+            SystemHealth::Degraded { reasons } => {
+                assert!(reasons.iter().any(|r| r.contains("111 revert failure")));
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn degraded_when_playbook_executor_missing() {
+        // Most production-like configuration: playbook executor is
+        // not yet wired (tracked-spec-playbook-execution), even
+        // when there are no orphaned responses today.
+        let degraded = super::DegradedSignals {
+            playbook_executor_missing: true,
+            ..Default::default()
+        };
+        let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
+        match h {
+            SystemHealth::Degraded { reasons } => {
+                assert!(
+                    reasons.iter().any(|r| r.contains("Playbook engine")),
+                    "missing playbook reason: {reasons:?}"
+                );
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn degraded_collects_all_reasons_in_priority_order() {
+        // When multiple drift signals are present the banner shows
+        // the headline (`reasons[0]`) but the operator can drill
+        // into the full list. Order matters: orphaned/revert-failure
+        // are immediate maintenance debt and should headline; the
+        // playbook executor gap is architectural and ranks last.
+        let degraded = super::DegradedSignals {
+            orphaned_total: 17,
+            revert_failures_total: 111,
+            playbook_executor_missing: true,
+        };
+        let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
+        match h {
+            SystemHealth::Degraded { reasons } => {
+                assert_eq!(reasons.len(), 3, "got {reasons:?}");
+                assert!(reasons[0].contains("orphaned"));
+                assert!(reasons[1].contains("revert failure"));
+                assert!(reasons[2].contains("Playbook engine"));
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operating_normally_only_when_truly_clean() {
+        // Anchor against the audit's central complaint: a clean
+        // green banner must require ALL signals to be zero. If any
+        // future field is added to `DegradedSignals`, the existing
+        // `..Default::default()` here keeps the assertion honest;
+        // adding a field that defaults to non-zero will make this
+        // test fail and force the author to think about whether
+        // the new signal warrants Degraded.
+        let degraded = super::DegradedSignals {
+            playbook_executor_missing: false,
+            ..Default::default()
+        };
+        let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
+        assert_eq!(h, SystemHealth::OperatingNormally);
+    }
+
+    #[test]
+    fn acute_red_verbs_take_priority_over_degraded() {
+        // When the AI is genuinely down (red), Degraded must not
+        // mask it. The headline operator sees is the most acute
+        // failure mode; chronic drift can wait until the immediate
+        // emergency is handled.
+        let mut pending = fresh_pending();
+        pending.stuck = 5;
+        let degraded = super::DegradedSignals {
+            orphaned_total: 17,
+            revert_failures_total: 111,
+            playbook_executor_missing: true,
+        };
+        let h = super::derive_system_health(&pending, Some(600), &degraded);
+        match h {
+            SystemHealth::AiNotResponding { stuck_count, .. } => {
+                assert_eq!(stuck_count, 5);
+            }
+            other => panic!("expected AiNotResponding to take priority, got {other:?}"),
+        }
     }
 }
