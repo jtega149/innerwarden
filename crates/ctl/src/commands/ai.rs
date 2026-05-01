@@ -435,6 +435,17 @@ pub(crate) fn cmd_configure_ai(
     model: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<()> {
+    cmd_configure_ai_with_restart(cli, provider, key, model, base_url, true)
+}
+
+fn cmd_configure_ai_with_restart(
+    cli: &Cli,
+    provider: &str,
+    key: Option<&str>,
+    model: Option<&str>,
+    base_url: Option<&str>,
+    restart: bool,
+) -> Result<()> {
     if !cli.dry_run {
         require_sudo(cli);
     }
@@ -492,7 +503,9 @@ pub(crate) fn cmd_configure_ai(
         println!("  [ok] agent.toml updated (provider={provider}, model={model})");
     }
 
-    restart_agent(cli);
+    if restart {
+        restart_agent(cli);
+    }
     println!("AI configured. Run 'innerwarden doctor' to validate.");
     Ok(())
 }
@@ -723,12 +736,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read as _};
+    use std::net::TcpListener;
     use std::process::Command as ProcessCommand;
     use std::sync::{Mutex, OnceLock};
+    use std::thread;
     use tempfile::TempDir;
 
     fn install_archive_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -767,6 +787,48 @@ mod tests {
         (archive, sha)
     }
 
+    fn serve_models_once(body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind model test server");
+        let addr = listener.local_addr().expect("test server address");
+        let body = body.to_string();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept model request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write model response");
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn wizard_providers_have_unique_names_and_supported_styles() {
+        let mut names = std::collections::BTreeSet::new();
+        for provider in WIZARD_PROVIDERS {
+            assert!(!provider.name.is_empty());
+            assert!(!provider.label.is_empty());
+            assert!(!provider.signup_url.is_empty());
+            assert!(provider.models_url.starts_with("https://"));
+            assert!(matches!(
+                provider.api_style,
+                "openai" | "anthropic" | "gemini"
+            ));
+            assert!(
+                names.insert(provider.name),
+                "duplicate wizard provider: {}",
+                provider.name
+            );
+        }
+        assert!(names.contains("openai"));
+        assert!(names.contains("gemini"));
+    }
+
     #[test]
     fn models_url_builds_expected_paths_per_api_style() {
         // Ensures provider-specific model-discovery endpoints remain stable.
@@ -799,6 +861,14 @@ mod tests {
         });
         let models = parse_models_response(&body, "openai");
         assert_eq!(models, vec!["gpt-4.1", "gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn parse_models_response_returns_empty_for_malformed_shapes() {
+        assert!(parse_models_response(&serde_json::json!({}), "openai").is_empty());
+        assert!(parse_models_response(&serde_json::json!({ "data": {} }), "openai").is_empty());
+        assert!(parse_models_response(&serde_json::json!({ "models": {} }), "ollama").is_empty());
+        assert!(parse_models_response(&serde_json::json!({ "models": [] }), "gemini").is_empty());
     }
 
     #[test]
@@ -852,6 +922,59 @@ mod tests {
     }
 
     #[test]
+    fn fetch_models_openai_reads_filters_and_sorts_local_response() {
+        let base = serve_models_once(
+            r#"{"data":[{"id":"zeta-chat"},{"id":"text-embedding-3-small"},{"id":"alpha-chat"}]}"#,
+        );
+
+        let models = fetch_models(&base, "test-key", "openai");
+
+        assert_eq!(models, vec!["alpha-chat", "zeta-chat"]);
+    }
+
+    #[test]
+    fn fetch_models_gemini_reads_local_response() {
+        let base = serve_models_once(
+            r#"{"models":[{"name":"models/gemini-2.5-pro"},{"name":"models/gemini-embedding-001"}]}"#,
+        );
+
+        let models = fetch_models(&base, "test-key", "gemini");
+
+        assert_eq!(models, vec!["gemini-2.5-pro"]);
+    }
+
+    #[test]
+    fn fetch_models_anthropic_reads_local_response() {
+        let base = serve_models_once(
+            r#"{"data":[{"id":"claude-haiku-4-5-20251001"},{"id":"text-embedding-3-small"}]}"#,
+        );
+
+        let models = fetch_models(&base, "test-key", "anthropic");
+
+        assert_eq!(models, vec!["claude-haiku-4-5-20251001"]);
+    }
+
+    #[test]
+    fn fetch_models_ollama_reads_local_response() {
+        let base = serve_models_once(
+            r#"{"models":[{"name":"qwen3-coder:480b"},{"name":"nomic-embed-text"}]}"#,
+        );
+
+        let models = fetch_models(&base, "", "ollama");
+
+        assert_eq!(models, vec!["qwen3-coder:480b"]);
+    }
+
+    #[test]
+    fn fetch_models_returns_empty_on_malformed_json() {
+        let base = serve_models_once("not-json");
+
+        let models = fetch_models(&base, "test-key", "openai");
+
+        assert!(models.is_empty());
+    }
+
+    #[test]
     fn choose_model_from_input_uses_default_for_empty_choice() {
         // Covers default-selection branch to keep interactive UX predictable.
         let models = vec!["first".to_string(), "second".to_string()];
@@ -867,6 +990,110 @@ mod tests {
             choose_model_from_input(&models, "custom-model"),
             "custom-model"
         );
+    }
+
+    #[test]
+    fn choose_model_from_input_clamps_numeric_choice() {
+        let models = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(choose_model_from_input(&models, "0"), "first");
+        assert_eq!(choose_model_from_input(&models, "999"), "second");
+    }
+
+    #[test]
+    fn cmd_configure_ai_dry_run_requires_key_for_keyed_provider() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+
+        let err = cmd_configure_ai(&cli, "openai", None, None, None)
+            .expect_err("openai requires an API key");
+
+        assert!(err.to_string().contains("requires an API key"));
+    }
+
+    #[test]
+    fn cmd_configure_ai_dry_run_accepts_ollama_without_key() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+
+        cmd_configure_ai(&cli, "ollama", None, Some("llama3.3"), None)
+            .expect("ollama should not require an API key");
+    }
+
+    #[test]
+    fn cmd_configure_ai_dry_run_accepts_custom_provider_base_url() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+
+        cmd_configure_ai(
+            &cli,
+            "acme",
+            Some("secret"),
+            Some("acme-chat"),
+            Some("https://api.acme.invalid"),
+        )
+        .expect("custom provider dry-run should accept explicit key and base url");
+    }
+
+    #[test]
+    fn cmd_configure_ai_dry_run_uses_provider_defaults() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+
+        cmd_configure_ai(&cli, "groq", Some("secret"), None, None)
+            .expect("known provider should use default model and base url");
+    }
+
+    #[test]
+    fn cmd_configure_ai_writes_config_and_env_without_restart_for_tests() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), false);
+
+        cmd_configure_ai_with_restart(
+            &cli,
+            "openai",
+            Some("sk-test"),
+            Some("gpt-4.1-mini"),
+            Some("https://api.openai.example"),
+            false,
+        )
+        .expect("configure ai should write temp config");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("read agent config");
+        assert!(agent.contains("[ai]"));
+        assert!(agent.contains("enabled = true"));
+        assert!(agent.contains("provider = \"openai\""));
+        assert!(agent.contains("model = \"gpt-4.1-mini\""));
+        assert!(agent.contains("base_url = \"https://api.openai.example\""));
+
+        let env = std::fs::read_to_string(tmp.path().join("agent.env")).expect("read agent env");
+        assert_eq!(env, "OPENAI_API_KEY=sk-test\n");
+    }
+
+    #[test]
+    fn cmd_ai_install_dry_run_accepts_explicit_key() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+
+        cmd_ai_install(&cli, "qwen3-coder:480b", Some("ollama-test-key"), true)
+            .expect("dry-run ollama install should not touch system services");
+    }
+
+    #[test]
+    fn cmd_ai_install_dry_run_reads_key_from_environment() {
+        let _guard = env_lock().lock().expect("env lock");
+        let previous = std::env::var_os("OLLAMA_API_KEY");
+        std::env::set_var("OLLAMA_API_KEY", "env-ollama-key");
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+        let result = cmd_ai_install(&cli, "qwen3-coder:480b", None, true);
+
+        match previous {
+            Some(value) => std::env::set_var("OLLAMA_API_KEY", value),
+            None => std::env::remove_var("OLLAMA_API_KEY"),
+        }
+
+        result.expect("dry-run ollama install should read env key");
     }
 
     // ── install-classifier helpers ─────────────────────────────────────
