@@ -88,9 +88,14 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
     // Autoencoder signal boost: if the neural model also flagged unusual
     // activity in this time window, boost confidence by up to 10 %. The
     // autoencoder is a silent intuition that reinforces real detections.
+    // Score range (post 2026-05-01 percentile_score fix): in-range
+    // events map to 0..0.99, above-max-anchor events extrapolate
+    // asymptotically into 0.99..<1.0. Practical max boost is ~9.9%
+    // instead of exactly 10%, which preserves the spirit of the
+    // formula while killing the prior saturation at 1.0.
     if let Some(anomaly_score) = state.latest_anomaly_score.take() {
         if anomaly_score > 0.7 {
-            let boost = (anomaly_score - 0.7) * 0.33; // 0.7 → 0 %, 1.0 → 10 %
+            let boost = (anomaly_score - 0.7) * 0.33; // 0.7 → 0 %, 1.0 → ~10 %
             let new_conf = (decision.confidence + boost).min(1.0);
             if new_conf > decision.confidence {
                 info!(

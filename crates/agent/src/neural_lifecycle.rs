@@ -730,6 +730,18 @@ fn parse_model_file(data: &[u8]) -> Option<ParsedModel> {
 /// 1 = worse than everything. Degenerate tables (empty or all-zero)
 /// return `None` so the caller can fall back to the legacy z-score
 /// path during the transition period.
+///
+/// 2026-05-01: events with `mse > anchors[last]` previously clipped to
+/// exactly 1.0 — every routine prod event saturated because the
+/// holdout's max anchor is computed from a deterministic 5-of-N
+/// sample of training windows and runtime traffic regularly exceeds
+/// it (drift between training-end and now, plus longer tails). When
+/// every signal is 1.0 the downstream boost in `incident_decision_eval`
+/// fires on every incident, washing out the discriminative value.
+/// The fix splits the output range: in-range MSE maps to 0..0.99 by
+/// straight rank, beyond-range MSE extrapolates into 0.99..=1.0 via
+/// `tanh((mse - max) / (p99 - p50))` so the engine still distinguishes
+/// "slightly past max" from "wildly past max" instead of clipping.
 pub(crate) fn percentile_score(mse: f32, anchors: &[f32]) -> Option<f32> {
     if anchors.len() < 2 {
         return None;
@@ -737,8 +749,15 @@ pub(crate) fn percentile_score(mse: f32, anchors: &[f32]) -> Option<f32> {
     if !anchors.iter().any(|&x| x > 0.0) {
         return None;
     }
-    let below = anchors.iter().filter(|&&a| a <= mse).count();
-    Some(below as f32 / anchors.len() as f32)
+    let max = *anchors.last().expect("non-empty: len() >= 2 above");
+    if mse <= max {
+        let below = anchors.iter().filter(|&&a| a <= mse).count();
+        return Some(0.99 * below as f32 / anchors.len() as f32);
+    }
+    let p50 = anchors[anchors.len() / 2];
+    let p99 = anchors[(anchors.len() * 99) / 100];
+    let scale = (p99 - p50).max(1e-6);
+    Some(0.99 + 0.01 * ((mse - max) / scale).tanh())
 }
 
 impl Default for AnomalyConfig {
@@ -1667,18 +1686,56 @@ mod tests {
 
     #[test]
     fn percentile_score_matches_expected_quantiles() {
-        // Linear ramp [0..100] → anchor[k] = k as f32. A live MSE of 50
-        // lies at the 51st anchor (51 of 101 <= 50) → score ≈ 0.505.
+        // Linear ramp [0..100] → anchor[k] = k as f32. A live MSE of
+        // 50 lies at the 51st anchor (51 of 101 <= 50). Post-fix the
+        // in-range path is `0.99 * 51 / 101 ≈ 0.50000` because the
+        // top 1% of the output range is reserved for above-max
+        // extrapolation (see `percentile_score_extrapolates_above_max`).
         let anchors: Vec<f32> = (0..=100).map(|k| k as f32).collect();
         let s = percentile_score(50.0, &anchors).expect("ramp anchors should score");
+        let expected = 0.99 * 51.0 / 101.0;
         assert!(
-            (s - 0.505).abs() < 1e-4,
-            "expected ≈0.505 at median, got {s}"
+            (s - expected).abs() < 1e-4,
+            "expected ≈{expected} near median, got {s}"
         );
         let s_low = percentile_score(-1.0, &anchors).expect("score below min");
         assert_eq!(s_low, 0.0);
-        let s_high = percentile_score(200.0, &anchors).expect("score above max");
-        assert_eq!(s_high, 1.0);
+    }
+
+    #[test]
+    fn percentile_score_extrapolates_above_max() {
+        // Pre-2026-05-01 every `mse > anchors[100]` clipped to 1.0,
+        // saturating the engine on routine prod traffic. The fix
+        // reserves [0.99, 1.0] for above-max extrapolation via tanh
+        // so two distinct "past the worst-case holdout" events get
+        // distinct scores.
+        let anchors: Vec<f32> = (0..=100).map(|k| k as f32).collect();
+        // p50=50, p99=99, scale=49. Just past max: tanh small → just
+        // above 0.99. Moderately past max: tanh closer to 1 → close to
+        // 1.0 but still strictly less. Far past max in f32 saturates
+        // tanh to 1.0 exactly, which is fine — the invariant we care
+        // about is that distinct "above max" events get distinct
+        // scores in the lower stretch of (0.99, 1.0].
+        let s_just_past = percentile_score(101.0, &anchors).expect("above max");
+        let s_moderate = percentile_score(150.0, &anchors).expect("moderately above max");
+        assert!(
+            (0.99..1.0).contains(&s_just_past),
+            "just past max should land in (0.99, 1.0), got {s_just_past}"
+        );
+        assert!(
+            s_moderate > s_just_past,
+            "moderately past ({s_moderate}) must score higher than just past ({s_just_past})"
+        );
+        assert!(
+            (s_moderate - s_just_past) > 0.001,
+            "extrapolation must give measurable gradient, gap={}",
+            s_moderate - s_just_past
+        );
+        // Bounded above by 1.0 (the asymptote, with f32 eventually
+        // saturating exactly there for very large z).
+        let s_far = percentile_score(1.0e9, &anchors).expect("far above max");
+        assert!(s_far <= 1.0, "score must never exceed 1.0, got {s_far}");
+        assert!(s_far > s_moderate, "far past must dominate moderately past");
     }
 
     #[test]
