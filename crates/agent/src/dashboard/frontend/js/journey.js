@@ -35,23 +35,31 @@ function dotCls(entry) {
 }
 
 // ── Summary line ───────────────────────────────────────────────────────
+// 2026-05-01 (audit finding 1.6): this function previously called
+// `esc()` internally on each return path AND the single call site
+// (`renderEvidenceCard` at line 285) wrapped the result in another
+// `esc()`. The double escape turned `>` into `&amp;gt;` which the
+// browser renders as the literal `&gt;` text — that is exactly
+// what the auditor saw on event timelines (e.g. `tcp_stream.ssh
+// SSH ? -&gt; ? (...)`). Canonical pattern: this function returns
+// plain text, the rendering boundary escapes once.
 function entrySummary(entry) {
   const d = entry.data || {};
   switch (entry.kind) {
     case 'event':
-      return esc((d.event_kind || '') + ' - ' + (d.summary || ''));
+      return (d.event_kind || '') + ' - ' + (d.summary || '');
     case 'incident':
-      return esc('[' + (d.severity || '').toUpperCase() + '] ' + (d.title || '') + ': ' + (d.summary || ''));
+      return '[' + (d.severity || '').toUpperCase() + '] ' + (d.title || '') + ': ' + (d.summary || '');
     case 'decision': {
       const conf = ((d.confidence || 0) * 100).toFixed(0);
       const reason = (d.reason || '').substring(0, 70);
-      return esc(d.action_type + ' (conf: ' + conf + '%) - ' + reason);
+      return d.action_type + ' (conf: ' + conf + '%) - ' + reason;
     }
     case 'honeypot_ssh': {
       const attempts = d.auth_attempts || [];
       const creds = attempts.filter(a => a.password).slice(0, 3)
-        .map(a => esc(a.username) + '/' + esc(a.password)).join(', ');
-      return esc(attempts.length + ' auth attempt(s)') + (creds ? ' · ' + creds : '');
+        .map(a => (a.username || '') + '/' + (a.password || '')).join(', ');
+      return attempts.length + ' auth attempt(s)' + (creds ? ' · ' + creds : '');
     }
     case 'honeypot_http': {
       const reqs = d.http_requests || [];
@@ -60,12 +68,12 @@ function entrySummary(entry) {
         const fields = Object.fromEntries((r.form_fields || []).map(([k,v]) => [k,v]));
         return (fields.username || fields.user || '') + '/' + (fields.password || fields.pass || '');
       }).filter(Boolean).join(', ');
-      return esc(reqs.length + ' request(s)') + (formCreds ? ' · ' + formCreds : '');
+      return reqs.length + ' request(s)' + (formCreds ? ' · ' + formCreds : '');
     }
     case 'honeypot_banner':
-      return esc('Banner probe - ' + (d.bytes_captured ?? 0) + ' bytes captured');
+      return 'Banner probe - ' + (d.bytes_captured ?? 0) + ' bytes captured';
     default:
-      return esc(entry.kind);
+      return entry.kind;
   }
 }
 
@@ -650,6 +658,31 @@ async function loadJourney(subjectType, subjectValue) {
     document.getElementById('journeyContent').innerHTML = '<div class="err">Failed to load journey: ' + esc(e.message) + '</div>';
   }
 }
+
+// Cytoscape node-color palette keyed by NodeType string identifier
+// (see `crates/agent/src/knowledge_graph/types.rs`). Defining this
+// as a `var` (function-scoped, hoisted) so the inline cytoscape
+// style callback below can reference it without a load-order
+// dependency. Pre-2026-05-01 this map was assumed to exist
+// somewhere, was never defined anywhere, and caused
+// `ReferenceError: NODE_COLORS is not defined` to surface in the
+// DOM the moment a journey graph rendered (audit finding 1.8).
+// Colours are tuned for readability against the dashboard's dark
+// theme; types not listed fall through to the neutral grey
+// (`#6b7280`) preserved at the call site.
+var NODE_COLORS = {
+  process:   '#60a5fa', // blue — runtime
+  ip:        '#fb7185', // red — network endpoint, often hostile
+  file:      '#fbbf24', // amber — filesystem
+  user:      '#a78bfa', // purple — identity
+  domain:    '#fb923c', // orange — DNS / external
+  port:      '#34d399', // green — service
+  container: '#22d3ee', // cyan — workload
+  device:    '#a3e635', // lime — hardware
+  system:    '#94a3b8', // slate — system services
+  incident:  '#f87171', // light red — incident node
+  campaign:  '#e879f9', // magenta — campaign cluster
+};
 
 async function loadJourneyGraph(subjectType, subjectValue) {
   const container = document.getElementById('journeyGraphContainer');

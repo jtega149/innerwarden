@@ -292,6 +292,21 @@ impl ReverseShellDetector {
             entities.push(EntityRef::ip(&target_ip));
         }
 
+        // 2026-05-01 (audit finding 1.7): the user-visible title and
+        // summary previously interpolated `comm` (the fd_redirect-time
+        // value), which is unreliable on some kernels and was
+        // observed in prod as Unicode replacement characters
+        // ("process ◆◆ (pid=...)"). The auditor saw this on the
+        // dashboard and could not identify the actual reverse-shell
+        // binary. `source_comm` is captured at the connect event
+        // time and is reliable; prefer it for the operator-visible
+        // strings, falling back to `comm` only when source_comm is
+        // empty (older sensor that did not yet emit it).
+        let display_comm = if source_comm.is_empty() {
+            comm.to_string()
+        } else {
+            source_comm.clone()
+        };
         Some(Incident {
             ts: now,
             host: self.host.clone(),
@@ -301,10 +316,10 @@ impl ReverseShellDetector {
             ),
             severity,
             title: format!(
-                "Reverse shell detected via eBPF ({pattern}): {comm} → {target_display}"
+                "Reverse shell detected via eBPF ({pattern}): {display_comm} → {target_display}"
             ),
             summary: format!(
-                "eBPF syscall sequence detected {pattern}: process {comm} (pid={pid}) \
+                "eBPF syscall sequence detected {pattern}: process {display_comm} (pid={pid}) \
                  established connection to {target_display} then redirected fd {newfd} to socket. \
                  This is a definitive reverse/bind shell — detected at kernel level."
             ),
@@ -835,6 +850,70 @@ mod tests {
             .unwrap();
         let ev = inc.evidence.as_array().unwrap().first().unwrap();
         assert_eq!(ev.get("source_comm").and_then(|v| v.as_str()), Some("evil"));
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_title_uses_reliable_source_comm_over_corrupted_fd_redirect_comm() {
+        // 2026-05-01 audit finding 1.7: prod logs showed
+        // `process ◆◆ (pid=...)` because the user-visible title and
+        // summary interpolated the fd_redirect-time `comm`, which
+        // was returning Unicode replacement characters on some
+        // kernels. Anchor: the operator-visible strings must use
+        // the connect-time `source_comm` value when available, so
+        // an operator triaging a reverse-shell incident sees the
+        // actual binary name and not garbage.
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        // Connect event captures the reliable comm "evil-binary".
+        det.process(&connect_event_with_comm(
+            7100,
+            "10.0.0.99",
+            4444,
+            "evil-binary",
+            now,
+        ));
+        // fd_redirect_event helper hardcodes comm: "bash" — simulates
+        // the divergence between the two events' comm values.
+        let inc = det
+            .process(&fd_redirect_event(7100, 5, 0, now + Duration::seconds(1)))
+            .unwrap();
+        assert!(
+            inc.title.contains("evil-binary"),
+            "title must use connect-time comm, got: {}",
+            inc.title
+        );
+        assert!(
+            inc.summary.contains("evil-binary"),
+            "summary must use connect-time comm, got: {}",
+            inc.summary
+        );
+        assert!(
+            !inc.title.contains("bash"),
+            "title must NOT use fd_redirect comm (potentially corrupt), got: {}",
+            inc.title
+        );
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_title_falls_back_to_comm_when_source_comm_is_empty() {
+        // Older sensor builds may emit network.outbound_connect
+        // events without a `comm` field (or with empty value). The
+        // fallback path uses `comm` from the fd_redirect event so
+        // the operator-visible string is never blank — better to
+        // show a possibly-corrupt name than no name at all.
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        // Connect event with empty comm — exercises the fallback.
+        det.process(&connect_event_with_comm(7101, "10.0.0.99", 4444, "", now));
+        let inc = det
+            .process(&fd_redirect_event(7101, 5, 0, now + Duration::seconds(1)))
+            .unwrap();
+        // fd_redirect_event helper hardcodes comm: "bash" → fallback.
+        assert!(
+            inc.title.contains("bash"),
+            "title must fall back to fd_redirect comm when source_comm empty, got: {}",
+            inc.title
+        );
     }
 
     #[test]

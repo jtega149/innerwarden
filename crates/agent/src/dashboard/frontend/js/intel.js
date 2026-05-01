@@ -273,18 +273,52 @@ async function loadChains() {
       <div class="kpi-card"><div class="kpi-value">${data.chains.filter(c=>c.severity==='Critical').length}</div><div class="kpi-label">Critical</div></div>
       <div class="kpi-card"><div class="kpi-value">${new Set(data.chains.flatMap(c=>c.layers_involved||[])).size}</div><div class="kpi-label">Layers Involved</div></div>
     </div>`;
+    // 2026-05-01 (audit finding 3.4): the chains list rendered every
+    // hit individually, producing 100 identical rows when the same
+    // rule fired repeatedly ("Data Exfiltration eBPF Sequence: 2
+    // stages 2 layers 5s, 85% confidence, ×100"). Dedup by
+    // `(rule_id, summary)` so each fingerprint shows once with a
+    // multiplicity count and the time range. Operator can still
+    // drill into individual chain_ids by following the link in the
+    // expanded view (future surface — for now the deduplication
+    // alone removes the wall-of-rows complaint).
+    const groups = new Map();
     for (const c of data.chains) {
-      const sevColor = c.severity === 'Critical' ? '#e74c3c' : c.severity === 'High' ? '#f39c12' : '#27ae60';
-      const layers = (c.layers_involved||[]).map(l=>`<span style="padding:1px 6px;border-radius:3px;background:#1a2634;color:#3498db;font-size:0.65rem;">${l}</span>`).join(' → ');
+      const key = (c.rule_id || '') + '|' + (c.summary || '');
+      let g = groups.get(key);
+      if (!g) {
+        g = {
+          rule_id: c.rule_id, rule_name: c.rule_name, summary: c.summary,
+          severity: c.severity, layers_involved: c.layers_involved || [],
+          confidence: c.confidence, stages_matched: c.stages_matched,
+          count: 0, first_ts: null, last_ts: null,
+          first_chain_id: c.chain_id,
+        };
+        groups.set(key, g);
+      }
+      g.count += 1;
+      // Track most severe colour across the group; Critical > High > Medium > else.
+      const sevRank = { Critical: 4, High: 3, Medium: 2, Low: 1 };
+      if ((sevRank[c.severity] || 0) > (sevRank[g.severity] || 0)) g.severity = c.severity;
+      // Track time range across the group.
+      if (c.start_ts) g.first_ts = (!g.first_ts || c.start_ts < g.first_ts) ? c.start_ts : g.first_ts;
+      if (c.last_ts)  g.last_ts  = (!g.last_ts  || c.last_ts  > g.last_ts)  ? c.last_ts  : g.last_ts;
+    }
+    const grouped = Array.from(groups.values()).sort((a, b) => b.count - a.count);
+    for (const g of grouped) {
+      const sevColor = g.severity === 'Critical' ? '#e74c3c' : g.severity === 'High' ? '#f39c12' : '#27ae60';
+      const layers = (g.layers_involved||[]).map(l=>`<span style="padding:1px 6px;border-radius:3px;background:#1a2634;color:#3498db;font-size:0.65rem;">${l}</span>`).join(' → ');
+      const countLabel = g.count > 1 ? ` ×${g.count}` : '';
+      const sampleLabel = g.count > 1 ? ` (sample: ${g.first_chain_id})` : ` ${g.first_chain_id}`;
       html += `<div class="kpi-card" style="padding:12px;margin-bottom:8px;">
         <div style="display:flex;justify-content:space-between;align-items:center;">
-          <div><span style="font-weight:700;">${c.chain_id}</span> <span style="font-size:0.8rem;color:var(--dim);">${c.rule_name}</span></div>
-          <span style="padding:2px 8px;border-radius:4px;background:${sevColor}20;color:${sevColor};font-size:0.75rem;">${c.severity}</span>
+          <div><span style="font-weight:700;">${g.rule_name}${countLabel}</span><span style="font-size:0.8rem;color:var(--dim);">${sampleLabel}</span></div>
+          <span style="padding:2px 8px;border-radius:4px;background:${sevColor}20;color:${sevColor};font-size:0.75rem;">${g.severity}</span>
         </div>
-        <div style="font-size:0.85rem;margin:6px 0;">${c.summary}</div>
+        <div style="font-size:0.85rem;margin:6px 0;">${g.summary}</div>
         <div style="margin:4px 0;">Layers: ${layers}</div>
-        <div style="font-size:0.75rem;color:var(--dim);">Confidence: ${(c.confidence*100).toFixed(0)}% · ${c.stages_matched} stages · Rule: ${c.rule_id}</div>
-        <div style="font-size:0.7rem;color:var(--dim);margin-top:4px;">${c.start_ts ? new Date(c.start_ts).toLocaleString() : ''} → ${c.last_ts ? new Date(c.last_ts).toLocaleString() : ''}</div>
+        <div style="font-size:0.75rem;color:var(--dim);">Confidence: ${(g.confidence*100).toFixed(0)}% · ${g.stages_matched} stages · Rule: ${g.rule_id}</div>
+        <div style="font-size:0.7rem;color:var(--dim);margin-top:4px;">${g.first_ts ? new Date(g.first_ts).toLocaleString() : ''} → ${g.last_ts ? new Date(g.last_ts).toLocaleString() : ''}</div>
       </div>`;
     }
     content.innerHTML = html;
@@ -301,7 +335,7 @@ async function loadBaseline() {
     const b = await loadJson('/api/baseline-status');
     let html = `<div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px;">
       <div class="kpi-card"><div class="kpi-value">${b.mature ? lucideIcon('check-circle',{size:14}) + ' Active' : lucideIcon('bar-chart-3',{size:14}) + ' Training'}</div><div class="kpi-label">Status</div></div>
-      <div class="kpi-card"><div class="kpi-value">${b.training_days||0}/7</div><div class="kpi-label">Training Days</div></div>
+      <div class="kpi-card" title="Days of baseline learning so far. The model needs 7 days minimum before anomaly detection activates; once mature it keeps learning but is no longer in training phase."><div class="kpi-value">${(b.training_days||0) >= 7 ? 'Mature ✓' : ((b.training_days||0) + '/7')}</div><div class="kpi-label">Training Days</div></div>
       <div class="kpi-card"><div class="kpi-value">${b.total_observations?.toLocaleString()||0}</div><div class="kpi-label">Observations</div></div>
       <div class="kpi-card"><div class="kpi-value">${Object.keys(b.process_lineages||{}).length||0}</div><div class="kpi-label">Known Lineages</div></div>
     </div>`;
@@ -369,15 +403,35 @@ async function loadPlaybooks() {
       <div class="kpi-card"><div class="kpi-value">${data.executions.filter(e=>e.overall_status==='ok').length}</div><div class="kpi-label">Successful</div></div>
       <div class="kpi-card"><div class="kpi-value">${new Set(data.executions.map(e=>e.playbook_id)).size}</div><div class="kpi-label">Unique Playbooks</div></div>
     </div>`;
+    // 2026-05-01 (audit finding 1.5): the playbook engine is an
+    // intent-recorder, not a step runner — every step persists with
+    // status="pending" and stays that way forever (verified passo-0
+    // 2026-05-01: 19 intents since 2026-04-13, 100% pending). The
+    // dashboard previously rendered "pending" as if execution were
+    // about to happen, which was misleading. Until the executor
+    // ships (tracked-spec-playbook-execution), relabel "pending" to
+    // "Triggered (no executor)" and append a tooltip explaining
+    // why no step ever transitions. Anything else (ok/failed)
+    // renders as before.
+    const statusLabel = (s) => s === 'pending' ? 'Triggered (no executor)' : s;
+    const statusTitle = (s) => s === 'pending'
+      ? 'Playbook engine recorded the intent but no step executor is wired yet. Tracked: tracked-spec-playbook-execution.'
+      : '';
     for (const exec of data.executions) {
       const statusColor = exec.overall_status === 'ok' ? '#27ae60' : exec.overall_status === 'pending' ? '#f39c12' : '#e74c3c';
+      const oTitle = statusTitle(exec.overall_status);
+      const oTitleAttr = oTitle ? ` title="${oTitle}"` : '';
       html += `<div class="kpi-card" style="padding:12px;margin-bottom:8px;">
         <div style="display:flex;justify-content:space-between;align-items:center;">
           <div><span style="font-weight:700;">${exec.playbook_name||exec.playbook_id}</span></div>
-          <span style="padding:2px 8px;border-radius:4px;background:${statusColor}20;color:${statusColor};font-size:0.75rem;">${exec.overall_status}</span>
+          <span${oTitleAttr} style="padding:2px 8px;border-radius:4px;background:${statusColor}20;color:${statusColor};font-size:0.75rem;">${statusLabel(exec.overall_status)}</span>
         </div>
         <div style="font-size:0.8rem;color:var(--dim);margin:4px 0;">Incident: ${exec.incident_id}</div>
-        <div style="font-size:0.75rem;margin-top:4px;">Steps: ${(exec.steps||[]).map(s=>`<span style="padding:1px 6px;border-radius:3px;background:var(--border);margin:1px;font-size:0.7rem;">${s.action} (${s.status})</span>`).join(' → ')}</div>
+        <div style="font-size:0.75rem;margin-top:4px;">Steps: ${(exec.steps||[]).map(s => {
+          const sTitle = statusTitle(s.status);
+          const sTitleAttr = sTitle ? ` title="${sTitle}"` : '';
+          return `<span${sTitleAttr} style="padding:1px 6px;border-radius:3px;background:var(--border);margin:1px;font-size:0.7rem;">${s.action} (${statusLabel(s.status)})</span>`;
+        }).join(' → ')}</div>
         <div style="font-size:0.65rem;color:var(--dim);margin-top:4px;">${exec.triggered_at ? new Date(exec.triggered_at).toLocaleString() : ''}</div>
       </div>`;
     }
@@ -399,15 +453,22 @@ async function loadMitreCoverage() {
     const pct = data.coverage_pct || 0;
     const pctColor = pct >= 70 ? 'var(--ok)' : pct >= 40 ? 'var(--warn)' : 'var(--danger)';
 
+    // 2026-05-01 (audit finding 3.1): "Coverage" KPI label was
+    // misleading — "100%" against `total_techniques = 55` reads as
+    // "InnerWarden detects all of MITRE ATT&CK", which is false.
+    // The denominator is the number of techniques the agent has a
+    // mapped detector for, not the ATT&CK Linux corpus (~200+
+    // techniques). Tooltip + relabel to "of mapped" + scope hint
+    // below the grid.
     let html = `<div class="kpi-grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:16px;">
-      <div class="kpi-card"><div class="kpi-value" style="color:${pctColor}">${pct}%</div><div class="kpi-label">Coverage</div></div>
-      <div class="kpi-card"><div class="kpi-value">${data.active_techniques}/${data.total_techniques}</div><div class="kpi-label">Techniques</div></div>
+      <div class="kpi-card" title="Percentage of techniques with a detector enabled, out of techniques InnerWarden maps to detectors. NOT the percentage of the full ATT&amp;CK corpus."><div class="kpi-value" style="color:${pctColor}">${pct}%</div><div class="kpi-label">Coverage of mapped</div></div>
+      <div class="kpi-card" title="Active vs total mapped techniques. The total is the count of ATT&amp;CK techniques InnerWarden maps to detectors in this build, not the size of the full ATT&amp;CK corpus."><div class="kpi-value">${data.active_techniques}/${data.total_techniques}</div><div class="kpi-label">Mapped techniques</div></div>
       <div class="kpi-card"><div class="kpi-value">${data.enabled_detectors || data.active_detectors}</div><div class="kpi-label">Enabled Detectors</div></div>
       <div class="kpi-card"><div class="kpi-value">${data.fired_today || 0}</div><div class="kpi-label">Fired Today</div></div>
       <div class="kpi-card"><div class="kpi-value"><a href="/api/mitre/navigator" style="color:var(--accent);text-decoration:none;">Export</a></div><div class="kpi-label">Navigator JSON</div></div>
     </div>`;
 
-    html += '<div style="font-size:0.75rem;color:var(--dim);margin-bottom:12px;">Green = detector enabled and covering this technique. Coverage shows what your server CAN detect with its current configuration.</div>';
+    html += '<div style="font-size:0.75rem;color:var(--dim);margin-bottom:12px;">Green = detector enabled and covering this technique. The total above is the set of ATT&amp;CK techniques InnerWarden maps to detectors in this build &mdash; full ATT&amp;CK has many more techniques outside this scope.</div>';
 
     // Tactic breakdown
     if (data.tactics && data.tactics.length) {

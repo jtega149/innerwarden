@@ -140,21 +140,60 @@ function renderCriticalBanner(top) {
   }
 }
 
-// CTA on the critical banner: deep-link to Threats with the IP
-// preselected so the operator lands directly on the journey.
+// CTA on the critical banner: deep-link to Threats with the
+// banner's subject preselected so the operator lands directly on
+// the matching journey.
+//
+// 2026-05-01 (audit finding 1.4): the previous version pivoted
+// only by IP. Some detectors emit incidents whose only entity is a
+// User (`graph_discovery_burst` is the canonical example — title
+// "Discovery burst: user uid:X" with `entities: [User]`, no IP).
+// When the operator clicked Review on a user-only incident, the
+// IP lookup returned undefined, `loadJourney` was skipped, and the
+// investigate panel kept showing whatever journey was last
+// rendered (typically a kill_chain IP from earlier in the
+// session). The operator concluded the link was broken.
+//
+// Fix: extract the most-specific entity available in priority
+// order (Ip > Container > User > Process), pivot accordingly. If
+// none is available, fall back to clearing the journey so the
+// operator sees the empty state instead of a stale subject.
 function openTopCritical(event) {
   if (event && event.preventDefault) event.preventDefault();
   var top = window._lastTopCritical;
-  if (!top) {
-    showView('investigate');
-    return false;
-  }
-  var ipEntity = (top.entities || []).find(function(e) {
-    return e && (e.type === 'Ip' || e.type === 'ip');
-  });
   showView('investigate');
-  if (ipEntity && typeof loadJourney === 'function') {
-    setTimeout(function() { loadJourney('ip', ipEntity.value); }, 30);
+  if (!top) return false;
+  if (typeof loadJourney !== 'function') return false;
+  var entities = top.entities || [];
+  var matchType = function(types) {
+    return entities.find(function(e) {
+      if (!e || !e.type) return false;
+      var t = String(e.type).toLowerCase();
+      return types.indexOf(t) !== -1;
+    });
+  };
+  var pivotEntity =
+    matchType(['ip']) ||
+    matchType(['container']) ||
+    matchType(['user']) ||
+    matchType(['process']);
+  if (pivotEntity) {
+    var pivotKind = String(pivotEntity.type).toLowerCase();
+    setTimeout(function() { loadJourney(pivotKind, pivotEntity.value); }, 30);
+  } else {
+    // No actionable subject on this incident — reset the journey
+    // panel to the empty state so a previously-loaded journey for
+    // an unrelated subject does not appear "as if Review opened
+    // the wrong thing" (the original audit symptom).
+    setTimeout(function() {
+      var content = document.getElementById('journeyContent');
+      var homeSt = document.getElementById('homeState');
+      if (content) content.style.display = 'none';
+      if (homeSt) homeSt.style.display = '';
+      document.querySelectorAll('.attacker-card').forEach(function(c) {
+        c.classList.remove('active');
+      });
+    }, 30);
   }
   return false;
 }

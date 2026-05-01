@@ -129,7 +129,7 @@ async function loadCompliance() {
         '<div style="height:8px;border-radius:4px;background:var(--line);overflow:hidden">' +
         '<div style="height:100%;width:' + pct + '%;background:' + barColor + ';border-radius:4px;transition:width 0.6s ease"></div>' +
         '</div>' +
-        '<div style="font-size:0.62rem;color:var(--muted);margin-top:4px">' + iso.met + ' of ' + iso.total + ' controls met &mdash; <a href="https://www.iso.org/standard/27001" target="_blank" style="color:var(--accent)">What is ISO 27001?</a></div>' +
+        '<div style="font-size:0.62rem;color:var(--muted);margin-top:4px" title="In-scope = the controls InnerWarden directly maps to its own audit/decision/log surface. ISO 27001 Annex A has 93 total controls; the rest are organisational policies outside a security tool\'s scope.">' + iso.met + ' of ' + iso.total + ' in-scope controls met (Annex A has 93 total) &mdash; <a href="https://www.iso.org/standard/27001" target="_blank" style="color:var(--accent)">What is ISO 27001?</a></div>' +
         '</div>';
 
       // Actions needed (not met) — shown first, prominent
