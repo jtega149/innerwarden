@@ -26,11 +26,32 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
         }
     }
 
+    // 2026-05-02 audit B1/P1 (Spec 039 P3): hydrate the canonical
+    // OverviewSnapshot for today so the Sensors HUD's `total_events`
+    // and `total_incidents` paint the same numbers the Home tile and
+    // Briefing/Report paint. Pre-fix the HUD scanned the KG and
+    // showed "47 events handled" while the Home tile said something
+    // different — a contradiction the auditor flagged on the same
+    // screen reload. The snapshot is computed inline (mirroring
+    // api_overview / api_briefing_generate); when it's unavailable
+    // the HUD falls back to the legacy KG / telemetry path.
+    let snapshot = state.sqlite_store.as_ref().and_then(|store| {
+        let today = super::helpers::resolve_date(None);
+        let now_dt = chrono::Utc::now();
+        let degraded = super::data_api::read_degraded_signals(&state);
+        super::data_api::compute_overview_counts_from_sqlite(
+            store, &today, 0, None, now_dt, &degraded,
+        )
+        .and_then(|counts| counts.snapshot)
+    });
+
     let kg = std::sync::Arc::clone(&state.knowledge_graph);
     let data_dir = state.data_dir.clone();
-    let result = tokio::task::spawn_blocking(move || build_sensors_payload(&kg, &data_dir))
-        .await
-        .unwrap_or_else(|_| serde_json::json!({}));
+    let result = tokio::task::spawn_blocking(move || {
+        build_sensors_payload(&kg, &data_dir, snapshot.as_ref())
+    })
+    .await
+    .unwrap_or_else(|_| serde_json::json!({}));
 
     // Update cache
     {
@@ -50,12 +71,13 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
 /// `build_sensors_payload` via `spawn_blocking`.
 #[allow(dead_code)]
 pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
-    build_sensors_payload(&state.knowledge_graph, &state.data_dir)
+    build_sensors_payload(&state.knowledge_graph, &state.data_dir, None)
 }
 
 fn build_sensors_payload(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: &std::path::Path,
+    snapshot: Option<&super::types::OverviewSnapshot>,
 ) -> serde_json::Value {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
@@ -164,10 +186,31 @@ fn build_sensors_payload(
         })
         .collect();
 
+    // 2026-05-02 audit B1/P1 (Spec 039 P3): canonical SoT override.
+    // When the OverviewSnapshot is available, the HUD's topline
+    // counters use snapshot fields (same as Home/Briefing/Report)
+    // instead of KG-derived numbers. Per-source breakdown
+    // (`sources`, `top_kinds`, `detectors`, `event_timeline`,
+    // `detector_timeline`) keeps coming from the KG/telemetry walks
+    // — those carry detail the snapshot does not.
+    let (total_events_canonical, total_incidents_canonical) = match snapshot {
+        Some(snap) => {
+            let buckets = &snap.buckets;
+            let total_inc = buckets.blocked.incidents
+                + buckets.observing.incidents
+                + buckets.honeypot.incidents
+                + buckets.dismissed.incidents
+                + buckets.allowlisted.incidents
+                + buckets.attention.incidents;
+            (snap.events_today, total_inc)
+        }
+        None => (total_events_val, total_incidents),
+    };
+
     serde_json::json!({
         "date": today,
-        "total_events": total_events_val,
-        "total_incidents": total_incidents,
+        "total_events": total_events_canonical,
+        "total_incidents": total_incidents_canonical,
         "sources": sources.iter().map(|(s, c)| serde_json::json!({"name": s, "count": c})).collect::<Vec<_>>(),
         "top_kinds": kinds.iter().map(|(k, c)| serde_json::json!({"name": k, "count": c})).collect::<Vec<_>>(),
         "detectors": detectors.iter().map(|(d, c)| serde_json::json!({"name": d, "count": c})).collect::<Vec<_>>(),
@@ -580,7 +623,7 @@ mod tests {
             crate::knowledge_graph::KnowledgeGraph::new(),
         ));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path());
+        let payload = build_sensors_payload(&kg, dir.path(), None);
 
         // Required fields: date, total_events, total_incidents, sources,
         // top_kinds, detectors, event_timeline, detector_timeline.
@@ -601,6 +644,81 @@ mod tests {
         }
         assert_eq!(payload["total_events"].as_u64(), Some(0));
         assert_eq!(payload["total_incidents"].as_u64(), Some(0));
+    }
+
+    // 2026-05-02 audit B1/P1 (Spec 039 P3) anchor: the Sensors HUD
+    // must paint the SAME total_events / total_incidents as the
+    // canonical OverviewSnapshot (which Home, Briefing, and Report
+    // already read). Pre-fix the HUD scanned the KG and showed
+    // "47 events handled" while the Home tile said something different.
+    #[test]
+    fn build_sensors_payload_reads_topline_counters_from_snapshot() {
+        use crate::dashboard::types::{
+            BucketStats, DetectorCount, OutcomeBuckets, OverviewSnapshot, PendingBreakdown,
+            SystemHealth,
+        };
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Snapshot says: 5+3+1+2+1+4 = 16 incidents today, 14_700_000 events.
+        let snap = OverviewSnapshot {
+            date: "2026-05-02".to_string(),
+            generated_at: chrono::Utc::now(),
+            health: SystemHealth::OperatingNormally,
+            buckets: OutcomeBuckets {
+                blocked: BucketStats {
+                    incidents: 5,
+                    unique_attackers: 3,
+                    severities: Default::default(),
+                },
+                observing: BucketStats {
+                    incidents: 3,
+                    unique_attackers: 0,
+                    severities: Default::default(),
+                },
+                honeypot: BucketStats {
+                    incidents: 1,
+                    unique_attackers: 0,
+                    severities: Default::default(),
+                },
+                dismissed: BucketStats {
+                    incidents: 2,
+                    unique_attackers: 0,
+                    severities: Default::default(),
+                },
+                allowlisted: BucketStats {
+                    incidents: 1,
+                    unique_attackers: 0,
+                    severities: Default::default(),
+                },
+                attention: BucketStats {
+                    incidents: 4,
+                    unique_attackers: 0,
+                    severities: Default::default(),
+                },
+            },
+            pending: PendingBreakdown::default(),
+            events_today: 14_700_000,
+            top_detectors: vec![DetectorCount {
+                detector: "ssh_bruteforce".to_string(),
+                count: 1,
+            }],
+        };
+
+        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap));
+        assert_eq!(
+            payload["total_events"].as_u64(),
+            Some(14_700_000),
+            "total_events must come from snapshot.events_today, not KG counter"
+        );
+        assert_eq!(
+            payload["total_incidents"].as_u64(),
+            Some(16),
+            "total_incidents must be the sum of OverviewSnapshot bucket incidents \
+             (5+3+1+2+1+4 = 16) — same source the Home tile and Briefing read"
+        );
     }
 
     #[tokio::test]
@@ -647,7 +765,7 @@ mod tests {
             crate::knowledge_graph::KnowledgeGraph::new(),
         ));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path());
+        let payload = build_sensors_payload(&kg, dir.path(), None);
         // Total stays 0 (no graph counters AND no telemetry file).
         assert_eq!(payload["total_events"].as_u64(), Some(0));
         let sources = payload["sources"].as_array().expect("sources array");
@@ -666,7 +784,7 @@ mod tests {
 
         let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path());
+        let payload = build_sensors_payload(&kg, dir.path(), None);
 
         assert_eq!(payload["total_events"].as_u64(), Some(3));
         let sources = payload["sources"].as_array().expect("sources array");
