@@ -2196,6 +2196,31 @@ mod tests {
         }
     }
 
+    fn tune_date() -> String {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        epoch_secs_to_date(now_secs)
+    }
+
+    fn write_jsonl(path: &Path, lines: &[String]) {
+        let content = if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", lines.join("\n"))
+        };
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn event_line(kind: &str) -> String {
+        serde_json::json!({ "kind": kind }).to_string()
+    }
+
+    fn incident_line(detector: &str, id: usize) -> String {
+        serde_json::json!({ "incident_id": format!("{detector}:{id}") }).to_string()
+    }
+
     #[test]
     fn apply_detector_threshold_map_writes_valid_detector_keys() {
         let dir = TempDir::new().unwrap();
@@ -2261,5 +2286,243 @@ mod tests {
         assert!(content.contains("[webhook]"));
         assert!(content.contains("[detectors.ssh_bruteforce]"));
         assert!(content.contains("threshold = 5"));
+    }
+
+    #[test]
+    fn cmd_configure_sensitivity_unknown_level_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+
+        cmd_configure_sensitivity(&cli, "chatty").unwrap();
+
+        assert!(!cli.agent_config.exists());
+    }
+
+    #[test]
+    fn append_or_update_env_creates_parent_and_new_key() {
+        let dir = TempDir::new().unwrap();
+        let env_file = dir.path().join("etc").join("innerwarden").join("agent.env");
+
+        append_or_update_env(&env_file, "INNERWARDEN_TOTP_SECRET", "ABC123").unwrap();
+
+        let content = std::fs::read_to_string(&env_file).unwrap();
+        assert_eq!(content, "INNERWARDEN_TOTP_SECRET=\"ABC123\"\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn append_or_update_env_updates_existing_key_and_preserves_other_lines() {
+        let dir = TempDir::new().unwrap();
+        let env_file = dir.path().join("agent.env");
+        std::fs::write(
+            &env_file,
+            "# managed by test\nINNERWARDEN_TOTP_SECRET=\"old\"\nOTHER=value\n",
+        )
+        .unwrap();
+
+        append_or_update_env(&env_file, "INNERWARDEN_TOTP_SECRET", "new").unwrap();
+
+        let content = std::fs::read_to_string(&env_file).unwrap();
+        assert_eq!(
+            content,
+            "# managed by test\nINNERWARDEN_TOTP_SECRET=\"new\"\nOTHER=value\n"
+        );
+        assert_eq!(content.matches("INNERWARDEN_TOTP_SECRET=").count(), 1);
+    }
+
+    #[test]
+    fn base32_encode_simple_matches_rfc4648_vectors_without_padding() {
+        let cases = [
+            (b"".as_slice(), ""),
+            (b"f".as_slice(), "MY"),
+            (b"fo".as_slice(), "MZXQ"),
+            (b"foo".as_slice(), "MZXW6"),
+            (b"foob".as_slice(), "MZXW6YQ"),
+            (b"fooba".as_slice(), "MZXW6YTB"),
+            (b"foobar".as_slice(), "MZXW6YTBOI"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(base32_encode_simple(input), expected);
+        }
+    }
+
+    #[test]
+    fn hotp_generation_matches_rfc4226_vectors() {
+        let secret = b"12345678901234567890";
+        let expected = [
+            755224, 287082, 359152, 969429, 338314, 254676, 287922, 162583, 399871, 520489,
+        ];
+
+        for (counter, code) in expected.into_iter().enumerate() {
+            assert_eq!(generate_totp_code(secret, counter as u64), code);
+        }
+    }
+
+    #[test]
+    fn totp_verification_rejects_non_six_digit_input() {
+        assert!(!verify_totp_code(b"secret", "12345"));
+        assert!(!verify_totp_code(b"secret", "1234567"));
+        assert!(!verify_totp_code(b"secret", "abcdef"));
+    }
+
+    #[test]
+    fn sha1_simple_matches_known_digest() {
+        assert_eq!(
+            sha1_simple(b"abc"),
+            [
+                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
+                0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
+            ]
+        );
+    }
+
+    #[test]
+    fn cmd_tune_handles_missing_event_data() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+
+        cmd_tune(&cli, 1, true, dir.path()).unwrap();
+    }
+
+    #[test]
+    fn cmd_tune_reports_calibrated_thresholds_without_changes() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        let date = tune_date();
+        let events_path = dir.path().join(format!("events-{date}.jsonl"));
+        let incidents_path = dir.path().join(format!("incidents-{date}.jsonl"));
+        let events = vec![event_line("ssh.login_failed"); 5];
+        write_jsonl(&events_path, &events);
+        write_jsonl(&incidents_path, &[]);
+        std::fs::write(
+            &cli.sensor_config,
+            "[detectors.ssh_bruteforce]\nthreshold = 8\n",
+        )
+        .unwrap();
+
+        cmd_tune(&cli, 1, true, dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(&cli.sensor_config).unwrap();
+        assert!(content.contains("threshold = 8"));
+    }
+
+    #[test]
+    fn cmd_tune_dry_run_reports_raise_suggestions_without_writing() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        let date = tune_date();
+        let events_path = dir.path().join(format!("events-{date}.jsonl"));
+        let incidents_path = dir.path().join(format!("incidents-{date}.jsonl"));
+        let events = vec![event_line("ssh.login_failed"); 100];
+        write_jsonl(&events_path, &events);
+        write_jsonl(&incidents_path, &[]);
+        std::fs::write(
+            &cli.sensor_config,
+            "[detectors.ssh_bruteforce]\nthreshold = 1\n",
+        )
+        .unwrap();
+
+        cmd_tune(&cli, 1, true, dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(&cli.sensor_config).unwrap();
+        assert!(content.contains("threshold = 1"));
+    }
+
+    #[test]
+    fn cmd_tune_applies_raise_suggestion_and_writes_audit() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), false);
+        let date = tune_date();
+        let events_path = dir.path().join(format!("events-{date}.jsonl"));
+        let incidents_path = dir.path().join(format!("incidents-{date}.jsonl"));
+        let events = vec![event_line("ssh.login_failed"); 100];
+        write_jsonl(&events_path, &events);
+        write_jsonl(&incidents_path, &[]);
+        std::fs::write(
+            &cli.sensor_config,
+            "[detectors.ssh_bruteforce]\nthreshold = 1\n",
+        )
+        .unwrap();
+
+        cmd_tune(&cli, 1, true, dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(&cli.sensor_config).unwrap();
+        assert!(content.contains("threshold = 3"));
+        let audit_path = dir
+            .path()
+            .join(format!("admin-actions-{}.jsonl", today_date_string()));
+        assert!(audit_path.exists());
+    }
+
+    #[test]
+    fn cmd_tune_applies_lower_suggestion_when_incidents_are_noisy() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), false);
+        let date = tune_date();
+        let events_path = dir.path().join(format!("events-{date}.jsonl"));
+        let incidents_path = dir.path().join(format!("incidents-{date}.jsonl"));
+        let events = vec![event_line("ssh.login_failed"); 20];
+        let incidents: Vec<String> = (0..20)
+            .map(|id| incident_line("ssh_bruteforce", id))
+            .collect();
+        write_jsonl(&events_path, &events);
+        write_jsonl(&incidents_path, &incidents);
+        std::fs::write(
+            &cli.sensor_config,
+            "[detectors.ssh_bruteforce]\nthreshold = 8\n",
+        )
+        .unwrap();
+
+        cmd_tune(&cli, 1, true, dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(&cli.sensor_config).unwrap();
+        assert!(content.contains("threshold = 7"));
+    }
+
+    #[test]
+    fn cmd_pipeline_test_writes_safe_incident_fixture() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+
+        cmd_pipeline_test(&cli, 0, dir.path()).unwrap();
+
+        let incident_path = dir
+            .path()
+            .join(format!("incidents-{}.jsonl", today_date_string()));
+        let content = std::fs::read_to_string(incident_path).unwrap();
+        assert!(content.contains("198.51.100.123"));
+        assert!(content.contains("pipeline-test"));
+    }
+
+    #[test]
+    fn cmd_backup_dry_run_accepts_explicit_output() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        let output = dir.path().join("backup.tar.gz");
+
+        cmd_backup(&cli, Some(&output)).unwrap();
+
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn cmd_backup_dry_run_accepts_generated_output_path() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+
+        cmd_backup(&cli, None).unwrap();
+    }
+
+    #[test]
+    fn cmd_completions_rejects_unknown_shell() {
+        let err = cmd_completions("powershell").unwrap_err();
+        assert!(err.to_string().contains("unsupported shell"));
     }
 }
