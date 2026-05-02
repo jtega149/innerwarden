@@ -22,8 +22,8 @@ use innerwarden_core::event::Event;
 // rather than constructing a struct, to avoid allocation overhead.
 
 /// Query type names for display.
-#[cfg(any(target_os = "linux", test))]
-fn qtype_name(qtype: u16) -> &'static str {
+#[allow(dead_code)]
+pub fn qtype_name(qtype: u16) -> &'static str {
     match qtype {
         1 => "A",
         2 => "NS",
@@ -41,8 +41,8 @@ fn qtype_name(qtype: u16) -> &'static str {
 
 /// Parse a DNS domain name from a packet buffer.
 /// DNS names are encoded as length-prefixed labels: \x03www\x06google\x03com\x00
-#[cfg(any(target_os = "linux", test))]
-fn parse_dns_name(data: &[u8], mut offset: usize) -> Option<(String, usize)> {
+#[allow(dead_code)]
+pub fn parse_dns_name(data: &[u8], mut offset: usize) -> Option<(String, usize)> {
     let mut labels = Vec::new();
     let mut total_len = 0;
     let max_labels = 128; // prevent infinite loops
@@ -91,8 +91,8 @@ fn parse_dns_name(data: &[u8], mut offset: usize) -> Option<(String, usize)> {
 }
 
 /// Parse a DNS query from a UDP payload.
-#[cfg(any(target_os = "linux", test))]
-fn parse_dns_query(udp_payload: &[u8]) -> Option<(u16, String, u16)> {
+#[allow(dead_code)]
+pub fn parse_dns_query(udp_payload: &[u8]) -> Option<(u16, String, u16)> {
     // DNS header is 12 bytes minimum
     if udp_payload.len() < 12 {
         return None;
@@ -130,8 +130,8 @@ fn parse_dns_query(udp_payload: &[u8]) -> Option<(u16, String, u16)> {
 // ---------------------------------------------------------------------------
 
 /// Parse Ethernet + IP + UDP headers, return (src_ip, src_port, dst_ip, dst_port, udp_payload).
-#[cfg(target_os = "linux")]
-fn parse_packet(raw: &[u8]) -> Option<(String, u16, String, u16, &[u8])> {
+#[allow(dead_code)]
+pub fn parse_packet(raw: &[u8]) -> Option<(String, u16, String, u16, &[u8])> {
     // Ethernet header: 14 bytes
     if raw.len() < 14 {
         return None;

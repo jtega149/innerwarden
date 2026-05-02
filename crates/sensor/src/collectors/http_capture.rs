@@ -20,26 +20,26 @@ use innerwarden_core::event::Event;
 // ---------------------------------------------------------------------------
 
 /// Parsed HTTP request line + headers.
-#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone)]
-struct HttpRequest {
-    method: String,
-    path: String,
-    version: String,
-    host: String,
-    user_agent: String,
-    content_type: String,
-    content_length: usize,
+#[allow(dead_code)]
+pub struct HttpRequest {
+    pub method: String,
+    pub path: String,
+    pub version: String,
+    pub host: String,
+    pub user_agent: String,
+    pub content_type: String,
+    pub content_length: usize,
 }
 
 /// Ports to monitor for HTTP traffic.
-#[cfg(any(target_os = "linux", test))]
-const HTTP_PORTS: &[u16] = &[80, 8080, 8443, 8787, 3000, 5000, 9090];
+#[allow(dead_code)]
+pub const HTTP_PORTS: &[u16] = &[80, 8080, 8443, 8787, 3000, 5000, 9090];
 
 /// Parse HTTP request from TCP payload.
 /// Returns None if not a valid HTTP request.
-#[cfg(any(target_os = "linux", test))]
-fn parse_http_request(payload: &[u8]) -> Option<HttpRequest> {
+#[allow(dead_code)]
+pub fn parse_http_request(payload: &[u8]) -> Option<HttpRequest> {
     // HTTP requests start with METHOD SP PATH SP VERSION CRLF
     let text = std::str::from_utf8(payload).ok()?;
 
@@ -103,8 +103,8 @@ fn parse_http_request(payload: &[u8]) -> Option<HttpRequest> {
 // ---------------------------------------------------------------------------
 
 /// Parse packet, return (src_ip, src_port, dst_ip, dst_port, tcp_payload) for HTTP.
-#[cfg(any(target_os = "linux", test))]
-fn parse_tcp_packet(raw: &[u8]) -> Option<(String, u16, String, u16, &[u8])> {
+#[allow(dead_code)]
+pub fn parse_tcp_packet(raw: &[u8]) -> Option<(String, u16, String, u16, &[u8])> {
     if raw.len() < 14 {
         return None;
     }
@@ -308,6 +308,7 @@ async fn run_linux(tx: mpsc::Sender<Event>, host: String) {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[allow(dead_code)]
 fn truncate_str(s: &str, max: usize) -> &str {
     if s.len() > max {
         &s[..max]
