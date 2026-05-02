@@ -712,17 +712,22 @@ pub(crate) fn setup_remediation_command(checks: &[SetupCheck], is_macos: bool) -
     Some("innerwarden setup --mode advanced".to_string())
 }
 
-fn collect_setup_checks(
-    cli: &Cli,
-    env_file: &Path,
-    notification_plan: &SetupNotificationPlan,
-    responder_plan: SetupResponderPlan,
-    expect_mesh: bool,
-    detected_agents: usize,
-) -> Vec<SetupCheck> {
-    let agent_doc = read_agent_doc(&cli.agent_config);
-    let env_vars = load_env_file(env_file);
-    let is_macos = std::env::consts::OS == "macos";
+#[derive(Debug, Clone, Copy)]
+struct SetupRuntimeStatus {
+    dashboard_reachable: bool,
+    agent_running: bool,
+}
+
+#[cfg(any(test, coverage))]
+fn collect_setup_runtime_status(_cli: &Cli, _is_macos: bool) -> SetupRuntimeStatus {
+    SetupRuntimeStatus {
+        dashboard_reachable: false,
+        agent_running: false,
+    }
+}
+
+#[cfg(not(any(test, coverage)))]
+fn collect_setup_runtime_status(cli: &Cli, is_macos: bool) -> SetupRuntimeStatus {
     let dashboard_url = resolve_dashboard_url(cli);
     let dashboard_status_url = format!("{dashboard_url}/api/status");
     let dashboard_reachable = ureq::get(&dashboard_status_url)
@@ -741,6 +746,25 @@ fn collect_setup_checks(
     } else {
         systemd::is_service_active("innerwarden-agent")
     };
+
+    SetupRuntimeStatus {
+        dashboard_reachable,
+        agent_running,
+    }
+}
+
+fn collect_setup_checks_with_status(
+    cli: &Cli,
+    env_file: &Path,
+    notification_plan: &SetupNotificationPlan,
+    responder_plan: SetupResponderPlan,
+    expect_mesh: bool,
+    detected_agents: usize,
+    runtime: SetupRuntimeStatus,
+) -> Vec<SetupCheck> {
+    let agent_doc = read_agent_doc(&cli.agent_config);
+    let env_vars = load_env_file(env_file);
+    let dashboard_url = resolve_dashboard_url(cli);
 
     let ai_ready = agent_bool(agent_doc.as_ref(), "ai", "enabled");
     let telegram_ready = env_has(&env_vars, "TELEGRAM_BOT_TOKEN")
@@ -773,7 +797,7 @@ fn collect_setup_checks(
             any_ready |= webhook_ready;
         }
         if notification_plan.dashboard {
-            any_ready |= dashboard_reachable;
+            any_ready |= runtime.dashboard_reachable;
         }
         any_ready
     };
@@ -809,22 +833,22 @@ fn collect_setup_checks(
         },
         SetupCheck {
             label: "Agent service".to_string(),
-            detail: if agent_running {
+            detail: if runtime.agent_running {
                 "running".to_string()
             } else {
                 "not running".to_string()
             },
-            ok: agent_running,
+            ok: runtime.agent_running,
             critical: true,
         },
         SetupCheck {
             label: "Dashboard".to_string(),
-            detail: if dashboard_reachable {
+            detail: if runtime.dashboard_reachable {
                 dashboard_url
             } else {
                 "not reachable".to_string()
             },
-            ok: dashboard_reachable,
+            ok: runtime.dashboard_reachable,
             critical: false,
         },
         SetupCheck {
@@ -850,6 +874,27 @@ fn collect_setup_checks(
             critical: false,
         },
     ]
+}
+
+fn collect_setup_checks(
+    cli: &Cli,
+    env_file: &Path,
+    notification_plan: &SetupNotificationPlan,
+    responder_plan: SetupResponderPlan,
+    expect_mesh: bool,
+    detected_agents: usize,
+) -> Vec<SetupCheck> {
+    let is_macos = std::env::consts::OS == "macos";
+    let runtime = collect_setup_runtime_status(cli, is_macos);
+    collect_setup_checks_with_status(
+        cli,
+        env_file,
+        notification_plan,
+        responder_plan,
+        expect_mesh,
+        detected_agents,
+        runtime,
+    )
 }
 
 fn prompt_notification_channels(
@@ -1354,6 +1399,19 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn make_test_cli(data_dir: &Path, dry_run: bool) -> Cli {
+        Cli {
+            sensor_config: data_dir.join("config.toml"),
+            agent_config: data_dir.join("agent.toml"),
+            data_dir: data_dir.to_path_buf(),
+            dry_run,
+            command: Some(crate::Command::Setup {
+                mode: "basic".to_string(),
+            }),
+        }
+    }
 
     #[test]
     fn test_ai_provider_defaults() {
@@ -1440,5 +1498,351 @@ mod tests {
 
         let complex_cmd = setup_remediation_command(&checks, false).unwrap();
         assert_eq!(complex_cmd, "innerwarden setup --mode advanced");
+    }
+
+    #[test]
+    fn setup_mode_parses_basic_and_advanced() {
+        assert_eq!(SetupMode::from_str("advanced"), SetupMode::Advanced);
+        assert_eq!(SetupMode::from_str("ADVANCED"), SetupMode::Advanced);
+        assert_eq!(SetupMode::from_str("basic"), SetupMode::Basic);
+        assert_eq!(SetupMode::from_str("anything-else"), SetupMode::Basic);
+        assert!(SetupMode::from_str("advanced").is_advanced());
+        assert!(!SetupMode::from_str("basic").is_advanced());
+    }
+
+    #[test]
+    fn setup_notification_plan_labels_selected_channels() {
+        let none = SetupNotificationPlan::default();
+        assert_eq!(none.label(), "none");
+        assert!(!none.any_selected());
+
+        let plan = SetupNotificationPlan {
+            telegram: true,
+            slack: true,
+            webhook: false,
+            dashboard: true,
+        };
+        assert_eq!(plan.label(), "Telegram + Slack + Dashboard");
+        assert!(plan.any_selected());
+    }
+
+    #[test]
+    fn setup_responder_plan_labels_modes() {
+        assert_eq!(SetupResponderPlan { dry_run: true }.label(), "Watch only");
+        assert_eq!(
+            SetupResponderPlan { dry_run: false }.label(),
+            "Auto-protect"
+        );
+    }
+
+    #[test]
+    fn parse_setup_capability_hint_reads_id_and_params() {
+        let plan = parse_setup_capability_hint(
+            "innerwarden enable search-protection --param nginx_access=/var/log/nginx/access.log --param threshold=15",
+        )
+        .unwrap();
+
+        assert_eq!(plan.id, "search-protection");
+        assert_eq!(
+            plan.params.get("nginx_access").map(String::as_str),
+            Some("/var/log/nginx/access.log")
+        );
+        assert_eq!(plan.params.get("threshold").map(String::as_str), Some("15"));
+
+        assert!(parse_setup_capability_hint("").is_none());
+        assert!(parse_setup_capability_hint("innerwarden list").is_none());
+        assert!(parse_setup_capability_hint("sudo innerwarden enable ai").is_none());
+    }
+
+    #[test]
+    fn setup_capability_restart_needs_maps_known_capabilities() {
+        assert_eq!(setup_capability_restart_needs("ai"), (false, true));
+        assert_eq!(setup_capability_restart_needs("block-ip"), (false, true));
+        assert_eq!(
+            setup_capability_restart_needs("sudo-protection"),
+            (true, true)
+        );
+        assert_eq!(setup_capability_restart_needs("shell-audit"), (true, false));
+        assert_eq!(
+            setup_capability_restart_needs("search-protection"),
+            (true, true)
+        );
+        assert_eq!(setup_capability_restart_needs("unknown"), (false, false));
+    }
+
+    #[test]
+    fn agent_doc_helpers_read_booleans_strings_and_env_values() {
+        let dir = TempDir::new().unwrap();
+        let cfg = dir.path().join("agent.toml");
+        std::fs::write(
+            &cfg,
+            "[ai]\nenabled = true\nprovider = \"openai\"\n\n[telegram]\nmin_severity = \"high\"\n",
+        )
+        .unwrap();
+
+        let doc = read_agent_doc(&cfg).unwrap();
+        assert!(agent_bool(Some(&doc), "ai", "enabled"));
+        assert!(!agent_bool(Some(&doc), "mesh", "enabled"));
+        assert_eq!(
+            agent_str(Some(&doc), "ai", "provider"),
+            Some("openai".to_string())
+        );
+        assert_eq!(agent_str(Some(&doc), "ai", "missing"), None);
+
+        std::fs::write(&cfg, "not = [valid").unwrap();
+        assert!(read_agent_doc(&cfg).is_none());
+        assert!(read_agent_doc(&dir.path().join("missing.toml")).is_none());
+
+        let mut env_vars = HashMap::new();
+        let key_prefix = format!(
+            "SETUP_TEST_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let empty_key = format!("{key_prefix}_EMPTY");
+        let present_key = format!("{key_prefix}_PRESENT");
+        let missing_key = format!("{key_prefix}_MISSING");
+        env_vars.insert(empty_key.clone(), "  ".to_string());
+        env_vars.insert(present_key.clone(), "value".to_string());
+        assert!(!env_has(&env_vars, &empty_key));
+        assert!(env_has(&env_vars, &present_key));
+        assert!(!env_has(&env_vars, &missing_key));
+    }
+
+    #[test]
+    fn build_setup_ai_plan_uses_env_config_and_default_keys() {
+        let openai =
+            build_setup_ai_plan("openai", "OpenAI", Some("sk-test".to_string()), None, None);
+        assert_eq!(openai.provider, "openai");
+        assert_eq!(openai.model, "gpt-4o-mini");
+        assert!(openai.base_url.is_none());
+        match openai.key {
+            SetupAiKey::Env { var, value } => {
+                assert_eq!(var, "OPENAI_API_KEY");
+                assert_eq!(value, "sk-test");
+            }
+            _ => panic!("expected env key"),
+        }
+
+        let ollama_cloud = build_setup_ai_plan(
+            "ollama",
+            "Ollama Cloud",
+            Some("ollama-key".to_string()),
+            Some("gpt-oss:20b".to_string()),
+            Some("https://api.ollama.com".to_string()),
+        );
+        match ollama_cloud.key {
+            SetupAiKey::Config { value } => assert_eq!(value, "ollama-key"),
+            _ => panic!("expected config key"),
+        }
+        assert_eq!(
+            ollama_cloud.base_url.as_deref(),
+            Some("https://api.ollama.com")
+        );
+
+        let local = build_setup_ai_plan("ollama", "Ollama", None, None, None);
+        assert!(matches!(local.key, SetupAiKey::None));
+    }
+
+    #[test]
+    fn apply_setup_ai_plan_writes_agent_config_and_env_file() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        let env_file = dir.path().join("agent.env");
+        let plan =
+            build_setup_ai_plan("groq", "Groq", Some("gsk_test_key".to_string()), None, None);
+
+        apply_setup_ai_plan(&cli, &env_file, &plan).unwrap();
+
+        let agent = std::fs::read_to_string(&cli.agent_config).unwrap();
+        assert!(agent.contains("[ai]"));
+        assert!(agent.contains("enabled = true"));
+        assert!(agent.contains("provider = \"groq\""));
+        assert!(agent.contains("model = \"llama-3.3-70b-versatile\""));
+        assert!(agent.contains("base_url = \"https://api.groq.com/openai\""));
+
+        let env = std::fs::read_to_string(&env_file).unwrap();
+        assert!(env.contains("GROQ_API_KEY"));
+        assert!(env.contains("gsk_test_key"));
+    }
+
+    #[test]
+    fn apply_setup_ai_plan_writes_ollama_cloud_key_to_config() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        let env_file = dir.path().join("agent.env");
+        let plan = build_setup_ai_plan(
+            "ollama",
+            "Ollama Cloud",
+            Some("ollama-key".to_string()),
+            Some("gpt-oss:20b".to_string()),
+            Some("https://api.ollama.com".to_string()),
+        );
+
+        apply_setup_ai_plan(&cli, &env_file, &plan).unwrap();
+
+        let agent = std::fs::read_to_string(&cli.agent_config).unwrap();
+        assert!(agent.contains("api_key = \"ollama-key\""));
+        assert!(!env_file.exists());
+    }
+
+    #[test]
+    fn collect_setup_checks_reports_ready_configured_components() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        let env_file = dir.path().join("agent.env");
+        std::fs::write(
+            &cli.agent_config,
+            "[ai]\nenabled = true\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"\n\n[telegram]\nenabled = true\n\n[responder]\nenabled = true\ndry_run = true\n\n[mesh]\nenabled = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &env_file,
+            "TELEGRAM_BOT_TOKEN=1234567890:abcdefghijklmnopqrstuvwxyz\nTELEGRAM_CHAT_ID=123456789\n",
+        )
+        .unwrap();
+
+        let checks = collect_setup_checks_with_status(
+            &cli,
+            &env_file,
+            &SetupNotificationPlan {
+                telegram: true,
+                ..Default::default()
+            },
+            SetupResponderPlan { dry_run: true },
+            true,
+            2,
+            SetupRuntimeStatus {
+                dashboard_reachable: false,
+                agent_running: true,
+            },
+        );
+
+        let ai = checks.iter().find(|check| check.label == "AI").unwrap();
+        assert!(ai.ok);
+        assert_eq!(ai.detail, "openai (gpt-4o-mini)");
+
+        let alerts = checks.iter().find(|check| check.label == "Alerts").unwrap();
+        assert!(alerts.ok);
+        assert_eq!(alerts.detail, "Telegram");
+
+        let protection = checks
+            .iter()
+            .find(|check| check.label == "Protection")
+            .unwrap();
+        assert!(protection.ok);
+        assert_eq!(protection.detail, "Watch only");
+
+        let service = checks
+            .iter()
+            .find(|check| check.label == "Agent service")
+            .unwrap();
+        assert!(service.ok);
+        assert_eq!(service.detail, "running");
+
+        let mesh = checks.iter().find(|check| check.label == "Mesh").unwrap();
+        assert!(mesh.ok);
+
+        let agents = checks
+            .iter()
+            .find(|check| check.label == "AI agents")
+            .unwrap();
+        assert!(agents.ok);
+        assert_eq!(agents.detail, "2 detected");
+    }
+
+    #[test]
+    fn collect_setup_checks_wrapper_uses_runtime_status_without_test_io() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        let env_file = dir.path().join("agent.env");
+        std::fs::write(
+            &cli.agent_config,
+            "[ai]\nenabled = true\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"\n\n[responder]\nenabled = true\ndry_run = true\n",
+        )
+        .unwrap();
+
+        let checks = collect_setup_checks(
+            &cli,
+            &env_file,
+            &SetupNotificationPlan {
+                dashboard: true,
+                ..Default::default()
+            },
+            SetupResponderPlan { dry_run: true },
+            false,
+            1,
+        );
+
+        let alerts = checks.iter().find(|check| check.label == "Alerts").unwrap();
+        assert!(!alerts.ok);
+        assert_eq!(alerts.detail, "Dashboard not ready");
+
+        let service = checks
+            .iter()
+            .find(|check| check.label == "Agent service")
+            .unwrap();
+        assert!(!service.ok);
+        assert_eq!(service.detail, "not running");
+
+        let dashboard = checks
+            .iter()
+            .find(|check| check.label == "Dashboard")
+            .unwrap();
+        assert!(!dashboard.ok);
+        assert_eq!(dashboard.detail, "not reachable");
+    }
+
+    #[test]
+    fn collect_setup_checks_marks_missing_selected_alerts_not_ready() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        let env_file = dir.path().join("agent.env");
+        std::fs::write(
+            &cli.agent_config,
+            "[ai]\nenabled = false\n\n[responder]\nenabled = true\ndry_run = false\n",
+        )
+        .unwrap();
+
+        let checks = collect_setup_checks_with_status(
+            &cli,
+            &env_file,
+            &SetupNotificationPlan {
+                slack: true,
+                ..Default::default()
+            },
+            SetupResponderPlan { dry_run: true },
+            false,
+            0,
+            SetupRuntimeStatus {
+                dashboard_reachable: false,
+                agent_running: false,
+            },
+        );
+
+        let alerts = checks.iter().find(|check| check.label == "Alerts").unwrap();
+        assert!(!alerts.ok);
+        assert_eq!(alerts.detail, "Slack not ready");
+
+        let ai = checks.iter().find(|check| check.label == "AI").unwrap();
+        assert!(!ai.ok);
+        assert_eq!(ai.detail, "not configured");
+
+        let protection = checks
+            .iter()
+            .find(|check| check.label == "Protection")
+            .unwrap();
+        assert!(!protection.ok);
+        assert_eq!(protection.detail, "Watch only");
+
+        let agents = checks
+            .iter()
+            .find(|check| check.label == "AI agents")
+            .unwrap();
+        assert!(!agents.ok);
+        assert_eq!(agents.detail, "none detected");
     }
 }

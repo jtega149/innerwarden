@@ -10,6 +10,9 @@ description = "InnerWarden control plane - manage capabilities and system config
 keywords = ["security", "linux", "capabilities", "rust"]
 categories = ["command-line-utilities"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+
 [[bin]]
 name = "innerwarden-ctl"
 path = "src/main.rs"
