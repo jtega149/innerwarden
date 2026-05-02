@@ -95,7 +95,7 @@ pub fn format_daily_digest_enriched(
         if !pipeline.deferred.is_empty() {
             msg.push_str("\n\n\u{1f916} <b>Handled silently:</b>");
             for (detector, count) in &pipeline.deferred {
-                let label = friendly_detector_name(detector);
+                let label = escape_html(friendly_detector_name(detector));
                 msg.push_str(&format!("\n\u{00a0}\u{00a0}\u{2022} {count} {label}"));
             }
         }
@@ -141,6 +141,7 @@ pub fn format_daily_digest_enriched(
         if !pipeline.deferred.is_empty() {
             msg.push_str("\nDeferred:");
             for (detector, count) in &pipeline.deferred {
+                let detector = escape_html(detector);
                 msg.push_str(&format!(" {detector}={count}"));
             }
         }
@@ -310,5 +311,23 @@ mod tests {
         let pipeline = empty_pipeline();
         let msg = format_daily_digest_enriched(1, 0, 0, 0, "evil<script>&", 1, false, &pipeline);
         assert!(msg.contains("evil&lt;script&gt;&amp;"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_html_escapes_deferred_detector_names() {
+        let pipeline = PipelineDigestStats {
+            suppressed_count: 1,
+            auto_resolved_groups: 0,
+            needs_review_groups: 0,
+            deferred: vec![("evil<script>&".to_string(), 2)],
+        };
+
+        let simple = format_daily_digest_enriched(2, 1, 0, 0, "safe", 1, true, &pipeline);
+        assert!(simple.contains("evil&lt;script&gt;&amp;"));
+        assert!(!simple.contains("evil<script>&"));
+
+        let technical = format_daily_digest_enriched(2, 1, 0, 0, "safe", 1, false, &pipeline);
+        assert!(technical.contains("evil&lt;script&gt;&amp;=2"));
+        assert!(!technical.contains("evil<script>&=2"));
     }
 }

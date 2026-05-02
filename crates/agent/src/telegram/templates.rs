@@ -39,3 +39,65 @@ pub fn explain_detector(detector: &str) -> String {
         escape_html(text)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explain_detector_known_detectors_render_operator_copy() {
+        let cases = [
+            ("ssh_bruteforce", "guessing passwords"),
+            ("credential_stuffing", "stolen passwords"),
+            ("port_scan", "checking which services"),
+            ("packet_flood", "large amount of network traffic"),
+            ("data_exfil", "send sensitive data"),
+            ("data_exfil_cmd", "send sensitive data"),
+            ("data_exfil_ebpf", "send sensitive data"),
+            ("reverse_shell", "remotely control your server"),
+            ("privesc", "administrator"),
+            ("rootkit", "kernel"),
+            ("ransomware", "encrypts your files"),
+            ("dns_tunneling", "DNS system"),
+            ("dns_tunneling_ebpf", "DNS system"),
+            ("c2_callback", "command and control"),
+            ("crypto_miner", "mine cryptocurrency"),
+            ("container_escape", "containerized application"),
+            ("lateral_movement", "move from one system"),
+            ("web_shell", "web-based backdoor"),
+            ("process_injection", "insert its code"),
+            ("fileless", "entirely in memory"),
+            ("log_tampering", "modify system logs"),
+            ("ssh_key_injection", "SSH key was added"),
+            ("crontab_persistence", "scheduled task or service"),
+            ("systemd_persistence", "scheduled task or service"),
+            ("kernel_module_load", "kernel module"),
+            ("discovery_burst", "map out your system"),
+            ("sigma", "signature database"),
+            ("suspicious_execution", "legitimate tool"),
+            ("sensitive_write", "important system file"),
+            ("user_creation", "new user account"),
+            ("process_tree", "suspicious chain"),
+            ("neural_anomaly", "normal patterns"),
+        ];
+
+        for (detector, fragment) in cases {
+            let msg = explain_detector(detector);
+            assert!(msg.starts_with("\u{2139}\u{fe0f} <b>What does this mean?</b>"));
+            assert!(
+                msg.contains(fragment),
+                "{detector} message should contain {fragment:?}, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_detector_unknown_uses_generic_copy_without_reflecting_input() {
+        let msg = explain_detector("unknown<script>&detector");
+
+        assert!(msg.contains("InnerWarden detected suspicious activity"));
+        assert!(!msg.contains("unknown"));
+        assert!(!msg.contains("<script>"));
+        assert!(!msg.contains("&detector"));
+    }
+}

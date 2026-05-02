@@ -3128,34 +3128,20 @@ mod tests {
     /// daily digests + manual approvals on a transient network blip
     /// were lost within journald's rotation window.
     ///
-    /// Test setup: route the client through a non-routable URL so
-    /// the send fails. Confirm `telegram-failed.jsonl` captures
-    /// the original message + the error.
+    /// Test setup: route the client through the local mock Telegram
+    /// server and force an ok=false API response. Confirm
+    /// `telegram-failed.jsonl` captures the original message + error.
     #[tokio::test]
-    async fn telegram_failed_jsonl_records_http_failure() -> Result<()> {
+    async fn telegram_failed_jsonl_records_api_failure() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        // Don't enable mock mode — we WANT the real HTTP path so the
-        // failure path executes. Point the client at a non-routable
-        // address that will refuse the connection immediately.
-        let mut client = TelegramClient::new("dummy-token", "dummy-chat", None)?;
+        let (_state, server, port, cert_dir) =
+            start_mock_telegram_server_with_options(vec![], true).await?;
+        let mut client = build_test_client(port, cert_dir.path())?;
         let failed_path = dir.path().join("telegram-failed.jsonl");
         client.set_failed_jsonl_path(failed_path.clone());
-        // Point the http client at a non-existent loopback port to
-        // force a connection refused. The TelegramClient uses
-        // `api.telegram.org` by default, but we override the
-        // resolution by replacing self.http with a client that
-        // resolves api.telegram.org to an unused localhost port.
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .resolve(
-                "api.telegram.org",
-                std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
-            )
-            .build()?;
-        client.http = http;
-        // Send must error.
-        let result = client.send_text_message("operator integrity alert").await;
-        assert!(result.is_err(), "send to dead address must fail");
+
+        client.send_text_message("operator integrity alert").await?;
+
         // The failed-jsonl file must exist with one record.
         let content = std::fs::read_to_string(&failed_path)?;
         let lines: Vec<&str> = content.lines().collect();
@@ -3166,7 +3152,8 @@ mod tests {
         assert!(parsed["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("http error"));
+            .contains("api ok=false"));
+        server.abort();
         Ok(())
     }
 }
