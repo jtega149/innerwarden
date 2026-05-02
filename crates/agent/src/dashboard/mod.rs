@@ -863,17 +863,46 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn serve_css() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS)
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            // Same rationale as STATIC_NO_CACHE on the JS handlers
+            // below: pre-fix, app.css was browser-cached heuristically
+            // and a deploy that updated CSS left the operator looking
+            // at the pre-deploy theme until they hard-refreshed.
+            (header::CACHE_CONTROL, "no-store, max-age=0"),
+        ],
+        APP_CSS,
+    )
 }
+
+// 2026-05-02: dashboard JS/CSS were served WITHOUT any Cache-Control
+// header. Browsers fall back to heuristic caching (often hours/days)
+// for static assets, which meant every deploy left users running the
+// pre-deploy JS until they manually hard-refreshed. Operator on
+// 2026-05-02: "parece que esse grafico ta congelado" / "parece que vc
+// fez uma PR so pra me enganar, porque nao mudou nada no dashboard"
+// — the binary on the server already had the fixes; the browser was
+// rendering stale JS from cache.
+//
+// Fix: stamp every static-asset response with `Cache-Control: no-store`
+// so the browser always fetches fresh after a deploy. The bundles are
+// small (tens of kB each, gzip ~5–15 kB), the dashboard is internal,
+// and the cost of "always re-fetch" is negligible compared to the
+// confidence of "what I deployed is what the operator sees".
+const STATIC_NO_CACHE: &str = "no-store, max-age=0";
 
 macro_rules! js_handler {
     ($name:ident, $content:expr) => {
         async fn $name() -> impl IntoResponse {
             (
-                [(
-                    header::CONTENT_TYPE,
-                    "application/javascript; charset=utf-8",
-                )],
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        "application/javascript; charset=utf-8",
+                    ),
+                    (header::CACHE_CONTROL, STATIC_NO_CACHE),
+                ],
                 $content,
             )
         }
@@ -3317,6 +3346,52 @@ mod tests {
         );
         // The branch that calls loadJourney must be reachable.
         assert!(JS_SSE.contains("loadJourney('ip', alertIp)"));
+    }
+
+    #[tokio::test]
+    async fn js_and_css_handlers_set_no_store_cache_control() {
+        // 2026-05-02: dashboard JS / CSS were served without any
+        // Cache-Control header. Browsers heuristically cached them for
+        // hours, so a deploy left every operator's browser running
+        // pre-deploy code until they hard-refreshed. The operator
+        // explicitly asked for the fix after seeing "the dashboard
+        // hasn't changed" through three deploys. This anchor pins
+        // the header on every static asset handler so the regression
+        // can't recur silently.
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        // Pick one representative JS handler — they all share the
+        // same macro, so testing one is sufficient to anchor the
+        // contract. If the macro regresses, the assertion fails for
+        // every handler.
+        let resp = serve_js_sse().await.into_response();
+        let cc = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .expect("JS responses must carry a Cache-Control header")
+            .to_str()
+            .unwrap();
+        assert!(
+            cc.contains("no-store"),
+            "JS Cache-Control must include `no-store` so browsers re-fetch \
+             after every deploy. Got: `{cc}`"
+        );
+        // Drain the body so the response object is dropped cleanly.
+        let _ = to_bytes(resp.into_body(), 1024 * 1024).await;
+
+        let resp = serve_css().await.into_response();
+        let cc = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .expect("CSS responses must carry a Cache-Control header")
+            .to_str()
+            .unwrap();
+        assert!(
+            cc.contains("no-store"),
+            "CSS Cache-Control must include `no-store`. Got: `{cc}`"
+        );
+        let _ = to_bytes(resp.into_body(), 1024 * 1024).await;
     }
 
     #[test]
