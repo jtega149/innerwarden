@@ -4210,6 +4210,95 @@ mod tests {
         );
     }
 
+    // ─── Wave 5 (2026-05-03) — Baseline login heatmap honesty ───
+    //
+    // Real prod observation 2026-05-03: the operator opened the
+    // Baseline tab and the "Who logs in, when" heatmap rendered
+    // many user rows (`snap_daemon`, `systemd-resolve`, `messagebus`,
+    // `_apt`, ...) on top of the real `ubuntu` SSH session. PAM emits
+    // "session opened" entries for daemon accounts using the same
+    // plumbing as real SSH logins; without filtering, the heatmap
+    // reads as "all these people have logged in" — which the
+    // operator's `last -F` and `journalctl` confirmed was false (only
+    // `ubuntu` had real SSH sessions).
+    //
+    // Fix is two layers:
+    //   1. Backend `/api/baseline-status` enriches the JSON with a
+    //      `user_classes` map keyed by username (anchored separately
+    //      in `dashboard::intelligence::baseline_enrich_tests`).
+    //   2. Frontend `loginHeatmap` reads `b.user_classes` and
+    //      default-hides rows where the class is `service`. A toggle
+    //      surfaces them on demand. Toggle state persists in
+    //      localStorage. Pagination kicks in at 20+ visible rows.
+    //
+    // This test pins the JS contract so a refactor that drops the
+    // filter / toggle / pagination ships red.
+    #[test]
+    fn js_login_heatmap_hides_service_accounts_by_default() {
+        // Default-hide branch: filter on the `service` class label.
+        assert!(
+            JS_INTEL.contains("if (c === 'service') return showServices"),
+            "loginHeatmap must hide entries with class === 'service' by default"
+        );
+        // Receives `userClasses` as the second argument. A renderer
+        // that drops the parameter would silently fall back to
+        // showing every entry (regression).
+        assert!(JS_INTEL.contains("function loginHeatmap(logins, userClasses)"));
+        // Operator-facing toggle copy must clearly name the hidden set.
+        assert!(JS_INTEL.contains("Show system accounts"));
+        assert!(JS_INTEL.contains("Hide system accounts"));
+        // Toggle handler exists and is wired through the same data
+        // path as the initial render (calls `loadBaseline()`).
+        assert!(JS_INTEL.contains("toggleLoginHeatmapServices"));
+        assert!(JS_INTEL.contains("loginHeatmapSetShowServices"));
+        // Choice persists in localStorage so it survives reloads.
+        assert!(JS_INTEL.contains("innerwarden.baseline.showServices"));
+        // Pagination is wired (anchored at 20-per-page).
+        assert!(JS_INTEL.contains("LOGIN_HEATMAP_PAGE_SIZE = 20"));
+        assert!(JS_INTEL.contains("loginHeatmapNextPage"));
+        assert!(JS_INTEL.contains("loginHeatmapPrevPage"));
+        // Per-row class badge is rendered so the operator can see
+        // why something was kept visible (Human / Root / Unknown).
+        // The class names are interpolated in JS (`login-class-badge-${c}`),
+        // so the literal strings live in the CSS — anchor there.
+        assert!(JS_INTEL.contains("classBadge"));
+        assert!(JS_INTEL.contains("login-class-badge-${c}"));
+        assert!(APP_CSS.contains(".login-class-badge-human"));
+        assert!(APP_CSS.contains(".login-class-badge-service"));
+        assert!(APP_CSS.contains(".login-class-badge-root"));
+        assert!(APP_CSS.contains(".login-class-badge-unknown"));
+        // The endpoint enrichment path is the SoT — frontend must
+        // read `b.user_classes`, not classify on its own.
+        assert!(
+            JS_INTEL.contains("loginHeatmap(b.user_login_hours, b.user_classes)"),
+            "loadBaseline must pass user_classes from the endpoint, not classify locally"
+        );
+        // Anti-regression: the operator-visible complaint was that
+        // `.login-heatmap` had `max-width: 720px` and stopped halfway
+        // across the Baseline card. The replacement uses `width: 100%`
+        // and the CSS carries a Wave-5 annotation pointing at the
+        // rationale. Anchor on both so a "tighten the layout" PR
+        // either preserves full width OR has to re-justify the
+        // narrowing in this test.
+        assert!(
+            APP_CSS.contains("/* 2026-05-03 (Wave 5):"),
+            "CSS must carry the Wave 5 annotation explaining width: 100%"
+        );
+        // The ORIGINAL bad pattern was `max-width: 720px;` ON the
+        // `.login-heatmap` rule, NOT inside a `@media` query.
+        // Stripping all whitespace makes the check robust to
+        // formatting drift while still catching the regressed shape.
+        let css_compact: String = APP_CSS.split_whitespace().collect();
+        assert!(
+            !css_compact.contains(".login-heatmap{display:flex;flex-direction:column;gap:4px;margin-bottom:12px;max-width:720px;}"),
+            ".login-heatmap must not regress to max-width: 720px"
+        );
+        assert!(
+            css_compact.contains(".login-heatmap{display:flex;flex-direction:column;gap:4px;margin-bottom:12px;width:100%;}"),
+            ".login-heatmap must use width: 100% so the grid fills the card"
+        );
+    }
+
     #[tokio::test]
     async fn csrf_protection_rejects_post_without_header() {
         // Wire the CSRF middleware to a tiny echo router and verify

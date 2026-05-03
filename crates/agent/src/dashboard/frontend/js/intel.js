@@ -487,28 +487,140 @@ function baselineHeroCard(b, deviations24h) {
     </div>`;
 }
 
-function loginHeatmap(logins) {
-  // Compact 24×N heatmap. Each user gets a single row of 24 cells.
+// 2026-05-03 (Wave 5): pagination state for the login heatmap. Stays a
+// module-level let so back/forward inside the same Baseline render
+// preserves the page; switching tabs resets via `_loginHeatmapPage = 0`
+// in `loadBaseline`. Toggle state is persisted in localStorage so the
+// operator's choice survives reloads.
+let _loginHeatmapPage = 0;
+const LOGIN_HEATMAP_PAGE_SIZE = 20;
+const LOGIN_HEATMAP_LS_KEY = 'innerwarden.baseline.showServices';
+
+function loginHeatmapShowServices() {
+  try {
+    return localStorage.getItem(LOGIN_HEATMAP_LS_KEY) === '1';
+  } catch (_) {
+    return false;
+  }
+}
+
+function loginHeatmapSetShowServices(v) {
+  try {
+    localStorage.setItem(LOGIN_HEATMAP_LS_KEY, v ? '1' : '0');
+  } catch (_) {}
+}
+
+// Exposed onclick handlers for the toggle + pagination. Re-renders by
+// calling `loadBaseline()` so the controls go through the same data path
+// as the initial load — a single source of truth for what the user sees.
+window.toggleLoginHeatmapServices = function () {
+  loginHeatmapSetShowServices(!loginHeatmapShowServices());
+  _loginHeatmapPage = 0;
+  loadBaseline();
+};
+window.loginHeatmapNextPage = function () {
+  _loginHeatmapPage += 1;
+  loadBaseline();
+};
+window.loginHeatmapPrevPage = function () {
+  _loginHeatmapPage = Math.max(0, _loginHeatmapPage - 1);
+  loadBaseline();
+};
+
+function loginHeatmap(logins, userClasses) {
+  // Full-width 24×N heatmap. Each user gets a single row of 24 cells.
   // Bright cell = login activity seen in that hour historically.
-  const users = Object.entries(logins);
-  if (users.length === 0) return '';
-  const rows = users.map(([user, hours]) => {
+  //
+  // 2026-05-03 (Wave 5 — semantics fix):
+  // - PAM emits "session opened" entries for daemon accounts
+  //   (snap_daemon, systemd-resolve, messagebus, _apt, ...) that share
+  //   plumbing with real SSH logins. Without filtering, the heatmap
+  //   reads as "many users have logged in" when in reality only the
+  //   `Human` + `Root` rows are real human SSH sessions.
+  // - The endpoint enriches the JSON with `user_classes`. When that
+  //   field is missing (older agent / classification failed), every
+  //   user falls back to `unknown` and is shown — operator visibility
+  //   beats false reassurance.
+  // - The "Show system accounts" toggle is persisted in localStorage
+  //   so the operator's choice survives reloads.
+  // - Pagination kicks in only when visible humans exceed
+  //   LOGIN_HEATMAP_PAGE_SIZE (20). Below that threshold, no paging
+  //   controls render at all — keeps the simple case simple.
+  const allUsers = Object.entries(logins);
+  if (allUsers.length === 0) return '';
+  const classes = userClasses || {};
+  const classOf = (u) => classes[u] || 'unknown';
+
+  const showServices = loginHeatmapShowServices();
+  const visible = allUsers.filter(([user]) => {
+    const c = classOf(user);
+    if (c === 'service') return showServices;
+    return true; // human, root, unknown — always visible
+  });
+  const hiddenServices = allUsers.length - visible.length;
+
+  const totalPages = Math.max(1, Math.ceil(visible.length / LOGIN_HEATMAP_PAGE_SIZE));
+  if (_loginHeatmapPage >= totalPages) _loginHeatmapPage = totalPages - 1;
+  const pageStart = _loginHeatmapPage * LOGIN_HEATMAP_PAGE_SIZE;
+  const pageUsers = visible.slice(pageStart, pageStart + LOGIN_HEATMAP_PAGE_SIZE);
+
+  const classBadge = (c) => {
+    const labels = { human: 'human', root: 'root', service: 'service', unknown: 'unknown' };
+    const label = labels[c] || c;
+    return `<span class="login-class-badge login-class-badge-${c}">${label}</span>`;
+  };
+
+  const rows = pageUsers.map(([user, hours]) => {
+    const c = classOf(user);
     const cells = hours.map((v, i) => {
       const active = v > 0;
       const cls = active ? 'login-cell login-cell-active' : 'login-cell';
-      return `<div class="${cls}" title="${esc(user)} - ${i}:00 ${active ? '✓ logged in at this hour' : '(no record)'}"></div>`;
+      const tip = `${user} (${c}) - ${i}:00 ${active ? '✓ session at this hour' : '(no record)'}`;
+      return `<div class="${cls}" title="${esc(tip)}"></div>`;
     }).join('');
     return `
       <div class="login-heatmap-row">
-        <div class="login-heatmap-user">${esc(user)}</div>
+        <div class="login-heatmap-user">
+          ${classBadge(c)}
+          <span class="login-heatmap-user-name" title="${esc(user)}">${esc(user)}</span>
+        </div>
         <div class="login-heatmap-cells">${cells}</div>
       </div>`;
   }).join('');
+
+  // Toggle row + (optional) pagination row + (optional) hint about
+  // hidden service entries. Keep them above the grid so the operator
+  // sees the controls before the data.
+  const showHideLabel = showServices
+    ? `Hide system accounts`
+    : (hiddenServices > 0
+      ? `Show system accounts (${hiddenServices})`
+      : `Show system accounts`);
+  const toggleRow = `
+    <div class="login-heatmap-controls">
+      <button type="button" class="login-heatmap-toggle" onclick="toggleLoginHeatmapServices()">
+        ${esc(showHideLabel)}
+      </button>
+      ${hiddenServices > 0 && !showServices ? `
+        <span class="login-heatmap-hint">
+          ${hiddenServices} ${hiddenServices === 1 ? 'daemon PAM session is' : 'daemon PAM sessions are'} hidden (snap_daemon, systemd-resolve, etc.) — they share SSH plumbing but are not real human logins.
+        </span>` : ''}
+    </div>`;
+
+  const paginationRow = visible.length > LOGIN_HEATMAP_PAGE_SIZE ? `
+    <div class="login-heatmap-pagination">
+      <button type="button" onclick="loginHeatmapPrevPage()" ${_loginHeatmapPage === 0 ? 'disabled' : ''}>← Prev</button>
+      <span class="login-heatmap-page-meta">Page ${_loginHeatmapPage + 1} of ${totalPages} · showing ${pageUsers.length} of ${visible.length} users</span>
+      <button type="button" onclick="loginHeatmapNextPage()" ${_loginHeatmapPage >= totalPages - 1 ? 'disabled' : ''}>Next →</button>
+    </div>` : '';
+
   return `
+    ${toggleRow}
     <div class="login-heatmap">
       <div class="login-heatmap-axis"><span>0h</span><span>6h</span><span>12h</span><span>18h</span><span>23h</span></div>
       ${rows}
-    </div>`;
+    </div>
+    ${paginationRow}`;
 }
 
 function eventRateAggregateSparkline(rates) {
@@ -617,8 +729,8 @@ async function loadBaseline() {
           ${eventRateAggregateSparkline(b.event_rate_by_hour || {})}
           ${Object.keys(b.user_login_hours || {}).length > 0 ? `
             <h4 class="baseline-subtitle">Who logs in, when</h4>
-            <p style="font-size:0.8rem;color:var(--dim);margin:0 0 8px;">Each row is a user; each square is an hour of the day this user was seen logging in at some point.</p>
-            ${loginHeatmap(b.user_login_hours)}
+            <p style="font-size:0.8rem;color:var(--dim);margin:0 0 8px;">Each row is a user; each square is an hour of the day this user was seen with an active session. System accounts (snap_daemon, systemd-resolve, _apt, ...) are hidden by default — they share PAM plumbing with real SSH logins but are not human sessions.</p>
+            ${loginHeatmap(b.user_login_hours, b.user_classes)}
           ` : ''}
           ${Object.keys(b.process_destinations || {}).length > 0 ? `
             <h4 class="baseline-subtitle">Processes that talk to the outside</h4>

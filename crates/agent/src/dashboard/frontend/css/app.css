@@ -2441,22 +2441,31 @@
       font-size: 0.65rem; color: var(--dim); margin-top: 4px;
     }
 
+    /* 2026-05-03 (Wave 5): max-width removed so the heatmap uses the
+       full Baseline-card width. The user-name column widened to 180px
+       to fit a class badge + name without wrapping. */
     .login-heatmap {
       display: flex; flex-direction: column; gap: 4px;
-      margin-bottom: 12px; max-width: 720px;
+      margin-bottom: 12px; width: 100%;
     }
     .login-heatmap-axis {
       display: flex; justify-content: space-between;
       font-size: 0.65rem; color: var(--dim);
-      padding-left: 110px; padding-right: 4px;
+      padding-left: 196px; padding-right: 4px;
     }
     .login-heatmap-row {
       display: flex; align-items: center; gap: 8px;
     }
     .login-heatmap-user {
-      width: 100px; font-family: monospace;
+      width: 188px; font-family: monospace;
       font-size: 0.78rem; color: var(--text);
-      text-align: right; flex-shrink: 0;
+      flex-shrink: 0;
+      display: flex; align-items: center; gap: 6px;
+      justify-content: flex-end;
+    }
+    .login-heatmap-user-name {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 110px;
     }
     .login-heatmap-cells {
       display: grid;
@@ -2468,6 +2477,53 @@
       border-radius: 1px;
     }
     .login-cell-active { background: rgba(127,231,255,0.7); }
+
+    /* 2026-05-03 (Wave 5): class badges + toggle + pagination */
+    .login-class-badge {
+      font-size: 0.6rem; padding: 1px 5px; border-radius: 3px;
+      text-transform: uppercase; letter-spacing: 0.05em;
+      font-family: var(--font-sans, system-ui, sans-serif);
+      flex-shrink: 0;
+    }
+    .login-class-badge-human {
+      background: rgba(127,231,255,0.18); color: rgba(127,231,255,1);
+    }
+    .login-class-badge-root {
+      background: rgba(251,191,36,0.18); color: rgba(251,191,36,1);
+    }
+    .login-class-badge-service {
+      background: rgba(148,163,184,0.18); color: rgba(148,163,184,1);
+    }
+    .login-class-badge-unknown {
+      background: rgba(248,113,113,0.18); color: rgba(248,113,113,1);
+    }
+    .login-heatmap-controls {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      margin: 8px 0;
+    }
+    .login-heatmap-toggle {
+      background: var(--card-bg); color: var(--text);
+      border: 1px solid var(--border);
+      padding: 4px 12px; border-radius: 4px;
+      font-size: 0.78rem; cursor: pointer;
+    }
+    .login-heatmap-toggle:hover { border-color: var(--accent); }
+    .login-heatmap-hint {
+      font-size: 0.72rem; color: var(--dim); flex: 1; min-width: 0;
+    }
+    .login-heatmap-pagination {
+      display: flex; align-items: center; gap: 12px; justify-content: center;
+      margin-top: 8px; font-size: 0.78rem;
+    }
+    .login-heatmap-pagination button {
+      background: var(--card-bg); color: var(--text);
+      border: 1px solid var(--border);
+      padding: 4px 12px; border-radius: 4px; cursor: pointer;
+    }
+    .login-heatmap-pagination button:disabled {
+      opacity: 0.5; cursor: not-allowed;
+    }
+    .login-heatmap-page-meta { color: var(--dim); }
 
     .baseline-dest-list {
       list-style: none; padding: 0; margin: 0;

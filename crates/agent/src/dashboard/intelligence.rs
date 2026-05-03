@@ -360,17 +360,196 @@ pub(super) async fn api_graph_neighborhood(
 }
 
 /// `GET /api/baseline-status` - baseline learning status and recent anomalies.
+///
+/// 2026-05-03 (Wave 5): the response is enriched with `user_classes`,
+/// a `{username: "human"|"service"|"root"|"unknown"}` map covering every
+/// user that appears in `user_login_hours`. The dashboard's "Who logs in,
+/// when" heatmap uses it to default-hide daemon PAM sessions
+/// (`snap_daemon`, `systemd-resolve`, `messagebus`, `_apt`, ...) which
+/// share the SSH login plumbing but are not real human logins. Without
+/// this filter the operator was reading the heatmap as "all these people
+/// have logged in" when in reality only the Human-class entries are real
+/// SSH sessions.
+///
+/// Classification reads `/etc/passwd` directly via
+/// `environment_profile::parse_passwd_for_user_classes`. We do not pull
+/// from the persisted `environment-profile.json` because that file is
+/// only refreshed on the periodic census; reading the live file keeps
+/// the dashboard honest if `useradd` ran since the last census tick.
 pub(super) async fn api_baseline_status(
     State(state): State<DashboardState>,
 ) -> Json<serde_json::Value> {
-    let baseline: serde_json::Value = state
+    let mut baseline: serde_json::Value = state
         .sqlite_store
         .as_ref()
         .and_then(|sq| sq.get_blob("baseline").ok().flatten())
         .or_else(|| safe_read_data_file(&state.data_dir, "baseline.json"))
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::json!({"mature": false, "training_days": 0}));
+
+    let classes = enrich_user_classes_for_logins(&baseline);
+    if let Some(obj) = baseline.as_object_mut() {
+        obj.insert("user_classes".to_string(), classes);
+    }
     Json(baseline)
+}
+
+/// Build the `user_classes` map for every user that appears in the
+/// baseline's `user_login_hours`. Pure with respect to the baseline JSON
+/// shape; `/etc/passwd` is the only side effect, isolated to
+/// `read_passwd_for_classification` so tests can drive it via the inner
+/// helper `build_user_classes_from_passwd`.
+///
+/// Returns an empty object when the baseline carries no logins or when
+/// `/etc/passwd` is unreadable. The frontend treats "missing" the same
+/// as "unknown" and shows the user, so a degraded path errs on the side
+/// of operator visibility.
+fn enrich_user_classes_for_logins(baseline: &serde_json::Value) -> serde_json::Value {
+    let Some(logins) = baseline.get("user_login_hours").and_then(|v| v.as_object()) else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    if logins.is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    let passwd = read_passwd_for_classification();
+    build_user_classes_from_passwd(logins.keys().map(|s| s.as_str()), passwd.as_deref())
+}
+
+fn read_passwd_for_classification() -> Option<String> {
+    std::fs::read_to_string("/etc/passwd").ok()
+}
+
+/// Pure: given an iterator of usernames and the contents of `/etc/passwd`
+/// (or `None` when the file is unreadable), return a JSON object
+/// `{username: class_string}`. Class strings match `UserClass::as_str`
+/// of the underlying enum so the frontend can switch on them without a
+/// translation table.
+///
+/// Split out so tests can drive it without touching the real
+/// `/etc/passwd`.
+fn build_user_classes_from_passwd<'a>(
+    usernames: impl IntoIterator<Item = &'a str>,
+    passwd: Option<&str>,
+) -> serde_json::Value {
+    use std::collections::HashMap;
+    let mut name_to_class: HashMap<String, &'static str> = HashMap::new();
+    if let Some(content) = passwd {
+        let scan = crate::environment_profile::parse_passwd_for_user_classes(content);
+        for n in scan.human_user_names {
+            name_to_class.insert(n, "human");
+        }
+        for n in scan.service_user_names {
+            name_to_class.insert(n, "service");
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for user in usernames {
+        let class = if user == "root" {
+            "root"
+        } else {
+            name_to_class.get(user).copied().unwrap_or("unknown")
+        };
+        out.insert(
+            user.to_string(),
+            serde_json::Value::String(class.to_string()),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+#[cfg(test)]
+mod baseline_enrich_tests {
+    use super::*;
+
+    /// 2026-05-03 (Wave 5 anchor): exact case the operator hit. The
+    /// baseline file shows logins for `ubuntu` (real SSH), `snap_daemon`
+    /// (snap PAM session, daemon), `systemd-resolve` (DNS resolver),
+    /// `messagebus` (dbus), and `root`. Only `ubuntu` and `root` are
+    /// real human-or-elevated logins; the rest are daemon PAM sessions.
+    /// The frontend keys off these class strings to default-hide
+    /// services so the operator does not read the heatmap as "many
+    /// users have SSH'd in".
+    #[test]
+    fn build_user_classes_marks_daemon_sessions_as_service() {
+        let synthetic_passwd = "\
+root:x:0:0::/root:/bin/bash\n\
+_apt:x:42:65534::/nonexistent:/usr/sbin/nologin\n\
+messagebus:x:103:108::/nonexistent:/usr/sbin/nologin\n\
+systemd-resolve:x:991:993::/run/systemd:/usr/sbin/nologin\n\
+ubuntu:x:1000:1000::/home/ubuntu:/bin/bash\n\
+snap_daemon:x:584788:584788::/nonexistent:/usr/bin/false\n\
+";
+        let users = [
+            "ubuntu",
+            "root",
+            "snap_daemon",
+            "systemd-resolve",
+            "messagebus",
+            "stranger_not_in_passwd",
+        ];
+        let result = build_user_classes_from_passwd(users.iter().copied(), Some(synthetic_passwd));
+        let obj = result.as_object().expect("object shape");
+        assert_eq!(obj.get("ubuntu").and_then(|v| v.as_str()), Some("human"));
+        assert_eq!(obj.get("root").and_then(|v| v.as_str()), Some("root"));
+        assert_eq!(
+            obj.get("snap_daemon").and_then(|v| v.as_str()),
+            Some("service"),
+            "snap_daemon must be Service so the heatmap hides it by default"
+        );
+        assert_eq!(
+            obj.get("systemd-resolve").and_then(|v| v.as_str()),
+            Some("service")
+        );
+        assert_eq!(
+            obj.get("messagebus").and_then(|v| v.as_str()),
+            Some("service")
+        );
+        assert_eq!(
+            obj.get("stranger_not_in_passwd").and_then(|v| v.as_str()),
+            Some("unknown"),
+            "users not in /etc/passwd fall through to Unknown — operator sees them by default"
+        );
+    }
+
+    /// Degraded path: `/etc/passwd` unreadable. Endpoint must still
+    /// return a well-formed object so the frontend's default-hide
+    /// branch can run; every entry maps to "unknown" (visible by
+    /// default) except literal "root".
+    #[test]
+    fn build_user_classes_falls_back_to_unknown_when_passwd_unreadable() {
+        let users = ["ubuntu", "root", "snap_daemon"];
+        let result = build_user_classes_from_passwd(users.iter().copied(), None);
+        let obj = result.as_object().expect("object shape");
+        assert_eq!(obj.get("ubuntu").and_then(|v| v.as_str()), Some("unknown"));
+        assert_eq!(obj.get("root").and_then(|v| v.as_str()), Some("root"));
+        assert_eq!(
+            obj.get("snap_daemon").and_then(|v| v.as_str()),
+            Some("unknown")
+        );
+    }
+
+    #[test]
+    fn enrich_returns_empty_when_no_logins_present() {
+        let baseline = serde_json::json!({"mature": true, "training_days": 7});
+        let result = enrich_user_classes_for_logins(&baseline);
+        assert_eq!(result, serde_json::json!({}));
+    }
+
+    #[test]
+    fn enrich_iterates_every_login_username() {
+        let zeros: Vec<u8> = vec![0; 24];
+        let baseline = serde_json::json!({
+            "user_login_hours": {
+                "ubuntu": zeros,
+                "snap_daemon": vec![0u8; 24],
+            }
+        });
+        let result = enrich_user_classes_for_logins(&baseline);
+        let obj = result.as_object().expect("object");
+        // Every key from user_login_hours is represented.
+        assert!(obj.contains_key("ubuntu"));
+        assert!(obj.contains_key("snap_daemon"));
+    }
 }
 
 /// `GET /api/deep-security` - aggregated status from firmware, hypervisor, killchain, DNA.
