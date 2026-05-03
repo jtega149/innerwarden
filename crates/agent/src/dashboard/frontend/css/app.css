@@ -507,6 +507,8 @@
     .dot-incident        { border-color: var(--danger); background: var(--danger); box-shadow: 0 0 7px var(--danger); }
     .dot-decision        { border-color: var(--accent); background: var(--accent); }
     .dot-decision-dry    { border-color: var(--muted);  background: transparent; }
+    .dot-decision-fail   { border-color: var(--danger); background: var(--danger); }
+    .dot-decision-missing{ border-color: var(--warn);   background: transparent; }
     .dot-honeypot        { border-color: var(--orange); background: var(--orange); box-shadow: 0 0 6px var(--orange); }
     .dot-default         { border-color: var(--muted);  background: transparent; }
 
@@ -551,6 +553,8 @@
     .bk-decision      { background: rgba(120,229,255,0.16); color: var(--accent); }
     .bk-decision-dry  { background: rgba(139,157,184,0.12); color: var(--muted); }
     .bk-decision-skip { background: rgba(139,157,184,0.08); color: var(--muted); }
+    .bk-decision-fail { background: rgba(244,63,94,0.17);   color: var(--danger); }
+    .bk-decision-missing { background: rgba(255,184,77,0.13); color: var(--warn); }
     .bk-honeypot      { background: rgba(255,140,66,0.17);  color: var(--orange); }
 
     /* ── Outcome badges ──────────────────────────────────────────── */

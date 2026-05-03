@@ -1797,13 +1797,19 @@ pub(super) fn build_journey_from_sqlite(
 
     let conn = store.conn().ok()?;
     let pattern = format!("{date}%");
+    // PR #423 Wave 4c: select `d.data` so we can parse the real
+    // `execution_result` from the decision JSON. The decisions table
+    // doesn't have a dedicated column for it (audit-trail invariant
+    // is hash-chained JSON), so we read the blob and pull the field
+    // out per-row. Cost: one extra column over the wire per incident
+    // joined with a decision; cheap relative to the network round trip.
     let mut stmt = conn
         .prepare_cached(
             "SELECT i.incident_id, i.ts, i.detector, i.severity, i.title, i.summary, i.data, \
-                    d.action_type, d.target_ip, d.confidence, d.auto_executed, d.reason \
+                    d.action_type, d.target_ip, d.confidence, d.auto_executed, d.reason, d.data \
              FROM incidents i \
              LEFT JOIN ( \
-                 SELECT incident_id, action_type, target_ip, confidence, auto_executed, reason, \
+                 SELECT incident_id, action_type, target_ip, confidence, auto_executed, reason, data, \
                         ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY id DESC) AS rn \
                  FROM decisions \
              ) d ON d.incident_id = i.incident_id AND d.rn = 1 \
@@ -1825,6 +1831,7 @@ pub(super) fn build_journey_from_sqlite(
                 row.get::<_, Option<f64>>(9)?,     // confidence
                 row.get::<_, Option<i64>>(10)?,    // auto_executed
                 row.get::<_, Option<String>>(11)?, // reason
+                row.get::<_, Option<String>>(12)?, // d.data JSON (may be NULL when no decision)
             ))
         })
         .ok()?;
@@ -1849,6 +1856,7 @@ pub(super) fn build_journey_from_sqlite(
             confidence,
             auto_executed,
             reason,
+            decision_data,
         )) = row
         else {
             continue;
@@ -1935,12 +1943,38 @@ pub(super) fn build_journey_from_sqlite(
             }),
         });
 
+        // PR #423 Wave 4c: parse the real `execution_result` from the
+        // decision JSON blob. Previously this was derived from
+        // `auto_executed` ("ok" | "skipped"), which lied for cases where
+        // a block was attempted but skipped because the IP was already
+        // blocked, or where the dry_run flag prevented the actual call.
+        // The real values stored by `DecisionWriter` are "ok",
+        // "skipped", "skipped: <why>", or "failed: <why>".
+        let real_execution_result = decision_data
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| {
+                v.get("execution_result")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+            });
+
         // Decision entry (if present). Outcome is computed via the
         // canonical contract so the verdict line agrees with the
         // Home tile and the Threats list.
         let outcome = threat_contract::classify_decision(action_type.as_deref(), Some("ok"));
         incident_outcomes.push(outcome);
         if let Some(action) = &action_type {
+            // Honest execution result: prefer the stored field, fall
+            // back to the auto_executed-derived value only when the
+            // decision JSON is missing or malformed.
+            let execution_result = real_execution_result.clone().unwrap_or_else(|| {
+                if auto_executed.unwrap_or(0) != 0 {
+                    "ok".to_string()
+                } else {
+                    "skipped".to_string()
+                }
+            });
             entries.push(JourneyEntry {
                 ts,
                 kind: "decision".to_string(),
@@ -1951,7 +1985,24 @@ pub(super) fn build_journey_from_sqlite(
                     "reason": reason.unwrap_or_default(),
                     "target_ip": target_ip,
                     "incident_id": incident_id,
-                    "execution_result": if auto_executed.unwrap_or(0) != 0 { "ok" } else { "skipped" },
+                    "execution_result": execution_result,
+                }),
+            });
+        } else {
+            // PR #423 Wave 4c: an incident with no associated decision
+            // is an audit gap. Render an explicit placeholder so the
+            // operator sees "this incident reached the agent but no
+            // decision was recorded for it" rather than a silently
+            // missing row. Real prod observation 2026-05-03: SSH-login-
+            // attempt incidents at 13:46 / 13:53 in 164.90.237.71's
+            // journey had no decision row, leaving the operator unable
+            // to audit what (if anything) happened.
+            entries.push(JourneyEntry {
+                ts,
+                kind: "decision_missing".to_string(),
+                data: serde_json::json!({
+                    "incident_id": incident_id,
+                    "note": "No decision recorded for this incident. Either the AI gate suppressed it (rule-based filter, allowlist match, or no provider available) or the incident wrote-without-deciding. Cross-check the agent log for this incident_id.",
                 }),
             });
         }
@@ -2088,6 +2139,14 @@ pub(super) fn build_journey_from_graph(
         .map(|e| e.from)
         .collect();
 
+    // PR #423 Wave 4c: pre-load real `execution_result` per incident
+    // from SQLite. The graph's Incident node only stores
+    // `auto_executed: bool`, which lies for "skipped: already blocked"
+    // and similar real outcomes. Batched once here so the per-incident
+    // decision entry emit below can use the truth without N+1 queries.
+    let execution_results: std::collections::HashMap<String, String> =
+        load_execution_results_for_date(sqlite, date);
+
     for inc_id in incident_ids {
         if let Some(Node::Incident {
             incident_id,
@@ -2134,6 +2193,20 @@ pub(super) fn build_journey_from_graph(
             });
 
             if let Some(action) = decision {
+                // PR #423 Wave 4c: prefer the real execution_result
+                // (from SQLite cross-lookup) over the auto_executed-
+                // derived fallback. Same fix as the SQLite path.
+                let execution_result =
+                    execution_results
+                        .get(incident_id)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            if *auto_executed {
+                                "ok".to_string()
+                            } else {
+                                "skipped".to_string()
+                            }
+                        });
                 entries.push(JourneyEntry {
                     ts: *ts,
                     kind: "decision".to_string(),
@@ -2144,7 +2217,21 @@ pub(super) fn build_journey_from_graph(
                         "reason": decision_reason.as_deref().unwrap_or(""),
                         "target_ip": decision_target,
                         "incident_id": incident_id,
-                        "execution_result": if *auto_executed { "ok" } else { "skipped" },
+                        "execution_result": execution_result,
+                    }),
+                });
+            } else {
+                // PR #423 Wave 4c: same audit-gap visibility as the
+                // SQLite path. The Incident node has no decision field
+                // either because no AI decision was made (gate-suppressed,
+                // no provider) or because the ingestion path didn't
+                // attach one. Either way, surface it explicitly.
+                entries.push(JourneyEntry {
+                    ts: *ts,
+                    kind: "decision_missing".to_string(),
+                    data: serde_json::json!({
+                        "incident_id": incident_id,
+                        "note": "No decision recorded for this incident. Either the AI gate suppressed it (rule-based filter, allowlist match, or no provider available) or the incident wrote-without-deciding. Cross-check the agent log for this incident_id.",
                     }),
                 });
             }
@@ -2190,6 +2277,20 @@ pub(super) fn build_journey_from_graph(
 
         // Skip edges that are just TriggeredBy (already covered by incidents above)
         if matches!(edge.relation, Relation::TriggeredBy) {
+            continue;
+        }
+
+        // PR #423 Wave 4c: defense-in-depth filter against agent-self
+        // metadata leaking into an attacker IP's journey. Real prod
+        // observation 2026-05-03: a file.read_access summary from
+        // tokio-rt-worker (the agent's own thread) appeared under IP
+        // 164.90.237.71's journey. The root cause was stale
+        // `_current_event_*` enriching out-of-cycle edges (fixed
+        // separately in `ingestion.rs`); this filter is the second
+        // line so any future regression that re-introduces the same
+        // class of bug doesn't reach the operator. Skips edges whose
+        // event_kind / summary clearly references agent self-traffic.
+        if subject_type == PivotKind::Ip && summary_references_agent_self(&summary, event_kind) {
             continue;
         }
 
@@ -3004,6 +3105,75 @@ pub(super) fn is_login_attempt_kind(kind: &str) -> bool {
         || kind.contains("credential_stuffing")
         || kind.contains("invalid_user")
         || kind.contains("password_attempt")
+}
+
+/// PR #423 Wave 4c: load `(incident_id, execution_result)` for every
+/// decision recorded today. Used by `build_journey_from_graph` to
+/// surface the real outcome (e.g. "skipped: already blocked") on
+/// decision entries built from graph nodes. Returns an empty map on
+/// any error or when no SQLite store is available — callers fall back
+/// to the auto_executed-derived value.
+pub(super) fn load_execution_results_for_date(
+    sqlite: Option<&std::sync::Arc<innerwarden_store::Store>>,
+    date: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let Some(store) = sqlite else { return out };
+    let Ok(conn) = store.conn() else { return out };
+    let pattern = format!("{date}%");
+    let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT incident_id, data FROM ( \
+             SELECT incident_id, data, \
+                    ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY id DESC) AS rn \
+             FROM decisions WHERE ts LIKE ?1 \
+         ) WHERE rn = 1",
+    ) else {
+        return out;
+    };
+    let Ok(iter) = stmt.query_map([&pattern], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return out;
+    };
+    for r in iter {
+        let Ok((incident_id, data)) = r else { continue };
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(er) = parsed
+                .get("execution_result")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+            {
+                out.insert(incident_id, er);
+            }
+        }
+    }
+    out
+}
+
+/// PR #423 Wave 4c: returns true when an edge's `summary` references
+/// the agent's own threads/binaries — the same comm allow-list the
+/// killchain inline tracker uses to ignore self-traffic. Used by the
+/// IP-pivot journey to drop any edge whose origin is plainly the agent
+/// itself, regardless of how the metadata got attached to an
+/// IP-touching edge.
+///
+/// Stays narrow on purpose: matches only against the `comm` allow-list,
+/// not against generic event_kind. A future post-pivot scenario where
+/// an attacker process performs file IO on the host should still
+/// surface in the journey — those events would NOT have an agent
+/// comm in their summary and would correctly pass this filter.
+///
+/// `event_kind` retained as a parameter for forward-compatibility (the
+/// filter may grow into kind-aware checks for specific narrow cases),
+/// currently unused.
+pub(super) fn summary_references_agent_self(summary: &str, _event_kind: &str) -> bool {
+    let lower = summary.to_ascii_lowercase();
+    for needle in crate::killchain_inline::KILLCHAIN_SELF_EXCLUDED_COMMS {
+        if lower.contains(&needle.to_ascii_lowercase()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Generate human-readable title / summary / highlights for a chapter.
@@ -5058,10 +5228,14 @@ mod tests {
 
         let journey = build_journey_from_sqlite(&store, date, PivotKind::Ip, "203.0.113.10", None)
             .expect("journey returned");
+        // PR #423 Wave 4c: incidents without an associated decision
+        // now emit a `decision_missing` placeholder so the audit gap
+        // is visible. Counts: 2 incidents + 1 real decision (for
+        // ssh:bf:1) + 1 decision_missing placeholder (for ti:1) = 4.
         assert_eq!(
             journey.entries.len(),
-            3,
-            "2 incidents + 1 decision = 3 entries for the target IP"
+            4,
+            "2 incidents + 1 decision + 1 decision_missing = 4 entries"
         );
         // Outcome from aggregate_outcomes: any block_ip wins.
         assert_eq!(journey.outcome, "blocked");
@@ -5071,6 +5245,12 @@ mod tests {
                 && e.data.get("action_type").and_then(|v| v.as_str()) == Some("block_ip")
         });
         assert!(has_block_decision);
+        // The other incident (ti:1, no decision) gets a placeholder.
+        let has_missing = journey.entries.iter().any(|e| {
+            e.kind == "decision_missing"
+                && e.data.get("incident_id").and_then(|v| v.as_str()) == Some("ti:1")
+        });
+        assert!(has_missing, "ti:1 must have decision_missing placeholder");
     }
 
     #[test]
@@ -5796,5 +5976,176 @@ mod tests {
                 date_arg, ip_count, det_count
             );
         }
+    }
+
+    // ─── PR #423 Wave 4c — journey honesty anchors ──────────────
+
+    #[test]
+    fn summary_references_agent_self_matches_killchain_self_comms() {
+        // Anchor: every comm in `KILLCHAIN_SELF_EXCLUDED_COMMS` must
+        // be detected by the journey-builder filter. If the killchain
+        // list grows (e.g. a new agent thread name), this test
+        // automatically covers it. If the journey filter starts using
+        // a different list, this test will catch the divergence.
+        for comm in crate::killchain_inline::KILLCHAIN_SELF_EXCLUDED_COMMS {
+            let summary = format!("{} (pid=1234) reading /etc/ssh/sshd_config", comm);
+            assert!(
+                summary_references_agent_self(&summary, "file.read_access"),
+                "self-comm {comm:?} must be filtered out of attacker IP journeys"
+            );
+        }
+
+        // Negative: an attacker process named `sshd` reading the same
+        // file must NOT be filtered. This is the "future post-pivot
+        // attacker file IO" case the filter must not regress.
+        assert!(!summary_references_agent_self(
+            "sshd (pid=1234) reading /etc/passwd",
+            "file.read_access"
+        ));
+
+        // Negative: a real network event from the attacker IP.
+        assert!(!summary_references_agent_self(
+            "nginx (PID 4150736) accepted incoming connection",
+            "network.accept"
+        ));
+    }
+
+    /// Helper for Wave 4c tests: build a minimal Incident with the
+    /// supplied IP in `entities` so the journey filter accepts it.
+    #[cfg(test)]
+    fn make_test_incident(
+        incident_id: &str,
+        ts: chrono::DateTime<Utc>,
+        ip: &str,
+        title: &str,
+    ) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
+            ts,
+            host: "test".into(),
+            incident_id: incident_id.into(),
+            severity: innerwarden_core::event::Severity::Medium,
+            title: title.into(),
+            summary: format!("Possible event from {ip}"),
+            evidence: serde_json::json!([]),
+            tags: vec![],
+            recommended_checks: vec![],
+            entities: vec![innerwarden_core::entities::EntityRef::ip(ip)],
+        }
+    }
+
+    #[test]
+    fn build_journey_from_sqlite_emits_decision_missing_when_no_decision() {
+        // Drives `build_journey_from_sqlite` against an SQLite store
+        // with one incident and no associated decision. The journey
+        // must emit a `decision_missing` placeholder so the operator
+        // sees the audit gap explicitly. Mirrors the prod state for
+        // the 13:46 / 13:53 SSH-login-attempts entries on 2026-05-03
+        // in IP 164.90.237.71's journey.
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open(dir.path()).expect("store opens"));
+
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-03T13:46:53Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let incident = make_test_incident(
+            "ssh_bruteforce:1.2.3.4:t1",
+            ts,
+            "1.2.3.4",
+            "SSH login attempts",
+        );
+        store.insert_incident(&incident).expect("insert incident");
+        // Intentionally NO decision row.
+
+        let journey =
+            build_journey_from_sqlite(&store, "2026-05-03", PivotKind::Ip, "1.2.3.4", None)
+                .expect("journey built");
+
+        let kinds: Vec<&str> = journey.entries.iter().map(|e| e.kind.as_str()).collect();
+        assert!(
+            kinds.contains(&"decision_missing"),
+            "expected decision_missing placeholder, got kinds: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"incident"),
+            "incident must still be present: {kinds:?}"
+        );
+
+        // The placeholder carries the incident_id so the JS group-by
+        // logic folds it under the same incident card.
+        let dm = journey
+            .entries
+            .iter()
+            .find(|e| e.kind == "decision_missing")
+            .unwrap();
+        assert_eq!(
+            dm.data.get("incident_id").and_then(|v| v.as_str()),
+            Some("ssh_bruteforce:1.2.3.4:t1")
+        );
+    }
+
+    #[test]
+    fn build_journey_from_sqlite_uses_real_execution_result() {
+        // When a decision row carries `execution_result: "skipped: \
+        // already blocked"`, the journey entry must surface that
+        // string verbatim instead of deriving "ok" / "skipped" from
+        // the auto_executed boolean.
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open(dir.path()).expect("store opens"));
+
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-03T14:37:38Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let incident = make_test_incident(
+            "ssh_bruteforce:1.2.3.4:t2",
+            ts,
+            "1.2.3.4",
+            "SSH login attempts",
+        );
+        store.insert_incident(&incident).expect("insert incident");
+
+        // Decision: auto_executed=1 but execution_result says skipped.
+        // This is the "already blocked from prior incident" case the
+        // user flagged on the dashboard.
+        let decision_data = serde_json::json!({
+            "execution_result": "skipped: already blocked",
+            "action_type": "block_ip",
+        })
+        .to_string();
+        store
+            .insert_decision(&innerwarden_store::decisions::DecisionRow {
+                ts: ts.to_rfc3339(),
+                incident_id: "ssh_bruteforce:1.2.3.4:t2".into(),
+                action_type: "block_ip".into(),
+                target_ip: Some("1.2.3.4".into()),
+                target_user: None,
+                confidence: 0.95,
+                auto_executed: true,
+                reason: Some(
+                    "Auto-blocked: ssh_bruteforce (rule-based, no AI needed, block 24h)".into(),
+                ),
+                data: decision_data,
+            })
+            .expect("insert decision");
+
+        let journey =
+            build_journey_from_sqlite(&store, "2026-05-03", PivotKind::Ip, "1.2.3.4", None)
+                .expect("journey built");
+
+        let dec = journey
+            .entries
+            .iter()
+            .find(|e| e.kind == "decision")
+            .expect("decision entry present");
+        let er = dec
+            .data
+            .get("execution_result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            er, "skipped: already blocked",
+            "execution_result must come from decision JSON, not auto_executed"
+        );
     }
 }

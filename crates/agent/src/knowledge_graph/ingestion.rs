@@ -230,7 +230,14 @@ impl KnowledgeGraph {
         // Record telemetry for sensors tab
         self.record_event_telemetry(&event.source, &event.kind, event.ts);
 
-        // Store event metadata for this ingest cycle (used by add_edge_with_event)
+        // Store event metadata for this ingest cycle (used by add_edge_with_event).
+        // PR #423 Wave 4c: must be cleared at the end of this fn — see the
+        // tail of the match block. Otherwise edges created OUTSIDE an ingest
+        // cycle (correlation chain linking, snapshot rebuild, periodic
+        // maintenance) inherit the last-ingested event's summary, which
+        // surfaces in the dashboard as e.g. a `file.read_access tokio-rt-worker`
+        // event under an attacker IP's journey. Real prod observation
+        // 2026-05-03 in the journey for IP 164.90.237.71.
         self._current_event_source = Some(event.source.clone());
         self._current_event_kind = Some(event.kind.clone());
         self._current_event_summary = Some(event.summary.clone());
@@ -332,6 +339,16 @@ impl KnowledgeGraph {
 
             _ => {} // Unknown event kind — skip silently
         }
+
+        // PR #423 Wave 4c: clear event metadata at the end of the ingest
+        // cycle so any subsequent add_edge call (outside ingest) starts
+        // from a clean slate. Without this, CorrelatedWith edges +
+        // ingest_incident's TriggeredBy edges + snapshot-rebuild edges
+        // would all inherit this event's summary as a stale property.
+        self._current_event_source = None;
+        self._current_event_kind = None;
+        self._current_event_summary = None;
+        self._current_event_severity = None;
     }
 
     /// Ingest an incident into the graph as an Incident node with TriggeredBy edges.
@@ -3070,5 +3087,131 @@ mod tests {
     fn detail_str_returns_some_trimmed_for_valid_value() {
         let event = make_event_with_ip("  1.2.3.4  ");
         assert_eq!(detail_str(&event, "src_ip"), Some("1.2.3.4".to_string()));
+    }
+
+    // ─── PR #423 Wave 4c — stale event metadata clear ────────────
+    //
+    // Real prod observation 2026-05-03 (IP 164.90.237.71 journey):
+    // a `file.read_access` summary string from `tokio-rt-worker`
+    // (the agent's own thread) appeared as a journey "event" entry
+    // under an attacker IP. The mechanism was `_current_event_*`
+    // staying set across ingest cycles, so any add_edge call OUTSIDE
+    // an ingest cycle (correlation chain linking, ingest_incident's
+    // TriggeredBy edges, snapshot rebuild) inherited the last
+    // ingested event's summary as a stale property.
+    //
+    // The fix clears `_current_event_*` at the end of ingest(). These
+    // tests pin both directions: ingest() must set them while running
+    // (so the original enrichment still works for the edges it creates)
+    // and clear them once it returns.
+
+    #[test]
+    fn ingest_clears_current_event_metadata_after_run() {
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        // Ingest a file.read_access event — has the high-signal
+        // summary that the prod bug surfaced.
+        let mut event = innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "test".into(),
+            source: "ebpf".into(),
+            kind: "file.read_access".into(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: "tokio-rt-worker (pid=1234) reading /etc/ssh/sshd_config".into(),
+            details: serde_json::json!({
+                "pid": 1234,
+                "comm": "tokio-rt-worker",
+                "path": "/etc/ssh/sshd_config",
+            }),
+            tags: vec![],
+            entities: vec![],
+        };
+        // Make event have IP entity for clarity (not strictly needed
+        // for this bug, but mirrors prod shape better).
+        event.entities = vec![innerwarden_core::entities::EntityRef::path(
+            "/etc/ssh/sshd_config",
+        )];
+        g.ingest(&event);
+
+        assert!(
+            g._current_event_source.is_none(),
+            "_current_event_source must be cleared after ingest"
+        );
+        assert!(
+            g._current_event_kind.is_none(),
+            "_current_event_kind must be cleared after ingest"
+        );
+        assert!(
+            g._current_event_summary.is_none(),
+            "_current_event_summary must be cleared after ingest"
+        );
+        assert!(
+            g._current_event_severity.is_none(),
+            "_current_event_severity must be cleared after ingest"
+        );
+    }
+
+    #[test]
+    fn add_edge_outside_ingest_does_not_inherit_stale_summary() {
+        // Reproduces the prod cross-attribution: ingest a file.read_access
+        // event, then create an unrelated edge (simulating
+        // link_correlated_incidents / snapshot rebuild). The new edge
+        // must NOT carry the stale file-read summary.
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+
+        let event = innerwarden_core::event::Event {
+            ts: now,
+            host: "test".into(),
+            source: "ebpf".into(),
+            kind: "file.read_access".into(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: "tokio-rt-worker (pid=1234) reading /etc/ssh/sshd_config".into(),
+            details: serde_json::json!({
+                "pid": 1234, "comm": "tokio-rt-worker", "path": "/etc/ssh/sshd_config",
+            }),
+            tags: vec![],
+            entities: vec![],
+        };
+        g.ingest(&event);
+
+        // Now create an edge entirely outside an ingest cycle, the
+        // way `link_correlated_incidents` does. Under the prod bug
+        // this edge would inherit the file.read_access summary as a
+        // property, surfacing it under any IP-pivot journey.
+        let ip_id = g.ensure_ip("164.90.237.71", now);
+        let sys_id = g.ensure_system("");
+        let edge_idx = g.add_edge(crate::knowledge_graph::types::Edge::new(
+            ip_id,
+            sys_id,
+            crate::knowledge_graph::types::Relation::BlockedBy,
+            now,
+        ));
+
+        // The Edge struct doesn't expose a clean accessor for properties
+        // on a stored edge by index, so re-fetch via all_edges.
+        let touching = g.all_edges(ip_id);
+        assert!(!touching.is_empty(), "expected edge for ip");
+        let stored = touching
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.relation,
+                    crate::knowledge_graph::types::Relation::BlockedBy
+                )
+            })
+            .expect("BlockedBy edge present");
+        assert!(
+            !stored.properties.contains_key("summary")
+                || stored
+                    .properties
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.contains("tokio-rt-worker"))
+                    .unwrap_or(true),
+            "out-of-cycle edge must not inherit the agent's file-read summary; \
+             stored properties: {:?}",
+            stored.properties
+        );
+        let _ = edge_idx;
     }
 }

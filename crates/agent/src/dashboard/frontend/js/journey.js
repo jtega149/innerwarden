@@ -9,9 +9,35 @@ function kindBadge(entry) {
     }
     case 'incident':     return `<span class="bk bk-incident">INCIDENT</span>`;
     case 'decision': {
+      // PR #423 Wave 4c: prefer the stored `execution_result` (real
+      // outcome) over the derived auto_executed-based label. The legacy
+      // path lied for `skipped: already blocked` cases by showing SKIPPED
+      // without explaining WHY the block didn't run.
+      const er = (d.execution_result || '').toString();
+      if (er.startsWith('failed')) {
+        return `<span class="bk bk-decision-fail" title="${esc(er)}">FAILED</span>`;
+      }
+      if (er.startsWith('skipped')) {
+        // Strip the "skipped: " prefix for the badge tooltip but keep
+        // the reason if present (operators want the WHY).
+        const why = er.length > 8 ? er.slice(8).trim() : '';
+        const tip = why ? `Skipped: ${why}` : 'Skipped';
+        return `<span class="bk bk-decision-skip" title="${esc(tip)}">SKIPPED</span>`;
+      }
+      if (er === 'ok') {
+        if (d.dry_run) return `<span class="bk bk-decision-dry">DRY RUN</span>`;
+        return `<span class="bk bk-decision">EXECUTED</span>`;
+      }
+      // Fallback for older rows where execution_result is missing
+      // (graph-path entries until queue item Wave 4d lands).
       if (!d.auto_executed) return `<span class="bk bk-decision-skip">SKIPPED</span>`;
       if (d.dry_run)        return `<span class="bk bk-decision-dry">DRY RUN</span>`;
       return `<span class="bk bk-decision">EXECUTED</span>`;
+    }
+    case 'decision_missing': {
+      // PR #423 Wave 4c: an audit-trail gap surfaced explicitly so the
+      // operator notices instead of inferring from the absence of a row.
+      return `<span class="bk bk-decision-missing" title="No decision recorded for this incident">NO DECISION</span>`;
     }
     case 'honeypot_ssh':    return `<span class="bk bk-honeypot" style="display:inline-flex;align-items:center;gap:4px">${lucideIcon('bug',{size:12})} SSH</span>`;
     case 'honeypot_http':   return `<span class="bk bk-honeypot" style="display:inline-flex;align-items:center;gap:4px">${lucideIcon('bug',{size:12})} HTTP</span>`;
@@ -26,7 +52,13 @@ function dotCls(entry) {
   switch (entry.kind) {
     case 'event': return 'dot-event-' + (d.severity || 'info');
     case 'incident': return 'dot-incident';
-    case 'decision': return (d.dry_run || !d.auto_executed) ? 'dot-decision-dry' : 'dot-decision';
+    case 'decision': {
+      const er = (d.execution_result || '').toString();
+      if (er.startsWith('failed')) return 'dot-decision-fail';
+      if (er.startsWith('skipped') || !d.auto_executed || d.dry_run) return 'dot-decision-dry';
+      return 'dot-decision';
+    }
+    case 'decision_missing': return 'dot-decision-missing';
     case 'honeypot_ssh':
     case 'honeypot_http':
     case 'honeypot_banner': return 'dot-honeypot';
@@ -54,6 +86,12 @@ function entrySummary(entry) {
       const conf = ((d.confidence || 0) * 100).toFixed(0);
       const reason = (d.reason || '').substring(0, 70);
       return d.action_type + ' (conf: ' + conf + '%) - ' + reason;
+    }
+    case 'decision_missing': {
+      // PR #423 Wave 4c: render the audit-gap explicitly. Operator
+      // sees "No decision recorded · audit gap" instead of an empty
+      // "Handled automatically" stamped on a decision-less incident.
+      return 'No decision recorded · audit gap';
     }
     case 'honeypot_ssh': {
       const attempts = d.auth_attempts || [];
@@ -423,7 +461,9 @@ function renderEntry(entry, idx) {
 /// in the same group regardless of `kind`.
 function entryGroupKey(entry) {
   const d = (entry && entry.data) || {};
-  if (entry.kind === 'incident' || entry.kind === 'decision') {
+  // PR #423 Wave 4c: `decision_missing` placeholders share the
+  // incident_id of the parent incident so they group together.
+  if (entry.kind === 'incident' || entry.kind === 'decision' || entry.kind === 'decision_missing') {
     const id = d.incident_id || '';
     return id ? id : null;
   }
