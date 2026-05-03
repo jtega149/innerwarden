@@ -147,6 +147,107 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
     Json(resp)
 }
 
+/// 2026-05-03 (Wave 5c PR-5): load incidents from
+/// `incidents-{date}.jsonl` for a list of dates. JSONL is the canonical
+/// historical record (the agent appends but never rewrites); the
+/// in-memory KG is a hot tier capped by TTL eviction. Live-feed reads
+/// BOTH and merges so the operator sees the full daily history even
+/// for entries that have been evicted from the graph.
+///
+/// I/O failures are swallowed (file missing, bad permissions) so a
+/// partial degradation never takes down the public live-feed endpoint.
+pub(super) fn load_jsonl_incidents(data_dir: &Path, dates: &[String]) -> Vec<Incident> {
+    let mut out = Vec::new();
+    for date in dates {
+        let path = data_dir.join(format!("incidents-{date}.jsonl"));
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(inc) = serde_json::from_str::<Incident>(line) {
+                out.push(inc);
+            }
+        }
+    }
+    out
+}
+
+/// 2026-05-03 (Wave 5c PR-5): load decisions from
+/// `decisions-{date}.jsonl` for a list of dates. Same rationale as
+/// `load_jsonl_incidents` — KG retains a Decision summary on the
+/// matching Incident node but only for incidents still in the graph.
+/// JSONL is the canonical record for the count surfaces (e.g.
+/// "Blocks today" KPI on the site live feed).
+pub(super) fn load_jsonl_decisions(data_dir: &Path, dates: &[String]) -> Vec<DecisionEntry> {
+    let mut out = Vec::new();
+    for date in dates {
+        let path = data_dir.join(format!("decisions-{date}.jsonl"));
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(dec) = serde_json::from_str::<DecisionEntry>(line) {
+                out.push(dec);
+            }
+        }
+    }
+    out
+}
+
+/// 2026-05-03 (Wave 5c PR-5): merge KG-derived and JSONL-derived
+/// incident lists, preferring the KG entry when both are present.
+/// KG carries richer context (entity links, decision metadata) than
+/// the on-disk JSONL line, so preferring KG keeps the operator-facing
+/// item list as informative as possible. JSONL fills in entries the
+/// KG has evicted under TTL pressure.
+///
+/// Pure function; takes ownership of the two vecs and returns one.
+/// Tested directly so the dedup contract stays pinned.
+pub(super) fn merge_incidents_prefer_kg(
+    kg_incidents: Vec<Incident>,
+    jsonl_incidents: Vec<Incident>,
+) -> Vec<Incident> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(kg_incidents.len() + jsonl_incidents.len());
+    for inc in kg_incidents {
+        seen.insert(inc.incident_id.clone());
+        out.push(inc);
+    }
+    for inc in jsonl_incidents {
+        if seen.insert(inc.incident_id.clone()) {
+            out.push(inc);
+        }
+    }
+    out
+}
+
+/// Same dedup contract as `merge_incidents_prefer_kg` but for
+/// decisions. KG-derived decisions arrive first in `kg_decisions`;
+/// JSONL fills in decisions whose incident has aged out of the graph.
+pub(super) fn merge_decisions_prefer_kg(
+    kg_decisions: Vec<DecisionEntry>,
+    jsonl_decisions: Vec<DecisionEntry>,
+) -> Vec<DecisionEntry> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(kg_decisions.len() + jsonl_decisions.len());
+    for d in kg_decisions {
+        seen.insert(d.incident_id.clone());
+        out.push(d);
+    }
+    for d in jsonl_decisions {
+        if seen.insert(d.incident_id.clone()) {
+            out.push(d);
+        }
+    }
+    out
+}
+
 /// Pure helper extracted from `api_live_feed` so the heavy work runs on the
 /// blocking pool and stays unit-testable. Same logic as before — only the
 /// scope of the read lock changed.
@@ -253,6 +354,40 @@ pub(super) fn build_live_feed_response(
             }
         }
     }
+
+    // 2026-05-03 (Wave 5c PR-5): drop the KG read lock before doing
+    // the JSONL augmentation. The on-disk read can take 10–50 ms on
+    // hot files; holding the read lock that long would block the
+    // slow_loop's KG mutations (cleanup_expired / enforce_memory_limit
+    // / save_to_store) which run under a write lock.
+    drop(graph);
+
+    // Augment with the canonical on-disk record. Operator hit on
+    // 2026-05-03: site reported `4 events / 0 blocks (24h)` while
+    // the prod JSONL had 42 incidents and 647 block decisions over
+    // the same window. Root cause: in-memory KG is the hot tier
+    // (TTL eviction, ADR-0003) and live_feed was reading it
+    // exclusively. JSONL is the cold tier with the full daily
+    // history; merging gives the operator the truth without
+    // breaking the rich-context KG path for fresh entries.
+    //
+    // Cross-midnight handling: include yesterday so the 00:00–01:00
+    // window does not lose the previous day's tail. Same trick the
+    // existing `api_quickwins` site uses (NUMBER_CONSISTENCY.md
+    // entry).
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let yesterday = (chrono::Local::now() - chrono::Duration::days(1))
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let dates = vec![today, yesterday];
+    let jsonl_incidents = load_jsonl_incidents(data_dir, &dates);
+    let jsonl_decisions = load_jsonl_decisions(data_dir, &dates);
+    let incidents = merge_incidents_prefer_kg(incidents, jsonl_incidents);
+    let decisions = merge_decisions_prefer_kg(decisions, jsonl_decisions);
 
     let decision_map: HashMap<String, &DecisionEntry> = decisions
         .iter()
@@ -755,6 +890,137 @@ pub(super) fn is_internal_incident_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Wave 5c PR-5 (2026-05-03) — JSONL fallback for live_feed ───
+    //
+    // Operator hit on 2026-05-03: site reported `4 events / 0 blocks
+    // (24h)` while prod JSONL had 42 incidents and 647 block decisions
+    // for the same window. Root cause was that `build_live_feed_response`
+    // only read in-memory KG (hot tier, TTL-capped). JSONL is the cold
+    // tier with full daily history; the fix merges both. These anchors
+    // pin the dedup contract + the IO-failure fallback so a refactor
+    // that drops either layer ships red.
+
+    fn make_incident(id: &str, ts: chrono::DateTime<chrono::Utc>) -> Incident {
+        Incident {
+            ts,
+            host: String::new(),
+            incident_id: id.to_string(),
+            severity: Severity::High,
+            title: format!("test incident {id}"),
+            summary: String::new(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    fn make_decision(id: &str, ts: chrono::DateTime<chrono::Utc>) -> DecisionEntry {
+        DecisionEntry {
+            ts,
+            incident_id: id.to_string(),
+            host: String::new(),
+            ai_provider: String::new(),
+            action_type: "block_ip".into(),
+            target_ip: Some("1.2.3.4".into()),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.9,
+            auto_executed: true,
+            dry_run: false,
+            reason: String::new(),
+            estimated_threat: String::new(),
+            execution_result: "ok".into(),
+            prev_hash: None,
+        }
+    }
+
+    #[test]
+    fn merge_incidents_prefers_kg_and_dedups_by_incident_id() {
+        let now = chrono::Utc::now();
+        let kg = vec![make_incident("a", now), make_incident("b", now)];
+        let jsonl = vec![
+            make_incident("b", now), // dup with KG → skipped
+            make_incident("c", now), // new → kept
+            make_incident("d", now), // new → kept
+        ];
+        let merged = merge_incidents_prefer_kg(kg, jsonl);
+        let ids: Vec<&str> = merged.iter().map(|i| i.incident_id.as_str()).collect();
+        // KG entries first, JSONL fills in the rest, no duplicates.
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn merge_decisions_prefers_kg_and_dedups_by_incident_id() {
+        let now = chrono::Utc::now();
+        let kg = vec![make_decision("inc-1", now)];
+        let jsonl = vec![
+            make_decision("inc-1", now), // dup → skipped
+            make_decision("inc-2", now), // new → kept
+        ];
+        let merged = merge_decisions_prefer_kg(kg, jsonl);
+        let ids: Vec<&str> = merged.iter().map(|d| d.incident_id.as_str()).collect();
+        assert_eq!(ids, vec!["inc-1", "inc-2"]);
+    }
+
+    /// 2026-05-03 (Wave 5c PR-5 anchor): the canonical operator-hit
+    /// case. KG has 0 incidents (TTL evicted everything), JSONL on
+    /// disk has 3. The merged total must be 3, NOT 0. This is the
+    /// site/dashboard count discrepancy at its smallest reproducible
+    /// shape. Anti-regression for any refactor that drops the JSONL
+    /// read or short-circuits when the KG is empty.
+    #[test]
+    fn jsonl_fallback_recovers_count_when_kg_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let path = dir.path().join(format!("incidents-{today}.jsonl"));
+        let now = chrono::Utc::now();
+        let lines: Vec<String> = (0..3)
+            .map(|n| {
+                serde_json::to_string(&make_incident(&format!("ssh_bruteforce:{n}"), now)).unwrap()
+            })
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let dates = vec![today.clone(), "1970-01-01".to_string()];
+        let loaded = load_jsonl_incidents(dir.path(), &dates);
+        assert_eq!(loaded.len(), 3, "JSONL load must surface every line");
+
+        // KG empty + JSONL has 3 → merged has 3.
+        let merged = merge_incidents_prefer_kg(Vec::new(), loaded);
+        assert_eq!(
+            merged.len(),
+            3,
+            "fallback must surface JSONL entries when KG is empty (operator's 2026-05-03 case)"
+        );
+    }
+
+    /// 2026-05-03 (Wave 5c PR-5): degraded-IO path. If
+    /// `incidents-{date}.jsonl` is missing or unreadable, the helper
+    /// returns an empty vec and the merge still works — the public
+    /// endpoint never crashes on file-system glitches.
+    #[test]
+    fn load_jsonl_incidents_returns_empty_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dates = vec!["1970-01-01".to_string()];
+        let loaded = load_jsonl_incidents(dir.path(), &dates);
+        assert!(loaded.is_empty());
+    }
+
+    /// Same shape for decisions — pinned because the count surfaces
+    /// (`total_blocked`) feed off this loader and a missing file
+    /// must NOT break the response.
+    #[test]
+    fn load_jsonl_decisions_returns_empty_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dates = vec!["1970-01-01".to_string()];
+        let loaded = load_jsonl_decisions(dir.path(), &dates);
+        assert!(loaded.is_empty());
+    }
 
     #[test]
     fn test_live_feed_title_formatting_rules() {
