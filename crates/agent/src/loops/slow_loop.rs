@@ -166,7 +166,28 @@ pub(crate) fn try_recover_sqlite_store(state: &mut AgentState) {
 /// zero. `block_in_place` keeps the inline-serialized semantics
 /// (one SQLite operation at a time within the tick) while preserving
 /// the original goal of not blocking the async runtime.
-const BACKFILL_BATCH_SIZE: usize = 1000;
+/// 2026-05-03 (Wave 5b PR-3): batch size dropped from 1000 → 100.
+/// On the operator's prod host the backfill txn was holding the SQLite
+/// writer lock long enough that the sensor's concurrent INSERTs into
+/// the same table (separate process, separate `Store::open`, same
+/// .db file) raced past the `busy_timeout=5000ms`. Result: every
+/// backfill batch failed with "database is locked", logged warn every
+/// 30 s for hours, and the migration never finished.
+///
+/// Smaller batches release the writer lock more frequently; the
+/// throttle below ensures the backfill only runs once per minute
+/// instead of every 30 s tick, so the sensor's writer has predictable
+/// write windows. Net: more batches succeed, total throughput equals
+/// or exceeds the 1000-rows-per-30s-but-failing baseline.
+const BACKFILL_BATCH_SIZE: usize = 100;
+
+/// Maximum retries on `database is locked` within a single backfill
+/// call. Retries with linear back-off so a transient sensor-write
+/// burst (a few hundred ms) does not waste a full minute waiting for
+/// the next tick.
+const BACKFILL_LOCK_RETRIES: u32 = 3;
+const BACKFILL_LOCK_BACKOFF_MS: u64 = 200;
+
 pub(crate) fn drive_events_src_ip_backfill(store: &innerwarden_store::Store) {
     let pending = match store.events_pending_src_ip_backfill() {
         Ok(0) => return,
@@ -176,20 +197,61 @@ pub(crate) fn drive_events_src_ip_backfill(store: &innerwarden_store::Store) {
             return;
         }
     };
-    match store.backfill_events_src_ip(BACKFILL_BATCH_SIZE) {
-        Ok(0) => {} // race with another writer; pick up next tick
-        Ok(updated) => {
-            info!(
-                updated,
-                pending_before = pending,
-                "events.src_ip backfill batch applied"
-            );
-        }
-        Err(e) => {
-            // warn-not-fail: backfill is best-effort. Readers already
-            // handle NULL src_ip gracefully so the agent stays
-            // functional while we retry next tick.
-            warn!("events.src_ip backfill batch failed: {e:#}");
+
+    for attempt in 0..=BACKFILL_LOCK_RETRIES {
+        match store.backfill_events_src_ip(BACKFILL_BATCH_SIZE) {
+            Ok(0) => return, // race with another writer; pick up next tick
+            Ok(updated) => {
+                if attempt > 0 {
+                    info!(
+                        updated,
+                        pending_before = pending,
+                        attempt,
+                        "events.src_ip backfill batch applied after retry"
+                    );
+                } else {
+                    info!(
+                        updated,
+                        pending_before = pending,
+                        "events.src_ip backfill batch applied"
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                // Distinguish "database is locked" (transient,
+                // retryable) from other errors (schema, IO, ...).
+                // The error string is the only reliable signal we
+                // have because rusqlite wraps the SQLite error code
+                // through several layers and the typed enum is
+                // generic over the inner cause.
+                let msg = format!("{e:#}");
+                let is_lock = msg.contains("database is locked") || msg.contains("SQLITE_BUSY");
+                if is_lock && attempt < BACKFILL_LOCK_RETRIES {
+                    // Linear back-off: 200 ms, 400 ms, 600 ms.
+                    // `block_in_place` is already in scope (caller
+                    // wraps this whole function) so a `std::thread::
+                    // sleep` does not stall the tokio scheduler.
+                    let delay = BACKFILL_LOCK_BACKOFF_MS * (attempt as u64 + 1);
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    continue;
+                }
+                // Non-lock errors AND lock errors after the final
+                // retry land here. warn-not-fail: backfill is
+                // best-effort and readers handle NULL src_ip
+                // gracefully (`events_for_training` normalizes the
+                // empty-string sentinel back to None). The agent
+                // stays functional and we try again next tick.
+                if is_lock {
+                    warn!(
+                        attempts = attempt + 1,
+                        "events.src_ip backfill batch failed: {e:#} (will retry next tick)"
+                    );
+                } else {
+                    warn!("events.src_ip backfill batch failed: {e:#}");
+                }
+                return;
+            }
         }
     }
 }
@@ -215,6 +277,48 @@ pub(crate) fn drive_events_src_ip_backfill(store: &innerwarden_store::Store) {
 /// The tick will spend ~5–50 ms here per batch when the backfill has
 /// rows to process; once `events_pending_src_ip_backfill` returns 0
 /// the call is a no-op (single SELECT).
+/// 2026-05-03 (Wave 5b PR-3): minimum interval between two backfill
+/// calls. The slow_loop ticks every 30 s; without this throttle the
+/// backfill ran twice as often as needed and contended with the
+/// sensor's concurrent writes for the SQLite writer lock. 60 s is a
+/// soft target — slow_loop drift can stretch it to ~62 s and that's
+/// fine.
+const BACKFILL_MIN_INTERVAL_SECS: i64 = 60;
+
+/// Unix timestamp of the last backfill attempt. 0 = never attempted
+/// (cold start). Updated when `backfill_throttle_allows` returns true.
+static BACKFILL_LAST_ATTEMPT_TS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Returns `true` if at least `BACKFILL_MIN_INTERVAL_SECS` have passed
+/// since the last allowed attempt, AND atomically records this
+/// moment as the new "last attempt" — so callers do not need a
+/// separate `mark_attempted` call. Pure side-effect on the static.
+fn backfill_throttle_allows() -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let last = BACKFILL_LAST_ATTEMPT_TS.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last < BACKFILL_MIN_INTERVAL_SECS {
+        return false;
+    }
+    // Race: two ticks crossing the interval boundary at the same time.
+    // Only one wins the CAS, so only one runs. The loser falls through
+    // to the next cycle, which is fine — the contract is "at most one
+    // attempt per BACKFILL_MIN_INTERVAL_SECS", not "exactly one".
+    BACKFILL_LAST_ATTEMPT_TS
+        .compare_exchange(
+            last,
+            now,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+#[cfg(test)]
+fn reset_backfill_throttle_for_test() {
+    BACKFILL_LAST_ATTEMPT_TS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn run_events_src_ip_backfill_in_place(state: &AgentState) {
     let Some(store) = state.sqlite_store.clone() else {
         return;
@@ -697,14 +801,22 @@ pub(crate) async fn process_narrative_tick(
     // `RECURRING_BUGS.md` "sqlite_store stuck at None after boot race".
     try_recover_sqlite_store(state);
 
-    // Drive the v2 src_ip backfill one batch per tick. Synchronous
-    // within the tick (so the writer lock is held without contention
-    // from this tick's other SQLite operations), but wrapped in
-    // `block_in_place` so other tokio tasks on sibling workers keep
-    // making progress. No-op when the store is missing or no NULL
-    // rows remain. Spec 037 I-05a — see `run_events_src_ip_backfill_in_place`
-    // doc comment for the history of why this is not `tokio::spawn`.
-    run_events_src_ip_backfill_in_place(state);
+    // Drive the v2 src_ip backfill at MOST once per minute. Wrapped
+    // in `block_in_place` so other tokio tasks on sibling workers
+    // keep making progress.
+    //
+    // 2026-05-03 (Wave 5b PR-3): throttled from "every tick (30 s)"
+    // to "every 60 s" to give the sensor's concurrent writer
+    // (separate process, separate SQLite connection, same .db file)
+    // predictable write windows. Combined with the smaller
+    // `BACKFILL_BATCH_SIZE` (1000 → 100) and the lock-error
+    // retry-with-backoff in `drive_events_src_ip_backfill`, prod
+    // hosts that were spinning on "database is locked" every 30 s
+    // now make forward progress without log spam. No-op when the
+    // store is missing or no NULL rows remain.
+    if backfill_throttle_allows() {
+        run_events_src_ip_backfill_in_place(state);
+    }
 
     let today = chrono::Local::now()
         .date_naive()
@@ -1322,6 +1434,35 @@ mod tests {
     use crate::knowledge_graph::types::Node;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    /// 2026-05-03 (Wave 5b PR-3 anchor): the slow_loop ticks every
+    /// 30 s, but the src_ip backfill must run at MOST once per
+    /// minute to give the sensor's concurrent SQLite writer
+    /// (separate process, separate `Store::open`, same .db file)
+    /// predictable write windows. Without this gate prod was racing
+    /// for the writer lock every 30 s and burning a stack trace per
+    /// race in the journal. The gate atomically records the last
+    /// allowed attempt so two simultaneous ticks (slow_loop +
+    /// out-of-band caller) cannot both pass.
+    #[test]
+    fn backfill_throttle_allows_one_per_minute_then_blocks() {
+        reset_backfill_throttle_for_test();
+        // Cold start: never attempted → first call passes.
+        assert!(
+            backfill_throttle_allows(),
+            "cold start must allow first backfill"
+        );
+        // Immediate retry: within the interval, must be blocked.
+        assert!(
+            !backfill_throttle_allows(),
+            "second call within {}s must be blocked",
+            BACKFILL_MIN_INTERVAL_SECS
+        );
+        assert!(
+            !backfill_throttle_allows(),
+            "third call within window must also be blocked"
+        );
+    }
 
     // ── extract_anomaly_subject (PR #414 / Baseline redesign) ───────
     //
