@@ -1,12 +1,22 @@
-# Default owner for everything
-* @InnerWarden
+# GitHub CODEOWNERS — auto-request review from listed owners on PRs
+# touching the matched paths. Combined with branch protection's
+# "Require review from Code Owners" the listed owners gate merge.
+#
+# Spec: https://docs.github.com/repositories/managing-your-repositorys-settings-and-customization/customizing-your-repository/about-code-owners
+#
+# Owner format must be a user (@handle) or team (@org/team-name).
+# A bare org handle (@InnerWarden) is rejected as "Unknown owner"
+# and the entry silently falls back to no protection — which is what
+# this file did until 2026-05-03.
 
-# Core crates
-/crates/core/    @InnerWarden
-/crates/sensor/  @InnerWarden
-/crates/agent/   @InnerWarden
-/crates/ctl/     @InnerWarden
+# Default — every change in the repo
+* @esteves-uk
 
-# Integrations and modules - community contributions welcome
-/integrations/   @InnerWarden
-/modules/        @InnerWarden
+# Critical surfaces — additional owner gate. Today the same operator
+# both owns and reviews; the value is forward-compat for when external
+# contributors arrive.
+/crates/agent/src/dashboard/   @esteves-uk
+/crates/agent/src/skills/      @esteves-uk
+/crates/sensor/src/detectors/  @esteves-uk
+/.github/workflows/            @esteves-uk
+/scripts/deploy-prod.sh        @esteves-uk
