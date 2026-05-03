@@ -195,7 +195,7 @@ function renderOrphanDiagnosticPanel() {
     <details id="orphanDiagnosticPanel" class="orphan-diag-panel" style="margin-top:18px;border:1px solid var(--border);border-radius:8px;background:rgba(231,76,60,0.04);">
       <summary onclick="loadOrphanDiagnostics()" style="padding:12px 14px;cursor:pointer;font-weight:600;font-size:0.9rem;color:var(--text);list-style:none;">
         ▸ Diagnose orphaned responses
-        <span style="font-weight:400;font-size:0.78rem;color:var(--dim);margin-left:8px;">(read-only — Wave 3 adds cleanup buttons with 2FA)</span>
+        <span style="font-weight:400;font-size:0.78rem;color:var(--dim);margin-left:8px;">(read + clear / mark-already-gone with 2FA)</span>
       </summary>
       <div id="orphanDiagBody" style="padding:14px;border-top:1px solid var(--border);">
         <p style="color:var(--dim);font-size:0.82rem;">Loading diagnostic…</p>
@@ -268,6 +268,28 @@ function renderOrphanCard(o) {
     : ageMin < 1440
       ? `${Math.floor(ageMin / 60)}h ago`
       : `${Math.floor(ageMin / 1440)}d ago`;
+  // PR #420 Wave 3: when an operator has already resolved this orphan,
+  // show their decision and date in place of the action buttons.
+  const resolvedBlock = o.resolution
+    ? `<div style="margin-top:8px;padding:6px 10px;border-radius:4px;background:rgba(39,174,96,0.08);border:1px solid rgba(39,174,96,0.25);font-size:0.74rem;color:var(--text);">
+         ${lucideIcon('check-circle',{size:13})}
+         Resolved as <strong>${esc(o.resolution.kind)}</strong>
+         by <code>${esc(o.resolution.operator)}</code>
+         · ${new Date(o.resolution.resolved_at).toLocaleString()}
+         <div style="font-size:0.7rem;color:var(--dim);margin-top:2px;">${esc(o.resolution.reason)}</div>
+       </div>`
+    : `<div class="orphan-actions" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">
+         <button type="button" class="btn-orphan-clear" data-orphan-id="${esc(o.id)}"
+           onclick="openOrphanResolveModal('${esc(o.id)}','cleared','${esc(o.target)}')"
+           style="padding:4px 10px;font-size:0.78rem;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">
+           Clear orphan
+         </button>
+         <button type="button" class="btn-orphan-mark-already-gone" data-orphan-id="${esc(o.id)}"
+           onclick="openOrphanResolveModal('${esc(o.id)}','already_gone','${esc(o.target)}')"
+           style="padding:4px 10px;font-size:0.78rem;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">
+           Mark already gone
+         </button>
+       </div>`;
   return `
     <div class="orphan-card" style="padding:12px 14px;border-radius:6px;background:var(--card-bg);margin-bottom:8px;border:1px solid var(--border);">
       <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
@@ -287,6 +309,95 @@ function renderOrphanCard(o) {
         <pre style="font-size:0.72rem;color:var(--dim);background:rgba(0,0,0,0.15);padding:6px 8px;border-radius:3px;margin-top:4px;overflow-x:auto;white-space:pre-wrap;">${esc(o.last_error || '(empty)')}</pre>
       </details>
       ${o.incident_id ? `<div style="font-size:0.7rem;color:var(--dim);margin-top:4px;">incident: <code>${esc(o.incident_id)}</code></div>` : ''}
+      ${resolvedBlock}
     </div>`;
+}
+
+// ─── PR #420 Wave 3 — orphan resolution modal + POST helpers ─────
+//
+// Buttons on each orphan card open a modal that collects the reason
+// + (optional) TOTP code, then POSTs to the matching endpoint with
+// the X-Requested-With header that the CSRF middleware requires.
+// On success, the panel reloads so the operator sees the resolved
+// state immediately.
+
+const ORPHAN_KIND_LABEL = {
+  cleared: 'Clear orphan',
+  already_gone: 'Mark already gone',
+};
+
+function openOrphanResolveModal(orphanId, kind, target) {
+  const existing = document.getElementById('orphanResolveModal');
+  if (existing) existing.remove();
+  const modal = document.createElement('div');
+  modal.id = 'orphanResolveModal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999;';
+  modal.innerHTML = `
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:18px;max-width:440px;width:90%;">
+      <h3 style="margin:0 0 4px;font-size:1rem;color:var(--text);">${ORPHAN_KIND_LABEL[kind] || kind}</h3>
+      <p style="margin:0 0 12px;font-size:0.78rem;color:var(--dim);">Target: <code>${esc(target)}</code></p>
+      <label style="display:block;font-size:0.78rem;color:var(--text);margin-bottom:4px;">Reason (required)</label>
+      <textarea id="orphanResolveReason" rows="3" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--card-bg);color:var(--text);font-family:inherit;font-size:0.82rem;margin-bottom:10px;" placeholder="Brief operator note for the audit trail"></textarea>
+      <label style="display:block;font-size:0.78rem;color:var(--text);margin-bottom:4px;">TOTP code <span style="color:var(--dim);">(if 2FA enabled — leave blank otherwise)</span></label>
+      <input id="orphanResolveTotp" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" style="width:120px;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--card-bg);color:var(--text);font-family:monospace;font-size:0.9rem;letter-spacing:0.2em;" placeholder="000000" />
+      <div id="orphanResolveError" style="color:#e74c3c;font-size:0.78rem;margin-top:8px;display:none;"></div>
+      <div style="margin-top:14px;display:flex;justify-content:flex-end;gap:8px;">
+        <button type="button" onclick="closeOrphanResolveModal()" style="padding:6px 12px;font-size:0.82rem;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Cancel</button>
+        <button type="button" id="orphanResolveSubmit" onclick="submitOrphanResolve('${esc(orphanId)}','${esc(kind)}')" style="padding:6px 12px;font-size:0.82rem;border-radius:4px;border:1px solid var(--accent);background:var(--accent);color:#000;cursor:pointer;font-weight:600;">Confirm</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  document.getElementById('orphanResolveReason')?.focus();
+}
+
+function closeOrphanResolveModal() {
+  const el = document.getElementById('orphanResolveModal');
+  if (el) el.remove();
+}
+
+async function submitOrphanResolve(orphanId, kind) {
+  const reasonEl = document.getElementById('orphanResolveReason');
+  const totpEl = document.getElementById('orphanResolveTotp');
+  const errEl = document.getElementById('orphanResolveError');
+  const btn = document.getElementById('orphanResolveSubmit');
+  const reason = (reasonEl?.value || '').trim();
+  const totp = (totpEl?.value || '').trim();
+  if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+  if (!reason) {
+    if (errEl) { errEl.textContent = 'Reason is required.'; errEl.style.display = 'block'; }
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Submitting…'; }
+  const path = kind === 'cleared'
+    ? `/api/responses/orphans/${encodeURIComponent(orphanId)}/clear`
+    : `/api/responses/orphans/${encodeURIComponent(orphanId)}/mark-already-gone`;
+  try {
+    const resp = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        // Required by the CSRF middleware (audit I-14). Browsers will
+        // not let a cross-origin <form> set this header, so requiring
+        // it blocks form-based CSRF without per-session tokens.
+        'x-requested-with': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ reason, totp }),
+      credentials: 'include',
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => `HTTP ${resp.status}`);
+      throw new Error(text || `HTTP ${resp.status}`);
+    }
+    closeOrphanResolveModal();
+    // Reload diagnostic so the resolved card flips to the read-only
+    // "Resolved by ..." block.
+    _orphanDiagLoaded = false;
+    const body = document.getElementById('orphanDiagBody');
+    if (body) body.innerHTML = '<p style="color:var(--dim);font-size:0.82rem;">Reloading…</p>';
+    loadOrphanDiagnostics();
+  } catch (e) {
+    if (errEl) { errEl.textContent = e.message || String(e); errEl.style.display = 'block'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Confirm'; }
+  }
 }
 

@@ -3,7 +3,7 @@ pub(crate) mod types;
 
 // Re-export types used by other modules in the crate.
 pub use auth::generate_password_hash_interactive;
-pub use state::{AgentGuardAlert, DashboardActionConfig, DeepSecuritySnapshot};
+pub use state::{AgentGuardAlert, DashboardActionConfig, DeepSecuritySnapshot, TwoFactorSettings};
 pub use types::AdvisoryEntry;
 
 #[allow(unused_imports)]
@@ -107,6 +107,56 @@ async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
         "strict-origin-when-cross-origin".parse().unwrap(),
     );
     resp
+}
+
+// ---------------------------------------------------------------------------
+// CSRF middleware (audit I-14)
+// ---------------------------------------------------------------------------
+
+/// PR #420 Wave 3: simple-yet-effective CSRF defense for state-changing
+/// requests. Rejects POST / PUT / PATCH / DELETE that arrive without
+/// `X-Requested-With: XMLHttpRequest`.
+///
+/// Why this works against CSRF on a Basic-Auth-protected dashboard:
+///
+/// - Browsers automatically attach Basic-Auth credentials to *any*
+///   request whose origin is in the operator's auth cache. A malicious
+///   site that submits an HTML `<form action=".../api/action/...">`
+///   would otherwise piggyback on those credentials.
+/// - Forms can only set `Content-Type: application/x-www-form-urlencoded`
+///   / `multipart/form-data` / `text/plain` and a small set of headers.
+///   Custom headers like `X-Requested-With` are NOT in that set and
+///   trigger a CORS preflight that the dashboard rejects (no CORS
+///   policy configured).
+/// - Therefore, requiring `X-Requested-With: XMLHttpRequest` is
+///   sufficient to block form-based CSRF without the complexity of
+///   per-session CSRF tokens.
+///
+/// GET / HEAD / OPTIONS pass through unchanged — they are read-only and
+/// already body-limited.
+async fn csrf_protection(req: axum::extract::Request, next: Next) -> Response {
+    use axum::http::{Method, StatusCode};
+    let method = req.method();
+    let needs_check = matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    );
+    if needs_check {
+        let header_ok = req
+            .headers()
+            .get("x-requested-with")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.eq_ignore_ascii_case("xmlhttprequest"))
+            .unwrap_or(false);
+        if !header_ok {
+            return (
+                StatusCode::FORBIDDEN,
+                "missing X-Requested-With: XMLHttpRequest header (CSRF protection)",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +398,7 @@ pub async fn serve(
     tls_cert: Option<String>,
     tls_key: Option<String>,
     insecure_no_tls: bool,
+    two_factor: state::TwoFactorSettings,
 ) -> Result<()> {
     // SEC-005: Reject non-loopback bind without authentication.
     let is_loopback_bind = is_loopback_address(&bind);
@@ -438,6 +489,7 @@ pub async fn serve(
         briefing_minute,
         sqlite_store,
         fleet_state,
+        two_factor: Arc::new(two_factor),
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -611,6 +663,14 @@ pub async fn serve(
         .route("/api/responses", get(api_responses))
         // PR #419 Wave 2: read-only orphan diagnostic.
         .route("/api/responses/orphans", get(api_responses_orphans))
+        // PR #420 Wave 3: operator-driven orphan resolution. Both
+        // routes require auth + CSRF (X-Requested-With) + 2FA when
+        // configured. Audit row written via append_admin_action.
+        .route("/api/responses/orphans/:id/clear", post(api_orphan_clear))
+        .route(
+            "/api/responses/orphans/:id/mark-already-gone",
+            post(api_orphan_mark_already_gone),
+        )
         // Spec 005 T017: active incident groups snapshot (noise-reduction view).
         .route("/api/incident-groups", get(api_incident_groups))
         .route("/api/mitre/navigator", get(api_mitre_navigator))
@@ -631,6 +691,10 @@ pub async fn serve(
         .route("/api/auth/logout", post(api_auth_logout))
         .route("/api/auth/sessions", get(api_auth_sessions))
         .layer(auth_layer.clone())
+        // PR #420 Wave 3 (audit I-14): require X-Requested-With on all
+        // state-changing requests. The dashboard JS sends this header
+        // automatically; cross-origin <form> POSTs cannot.
+        .layer(middleware::from_fn(csrf_protection))
         .with_state(state.clone());
 
     // Live-feed routes are intentionally public (no auth) regardless of bind
@@ -4071,5 +4135,106 @@ mod tests {
                 needle
             );
         }
+    }
+
+    // ─── PR #420 Wave 3 — orphan resolution UI + CSRF + 2FA ─────
+
+    #[test]
+    fn js_responses_contains_orphan_resolve_modal() {
+        // Wave 3 adds buttons + modal + POST helper for the two
+        // orphan resolution endpoints. Anchor on the exact identifiers
+        // so renames must update this test in lockstep with the route
+        // wiring in `serve()` above.
+        assert!(JS_RESPONSES.contains("openOrphanResolveModal"));
+        assert!(JS_RESPONSES.contains("submitOrphanResolve"));
+        assert!(JS_RESPONSES.contains("closeOrphanResolveModal"));
+        // Endpoint paths must match the registered routes.
+        assert!(JS_RESPONSES.contains("/clear"));
+        assert!(JS_RESPONSES.contains("/mark-already-gone"));
+        // POST request must include the CSRF header — test pins this
+        // so a future refactor that removes the header gets caught.
+        assert!(JS_RESPONSES.contains("'x-requested-with': 'XMLHttpRequest'"));
+        // TOTP field is included so 2FA-enabled deployments work.
+        assert!(JS_RESPONSES.contains("orphanResolveTotp"));
+        // Operator-facing labels rendered for resolved cards.
+        assert!(JS_RESPONSES.contains("Resolved as"));
+    }
+
+    #[tokio::test]
+    async fn csrf_protection_rejects_post_without_header() {
+        // Wire the CSRF middleware to a tiny echo router and verify
+        // a POST without `X-Requested-With` returns 403.
+        use axum::http::{Method, Request, StatusCode};
+        use axum::routing::post;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/api/echo", post(|| async { "ok" }))
+            .layer(middleware::from_fn(csrf_protection));
+
+        let no_header = Request::builder()
+            .method(Method::POST)
+            .uri("/api/echo")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(no_header).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let with_header = Request::builder()
+            .method(Method::POST)
+            .uri("/api/echo")
+            .header("x-requested-with", "XMLHttpRequest")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(with_header).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Wrong value also rejected.
+        let wrong_value = Request::builder()
+            .method(Method::POST)
+            .uri("/api/echo")
+            .header("x-requested-with", "Fetch")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(wrong_value).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // GET is exempt — read-only requests pass without the header.
+        let get = Request::builder()
+            .method(Method::GET)
+            .uri("/api/echo")
+            .body(Body::empty())
+            .unwrap();
+        // GET on a POST-only route returns 405, not 403 — the CSRF
+        // middleware lets the request through and axum responds.
+        let resp = app.clone().oneshot(get).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn two_factor_settings_enforcement_logic() {
+        // Public surface that the orphan endpoints depend on.
+        let none = state::TwoFactorSettings::default();
+        assert!(!none.is_enforced());
+
+        let totp_no_secret = state::TwoFactorSettings::new("totp", "");
+        assert!(
+            !totp_no_secret.is_enforced(),
+            "method=totp + empty secret = not enforced (operator hasn't run setup)"
+        );
+
+        let totp_with_secret = state::TwoFactorSettings::new("totp", "JBSWY3DPEHPK3PXP");
+        assert!(totp_with_secret.is_enforced());
+
+        // Case-insensitive on the method label so config like
+        // `method = "TOTP"` still trips the gate.
+        let totp_upper = state::TwoFactorSettings::new("TOTP", "JBSWY3DPEHPK3PXP");
+        assert!(totp_upper.is_enforced());
+
+        // Anything other than "totp" = not enforced (placeholder for
+        // future "dashboard" method which lives outside this test).
+        let dash = state::TwoFactorSettings::new("dashboard", "JBSWY3DPEHPK3PXP");
+        assert!(!dash.is_enforced());
     }
 }

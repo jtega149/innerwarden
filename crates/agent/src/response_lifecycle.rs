@@ -36,7 +36,7 @@
 use std::collections::VecDeque;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 /// Read a v2 response-lifecycle snapshot file, surfacing genuine I/O
@@ -1183,6 +1183,12 @@ pub struct OrphanDiagnostic {
     /// purely informational. The actual revert path lives in
     /// `execute_revert` and is unchanged.
     pub revert_command: String,
+    /// PR #420 Wave 3: operator resolution if one has been recorded.
+    /// `None` means the orphan is still unresolved. The dashboard
+    /// uses this to filter resolved orphans out of the live cluster
+    /// summary while still surfacing them in a "resolved" section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<OrphanResolution>,
 }
 
 /// Operator-facing classification of orphan revert failure patterns.
@@ -1343,9 +1349,113 @@ pub fn enumerate_orphans_from_responses_json(raw: &str) -> Vec<OrphanDiagnostic>
                 last_error,
                 cluster,
                 revert_command,
+                resolution: None,
             })
         })
         .collect()
+}
+
+// ─── PR #420 Wave 3 — operator-driven orphan resolution ───────────
+//
+// The dashboard cannot mutate the agent loop's `ResponseLifecycle`
+// directly (different ownership). Instead, operator decisions are
+// appended to a sidecar JSONL `orphan_resolutions.jsonl` in the
+// data dir. The orphan diagnostic enumerator joins against this
+// file so resolved orphans are filtered (or surfaced separately).
+// Append-only — every operator action keeps an audit trail outside
+// of `admin-actions-YYYY-MM-DD.jsonl` so re-resolving an id keeps
+// each step.
+
+/// Operator-driven resolution recorded by Wave 3 dashboard endpoints.
+/// Stored as a JSONL line in `<data_dir>/orphan_resolutions.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrphanResolution {
+    /// Orphan id (matches `CompletedResponse::id`).
+    pub orphan_id: String,
+    /// "cleared" — operator reviewed and confirms the entry is stale.
+    /// "already_gone" — operator confirms the kernel state was actually clean.
+    pub kind: String,
+    /// Operator-supplied free-text reason. Mandatory at API boundary.
+    pub reason: String,
+    /// Dashboard username (basic-auth user) at the time of action.
+    pub operator: String,
+    /// When the resolution was recorded.
+    pub resolved_at: DateTime<Utc>,
+}
+
+impl OrphanResolution {
+    /// Allowed values of `kind`. Public so the handler validates input
+    /// against the same list — no string magic in two places.
+    pub const KIND_CLEARED: &'static str = "cleared";
+    pub const KIND_ALREADY_GONE: &'static str = "already_gone";
+}
+
+/// Append-only writer for `orphan_resolutions.jsonl`. Relies on POSIX
+/// `O_APPEND` atomicity for writes shorter than `PIPE_BUF` (4096 B on
+/// Linux/macOS) — a single resolution line is ~250 B so concurrent
+/// dashboard clicks cannot interleave. No `flock` ceremony.
+pub fn append_orphan_resolution(
+    data_dir: &std::path::Path,
+    resolution: &OrphanResolution,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let canonical = std::fs::canonicalize(data_dir)?;
+    let path = canonical.join("orphan_resolutions.jsonl");
+    if !path.starts_with(&canonical) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "constructed path escapes data directory",
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    let line = serde_json::to_string(resolution)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("serde: {e}")))?;
+    // Compose the full line + newline first so the kernel sees a
+    // single write() — keeps it under PIPE_BUF and atomic with O_APPEND.
+    let bytes = format!("{line}\n");
+    file.write_all(bytes.as_bytes())?;
+    file.flush()
+}
+
+/// Read every resolution recorded so far. Last-write-wins per orphan
+/// id (operator may revise their decision; the latest line is the
+/// effective one). Malformed lines are skipped, never panic.
+///
+/// Canonicalizes `data_dir` and rejects paths that escape it. Mirrors
+/// the writer's CWE-22 guard so CodeQL `rust/path-injection` is closed
+/// on both directions.
+pub fn read_orphan_resolutions(
+    data_dir: &std::path::Path,
+) -> std::collections::HashMap<String, OrphanResolution> {
+    use std::collections::HashMap;
+    // Canonicalize the directory; if it can't be resolved the file
+    // also can't be read — return empty.
+    let canonical = match std::fs::canonicalize(data_dir) {
+        Ok(p) => p,
+        Err(_) => return HashMap::new(),
+    };
+    let path = canonical.join("orphan_resolutions.jsonl");
+    if !path.starts_with(&canonical) {
+        // Defence in depth: a future change that constructs the
+        // filename dynamically must not escape data_dir.
+        return HashMap::new();
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let mut latest: HashMap<String, OrphanResolution> = HashMap::new();
+    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(r) = serde_json::from_str::<OrphanResolution>(line) {
+            // Last-wins: a later append overrides earlier resolutions
+            // for the same orphan id (operator changed their mind).
+            latest.insert(r.orphan_id.clone(), r);
+        }
+    }
+    latest
 }
 
 impl ResponseLifecycle {
@@ -3262,5 +3372,84 @@ mod tests {
         // history with a non-orphan entry only.
         let none = r#"{"history": [{"reason": "expired_ttl"}]}"#;
         assert!(enumerate_orphans_from_responses_json(none).is_empty());
+    }
+
+    // ─── PR #420 Wave 3 — orphan resolution storage anchor tests ────
+
+    #[test]
+    fn append_then_read_orphan_resolution_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = OrphanResolution {
+            orphan_id: "orph-1".to_string(),
+            kind: OrphanResolution::KIND_CLEARED.to_string(),
+            reason: "stale entry, IP no longer relevant".to_string(),
+            operator: "alice".to_string(),
+            resolved_at: chrono::Utc::now(),
+        };
+        append_orphan_resolution(dir.path(), &r).unwrap();
+        let loaded = read_orphan_resolutions(dir.path());
+        assert_eq!(loaded.len(), 1);
+        let got = loaded.get("orph-1").expect("orphan-1 present");
+        assert_eq!(got.kind, OrphanResolution::KIND_CLEARED);
+        assert_eq!(got.reason, "stale entry, IP no longer relevant");
+        assert_eq!(got.operator, "alice");
+    }
+
+    #[test]
+    fn read_orphan_resolutions_last_write_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = OrphanResolution {
+            orphan_id: "orph-X".to_string(),
+            kind: OrphanResolution::KIND_CLEARED.to_string(),
+            reason: "first".to_string(),
+            operator: "alice".to_string(),
+            resolved_at: chrono::Utc::now(),
+        };
+        append_orphan_resolution(dir.path(), &a).unwrap();
+        // Second append for the same orphan_id with different fields.
+        a.kind = OrphanResolution::KIND_ALREADY_GONE.to_string();
+        a.reason = "actually it was already gone".to_string();
+        a.operator = "bob".to_string();
+        append_orphan_resolution(dir.path(), &a).unwrap();
+
+        let loaded = read_orphan_resolutions(dir.path());
+        assert_eq!(loaded.len(), 1, "still keyed by orphan_id");
+        let got = loaded.get("orph-X").unwrap();
+        assert_eq!(got.kind, OrphanResolution::KIND_ALREADY_GONE);
+        assert_eq!(got.operator, "bob");
+        assert_eq!(got.reason, "actually it was already gone");
+    }
+
+    #[test]
+    fn read_orphan_resolutions_skips_malformed_lines() {
+        // Mix of valid + garbage lines — readers must never panic.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan_resolutions.jsonl");
+        let mut content = String::new();
+        content.push_str("not json at all\n");
+        content.push_str("{}\n"); // missing required fields
+        let valid = OrphanResolution {
+            orphan_id: "orph-Y".to_string(),
+            kind: OrphanResolution::KIND_CLEARED.to_string(),
+            reason: "ok".to_string(),
+            operator: "alice".to_string(),
+            resolved_at: chrono::Utc::now(),
+        };
+        content.push_str(&serde_json::to_string(&valid).unwrap());
+        content.push('\n');
+        content.push_str("{trailing garbage\n");
+        std::fs::write(&path, content).unwrap();
+
+        let loaded = read_orphan_resolutions(dir.path());
+        assert_eq!(loaded.len(), 1, "only the well-formed line survives");
+        assert!(loaded.contains_key("orph-Y"));
+    }
+
+    #[test]
+    fn read_orphan_resolutions_returns_empty_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Don't create the file at all.
+        let loaded = read_orphan_resolutions(dir.path());
+        assert!(loaded.is_empty());
     }
 }

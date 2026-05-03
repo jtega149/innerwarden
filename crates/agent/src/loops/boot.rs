@@ -492,6 +492,17 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         let tls_cert = cli.tls_cert.clone();
         let tls_key = cli.tls_key.clone();
         let insecure_no_tls = cli.insecure_no_tls;
+        // PR #420 Wave 3: thread 2FA config into the dashboard so the
+        // sensitive POST endpoints (orphan clear / mark-already-gone)
+        // can gate on operator-provided TOTP codes. `[security]` is
+        // optional in the TOML; absent → no 2FA, same as method = "none".
+        let dashboard_two_factor = match cfg.security.as_ref() {
+            Some(sec) => dashboard::TwoFactorSettings::new(
+                sec.two_factor_method.clone(),
+                sec.totp_secret.clone(),
+            ),
+            None => dashboard::TwoFactorSettings::default(),
+        };
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -516,6 +527,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 tls_cert,
                 tls_key,
                 insecure_no_tls,
+                dashboard_two_factor,
             )
             .await
             {

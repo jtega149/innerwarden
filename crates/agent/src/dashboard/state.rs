@@ -201,6 +201,43 @@ pub(crate) struct DashboardState {
     /// `[fleet].enabled = false` so the route handler returns 404
     /// for `/api/fleet/hosts` instead of an empty list.
     pub(super) fleet_state: Option<crate::fleet::FleetState>,
+    /// PR #420 Wave 3: 2FA settings consulted by sensitive POST
+    /// endpoints (orphan clear / mark-already-gone). Cloned from
+    /// `[security]` config at boot. When `method == "none"` the
+    /// 2FA gate is bypassed; otherwise `totp_secret` is verified
+    /// against the operator-supplied code.
+    pub(super) two_factor: Arc<TwoFactorSettings>,
+}
+
+/// PR #420 Wave 3: thin clone of the operator's 2FA config used by
+/// dashboard handlers. Kept separate from `crate::config::SecurityConfig`
+/// so we don't pull the whole config tree into `DashboardState`.
+#[derive(Clone, Default)]
+pub struct TwoFactorSettings {
+    /// "none" / "totp" / "dashboard". Anything other than "totp" is
+    /// treated as no 2FA — handler-level gates short-circuit to OK.
+    pub(crate) method: String,
+    /// Base32-encoded TOTP secret. Empty means 2FA effectively disabled
+    /// even if `method == "totp"` (operator hasn't run `configure 2fa`).
+    pub(crate) totp_secret: String,
+}
+
+impl TwoFactorSettings {
+    /// Construct from the operator's `[security]` config. Matches the
+    /// field names used in `crate::config::SecurityConfig` so callers
+    /// at boot can pass through directly.
+    pub fn new(method: impl Into<String>, totp_secret: impl Into<String>) -> Self {
+        Self {
+            method: method.into(),
+            totp_secret: totp_secret.into(),
+        }
+    }
+
+    /// True when the gate should be enforced. False when 2FA is
+    /// disabled by config (`method != "totp"` or no secret stored).
+    pub(crate) fn is_enforced(&self) -> bool {
+        self.method.eq_ignore_ascii_case("totp") && !self.totp_secret.is_empty()
+    }
 }
 
 /// Aggregated status from integrated security modules.
@@ -292,6 +329,7 @@ pub(super) fn test_dashboard_state(data_dir: &std::path::Path) -> DashboardState
         briefing_minute: 0,
         sqlite_store: None,
         fleet_state: None,
+        two_factor: Arc::new(TwoFactorSettings::default()),
     }
 }
 
