@@ -1,10 +1,11 @@
 //! Atomic, capped JSON-array log helper.
 //!
-//! Two production logs (`playbook-log.json`, `attack-chains.json`) follow
-//! the same shape: a JSON array of records that grows over time, capped
-//! at the latest N entries, written to disk so the dashboard can read it.
+//! `attack-chains.json` follows the shape: a JSON array of records that
+//! grows over time, capped at the latest N entries, written to disk so
+//! the dashboard can read it. (`playbook-log.json` was the second user
+//! pre-2026-05-03; removed with the playbook engine in PR #413.)
 //!
-//! Pre-2026-04-23 each call site had its own copy of the read-modify-write
+//! Pre-2026-04-23 the call site had its own copy of the read-modify-write
 //! pattern: load the file, parse, push the new entry, trim, then `fs::write`
 //! over the original. Two flaws:
 //!
@@ -19,11 +20,10 @@
 //! write to a sibling temp file (`<path>.tmp`) and `rename` it onto the
 //! target. `rename` is atomic on POSIX, so observers see either the old
 //! file or the new file — never a half-written one. The temp file
-//! includes the process id so concurrent writers (a corner case — both
-//! call sites only fire from the agent loop) cannot stomp each other.
+//! includes the process id so concurrent writers (a corner case) cannot
+//! stomp each other.
 //!
-//! See `RECURRING_BUGS.md` "RMW pattern on attack-chains.json /
-//! playbook-log.json".
+//! See `RECURRING_BUGS.md` "RMW pattern on attack-chains.json".
 
 use std::path::Path;
 
@@ -36,7 +36,7 @@ use serde::Serialize;
 /// the rename step. Read failures (file missing or corrupt) are
 /// recovered silently — the new entry simply starts a fresh array.
 /// This matches the pre-existing semantics, where a corrupt
-/// `attack-chains.json` would not block playbook execution.
+/// `attack-chains.json` would not block downstream consumers.
 pub(crate) fn append_with_cap<T>(path: &Path, entry: &T, cap: usize) -> std::io::Result<()>
 where
     T: Serialize,

@@ -12,9 +12,9 @@ use crate::{
     incident_auto_rules, incident_autodismiss, incident_crowdsec, incident_decision_eval,
     incident_enrichment, incident_execution_gate, incident_flow, incident_forensics,
     incident_honeypot_router, incident_honeypot_suggestion, incident_notifications,
-    incident_obvious, incident_playbook, incident_post_decision, incident_prelude,
-    incident_reputation, process::telegram_approval::process_telegram_approval, reader, skills,
-    telegram, telemetry_tick, AgentState,
+    incident_obvious, incident_post_decision, incident_prelude, incident_reputation,
+    process::telegram_approval::process_telegram_approval, reader, skills, telegram,
+    telemetry_tick, AgentState,
 };
 
 // ---------------------------------------------------------------------------
@@ -690,8 +690,14 @@ pub(crate) async fn process_incidents(
             );
         }
 
-        incident_playbook::maybe_evaluate_and_persist_playbook(incident, data_dir, cfg, state)
-            .await;
+        // 2026-05-03 (PR #413): playbook engine removed from the free
+        // version. The 3 step types that worked (notify /
+        // capture_forensics / escalate) already have independent
+        // triggers — incident_notifications.rs sends Telegram on
+        // severity threshold; incident_forensics::maybe_capture_incident_forensics
+        // fires pcap on high/critical; warn-loud is a tracing macro.
+        // No operational regression. Future home for declarative
+        // playbook-style orchestration: Spec 042 active defense (Lua).
 
         incident_action_report::maybe_send_post_execution_telegram_report(
             incident,

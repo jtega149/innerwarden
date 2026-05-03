@@ -608,7 +608,6 @@ pub async fn serve(
         .route("/api/graph/process-tree", get(api_graph_process_tree))
         .route("/api/graph/timeline", get(api_graph_timeline))
         .route("/api/graph/threats", get(api_graph_threats))
-        .route("/api/playbook-log", get(api_playbook_log))
         .route("/api/responses", get(api_responses))
         // Spec 005 T017: active incident groups snapshot (noise-reduction view).
         .route("/api/incident-groups", get(api_incident_groups))
@@ -3454,54 +3453,27 @@ mod tests {
         );
     }
 
+    // 2026-05-03 (PR #413): the playbook engine was removed from the
+    // free version. The previous anchor `playbooks_tab_hidden_behind_feature_flag`
+    // is gone with it; future declarative orchestration belongs to
+    // Spec 042 active defense.
     #[test]
-    fn playbooks_tab_hidden_behind_feature_flag() {
-        // 2026-05-02 audit B4 (Spec 041 Option B): the Playbooks Intel
-        // sub-tab is hidden by default. The playbook engine still
-        // records intents in the background, but the v1 executor only
-        // handles a few step types and the rest render as "Triggered
-        // (no executor)". The auditor's complaint was that the tab
-        // displayed this misleading state on every install. Default-
-        // hide closes that complaint. Operators who flip
-        // `[playbook] enabled = true` see the tab re-appear.
-
-        // HTML: the tab button starts hidden.
-        let nav_btn_start = INDEX_HTML
-            .find("id=\"intelTabPlaybooks\"")
-            .expect("Playbooks Intel sub-tab button must exist");
-        let nav_btn_slice = &INDEX_HTML[nav_btn_start..nav_btn_start + 400];
+    fn playbook_surface_is_fully_removed() {
+        // Anchor against accidental re-introduction. If anyone wires a
+        // Playbooks Intel sub-tab back in without the active-defense
+        // spec, this fails.
         assert!(
-            nav_btn_slice.contains("display:none"),
-            "intelTabPlaybooks must start hidden — operators opt in via \
-             `[playbook] enabled = true` (audit B4 / Spec 041 Option B)"
-        );
-
-        // intel.js carries the probe + invokes it at boot.
-        assert!(
-            JS_INTEL.contains("function probePlaybooksEnabled"),
-            "intel.js must define probePlaybooksEnabled — mirrors the \
-             probeFleetEnabled pattern for Fleet"
+            !INDEX_HTML.contains("id=\"intelTabPlaybooks\""),
+            "Playbooks sub-tab button removed in PR #413; do not re-add \
+             without Spec 042 active-defense design review."
         );
         assert!(
-            JS_INTEL.contains("probePlaybooksEnabled();"),
-            "intel.js must invoke probePlaybooksEnabled() at boot so the \
-             tab unhides automatically when the operator opts in"
+            !JS_INTEL.contains("function probePlaybooksEnabled"),
+            "probePlaybooksEnabled removed in PR #413"
         );
-        // Probe reads the flag from /api/status (matches backend
-        // expose path).
         assert!(
-            JS_INTEL.contains("status.playbooks && status.playbooks.executor_enabled"),
-            "probe must read the executor flag from /api/status. If the \
-             backend renames the field, this test will catch the drift."
-        );
-        // Deep-link safety: if the operator lands on the Playbooks
-        // sub-tab via state and the executor is off, fall back to
-        // Profiles instead of leaving them on a hidden tab.
-        assert!(
-            JS_INTEL.contains("currentIntelTab === 'playbooks'")
-                && JS_INTEL.contains("switchIntelTab('profiles')"),
-            "probe must redirect away from the Playbooks tab when the \
-             executor is off and the operator deep-linked into it"
+            !JS_INTEL.contains("function loadPlaybooks"),
+            "loadPlaybooks removed in PR #413"
         );
     }
 

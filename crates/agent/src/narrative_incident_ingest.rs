@@ -146,27 +146,17 @@ pub(crate) fn ingest_new_incidents(
                 }
             }
 
-            // Evaluate chain-triggered playbooks
-            for incident in &new_incidents {
-                if let Some(exec) = state
-                    .playbook_engine
-                    .evaluate_chain(&chain.rule_id, incident)
-                {
-                    info!(
-                        playbook = %exec.playbook_id,
-                        chain = %chain.rule_id,
-                        steps = exec.steps.len(),
-                        "chain-triggered playbook: {}",
-                        exec.playbook_name
-                    );
-                }
-            }
+            // 2026-05-03 (PR #413): chain-triggered playbook
+            // evaluation removed with the playbook engine. Chain
+            // detection itself stays — chains continue to be
+            // persisted below for the dashboard, and severity-based
+            // notifications fire via incident_notifications.rs. Future
+            // home for chain-driven orchestration: Spec 042 active
+            // defense (Lua-driven).
         }
 
         // Persist detected chains to JSON for dashboard via the shared
         // atomic-rename helper (`crate::capped_log::append_with_cap`).
-        // Same back-compat anchor as `incident_playbook.rs` — see that
-        // file's note for the rationale.
         if !chains.is_empty() {
             let chains_path = data_dir.join("attack-chains.json");
             for chain in &chains {

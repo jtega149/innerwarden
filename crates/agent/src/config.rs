@@ -110,56 +110,6 @@ pub struct AgentConfig {
     /// Incident lifecycle flow configuration (spec 028).
     #[serde(default)]
     pub incident_flow: IncidentFlowConfig,
-    /// Playbook step executor (`tracked-spec-playbook-execution`,
-    /// 2026-05-01). Default-off; operator opts in by setting
-    /// `[playbook] enabled = true` in `agent.toml`. See
-    /// `playbook_executor.rs` for safety invariants and the v1
-    /// scope (notify / capture_forensics / escalate executed,
-    /// dangerous primitives skipped because the AI decision path
-    /// owns them).
-    #[serde(default)]
-    pub playbook: PlaybookConfig,
-}
-
-/// Playbook step executor configuration.
-///
-/// Defaults are SAFE: `enabled = false`, so installing a new agent
-/// binary on a host with no `[playbook]` section in agent.toml
-/// preserves the legacy intent-only behaviour. Operator must
-/// explicitly set `enabled = true` to opt in. When enabled, the
-/// executor still runs in `dry_run = true` mode by default — every
-/// step logs what it would do without the side effect — until the
-/// operator flips that off too. This two-step opt-in is the
-/// blast-radius mitigation for "what if the executor has a bug
-/// and starts blocking everything".
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlaybookConfig {
-    /// Master switch. `false` (default) leaves the legacy
-    /// intent-only path untouched; `true` runs the executor with
-    /// the v1 step set (notify, capture_forensics, escalate).
-    #[serde(default)]
-    pub enabled: bool,
-    /// When `enabled`, controls whether steps perform their side
-    /// effect (`false`) or only log what they would do (`true`,
-    /// default-when-enabled). The two-step pattern matches the
-    /// responder's existing `enabled` + `dry_run` knobs and lets
-    /// an operator validate the executor for 24h before flipping
-    /// to live.
-    #[serde(default = "default_playbook_dry_run")]
-    pub dry_run: bool,
-}
-
-impl Default for PlaybookConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dry_run: default_playbook_dry_run(),
-        }
-    }
-}
-
-fn default_playbook_dry_run() -> bool {
-    true
 }
 
 /// Incident lifecycle routing knobs (spec 028).

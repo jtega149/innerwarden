@@ -104,16 +104,6 @@ pub struct DashboardActionConfig {
     /// to the previous hardcoded prompts (preserves old behaviour in tests
     /// and when the operator explicitly blanks personality).
     pub ai_personality: String,
-    /// Whether the playbook step executor is enabled
-    /// (`tracked-spec-playbook-execution`, 2026-05-01). When
-    /// `false`, the engine is in legacy intent-only mode and the
-    /// dashboard's degraded-banner derivation lights up the
-    /// "Playbook engine records intent but executes no steps"
-    /// reason. When `true`, the executor runs (notify /
-    /// capture_forensics / escalate execute; dangerous primitives
-    /// stay handled by the AI decision path) and the reason
-    /// clears from the banner.
-    pub playbook_executor_enabled: bool,
 }
 
 impl Default for DashboardActionConfig {
@@ -150,7 +140,6 @@ impl Default for DashboardActionConfig {
             trusted_ips: vec![],
             trusted_users: vec![],
             ai_personality: String::new(),
-            playbook_executor_enabled: false,
         }
     }
 }

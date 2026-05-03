@@ -114,7 +114,6 @@ mod incident_honeypot_router;
 mod incident_honeypot_suggestion;
 mod incident_notifications;
 mod incident_obvious;
-mod incident_playbook;
 mod incident_post_decision;
 mod incident_prelude;
 mod incident_reputation;
@@ -144,8 +143,6 @@ mod notification_pipeline;
 mod observation_verify;
 mod orphan_recovery;
 mod pcap_capture;
-mod playbook;
-mod playbook_executor;
 mod process;
 mod process_health;
 #[allow(dead_code)]
@@ -549,8 +546,6 @@ struct AgentState {
     correlation_engine: correlation_engine::CorrelationEngine,
     /// Baseline learning: detects anomalies from normal behavior.
     baseline: baseline::BaselineStore,
-    /// Playbook engine: automated response sequences.
-    playbook_engine: playbook::PlaybookEngine,
     /// Selective packet capture on incidents.
     pcap_capture: pcap_capture::PcapCapture,
     /// V10 neural scoring model — replaced by autoencoder (anomaly_engine).

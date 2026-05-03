@@ -555,11 +555,11 @@ pub(super) fn compute_overview_counts_from_sqlite(
 
 /// Read totals from the response lifecycle JSON (SQLite blob first,
 /// then `data_dir/responses.json` fallback — same precedence as the
-/// `/api/responses` handler) and stitch in the playbook-executor
-/// constant. The function is best-effort: any read or parse failure
-/// returns `Default::default()` so a transient I/O hiccup never
-/// flips the banner red on its own. The caller (api_overview) treats
-/// this as a snapshot input, not a critical-path read.
+/// `/api/responses` handler). The function is best-effort: any read
+/// or parse failure returns `Default::default()` so a transient I/O
+/// hiccup never flips the banner red on its own. The caller
+/// (api_overview) treats this as a snapshot input, not a
+/// critical-path read.
 pub(super) fn read_degraded_signals(state: &super::state::DashboardState) -> DegradedSignals {
     let raw = state
         .sqlite_store
@@ -587,29 +587,24 @@ pub(super) fn read_degraded_signals(state: &super::state::DashboardState) -> Deg
                 .unwrap_or(0);
         }
     }
-    // Playbook executor flag, dynamic from the action config
-    // (sourced from `cfg.playbook.enabled` at dashboard init).
-    // Pre-2026-05-01 this was a constant `true` because no
-    // executor existed; with `tracked-spec-playbook-execution`
-    // the operator can flip the executor on (`[playbook] enabled
-    // = true` in agent.toml), which clears the corresponding
-    // reason from the Degraded banner. Documented in
-    // `.claude-local/AUDIT_2026-05-01_dashboard.md` finding 1.5.
-    signals.playbook_executor_missing = !state.action_cfg.playbook_executor_enabled;
     signals
 }
 
 /// Inputs to `derive_system_health` that surface chronic drift
 /// rather than acute pipeline emergencies. None of these tip the
 /// system into a red verb on their own — they accumulate from
-/// historical orphaned/failed responses and from architectural gaps
-/// (playbook engine recording intent without an executor). Their
-/// purpose is to block the green PROTECTED banner from sitting over
-/// silent failures (2026-05-01 dashboard QA audit finding 1.2).
+/// historical orphaned/failed responses. Their purpose is to block
+/// the green PROTECTED banner from sitting over silent failures
+/// (2026-05-01 dashboard QA audit finding 1.2).
 ///
 /// Numbers are operator-visible — they get embedded in the reason
 /// strings on the banner. Keep them honest. Zero is the only value
 /// that is allowed to disappear from the UI.
+///
+/// 2026-05-03 (PR #413): the `playbook_executor_missing` signal was
+/// removed alongside the playbook engine itself — there is no
+/// engine to be missing an executor for. Future declarative
+/// orchestration belongs to Spec 042 active defense.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DegradedSignals {
     /// Cumulative orphaned-response count from `responses.json`
@@ -626,16 +621,6 @@ pub(super) struct DegradedSignals {
     /// rejected" — a non-zero total indicates either a config drift
     /// (rule was rewritten by an external tool) or a backend bug.
     pub(super) revert_failures_total: u64,
-    /// True when the playbook engine has no step executor wired (it
-    /// builds `PlaybookExecution` records with every step `pending`
-    /// and persists them, but no code transitions them to
-    /// `running/success/failed`). 2026-05-01 audit finding 1.5
-    /// (verified via `playbook-log.json` — 19 intents, all 100%
-    /// pending). Track here so the banner does not lie about an
-    /// automated-response chain that genuinely does not exist yet.
-    /// Spec `tracked-spec-playbook-execution` will land the
-    /// executor; until then this stays `true`.
-    pub(super) playbook_executor_missing: bool,
 }
 
 /// Derive the operator-visible health verb from the pending
@@ -653,7 +638,7 @@ pub(super) struct DegradedSignals {
 /// 2026-05-01 (audit 1.2 fix): `DegradedSignals` introduces a
 /// fourth yellow verb that catches chronic drift the existing red
 /// verbs cannot represent (historical orphaned and revert-failure
-/// totals above zero, playbook executor missing). Acute red verbs
+/// totals above zero). Acute red verbs
 /// still take priority; Degraded is the catch-all just before
 /// `OperatingNormally` so a clean system stays green.
 ///
@@ -727,11 +712,6 @@ fn collect_degraded_reasons(degraded: &DegradedSignals) -> Vec<String> {
             degraded.revert_failures_total,
             if degraded.revert_failures_total == 1 { "" } else { "s" },
         ));
-    }
-    if degraded.playbook_executor_missing {
-        reasons.push(
-            "Playbook engine records intent but executes no steps — automated response chain is not yet wired (tracked-spec-playbook-execution)".to_string(),
-        );
     }
     reasons
 }
@@ -3073,11 +3053,10 @@ mod tests {
     // ── Degraded health verb (audit 1.2) ─────────────────────────
     //
     // Anchor for the recurring audit complaint: green PROTECTED
-    // banner sitting on top of historical orphaned responses,
-    // accumulated revert failures, and a playbook engine that
-    // records intent without ever executing a step. Each test pins
-    // one signal so a future regression that drops a signal from
-    // the derivation is caught immediately.
+    // banner sitting on top of historical orphaned responses or
+    // accumulated revert failures. Each test pins one signal so a
+    // future regression that drops a signal from the derivation is
+    // caught immediately.
 
     use super::super::types::{PendingBreakdown, SystemHealth};
 
@@ -3116,45 +3095,22 @@ mod tests {
     }
 
     #[test]
-    fn degraded_when_playbook_executor_missing() {
-        // Most production-like configuration: playbook executor is
-        // not yet wired (tracked-spec-playbook-execution), even
-        // when there are no orphaned responses today.
-        let degraded = super::DegradedSignals {
-            playbook_executor_missing: true,
-            ..Default::default()
-        };
-        let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
-        match h {
-            SystemHealth::Degraded { reasons } => {
-                assert!(
-                    reasons.iter().any(|r| r.contains("Playbook engine")),
-                    "missing playbook reason: {reasons:?}"
-                );
-            }
-            other => panic!("expected Degraded, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn degraded_collects_all_reasons_in_priority_order() {
         // When multiple drift signals are present the banner shows
         // the headline (`reasons[0]`) but the operator can drill
-        // into the full list. Order matters: orphaned/revert-failure
-        // are immediate maintenance debt and should headline; the
-        // playbook executor gap is architectural and ranks last.
+        // into the full list. Order matters: orphaned and revert-
+        // failure are immediate maintenance debt — orphaned headlines
+        // because the kernel state may still be live.
         let degraded = super::DegradedSignals {
             orphaned_total: 17,
             revert_failures_total: 111,
-            playbook_executor_missing: true,
         };
         let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
         match h {
             SystemHealth::Degraded { reasons } => {
-                assert_eq!(reasons.len(), 3, "got {reasons:?}");
+                assert_eq!(reasons.len(), 2, "got {reasons:?}");
                 assert!(reasons[0].contains("orphaned"));
                 assert!(reasons[1].contains("revert failure"));
-                assert!(reasons[2].contains("Playbook engine"));
             }
             other => panic!("expected Degraded, got {other:?}"),
         }
@@ -3169,10 +3125,7 @@ mod tests {
         // adding a field that defaults to non-zero will make this
         // test fail and force the author to think about whether
         // the new signal warrants Degraded.
-        let degraded = super::DegradedSignals {
-            playbook_executor_missing: false,
-            ..Default::default()
-        };
+        let degraded = super::DegradedSignals::default();
         let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
         assert_eq!(h, SystemHealth::OperatingNormally);
     }
@@ -3188,7 +3141,6 @@ mod tests {
         let degraded = super::DegradedSignals {
             orphaned_total: 17,
             revert_failures_total: 111,
-            playbook_executor_missing: true,
         };
         let h = super::derive_system_health(&pending, Some(600), &degraded);
         match h {

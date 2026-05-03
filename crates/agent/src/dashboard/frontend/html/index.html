@@ -501,14 +501,9 @@
       <button type="button" id="intelTabCampaigns" onclick="switchIntelTab('campaigns')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Campaigns</button>
       <button type="button" id="intelTabChains" onclick="switchIntelTab('chains')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Chains</button>
       <button type="button" id="intelTabBaseline" onclick="switchIntelTab('baseline')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Baseline</button>
-      <!-- 2026-05-02 audit B4 (Spec 041 Option B): Playbooks tab is
-           hidden by default. The playbook engine still records intents
-           but the executor is off in the default config (`[playbook]
-           enabled = false`), and the tab rendered "Triggered (no
-           executor)" in a way the auditor flagged as misleading. The
-           tab is unhidden by `intel.js::probePlaybooksEnabled` when
-           the operator opts in via the config flag. -->
-      <button type="button" id="intelTabPlaybooks" onclick="switchIntelTab('playbooks')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;display:none;">Playbooks</button>
+      <!-- 2026-05-03 (PR #413): Playbooks Intel sub-tab removed
+           alongside the playbook engine. Future declarative
+           orchestration belongs to Spec 042 active defense. -->
       <button type="button" id="intelTabMitre" onclick="switchIntelTab('mitre')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">MITRE</button>
       <select id="intelSort" onchange="loadIntel()" style="margin-left:8px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);">
         <option value="risk_score">Sort: Risk Score</option>

@@ -1,35 +1,7 @@
 // ── Intelligence tab ──────────────────────────────────────────────
-
-// 2026-05-02 audit B4 (Spec 041 Option B): the Playbooks Intel sub-tab
-// is hidden by default. The playbook engine records intents in the
-// background regardless, but the v1 executor only handles
-// notify/capture_forensics/escalate — every other step type renders
-// as "Triggered (no executor)", which the auditor flagged as
-// misleading in the UI. Default-hide closes that complaint without
-// removing the engine. Operators who flip `[playbook] enabled = true`
-// in agent.toml see the tab re-appear automatically.
-//
-// Probe runs once at boot (boot.js dispatches via DOMContentLoaded).
-// Same pattern as `probeFleetEnabled` for the Fleet tab.
-async function probePlaybooksEnabled() {
-  try {
-    const status = await loadJson('/api/status');
-    const enabled = !!(status && status.playbooks && status.playbooks.executor_enabled);
-    const btn = document.getElementById('intelTabPlaybooks');
-    if (btn) {
-      btn.style.display = enabled ? '' : 'none';
-    }
-    // If the operator deep-linked into Intel with the Playbooks
-    // sub-tab active and the executor is off, fall back to Profiles
-    // so they don't see an empty Playbooks pane with no nav button.
-    if (!enabled && typeof currentIntelTab !== 'undefined' && currentIntelTab === 'playbooks') {
-      if (typeof switchIntelTab === 'function') switchIntelTab('profiles');
-    }
-  } catch (_e) {
-    // Probe failures keep the default-hidden state — safer than
-    // showing a tab whose backend may not exist.
-  }
-}
+// 2026-05-03 (PR #413): the Playbooks Intel sub-tab + probe were
+// removed alongside the playbook engine. Future declarative
+// orchestration belongs to Spec 042 active defense.
 
 async function loadIntel() {
   const status = document.getElementById('intelViewStatus');
@@ -191,7 +163,7 @@ async function showProfileDetail(ip) {
 let currentIntelTab = 'profiles';
 function switchIntelTab(tab) {
   currentIntelTab = tab;
-  const tabs = ['Profiles','Campaigns','Chains','Baseline','Playbooks','Mitre'];
+  const tabs = ['Profiles','Campaigns','Chains','Baseline','Mitre'];
   tabs.forEach(t => {
     const btn = document.getElementById('intelTab'+t);
     if (btn) { const active = t.toLowerCase() === tab; btn.style.background = active ? 'var(--accent)' : 'var(--card-bg)'; btn.style.color = active ? '#0a0f1a' : 'var(--text)'; btn.style.fontWeight = active ? '600' : '400'; btn.style.borderColor = active ? 'var(--accent)' : 'var(--border)'; }
@@ -213,7 +185,6 @@ function switchIntelTab(tab) {
   if (tab === 'campaigns') loadCampaigns();
   else if (tab === 'chains') loadChains();
   else if (tab === 'baseline') loadBaseline();
-  else if (tab === 'playbooks') loadPlaybooks();
   else if (tab === 'mitre') loadMitreCoverage();
   else loadIntel();
 }
@@ -441,66 +412,9 @@ async function loadBaseline() {
   }
 }
 
-// ── Playbooks sub-tab ─────────────────────────────────────────────
-async function loadPlaybooks() {
-  const content = document.getElementById('intelContent');
-  const status = document.getElementById('intelViewStatus');
-  if (status) status.textContent = 'Loading playbooks…';
-  const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
-  try {
-    const data = await loadJson('/api/playbook-log', { signal });
-    if (!data?.executions?.length) {
-      // 2026-04-30: same fix as the chains empty-state path above —
-      // single-quoted JS string with embedded ${lucideIcon('clipboard-list',...)}
-      // syntax-broke the file. Backtick template literal.
-      content.innerHTML = `<div style="text-align:center;padding:40px;"><div>${lucideIcon('clipboard-list',{size:32})}</div><p style="color:var(--dim);">No playbook executions yet.</p><p style="font-size:0.8rem;color:var(--dim);">Playbooks trigger automatically when incidents match predefined patterns (ransomware, reverse shell, data exfil, etc.).</p></div>`;
-      if (status) status.textContent = '0 executions';
-      return;
-    }
-    let html = `<div class="kpi-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:16px;">
-      <div class="kpi-card"><div class="kpi-value">${data.total}</div><div class="kpi-label">Total Executions</div></div>
-      <div class="kpi-card"><div class="kpi-value">${data.executions.filter(e=>e.overall_status==='ok').length}</div><div class="kpi-label">Successful</div></div>
-      <div class="kpi-card"><div class="kpi-value">${new Set(data.executions.map(e=>e.playbook_id)).size}</div><div class="kpi-label">Unique Playbooks</div></div>
-    </div>`;
-    // 2026-05-01 (audit finding 1.5): the playbook engine is an
-    // intent-recorder, not a step runner — every step persists with
-    // status="pending" and stays that way forever (verified passo-0
-    // 2026-05-01: 19 intents since 2026-04-13, 100% pending). The
-    // dashboard previously rendered "pending" as if execution were
-    // about to happen, which was misleading. Until the executor
-    // ships (tracked-spec-playbook-execution), relabel "pending" to
-    // "Triggered (no executor)" and append a tooltip explaining
-    // why no step ever transitions. Anything else (ok/failed)
-    // renders as before.
-    const statusLabel = (s) => s === 'pending' ? 'Triggered (no executor)' : s;
-    const statusTitle = (s) => s === 'pending'
-      ? 'Playbook engine recorded the intent but no step executor is wired yet. Tracked: tracked-spec-playbook-execution.'
-      : '';
-    for (const exec of data.executions) {
-      const statusColor = exec.overall_status === 'ok' ? '#27ae60' : exec.overall_status === 'pending' ? '#f39c12' : '#e74c3c';
-      const oTitle = statusTitle(exec.overall_status);
-      const oTitleAttr = oTitle ? ` title="${oTitle}"` : '';
-      html += `<div class="kpi-card" style="padding:12px;margin-bottom:8px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <div><span style="font-weight:700;">${exec.playbook_name||exec.playbook_id}</span></div>
-          <span${oTitleAttr} style="padding:2px 8px;border-radius:4px;background:${statusColor}20;color:${statusColor};font-size:0.75rem;">${statusLabel(exec.overall_status)}</span>
-        </div>
-        <div style="font-size:0.8rem;color:var(--dim);margin:4px 0;">Incident: ${exec.incident_id}</div>
-        <div style="font-size:0.75rem;margin-top:4px;">Steps: ${(exec.steps||[]).map(s => {
-          const sTitle = statusTitle(s.status);
-          const sTitleAttr = sTitle ? ` title="${sTitle}"` : '';
-          return `<span${sTitleAttr} style="padding:1px 6px;border-radius:3px;background:var(--border);margin:1px;font-size:0.7rem;">${s.action} (${statusLabel(s.status)})</span>`;
-        }).join(' → ')}</div>
-        <div style="font-size:0.65rem;color:var(--dim);margin-top:4px;">${exec.triggered_at ? new Date(exec.triggered_at).toLocaleString() : ''}</div>
-      </div>`;
-    }
-    content.innerHTML = html;
-    if (status) status.textContent = `${data.total} executions`;
-  } catch(e) {
-    if (e && (e.name === 'AbortError' || e.code === 20)) return;
-    content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`;
-  }
-}
+// 2026-05-03 (PR #413): Playbooks sub-tab + loadPlaybooks removed
+// alongside the playbook engine. Future declarative orchestration
+// belongs to Spec 042 active defense.
 
 // Defender Brain sub-tab removed: the AlphaZero brain was replaced
 // by the SecureBERT classifier provider routed through ai::AiRouter.
@@ -589,6 +503,4 @@ async function loadMitreCoverage() {
   }
 }
 
-// Boot probe: hide the Playbooks sub-tab unless the executor is on.
-probePlaybooksEnabled();
 

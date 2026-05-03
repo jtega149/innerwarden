@@ -344,16 +344,6 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
             "block_backend": action_cfg.block_backend,
             "allowed_skills": action_cfg.allowed_skills
         },
-        // 2026-05-02 audit B4 (Spec 041 Option B): surface the playbook
-        // executor flag so the frontend can hide the Playbooks Intel
-        // sub-tab when the executor is off. Auditor's complaint:
-        // "Triggered (no executor)" rendered in the UI as if execution
-        // were imminent, masking that no step ever transitions. Default
-        // is `enabled = false`, so the tab is hidden until the operator
-        // explicitly opts in via `[playbook] enabled = true`.
-        "playbooks": {
-            "executor_enabled": action_cfg.playbook_executor_enabled,
-        },
         "webhook_format": action_cfg.webhook_format,
         "sudo_protection": action_cfg.sudo_protection_enabled,
         "execution_guard": action_cfg.execution_guard_enabled,

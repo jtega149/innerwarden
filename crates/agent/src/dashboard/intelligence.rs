@@ -373,22 +373,6 @@ pub(super) async fn api_baseline_status(
     Json(baseline)
 }
 
-/// `GET /api/playbook-log` - recent playbook executions.
-pub(super) async fn api_playbook_log(
-    State(state): State<DashboardState>,
-) -> Json<serde_json::Value> {
-    let log: Vec<serde_json::Value> = state
-        .sqlite_store
-        .as_ref()
-        .and_then(|sq| sq.get_blob("playbook_log").ok().flatten())
-        .or_else(|| safe_read_data_file(&state.data_dir, "playbook-log.json"))
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    Json(serde_json::json!({
-        "total": log.len(),
-        "executions": log,
-    }))
-}
 /// `GET /api/deep-security` - aggregated status from firmware, hypervisor, killchain, DNA.
 pub(super) async fn api_deep_security(
     State(state): State<DashboardState>,

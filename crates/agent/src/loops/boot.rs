@@ -460,7 +460,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             trusted_ips: cfg.allowlist.trusted_ips.clone(),
             trusted_users: cfg.allowlist.trusted_users.clone(),
             ai_personality: cfg.telegram.bot.personality.clone(),
-            playbook_executor_enabled: cfg.playbook.enabled,
         };
         let dashboard_data_dir = cli.data_dir.clone();
         let dashboard_bind = cli.dashboard_bind.clone();
@@ -981,7 +980,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         attacker_profiles: HashMap::new(), // loaded from redb below
         last_intel_consolidation_at: None,
         correlation_engine: correlation_engine::CorrelationEngine::new(),
-        playbook_engine: playbook::PlaybookEngine::new(&cli.data_dir),
         pcap_capture: pcap_capture::PcapCapture::new(&cli.data_dir),
         scoring_engine: scoring::ScoringEngine::new(0.95),
         last_firmware_incident_at: None,

@@ -263,9 +263,8 @@ pub(crate) enum SystemHealth {
     },
     /// 2026-05-01 dashboard QA audit finding 1.2: the green PROTECTED
     /// banner was sitting on top of 17 orphaned + 111 revert
-    /// failures + 1393 expired responses + a playbook engine that
-    /// records intent but never executes any step. None of those is
-    /// an "AI is down right now" emergency, so they did not trip the
+    /// failures + 1393 expired responses. None of those is an "AI
+    /// is down right now" emergency, so they did not trip the
     /// existing red verbs. They are a chronic cumulative drift —
     /// silent failures that the banner must not conceal. `Degraded`
     /// turns the badge yellow with operator-readable reasons. The

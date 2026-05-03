@@ -92,8 +92,8 @@ impl UntouchableClass {
 ///
 /// Identification is primarily prefix-matched on `incident_id`
 /// because that is the field every existing persistence path
-/// (`decisions.jsonl`, `playbook-log.json`, SQLite `decisions`
-/// table) already serialises consistently, and changing the agent's
+/// (`decisions.jsonl`, SQLite `decisions` table) already serialises
+/// consistently, and changing the agent's
 /// incident-id convention is out of scope for an audit-completeness
 /// fix. Evidence-field probing supplements this for the
 /// reverse-shell case where we must distinguish kernel-level
