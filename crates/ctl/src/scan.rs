@@ -1062,7 +1062,7 @@ pub fn score_modules(p: &SystemProbes) -> Vec<ModuleRec> {
                 name: "Docker Lifecycle Events",
                 description: "Tracks Docker container events; alerts on privileged/OOM containers.",
                 why,
-                enable_hint: "innerwarden enable container-security",
+                enable_hint: "innerwarden module install container-security",
                 stars: s,
                 tier,
                 needs_tool: if skip { Some("Docker") } else { None },
@@ -1662,7 +1662,7 @@ fn activation_sequence(probes: &SystemProbes) -> Vec<(&'static str, &'static str
 
     if probes.has_docker {
         seq.push((
-            "innerwarden enable container-security",
+            "innerwarden module install container-security",
             "Docker lifecycle + privilege escalation detection",
         ));
     }
@@ -1867,6 +1867,51 @@ mod tests {
         let recs = score_modules(&p);
         let container = recs.iter().find(|r| r.id == "container-security").unwrap();
         assert_eq!(container.tier, Tier::NotAvailable);
+    }
+
+    // Anchor (Wave 7b, 2026-05-03): scan recommendations for module-style entries
+    // must use `module install <id>`, not `enable <id>`. The latter fails because
+    // capability `<id>` does not exist. Real capability hints (block-ip,
+    // sudo-protection, shell-audit) and integration hints (`integrate`, `notify`)
+    // are exempt.
+    #[test]
+    fn module_ids_use_module_install_not_enable() {
+        // Real capability IDs that legitimately use `enable`.
+        let real_capabilities = ["block-ip", "sudo-protection", "shell-audit", "ai"];
+
+        let recs = score_modules(&probes_with_docker());
+        for rec in &recs {
+            if rec.enable_hint.starts_with("innerwarden enable ") {
+                let cap = rec
+                    .enable_hint
+                    .trim_start_matches("innerwarden enable ")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                assert!(
+                    real_capabilities.contains(&cap),
+                    "Module '{}' uses `innerwarden enable {cap}` but '{cap}' is not a real \
+                     capability (only {real_capabilities:?} are). Use \
+                     `innerwarden module install {}` instead. \
+                     See RECURRING_BUGS.md: 'CLI: modules vs capabilities confusion'.",
+                    rec.id,
+                    rec.id,
+                );
+            }
+        }
+
+        // Same check on the activation_sequence helper.
+        let seq = activation_sequence(&probes_with_docker());
+        for (cmd, _why) in &seq {
+            if let Some(rest) = cmd.strip_prefix("innerwarden enable ") {
+                let cap = rest.split_whitespace().next().unwrap_or("");
+                assert!(
+                    real_capabilities.contains(&cap),
+                    "activation_sequence step `{cmd}` enables non-existent capability '{cap}'. \
+                     Use `innerwarden module install {cap}` instead.",
+                );
+            }
+        }
     }
 
     #[test]

@@ -2729,11 +2729,59 @@ pub(crate) fn make_opts(
     }
 }
 
+/// 2026-05-04 (Wave 7b): the registry.toml that ships at the repo
+/// root, embedded at compile time so we can suggest `module install`
+/// from inside the capability error path WITHOUT making a network
+/// request. Keeps the suggestion offline-friendly and always in sync
+/// with the source-of-truth registry.
+const EMBEDDED_REGISTRY: &str = include_str!("../../../registry.toml");
+
+/// 2026-05-04 (Wave 7b): does the given name match a built-in module
+/// declared in `registry.toml`? Used by `unknown_cap_error` to point
+/// the operator at the correct surface (`module install`) instead of
+/// leaving them to grep through `innerwarden list` output.
+///
+/// Implementation is a deliberately stupid line scan against the
+/// embedded registry. We only care about `id = "..."` declarations
+/// and the registry has fewer than 20 entries, so a full TOML parser
+/// would be overkill for this error path. Tolerates any whitespace
+/// between `id` and `=` so registry reformatting does not silently
+/// break the helpful suggestion.
+fn known_module_id(name: &str) -> bool {
+    let target = format!("\"{name}\"");
+    EMBEDDED_REGISTRY.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("id") {
+            return false;
+        }
+        let rest = trimmed[2..].trim_start();
+        rest.starts_with('=') && rest[1..].trim_start().starts_with(&target)
+    })
+}
+
 pub(crate) fn unknown_cap_error(id: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "unknown capability '{}' - run 'innerwarden list' to see available capabilities",
-        id
-    )
+    if known_module_id(id) {
+        // Bug-class fix from 2026-05-04: operator runs
+        // `sudo innerwarden enable openclaw-protection` and the old
+        // error left them to grep through `innerwarden list` (which
+        // does not show modules at all). Now we point them at the
+        // module surface directly.
+        anyhow::anyhow!(
+            "no capability '{id}', but '{id}' is a registered module.\n\
+             Try: sudo innerwarden module install {id}\n\
+             \n\
+             Modules and capabilities are different surfaces. Capabilities \
+             are toggled with `enable`/`disable`; modules are installed and \
+             enabled separately. Run `innerwarden module list` to see \
+             installed modules, or `innerwarden module search` to browse \
+             the registry."
+        )
+    } else {
+        anyhow::anyhow!(
+            "unknown capability '{}' - run 'innerwarden list' to see available capabilities",
+            id
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2769,6 +2817,59 @@ mod tests {
                 action: None,
             }),
         }
+    }
+
+    // Anchor (Wave 7b, 2026-05-03): `known_module_id` must recognise
+    // module IDs declared in the workspace `registry.toml`, regardless
+    // of how the file is whitespace-formatted. The substring scan it
+    // replaced was tied to a specific 10-space indent. See
+    // RECURRING_BUGS.md: 'CLI: modules vs capabilities confusion'.
+    #[test]
+    fn known_module_id_recognises_registry_modules() {
+        assert!(known_module_id("openclaw-protection"));
+        assert!(known_module_id("cloudflare-integration"));
+        assert!(known_module_id("ssh-protection"));
+        assert!(known_module_id("container-security"));
+    }
+
+    #[test]
+    fn known_module_id_rejects_capabilities_and_typos() {
+        // Real capabilities are NOT modules.
+        assert!(!known_module_id("block-ip"));
+        assert!(!known_module_id("shell-audit"));
+        // Typos and partial matches must not pass.
+        assert!(!known_module_id("openclaw"));
+        assert!(!known_module_id("ssh-protect"));
+        assert!(!known_module_id(""));
+    }
+
+    // Anchor (Wave 7b): when an operator types
+    // `sudo innerwarden enable openclaw-protection` (a module),
+    // the error MUST point them at `module install`. The original
+    // bug left them grepping `innerwarden list` output that did
+    // not contain the module at all.
+    #[test]
+    fn unknown_cap_error_suggests_module_install_for_modules() {
+        let err = unknown_cap_error("openclaw-protection");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("module install openclaw-protection"),
+            "expected module-install hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_cap_error_falls_back_for_typos() {
+        let err = unknown_cap_error("definitely-not-a-thing");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown capability"),
+            "expected generic fallback for non-module typos, got: {msg}"
+        );
+        assert!(
+            !msg.contains("module install"),
+            "non-modules must not get the module-install hint, got: {msg}"
+        );
     }
 
     #[test]

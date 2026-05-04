@@ -145,6 +145,26 @@ tier        = "open"
 builtin     = true
 enables     = []
 
+[[modules]]
+id          = "openclaw-protection"
+name        = "AI Agent Protection"
+version     = "0.1.0"
+description = "Monitor and protect servers running OpenClaw, n8n, Langchain, or any autonomous AI agent - detects dangerous commands, suspicious execution patterns, and config tampering"
+tags        = ["ai-agents", "openclaw", "execution-guard", "observability"]
+tier        = "open"
+builtin     = true
+enables     = []   # observe mode - incidents go to AI pipeline + agent API
+
+[[modules]]
+id          = "cloudflare-integration"
+name        = "Cloudflare Integration"
+version     = "0.1.0"
+description = "Push IP block decisions to Cloudflare's edge. When innerwarden blocks an attacking IP at the host firewall, it is also blocked at the CDN level via IP Access Rules before reaching the server."
+tags        = ["cloudflare", "cdn", "edge-blocking"]
+tier        = "open"
+builtin     = true
+enables     = []   # configured via [cloudflare] in agent.toml
+
 # ---------------------------------------------------------------------------
 # Community modules - add yours here via pull request
 # ---------------------------------------------------------------------------

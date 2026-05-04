@@ -101,6 +101,18 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/neural_lifecycle.rs::tests::train_nightly_post_recal_skips_when_no_graph_features` — the post-train recalibration block in `train_nightly_with_store` is gated on `Some(graph_features)`; without graph features the recalibration is skipped so test fixtures and pre-graph boots do not get a recalibration that would overwrite anchors with a degraded no-graph distribution. Pinned the operator-observed bug where the 2026-05-04 nightly retrain wiped Wave 7a's boot recalibration and prod returned to 100% saturation by morning.
 
+### CLI module/capability surface (Wave 7b)
+
+- `crates/ctl/src/scan.rs::tests::module_ids_use_module_install_not_enable` — every `enable_hint` on a `ModuleRec` and every step of `activation_sequence()` that starts with `innerwarden enable <id>` must use a real capability id (`block-ip`, `sudo-protection`, `shell-audit`, `ai`); module ids must use `innerwarden module install <id>`. Pinned the 2026-05-04 operator-hit bug where `innerwarden scan` printed `→ innerwarden enable container-security` and the operator running it got `unknown capability 'container-security'` because container-security is a module, not a capability.
+
+- `crates/ctl/src/main.rs::tests::known_module_id_recognises_registry_modules` — `known_module_id` recognises module ids declared in the workspace `registry.toml` (`openclaw-protection`, `cloudflare-integration`, etc.) regardless of the file's whitespace formatting. Anti-regression for the brittle 10-space substring scan the helper replaced.
+
+- `crates/ctl/src/main.rs::tests::known_module_id_rejects_capabilities_and_typos` — capability ids (`block-ip`, `shell-audit`) and partial-match typos (`openclaw`, `ssh-protect`) do NOT classify as modules, so the suggestion path is not triggered for the wrong surfaces.
+
+- `crates/ctl/src/main.rs::tests::unknown_cap_error_suggests_module_install_for_modules` — when the operator runs `enable <name>` and `<name>` matches a module id from the registry, the error message contains `module install <name>` so they have a one-paste path to recovery instead of grepping `innerwarden list`.
+
+- `crates/ctl/src/main.rs::tests::unknown_cap_error_falls_back_for_typos` — when `<name>` is not a known module id, the error is the generic "unknown capability" line. Anti-regression for accidentally suggesting `module install` for typos like `enable bllock-ip`, which would dead-end the operator on the wrong surface.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
