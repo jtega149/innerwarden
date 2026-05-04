@@ -80,10 +80,6 @@ var COLLECTOR_LABELS = {
   nginx_access:       'Web server access',
   nginx_error:        'Web server errors',
   syslog_firewall:    'Firewall log',
-  falco_log:          'Falco events',
-  suricata_eve:       'Suricata alerts',
-  wazuh_alerts:       'Wazuh alerts',
-  osquery_log:        'osquery events',
   macos_log:          'macOS log',
   cloudtrail:         'AWS CloudTrail',
   integrity:          'File integrity'

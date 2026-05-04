@@ -1,0 +1,27 @@
+name: Doc vs Source
+
+# Asserts that the collector and detector lists in `.claude/CLAUDE.md`
+# match what is actually in `crates/sensor/src/{collectors,detectors}/`.
+# Fails the PR if a new file lands without doc updates, or if the docs
+# claim modules that do not exist (Wave 8b/8c shipped this gate after
+# four phantom collectors and six phantom/missing detectors silently
+# misled operators for months).
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - development
+
+permissions:
+  contents: read
+
+jobs:
+  verify-doc-vs-source:
+    name: Verify CLAUDE.md matches sensor source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run verify-doc-vs-source.sh
+        run: ./scripts/verify-doc-vs-source.sh
