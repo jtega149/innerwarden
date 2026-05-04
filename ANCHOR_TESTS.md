@@ -247,6 +247,14 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/supervisor/src/health.rs::tests::url_is_loopback_https_rejects_lookalike_hosts` - the matcher uses exact host equality, NOT prefix or substring match. Anti-regression for a future "starts_with" shortcut that would let an attacker-controlled `127.0.0.1.attacker.com` skip TLS verification.
 
+### Agent /livez liveness endpoint (PR α2 - AUDIT-005 follow-up anchor)
+
+- `crates/agent/src/dashboard/mod.rs::tests::js_livez_endpoint_is_unauthenticated` - the `/livez` route returns 200 OK without Basic Auth, regardless of whether the dashboard is bound to loopback or non-loopback. Pinned the AUDIT-005 follow-up: the supervisor's health probe got 401 from `/metrics` even after the HTTPS fix because every agent endpoint required auth on non-loopback bind. `/livez` is the contract that splits "process alive" from "operator can read counters".
+
+- `crates/agent/src/dashboard/mod.rs::tests::js_livez_endpoint_returns_constant_body` - the body is exactly `ok\n` with no JSON, no state, no per-host info. Anti-regression for accidentally turning `/livez` into a verbose status page that leaks deployment details to unauthenticated probes.
+
+- `crates/supervisor/src/health.rs::tests::probe_path_is_livez_not_metrics` - the supervisor probes `<agent_api>/livez`, NOT `/metrics`. Anti-regression for a "let's reuse /metrics" simplification that would re-introduce the AUDIT-005 401 false-alarm against any non-loopback bind.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

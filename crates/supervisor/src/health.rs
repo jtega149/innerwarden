@@ -52,10 +52,23 @@ impl HealthChecker {
         }
     }
 
-    /// Probe `<agent_api>/metrics`. Returns `Err` only after `max_failures`
+    /// Probe `<agent_api>/livez`. Returns `Err` only after `max_failures`
     /// consecutive non-2xx or transport errors.
+    ///
+    /// # Why `/livez` and not `/metrics`
+    ///
+    /// AUDIT-005 follow-up (2026-05-04): the OSS agent's `/metrics`
+    /// endpoint is auth-gated when bound to a non-loopback address, so
+    /// the supervisor's unauthenticated probe got 401 and counted it as
+    /// a failure → SIGKILL → respawn loop. `/livez` is the kubernetes-
+    /// style liveness contract: 200 OK if the process is up, no auth,
+    /// no business logic, no exposed counters. The same supervisor
+    /// build pre-AUDIT-005 worked against an old agent that did not
+    /// gate `/metrics`; current agents must expose `/livez`. There is
+    /// no fallback - emitting traffic to `/metrics` from a public
+    /// supervisor would re-introduce the auth-gated 401 false alarm.
     pub fn check(&mut self) -> Result<()> {
-        let url = format!("{}/metrics", self.agent_api);
+        let url = format!("{}/livez", self.agent_api);
         let mut builder =
             ureq::config::Config::builder().timeout_global(Some(std::time::Duration::from_secs(5)));
         if self.skip_tls_verify {
@@ -265,6 +278,33 @@ mod tests {
         assert!(!url_is_loopback_https("https://localhost.attacker.com"));
         assert!(!url_is_loopback_https("https://127.0.0.2"));
         assert!(!url_is_loopback_https("https://0.0.0.0"));
+    }
+
+    #[test]
+    fn probe_path_is_livez_not_metrics() {
+        // AUDIT-005 follow-up anchor: even when the watchdog targets the
+        // OSS agent on a non-loopback bind (where `/metrics` is auth-
+        // gated), the probe must use `/livez` so it gets 200 OK without
+        // credentials. Anti-regression for a "let's reuse /metrics"
+        // simplification that would re-introduce the 401 false-alarm
+        // documented in PR α / AUDIT-005.
+        //
+        // We assert against the source verbatim because building a real
+        // probe against a real server inside a unit test is more work
+        // than the value justifies; a single `assert!` on the call-site
+        // path is enough to catch a regression at test time.
+        let source = include_str!("health.rs");
+        // The exact line that builds the probe URL. Using `contains`
+        // rather than line-equality so a future trivial reformat does
+        // not break the test, but the path itself is pinned.
+        assert!(
+            source.contains("format!(\"{}/livez\", self.agent_api)"),
+            "supervisor probe path must be /livez per AUDIT-005 follow-up"
+        );
+        assert!(
+            !source.contains("format!(\"{}/metrics\", self.agent_api)"),
+            "supervisor must NOT probe /metrics (auth-gated on non-loopback)"
+        );
     }
 
     #[test]

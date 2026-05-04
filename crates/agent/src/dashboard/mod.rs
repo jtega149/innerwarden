@@ -697,6 +697,26 @@ pub async fn serve(
         .layer(middleware::from_fn(csrf_protection))
         .with_state(state.clone());
 
+    // AUDIT-005 follow-up: unauthenticated `/livez` liveness probe.
+    //
+    // Returns 200 OK with the constant body "ok\n". NO business logic,
+    // NO secrets, NO state, NO auth. The watchdog supervisor probes this
+    // endpoint every 30 s to confirm the agent's HTTP listener is up;
+    // it deliberately does NOT scrape `/metrics` because (a) metrics are
+    // auth-gated to protect per-detector counts that could inform an
+    // attacker, and (b) any non-2xx (incl. 401) on the supervisor's
+    // probe is treated as an unresponsive agent and triggers SIGKILL.
+    //
+    // Pre-AUDIT-005 the supervisor probed `/metrics` against an HTTPS
+    // server with basic-auth and got 401 → 1175 SIGKILLs in ~10 hours
+    // against a perfectly healthy agent. `/livez` is the explicit
+    // contract that splits "process alive AND serving HTTP" (the
+    // supervisor's question) from "operator can read internal counters"
+    // (the metrics surface). Same shape as kubernetes livenessProbe.
+    let health_api = Router::new()
+        .route("/livez", get(|| async { "ok\n" }))
+        .with_state(state.clone());
+
     // Live-feed routes are intentionally public (no auth) regardless of bind
     // address. The response shape is already sanitised in `live_feed.rs`:
     // `host` is blanked, `evidence` is empty, `recommended_checks` is empty,
@@ -719,6 +739,7 @@ pub async fn serve(
 
     let app = agent_api
         .merge(auth_login)
+        .merge(health_api)
         .merge(live_api)
         .merge(dashboard)
         .layer(build_body_limit_layer())
@@ -4095,6 +4116,59 @@ mod tests {
         assert!(JS_RESPONSES.contains("ORPHAN_KERNEL_STATE_BADGE"));
         // The endpoint path must match the route registered in this file.
         assert!(JS_RESPONSES.contains("/api/responses/orphans"));
+    }
+
+    // ─── PR α2 — /livez liveness contract (AUDIT-005 follow-up) ───
+    #[test]
+    fn js_livez_endpoint_is_unauthenticated() {
+        // The supervisor probes /livez every 30 s without credentials.
+        // If a future refactor accidentally folds /livez into the
+        // auth-gated `agent_api_router`, the watchdog's probe gets 401
+        // and SIGKILLs the agent in a loop (the exact prod failure
+        // mode AUDIT-005 traced for ~10 hours). Pin the structural
+        // separation: the route lives in a dedicated `health_api`
+        // router merged BEFORE auth-gated routers.
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains("let health_api = Router::new()")
+                && source.contains(".route(\"/livez\""),
+            "agent must define a dedicated health_api router with /livez"
+        );
+        // Anti-regression: the /livez route must NOT appear inside the
+        // agent_api_router block (which is conditionally wrapped in the
+        // auth layer based on bind address).
+        let agent_api_block_start = source
+            .find("let agent_api_router = Router::new()")
+            .expect("agent_api_router must exist");
+        let agent_api_block_end = source[agent_api_block_start..]
+            .find("let agent_api =")
+            .expect("agent_api_router block must terminate")
+            + agent_api_block_start;
+        let agent_api_block = &source[agent_api_block_start..agent_api_block_end];
+        assert!(
+            !agent_api_block.contains("\"/livez\""),
+            "/livez must NOT live inside the auth-gated agent_api_router"
+        );
+        // The health_api router is merged into the final app.
+        assert!(
+            source.contains(".merge(health_api)"),
+            "health_api must be merged into the final app router"
+        );
+    }
+
+    #[test]
+    fn js_livez_endpoint_returns_constant_body() {
+        // /livez body is exactly "ok\n" - no JSON, no host info, no
+        // version, no per-request state. Anti-regression for a future
+        // helpful contributor turning the endpoint into a verbose
+        // status page (which would leak deployment metadata to any
+        // unauthenticated probe and re-introduce the auth tradeoff
+        // AUDIT-005 was meant to remove).
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains("|| async { \"ok\\n\" }"),
+            "/livez handler must return the literal \"ok\\n\" with no extra fields"
+        );
     }
 
     // ─── PR #419 Wave 2 — Baseline tab is in English ────────────
