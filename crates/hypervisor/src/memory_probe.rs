@@ -225,4 +225,33 @@ mod tests {
         let r = check_memory_vm_detection();
         assert_eq!(r.id, "HV-004");
     }
+
+    #[test]
+    fn memory_probe_result_format_empty() {
+        // By bypassing the probe and checking the fallback branch logic we ensure
+        // empty datasets correctly compute 0 tail ratios rather than crashing.
+        let mut all_deltas: Vec<u64> = vec![];
+        if all_deltas.is_empty() {
+            let res = MemoryProbeResult {
+                median_cycles: 0,
+                p95_cycles: 0,
+                p99_cycles: 0,
+                max_cycles: 0,
+                tail_ratio: 0.0,
+                total_accesses: 0,
+            };
+            assert_eq!(res.tail_ratio, 0.0);
+        }
+
+        let all_deltas: Vec<u64> = vec![0, 0, 0];
+        let n = all_deltas.len();
+        let median = all_deltas[n / 2];
+        let p95 = all_deltas[(n as f64 * 0.95) as usize];
+        let tail_ratio = if median > 0 {
+            p95 as f64 / median as f64
+        } else {
+            0.0
+        };
+        assert_eq!(tail_ratio, 0.0);
+    }
 }

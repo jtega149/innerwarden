@@ -390,4 +390,24 @@ mod tests {
             assert_ne!(r.status, CheckStatus::Unavailable);
         }
     }
+
+    #[test]
+    fn analyze_distribution_empty() {
+        let dist = analyze_distribution(vec![], 1_000_000_000);
+        assert_eq!(dist.sample_count, 0);
+        assert_eq!(dist.median_cycles, 0);
+        assert_eq!(dist.jitter_ratio, 0.0);
+    }
+
+    #[test]
+    fn analyze_distribution_zero_median() {
+        let dist = analyze_distribution(vec![0, 0, 0], 1_000_000_000);
+        assert_eq!(dist.median_cycles, 0);
+        assert_eq!(dist.jitter_ratio, 0.0);
+    }
+
+    #[test]
+    fn cycles_to_ns_zero_freq() {
+        assert_eq!(cycles_to_ns(100, 0), 0.0);
+    }
 }

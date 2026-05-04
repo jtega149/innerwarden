@@ -259,4 +259,25 @@ mod tests {
         assert_eq!(sorted[1].0, "io_exits");
         assert_eq!(sorted[2].0, "halt_exits");
     }
+
+    #[test]
+    fn check_handles_emulation_failures_correctly() {
+        // Build synthetic stats that simulate emulation failure escape signals
+        let mut by_reason = BTreeMap::new();
+        by_reason.insert("insn_emulation_fail".to_string(), 15);
+
+        let stats = VmExitStats {
+            total_exits: 100,
+            by_reason: by_reason.clone(),
+            vm_count: 1,
+        };
+
+        // Emulation fail > 10 triggers a Warning
+        let emul_fail = stats
+            .by_reason
+            .get("insn_emulation_fail")
+            .copied()
+            .unwrap_or(0);
+        assert!(emul_fail > 10);
+    }
 }

@@ -295,4 +295,61 @@ mod tests {
         let result = check_cpuid_consistency();
         assert_eq!(result.id, "HV-002");
     }
+
+    #[test]
+    fn identify_all_hypervisor_brands() {
+        // Exhaustive brand mapping: each known hypervisor keyword must map
+        // to its canonical display name without typos.
+        assert_eq!(
+            identify_hypervisor(&Some("QEMU Virtual CPU".into())),
+            Some("KVM/QEMU".into())
+        );
+        assert_eq!(
+            identify_hypervisor(&Some("VirtualBox Hard Drive".into())),
+            Some("VirtualBox".into())
+        );
+        assert_eq!(
+            identify_hypervisor(&Some("VBox Tools".into())),
+            Some("VirtualBox".into())
+        );
+        assert_eq!(
+            identify_hypervisor(&Some("Hyper-V Root Partition".into())),
+            Some("Hyper-V".into())
+        );
+        assert_eq!(
+            identify_hypervisor(&Some("Xen Platform".into())),
+            Some("Xen".into())
+        );
+        assert_eq!(
+            identify_hypervisor(&Some("Parallels Desktop".into())),
+            Some("Parallels".into())
+        );
+        assert_eq!(
+            identify_hypervisor(&Some("bhyve hypervisor".into())),
+            Some("bhyve".into())
+        );
+        assert_eq!(
+            identify_hypervisor(&Some("Oracle OVM Server".into())),
+            Some("Oracle VM".into())
+        );
+    }
+
+    #[test]
+    fn identify_hypervisor_none_on_empty_string() {
+        assert!(identify_hypervisor(&Some("".into())).is_none());
+    }
+
+    #[test]
+    fn known_vendor_table_covers_all_major_hypervisors() {
+        // Completeness: table must include at minimum the 7 most common
+        // hypervisors deployed in enterprise environments.
+        let names: Vec<&str> = KNOWN_VENDORS.iter().map(|(_, name)| *name).collect();
+        assert!(names.contains(&"KVM"));
+        assert!(names.contains(&"VMware"));
+        assert!(names.contains(&"Xen"));
+        assert!(names.contains(&"Hyper-V"));
+        assert!(names.contains(&"VirtualBox"));
+        assert!(names.contains(&"Parallels"));
+        assert!(names.contains(&"bhyve"));
+    }
 }

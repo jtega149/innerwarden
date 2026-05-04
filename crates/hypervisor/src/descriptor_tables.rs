@@ -33,6 +33,10 @@ pub struct InterruptStats {
 impl InterruptStats {
     pub fn read() -> Option<Self> {
         let content = fs::read_to_string("/proc/interrupts").ok()?;
+        Self::parse(&content)
+    }
+
+    pub fn parse(content: &str) -> Option<Self> {
         let mut lines = content.lines();
 
         // First line: CPU headers.
@@ -282,5 +286,49 @@ mod tests {
     fn check_descriptors_runs() {
         let r = check_descriptor_tables();
         assert_eq!(r.id, "HV-006");
+    }
+
+    #[test]
+    fn parse_interrupt_stats_basic() {
+        let content = "            CPU0       CPU1
+   0:        100        200   PCI-MSI edge      eth0
+ NMI:       1000       2000   Non-maskable interrupts
+ LOC:       5000       6000   Local timer interrupts
+";
+        let stats = InterruptStats::parse(content).expect("should parse");
+        assert_eq!(stats.source_count, 3);
+        assert_eq!(stats.total, 100 + 200 + 1000 + 2000 + 5000 + 6000);
+        assert_eq!(stats.per_cpu[&0], 100 + 1000 + 5000);
+        assert_eq!(stats.per_cpu[&1], 200 + 2000 + 6000);
+        // NMI and LOC are notable.
+        assert!(stats.notable_sources.iter().any(|(n, _)| n == "NMI"));
+        assert!(stats.notable_sources.iter().any(|(n, _)| n == "LOC"));
+    }
+
+    #[test]
+    fn parse_interrupt_stats_skips_short_lines() {
+        let content = "CPU0\n\n  short";
+        // Should not crash on short/blank lines.
+        let _ = InterruptStats::parse(content);
+    }
+
+    #[test]
+    fn parse_interrupt_stats_single_cpu() {
+        let content = "            CPU0
+   0:        500
+";
+        let stats = InterruptStats::parse(content).expect("single cpu should parse");
+        assert_eq!(stats.total, 500);
+        assert_eq!(stats.per_cpu.len(), 1);
+    }
+
+    #[test]
+    fn parse_interrupt_stats_no_notable_when_zero() {
+        let content = "            CPU0
+ NMI:           0
+";
+        let stats = InterruptStats::parse(content).expect("should parse");
+        // NMI count is zero — should NOT appear in notable.
+        assert!(stats.notable_sources.is_empty());
     }
 }

@@ -54,13 +54,19 @@ impl KvmState {
 
 /// Detect loaded KVM kernel modules.
 fn detect_kvm_modules() -> Vec<String> {
-    let mut kvm_mods = Vec::new();
     if let Ok(content) = fs::read_to_string("/proc/modules") {
-        for line in content.lines() {
-            if let Some(name) = line.split_whitespace().next() {
-                if name.starts_with("kvm") {
-                    kvm_mods.push(name.to_string());
-                }
+        parse_kvm_modules(&content)
+    } else {
+        Vec::new()
+    }
+}
+
+fn parse_kvm_modules(content: &str) -> Vec<String> {
+    let mut kvm_mods = Vec::new();
+    for line in content.lines() {
+        if let Some(name) = line.split_whitespace().next() {
+            if name.starts_with("kvm") {
+                kvm_mods.push(name.to_string());
             }
         }
     }
@@ -254,5 +260,26 @@ mod tests {
         let unique: BTreeSet<u32> = pids.iter().copied().collect();
         assert_eq!(count, pids.len());
         assert_eq!(unique.len(), pids.len());
+    }
+
+    #[test]
+    fn parse_kvm_modules_extracts_correctly() {
+        let content = "kvm_intel 315392 0 - Live 0xffffffffc0000000
+kvm 1024000 1 kvm_intel, Live 0xffffffffc0100000
+ext4 1000000 2 - Live 0xffffffffc0200000
+kvm_amd 100000 0 - Live 0xffffffffc0300000";
+        let mods = parse_kvm_modules(content);
+        assert_eq!(mods.len(), 3);
+        assert!(mods.contains(&"kvm_intel".to_string()));
+        assert!(mods.contains(&"kvm".to_string()));
+        assert!(mods.contains(&"kvm_amd".to_string()));
+    }
+
+    #[test]
+    fn parse_kvm_modules_empty_if_no_kvm() {
+        let content = "ext4 1000000 2 - Live 0xffffffffc0200000
+zfs 500000 1 - Live 0xffffffffc0300000";
+        let mods = parse_kvm_modules(content);
+        assert!(mods.is_empty());
     }
 }

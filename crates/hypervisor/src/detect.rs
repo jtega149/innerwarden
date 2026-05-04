@@ -74,4 +74,55 @@ mod tests {
             Environment::VirtualMachine { .. }
         ));
     }
+
+    #[test]
+    fn hypervisor_host_when_kvm_running_vms() {
+        let checks = vec![CheckResult {
+            id: "KVM-001",
+            name: "test",
+            status: CheckStatus::Secure,
+            confidence: 0.9,
+            detail: "KVM host active. running 3 VM(s)".into(),
+        }];
+        assert!(matches!(
+            determine_environment(&checks),
+            Environment::HypervisorHost { vm_count: 3 }
+        ));
+    }
+
+    #[test]
+    fn hypervisor_host_zero_vms_fallback_if_detail_unparseable() {
+        let checks = vec![CheckResult {
+            id: "KVM-001",
+            name: "test",
+            status: CheckStatus::Secure,
+            confidence: 0.9,
+            detail: "KVM active, no running VMs".into(),
+        }];
+        assert!(matches!(
+            determine_environment(&checks),
+            Environment::HypervisorHost { vm_count: 0 }
+        ));
+    }
+
+    #[test]
+    fn unknown_hypervisor_when_flag_set_but_unrecognized() {
+        let checks = vec![CheckResult {
+            id: "HV-001",
+            name: "test",
+            status: CheckStatus::Warning,
+            confidence: 0.7,
+            detail: "hypervisor flag SET but vendor UNRECOGNIZED: Some(\"weird\"). Investigate"
+                .into(),
+        }];
+        assert!(matches!(
+            determine_environment(&checks),
+            Environment::UnknownHypervisor
+        ));
+    }
+
+    #[test]
+    fn bare_metal_when_no_matching_checks() {
+        assert!(matches!(determine_environment(&[]), Environment::BareMetal));
+    }
 }
