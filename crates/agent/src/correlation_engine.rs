@@ -172,7 +172,7 @@ impl CorrelationEngine {
 
             let stage = &rule.stages[pc.next_stage];
 
-            if matches_stage(stage, &event, &pc.matched_entities) {
+            if matches_stage(stage, &event, &pc.matched_entities, &pc.rule_id) {
                 pc.matched_events.push(event.clone());
                 // Add all entity values to the set for next-stage matching
                 for entity in &event.entities {
@@ -274,7 +274,7 @@ impl CorrelationEngine {
         // Try to start new chains (event matches first stage of a rule)
         for rule in &self.rules {
             let first_stage = &rule.stages[0];
-            if matches_stage(first_stage, &event, &HashSet::new()) {
+            if matches_stage(first_stage, &event, &HashSet::new(), &rule.id) {
                 let mut entities = HashSet::new();
                 for entity in &event.entities {
                     entities.insert(format!(
@@ -474,6 +474,7 @@ fn matches_stage(
     stage: &RuleStage,
     event: &CorrelationEvent,
     previous_entities: &HashSet<String>,
+    rule_id: &str,
 ) -> bool {
     // Layer check
     if let Some(required_layer) = stage.layer {
@@ -513,8 +514,122 @@ fn matches_stage(
         }
     }
 
+    // Wave 8a (2026-05-04): per-rule comm suppression.
+    // Suppresses chains where the originating process is a known package
+    // manager / system-update tool. Without this CL-008 was blocking
+    // Ubuntu mirrors, GitHub Pages, Telegram, etc. during apt upgrades
+    // (the agent's own notification infra in Telegram's case).
+    if event_comm_is_suppressed(rule_id, event) {
+        return false;
+    }
+
     true
 }
+
+/// Wave 8a (2026-05-04): does `event.details.comm` match the per-rule
+/// suppression list? Used to keep correlation chains from misclassifying
+/// legitimate package-manager activity (apt/dpkg/dnf/zypper/etc reading
+/// /etc/* and connecting to mirrors) as data exfiltration.
+///
+/// Returns false when no suppression list applies, when the event has
+/// no comm field, or when the comm does not match.
+pub(crate) fn event_comm_is_suppressed(rule_id: &str, event: &CorrelationEvent) -> bool {
+    let suppressions = rule_comm_suppressions(rule_id);
+    if suppressions.is_empty() {
+        return false;
+    }
+    let Some(comm) = event.details.get("comm").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    suppressions.contains(&comm)
+}
+
+/// Wave 8a (2026-05-04): per-rule list of `comm` values whose events
+/// should NOT participate in chain matching. Returning `&[]` (the
+/// default) means no suppression — events match by kind/layer/entity
+/// only, as before.
+///
+/// Currently only CL-008 (Data Exfiltration via eBPF Sequence) opts in,
+/// because that rule's two stages (sensitive file read + outbound
+/// connect) trigger every package-manager run on every distro. Other
+/// rules can opt in by adding a match arm here.
+fn rule_comm_suppressions(rule_id: &str) -> &'static [&'static str] {
+    match rule_id {
+        "CL-008" => PACKAGE_MANAGER_COMMS,
+        _ => &[],
+    }
+}
+
+/// Wave 8a (2026-05-04): comm names of package managers and related
+/// system-update tooling across the major Linux distros (and macOS
+/// Homebrew, since the agent runs there too).
+///
+/// All entries match `event.details.comm` exactly. Linux truncates
+/// `comm` to 15 characters (TASK_COMM_LEN - 1), so long names are
+/// pre-truncated here (e.g. `unattended-upgrade` → `unattended-upgr`,
+/// `dpkg-statoverride` → `dpkg-statoverri`). Distro-agnostic by design:
+/// covers apt, dpkg, snap, dnf/yum, rpm, zypper, pacman, apk, emerge,
+/// xbps, flatpak, brew, PackageKit.
+const PACKAGE_MANAGER_COMMS: &[&str] = &[
+    // Debian / Ubuntu — apt family
+    "apt",
+    "apt-get",
+    "apt-cache",
+    "apt-config",
+    "aptitude",
+    "apt-listchanges",
+    "apt-listbugs",
+    // Debian / Ubuntu — dpkg family (truncated forms first where >15 chars)
+    "dpkg",
+    "dpkg-deb",
+    "dpkg-query",
+    "dpkg-divert",
+    "dpkg-statoverri", // dpkg-statoverride truncated
+    "dpkg-trigger",
+    // Debian / Ubuntu — auto-update + restart helpers
+    "unattended-upgr", // unattended-upgrade truncated
+    "needrestart",
+    // Snap (cross-distro)
+    "snap",
+    "snapd",
+    "snap-update-ns",
+    "snap-confine",
+    "snap-mgmt",
+    // RHEL / Fedora / Rocky / Alma — yum / dnf family
+    "yum",
+    "dnf",
+    "dnf5",
+    "microdnf",
+    "yumdownloader",
+    "rpm",
+    "rpm-ostree",
+    // SUSE
+    "zypper",
+    // Arch
+    "pacman",
+    "pacstrap",
+    "makepkg",
+    "yay",
+    "paru",
+    // Alpine
+    "apk",
+    "abuild",
+    // Gentoo
+    "emerge",
+    "ebuild",
+    "portageq",
+    // Void
+    "xbps-install",
+    "xbps-remove",
+    "xbps-query",
+    // Cross-distro app distribution
+    "flatpak",
+    // macOS
+    "brew",
+    // Cross-distro service-style package backends
+    "PackageKit",
+    "packagekitd",
+];
 
 fn entity_type_str(et: &EntityType) -> &'static str {
     match et {
@@ -745,7 +860,15 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             min_confidence: 0.9,
             severity: Severity::Critical,
         },
-        // CL-008: Data Exfiltration via eBPF sequence
+        // CL-008: Data Exfiltration via eBPF sequence.
+        // Wave 8a (2026-05-04): this rule opts into per-rule comm
+        // suppression via PACKAGE_MANAGER_COMMS, because both stages
+        // (sensitive file read + outbound connect) trigger on every
+        // package-manager run on every distro. Without the carve-out
+        // CL-008 was blocking Ubuntu mirrors, GitHub, and Telegram
+        // (the agent's OWN notification infra) during apt upgrades.
+        // See `rule_comm_suppressions` and the anchor tests
+        // `cl008_*` in this file.
         CorrelationRule {
             id: "CL-008".into(),
             name: "Data Exfiltration (eBPF Sequence)".into(),
@@ -2036,10 +2159,10 @@ mod tests {
             entity_must_match: false,
         };
         let ev = make_event(Layer::Firmware, "firmware.msr_write", "10.0.0.1");
-        assert!(matches_stage(&stage, &ev, &HashSet::new()));
+        assert!(matches_stage(&stage, &ev, &HashSet::new(), "test"));
 
         let ev2 = make_event(Layer::Kernel, "privilege.escalation", "10.0.0.1");
-        assert!(!matches_stage(&stage, &ev2, &HashSet::new()));
+        assert!(!matches_stage(&stage, &ev2, &HashSet::new(), "test"));
     }
 
     #[test]
@@ -2050,12 +2173,145 @@ mod tests {
             entity_must_match: false,
         };
         let ev1 = make_event(Layer::Userspace, "ssh_bruteforce", "10.0.0.1");
-        assert!(matches_stage(&stage, &ev1, &HashSet::new()));
+        assert!(matches_stage(&stage, &ev1, &HashSet::new(), "test"));
 
         let ev2 = make_event(Layer::Userspace, "credential_stuffing", "10.0.0.1");
-        assert!(matches_stage(&stage, &ev2, &HashSet::new()));
+        assert!(matches_stage(&stage, &ev2, &HashSet::new(), "test"));
 
         let ev3 = make_event(Layer::Userspace, "port_scan", "10.0.0.1");
-        assert!(!matches_stage(&stage, &ev3, &HashSet::new()));
+        assert!(!matches_stage(&stage, &ev3, &HashSet::new(), "test"));
+    }
+
+    // Wave 8a anchor (2026-05-04): operator-hit prod bug — CL-008
+    // (Data Exfiltration via eBPF Sequence) blocked Ubuntu archive
+    // mirrors, GitHub Pages CDN, Telegram (the agent's own notification
+    // infra) and Oracle Cloud during a routine `apt upgrade` on
+    // 2026-05-04 (32 critical incidents in one day, all auto-block via
+    // UFW with dry_run=false). Root cause: the rule's stages
+    // (file.read_access + network.outbound_connect) trigger on every
+    // package-manager run that opens /etc/* and connects to a mirror.
+    // This anchor pins the per-rule comm suppression that makes
+    // CL-008 ignore events whose `details.comm` is a known package
+    // manager. It is distro-agnostic (covers apt/dpkg/snap/dnf/yum/
+    // rpm/zypper/pacman/apk/emerge/xbps/flatpak/brew/PackageKit).
+    #[test]
+    fn cl008_does_not_match_when_originating_process_is_a_package_manager() {
+        // Ubuntu apt upgrade reading /var/cache/apt files and connecting
+        // to archive.ubuntu.com (91.189.91.46 = real prod block).
+        let mut ev_read = make_event(Layer::Userspace, "file.read_access", "127.0.0.1");
+        ev_read.details =
+            serde_json::json!({"pid": 1234, "comm": "apt-get", "path": "/etc/apt/sources.list"});
+        let mut ev_connect = make_event(Layer::Network, "network.outbound_connect", "91.189.91.46");
+        ev_connect.details = serde_json::json!({"pid": 1234, "comm": "apt-get", "dst_ip": "91.189.91.46", "dst_port": 80});
+
+        let stages = &[
+            RuleStage {
+                layer: None,
+                kind_patterns: vec!["file.read_access".into()],
+                entity_must_match: false,
+            },
+            RuleStage {
+                layer: Some(Layer::Network),
+                kind_patterns: vec!["network.outbound_connect".into()],
+                entity_must_match: true,
+            },
+        ];
+
+        // CL-008 must reject both stages when comm is apt-get (suppression active).
+        assert!(
+            !matches_stage(&stages[0], &ev_read, &HashSet::new(), "CL-008"),
+            "CL-008 stage 1 must NOT match apt-get reading /etc/apt — \
+             that's a package upgrade, not exfil. Pinned by Wave 8a after \
+             the 2026-05-04 prod incident where 32 critical chains fired \
+             during apt upgrade and blocked Ubuntu mirrors via UFW."
+        );
+
+        let mut entities: HashSet<String> = HashSet::new();
+        entities.insert("ip:91.189.91.46".to_string());
+        assert!(
+            !matches_stage(&stages[1], &ev_connect, &entities, "CL-008"),
+            "CL-008 stage 2 must NOT match apt-get connecting to a \
+             repository mirror. See ANCHOR_TESTS.md Wave 8a entry."
+        );
+    }
+
+    #[test]
+    fn cl008_still_matches_for_non_package_manager_processes() {
+        // Same shape as the test above but the comm is a generic shell —
+        // the rule MUST still fire here; suppression is a tight allowlist,
+        // not a hole that disables the chain.
+        let mut ev_read = make_event(Layer::Userspace, "file.read_access", "127.0.0.1");
+        ev_read.details = serde_json::json!({"pid": 999, "comm": "bash", "path": "/etc/shadow"});
+        let mut ev_connect = make_event(Layer::Network, "network.outbound_connect", "203.0.113.7");
+        ev_connect.details = serde_json::json!({"pid": 999, "comm": "bash", "dst_ip": "203.0.113.7", "dst_port": 4444});
+
+        let stage1 = RuleStage {
+            layer: None,
+            kind_patterns: vec!["file.read_access".into()],
+            entity_must_match: false,
+        };
+        let stage2 = RuleStage {
+            layer: Some(Layer::Network),
+            kind_patterns: vec!["network.outbound_connect".into()],
+            entity_must_match: true,
+        };
+
+        assert!(matches_stage(&stage1, &ev_read, &HashSet::new(), "CL-008"));
+
+        let mut entities: HashSet<String> = HashSet::new();
+        entities.insert("ip:203.0.113.7".to_string());
+        assert!(matches_stage(&stage2, &ev_connect, &entities, "CL-008"));
+    }
+
+    // Wave 8a (2026-05-04): unattended-upgrade and dpkg-statoverride
+    // are both >15 chars. Linux truncates `comm` at TASK_COMM_LEN-1 = 15.
+    // The suppression list MUST contain the truncated forms or the bug
+    // returns silently for anyone running unattended-upgrades (the Ubuntu
+    // default, including the prod host that hit this on 2026-05-04).
+    #[test]
+    fn cl008_suppression_handles_15char_truncated_comms() {
+        for comm in &["unattended-upgr", "dpkg-statoverri", "snap-update-ns"] {
+            let mut ev = make_event(Layer::Userspace, "file.read_access", "127.0.0.1");
+            ev.details = serde_json::json!({"pid": 1, "comm": comm, "path": "/etc/passwd"});
+            let stage = RuleStage {
+                layer: None,
+                kind_patterns: vec!["file.read_access".into()],
+                entity_must_match: false,
+            };
+            assert!(
+                !matches_stage(&stage, &ev, &HashSet::new(), "CL-008"),
+                "comm {comm:?} (truncated at 15 chars by the Linux kernel) \
+                 must be in PACKAGE_MANAGER_COMMS — see neighbour comments."
+            );
+        }
+    }
+
+    // Wave 8a (2026-05-04): suppression is opt-in by rule_id. Other
+    // chains must still fire on package-manager activity if their kind
+    // patterns match — we only carve out CL-008 today.
+    #[test]
+    fn comm_suppression_does_not_leak_to_other_rules() {
+        let mut ev = make_event(Layer::Userspace, "file.read_access", "127.0.0.1");
+        ev.details = serde_json::json!({"pid": 1, "comm": "apt-get", "path": "/etc/passwd"});
+        let stage = RuleStage {
+            layer: None,
+            kind_patterns: vec!["file.read_access".into()],
+            entity_must_match: false,
+        };
+        // A made-up rule id must NOT inherit CL-008's suppression list.
+        assert!(matches_stage(&stage, &ev, &HashSet::new(), "CL-XXX"));
+        // The dedicated helper agrees.
+        assert!(!event_comm_is_suppressed("CL-XXX", &ev));
+        assert!(event_comm_is_suppressed("CL-008", &ev));
+    }
+
+    #[test]
+    fn cl008_no_comm_field_does_not_panic_and_falls_through() {
+        // Real events from older sensors might not carry `comm`. Make sure
+        // suppression returns false (event proceeds to normal kind/entity
+        // matching) instead of panicking or accidentally suppressing.
+        let mut ev = make_event(Layer::Userspace, "file.read_access", "127.0.0.1");
+        ev.details = serde_json::json!({"pid": 1, "path": "/etc/passwd"});
+        assert!(!event_comm_is_suppressed("CL-008", &ev));
     }
 }

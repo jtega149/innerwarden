@@ -113,6 +113,18 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/ctl/src/main.rs::tests::unknown_cap_error_falls_back_for_typos` — when `<name>` is not a known module id, the error is the generic "unknown capability" line. Anti-regression for accidentally suggesting `module install` for typos like `enable bllock-ip`, which would dead-end the operator on the wrong surface.
 
+### Correlation engine — package-manager false-positive suppression (Wave 8a)
+
+- `crates/agent/src/correlation_engine.rs::tests::cl008_does_not_match_when_originating_process_is_a_package_manager` — CL-008 (Data Exfiltration via eBPF Sequence) refuses to match when `event.details.comm` is a package manager (apt-get reading /etc/apt/sources.list + connecting to archive.ubuntu.com). Pinned the 2026-05-04 prod incident where CL-008 fired 32 critical chains in one day and auto-blocked Ubuntu archive mirrors (91.189.91.46), GitHub Pages CDN (185.199.108-111.153), Telegram (149.154.166.110 — the agent's own notification infra) and Oracle Cloud (147.154/16) via UFW with `dry_run=false`.
+
+- `crates/agent/src/correlation_engine.rs::tests::cl008_still_matches_for_non_package_manager_processes` — same shape as above but `comm = "bash"` reading /etc/shadow + connecting to a random IP — chain MUST still fire. The suppression list is a tight allowlist, not a hole that disables the chain entirely.
+
+- `crates/agent/src/correlation_engine.rs::tests::cl008_suppression_handles_15char_truncated_comms` — Linux truncates `comm` at TASK_COMM_LEN-1 = 15 chars, so `unattended-upgrade` arrives as `unattended-upgr`, `dpkg-statoverride` as `dpkg-statoverri`, etc. The suppression list MUST contain the truncated forms or the bug returns silently for any host running unattended-upgrades (the Ubuntu default — including the prod host that hit this on 2026-05-04).
+
+- `crates/agent/src/correlation_engine.rs::tests::comm_suppression_does_not_leak_to_other_rules` — only CL-008 opts into package-manager suppression today. Other rules with the same kind patterns must still fire; suppression is keyed by `rule_id`, not global. Anti-regression for accidentally lifting the per-rule gate (would silently disable many chains).
+
+- `crates/agent/src/correlation_engine.rs::tests::cl008_no_comm_field_does_not_panic_and_falls_through` — older sensors (or non-eBPF event sources) emit `file.read_access` without a `comm` field. `event_comm_is_suppressed` returns false in that case (event proceeds to normal kind/entity matching) instead of panicking on the missing JSON key.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
