@@ -526,41 +526,52 @@ fn matches_stage(
     true
 }
 
-/// Does `event.details.comm` match a suppression list, either the
-/// per-rule package-manager list (Wave 8a) or the rule-agnostic
-/// InnerWarden self-traffic list (PR ε, 2026-05-04)?
+/// Does `event.details.comm` match a suppression list? Three distinct
+/// policies share this gate:
 ///
-/// Two distinct policies share this gate:
+/// 1. **InnerWarden binary self-traffic** (Wave 8a + PR ε; rule-agnostic,
+///    every rule). The originating process is one of our binaries
+///    (`innerwarden-age` truncated, `innerwarden-sen`, `innerwarden-ctl`,
+///    `innerwarden-watc`). These names are unambiguous - no third-party
+///    process produces them - so we suppress regardless of which chain
+///    wants to claim the event.
 ///
-/// 1. **Self-traffic** (always applies, every rule): the originating
-///    process is the agent / sensor / watchdog / one of their
-///    tokio-rt-worker threads. The chain is the agent's own outbound
-///    traffic (Telegram polling, AbuseIPDB API, threat-feed downloads,
-///    GeoIP refresh, watchdog health probes, ...) and must never be
-///    classified as attacker activity. Same intent as the inline
-///    killchain `self-traffic-fp` dismiss path - lifted to the
-///    correlation-engine layer so cross-layer chains (CL-008 et al.)
-///    get the same gate.
+/// 2. **CL-008-only Tokio worker carve-out** (PR ε; CL-008 only).
+///    `tokio-rt-worker` is the thread name Tokio gives every runtime
+///    worker on every Tokio-based process, which means a malicious
+///    Tokio app could legitimately execute under that comm. We do NOT
+///    suppress it rule-agnostically, but for CL-008 specifically (the
+///    "file.read + outbound connect" data-exfil chain) the false-
+///    positive rate from the agent's own outbound traffic is high
+///    enough to warrant suppression there. Other chains
+///    (`lateral_movement`, `credential_theft`, etc.) still fire on
+///    `tokio-rt-worker` if their own kind patterns match.
 ///
-/// 2. **Package manager** (per-rule, currently only CL-008): the
-///    originating process is apt / dnf / pacman / brew / etc.
-///    reading /etc/passwd-style sensitive files and connecting to
-///    distribution mirrors. Wave 8a. Distinct from self-traffic
-///    because operators may legitimately want package-manager
-///    suppressed for some chains and not others.
+/// 3. **Per-rule package manager** (Wave 8a; opt-in by `rule_id`,
+///    currently only CL-008). Apt/dpkg/dnf/etc. running upgrades
+///    naturally trigger CL-008's two stages. Operators may want
+///    package-manager suppression for some chains and not others, so
+///    this stays per-rule via [`rule_comm_suppressions`].
 ///
-/// Returns false when the event has no `comm` field or when the
-/// `comm` does not match either list.
+/// Returns false when the event has no `comm` field or when no list
+/// matches.
 pub(crate) fn event_comm_is_suppressed(rule_id: &str, event: &CorrelationEvent) -> bool {
     let Some(comm) = event.details.get("comm").and_then(|v| v.as_str()) else {
         return false;
     };
-    // PR ε: self-traffic suppression is rule-agnostic. Whatever chain
-    // a self-comm event is participating in, the chain is not real
-    // attacker activity. We check this BEFORE the per-rule list so
-    // self-traffic short-circuits even when the rule's per-rule list
-    // is empty.
+    // PR ε: rule-agnostic InnerWarden binary suppression. Pinned by
+    // `innerwarden_binary_self_traffic_suppression_is_rule_agnostic`.
     if INNERWARDEN_SELF_COMMS.contains(&comm) {
+        return true;
+    }
+    // PR ε: CL-008-only `tokio-rt-worker` carve-out. The thread name
+    // is generic (every Tokio app uses it), so we deliberately do NOT
+    // promote it to the rule-agnostic list - that would create a
+    // blind spot for a malicious Tokio-based attacker tool. We only
+    // suppress it for the rule whose FP rate makes it operationally
+    // necessary. Pinned by both `cl008_suppressed_..._tokio_rt_worker`
+    // and `tokio_rt_worker_only_suppressed_on_cl008_not_other_rules`.
+    if rule_id == "CL-008" && comm == "tokio-rt-worker" {
         return true;
     }
     // Wave 8a: per-rule package-manager suppression.
@@ -654,12 +665,10 @@ const PACKAGE_MANAGER_COMMS: &[&str] = &[
     "packagekitd",
 ];
 
-/// PR ε (2026-05-04): comm names of InnerWarden's own processes.
+/// PR ε (2026-05-04): comm names of InnerWarden's own binaries.
 /// Correlation chains whose originating event has one of these comms
-/// are agent self-traffic (Telegram polling, AbuseIPDB API calls,
-/// threat-feed downloads, watchdog health probes, GeoIP refresh,
-/// etc.) and must NOT be classified as attacker activity regardless
-/// of the rule that wants to claim them.
+/// are agent self-traffic and must NOT be classified as attacker
+/// activity regardless of the rule that wants to claim them.
 ///
 /// Linux truncates `comm` to 15 characters (TASK_COMM_LEN - 1), so
 /// `innerwarden-agent` (17 chars) appears as `innerwarden-age` in
@@ -667,32 +676,31 @@ const PACKAGE_MANAGER_COMMS: &[&str] = &[
 /// the exact-match comparison works against what the kernel actually
 /// produces - the full untruncated names would never match.
 ///
+/// **Deliberately excludes `tokio-rt-worker`**: that thread name is
+/// emitted by every Tokio-based process, not just ours. Including it
+/// here would let a malicious Tokio app bypass every correlation
+/// rule. The CL-008-specific carve-out for `tokio-rt-worker` lives
+/// inline in `event_comm_is_suppressed` instead, so it only relaxes
+/// the one rule with a documented FP rate from the agent's own
+/// outbound calls.
+///
 /// Distinct from the existing graph-level
-/// `is_self_traffic_incident` filter (which catches incidents AFTER
-/// they have been ingested into the knowledge graph and tags them
-/// `research_only`): this list short-circuits the chain at correlation
-/// time so the chain is never CREATED to begin with. The two layers
-/// are complementary - the graph filter still catches single-stage
-/// noise, this one stops cross-layer chain false positives upstream.
+/// [`crate::knowledge_graph::ingestion::is_self_traffic_incident`]
+/// (which catches incidents AFTER they have been ingested into the
+/// knowledge graph): this list short-circuits the chain at correlation
+/// time so the chain is never CREATED to begin with.
 ///
 /// AUDIT-CL008-SELF (2026-05-04 prod): pre-fix CL-008 fired 72x in
 /// 30 min on prod, blocking outbound to 208.95.112.1 (an external
-/// dependency the agent reaches), to Telegram (149.154.166.110 -
-/// would have been blocked but for the operator's allowlist), and
-/// to the host's own cloud provider (147.154.x = Oracle Cloud). All
-/// of these had `comm = tokio-rt-worker` from the agent's outbound
-/// connect path; without this list, every such call became a
-/// 24-hour UFW block.
+/// dependency the agent reaches), to Telegram, and to the host's
+/// own cloud provider. All of these had `comm = tokio-rt-worker`
+/// from the agent's outbound connect path; this list + the
+/// CL-008 carve-out together stop them upstream of the chain.
 const INNERWARDEN_SELF_COMMS: &[&str] = &[
-    // Main binaries - kernel truncates to 15 chars (TASK_COMM_LEN-1).
     "innerwarden-age",  // innerwarden-agent (17 chars truncated)
     "innerwarden-sen",  // innerwarden-sensor (18 chars truncated)
     "innerwarden-ctl",  // 15 chars - exact
     "innerwarden-watc", // innerwarden-watchdog (20 chars truncated)
-    // Tokio runtime worker thread name - all outbound HTTP / Redis /
-    // DNS calls from the agent execute on these threads, so the
-    // eBPF connect() events carry this as comm. 15 chars exactly.
-    "tokio-rt-worker",
 ];
 
 fn entity_type_str(et: &EntityType) -> &'static str {
@@ -2377,5 +2385,161 @@ mod tests {
         let mut ev = make_event(Layer::Userspace, "file.read_access", "127.0.0.1");
         ev.details = serde_json::json!({"pid": 1, "path": "/etc/passwd"});
         assert!(!event_comm_is_suppressed("CL-008", &ev));
+    }
+
+    // ── PR ε (2026-05-04) — InnerWarden self-traffic suppression ──────
+    //
+    // Pre-fix the prod CL-008 was firing 72x in 30 min and blocking
+    // outbound to:
+    //   - 208.95.112.1 (a real external dependency the agent reaches)
+    //   - 149.154.166.110 (Telegram - agent's own notification infra,
+    //     would have been blocked but for the operator's allowlist)
+    //   - 147.154.x (Oracle Cloud - the agent's OWN cloud provider)
+    // All had comm = tokio-rt-worker from the agent's outbound connect
+    // path. Wave 8a's PACKAGE_MANAGER_COMMS only covered apt/dpkg/etc.;
+    // these anchors pin the broader self-traffic carve-out.
+
+    #[test]
+    fn cl008_suppressed_when_originating_comm_is_innerwarden_agent() {
+        // Truncated comm shape that the kernel actually emits
+        // (TASK_COMM_LEN - 1 = 15 chars, so `innerwarden-agent` becomes
+        // `innerwarden-age`). The agent's outbound call to e.g. AbuseIPDB
+        // must NOT trigger CL-008 even though the chain shape (file.read
+        // + outbound connect) technically matches.
+        let mut ev_read = make_event(Layer::Userspace, "file.read_access", "127.0.0.1");
+        ev_read.details = serde_json::json!({
+            "pid": 12345, "comm": "innerwarden-age", "path": "/etc/innerwarden/license.key"
+        });
+        let mut ev_connect = make_event(Layer::Network, "network.outbound_connect", "208.95.112.1");
+        ev_connect.details = serde_json::json!({
+            "pid": 12345, "comm": "innerwarden-age", "dst_ip": "208.95.112.1", "dst_port": 443
+        });
+
+        assert!(
+            event_comm_is_suppressed("CL-008", &ev_read),
+            "innerwarden-age (truncated) reading the license file must be suppressed"
+        );
+        assert!(
+            event_comm_is_suppressed("CL-008", &ev_connect),
+            "innerwarden-age (truncated) outbound connect must be suppressed"
+        );
+    }
+
+    #[test]
+    fn cl008_suppressed_when_originating_comm_is_tokio_rt_worker() {
+        // Tokio runtime workers carry the literal string `tokio-rt-worker`
+        // (15 chars exactly). The agent's HTTP / Redis / DNS calls all
+        // happen on these threads; the eBPF connect() events therefore
+        // carry `comm = tokio-rt-worker` in their details. The exact
+        // shape that drove the AUDIT-CL008-SELF prod incident.
+        let mut ev = make_event(
+            Layer::Network,
+            "network.outbound_connect",
+            "149.154.166.110",
+        );
+        ev.details = serde_json::json!({
+            "pid": 12346, "comm": "tokio-rt-worker", "dst_ip": "149.154.166.110", "dst_port": 443
+        });
+        assert!(
+            event_comm_is_suppressed("CL-008", &ev),
+            "tokio-rt-worker outbound to Telegram (149.154.166.110) must be suppressed"
+        );
+    }
+
+    #[test]
+    fn innerwarden_binary_self_traffic_suppression_is_rule_agnostic() {
+        // PR ε: unlike the package-manager carve-out (Wave 8a, opt-in by
+        // rule_id), suppression for our OWN binary names applies to EVERY
+        // rule. A chain that wants to claim agent self-traffic for any
+        // reason is wrong about the threat model. The binary names are
+        // unambiguous - no third-party process produces `innerwarden-age`
+        // - so the rule-agnostic suppression is safe.
+        //
+        // Anti-regression for accidentally attaching the list to
+        // `rule_comm_suppressions` (which would scope it to CL-008 only).
+        let mut ev = make_event(Layer::Network, "network.outbound_connect", "147.154.234.47");
+        ev.details = serde_json::json!({
+            "pid": 12347, "comm": "innerwarden-age", "dst_ip": "147.154.234.47", "dst_port": 443
+        });
+        for rule_id in &["CL-001", "CL-002", "CL-008", "CL-011", "CL-XXX-future"] {
+            assert!(
+                event_comm_is_suppressed(rule_id, &ev),
+                "innerwarden-age outbound must be suppressed regardless of rule_id (rule={rule_id:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn tokio_rt_worker_only_suppressed_on_cl008_not_other_rules() {
+        // PR ε: `tokio-rt-worker` is the thread name Tokio gives every
+        // runtime worker, NOT something specific to the InnerWarden
+        // agent. If a malicious Tokio-based attacker tool fires e.g. a
+        // credential-theft chain (CL-011) using this same comm, we
+        // MUST still see the chain. The carve-out is deliberately
+        // CL-008-only because that one rule has a documented prod FP
+        // rate from the agent's own outbound calls - all other rules
+        // see `tokio-rt-worker` as a normal comm.
+        //
+        // Anti-regression for promoting `tokio-rt-worker` to
+        // `INNERWARDEN_SELF_COMMS` (which would create a workspace-wide
+        // blind spot for any Tokio-based malware).
+        let mut ev = make_event(Layer::Network, "network.outbound_connect", "203.0.113.99");
+        ev.details = serde_json::json!({
+            "pid": 999, "comm": "tokio-rt-worker", "dst_ip": "203.0.113.99", "dst_port": 4444
+        });
+
+        // CL-008: suppressed (the documented FP class).
+        assert!(
+            event_comm_is_suppressed("CL-008", &ev),
+            "CL-008 must suppress tokio-rt-worker (matches PR ε docs)"
+        );
+        // Every other rule: NOT suppressed - the chain still has to
+        // fire if the kind patterns / entities line up.
+        for rule_id in &["CL-001", "CL-002", "CL-011", "CL-014", "CL-XXX-future"] {
+            assert!(
+                !event_comm_is_suppressed(rule_id, &ev),
+                "rule {rule_id:?} must NOT suppress tokio-rt-worker - this comm is not InnerWarden-specific"
+            );
+        }
+    }
+
+    #[test]
+    fn self_traffic_suppression_does_not_match_full_untruncated_names() {
+        // Anti-regression: someone reading the source might "fix" the
+        // truncated entries by adding the full names too. That's
+        // wrong - the kernel NEVER produces them on Linux because of
+        // TASK_COMM_LEN, so the full name in the list adds dead weight
+        // and could shadow a legitimate match if a future eBPF program
+        // ever exposed an untruncated name via /proc/<pid>/cmdline.
+        // The list pins the kernel-truth shape.
+        let untruncated_full_names = [
+            "innerwarden-agent",    // 17 chars, truncated to innerwarden-age
+            "innerwarden-sensor",   // 18 chars, truncated to innerwarden-sen
+            "innerwarden-watchdog", // 20 chars, truncated to innerwarden-watc
+        ];
+        for full in &untruncated_full_names {
+            let mut ev = make_event(Layer::Network, "network.outbound_connect", "10.0.0.1");
+            ev.details = serde_json::json!({"pid": 1, "comm": full, "dst_ip": "10.0.0.1"});
+            assert!(
+                !event_comm_is_suppressed("CL-008", &ev),
+                "full untruncated comm {full:?} must NOT match - the kernel never emits it"
+            );
+        }
+    }
+
+    #[test]
+    fn self_traffic_suppression_keeps_real_attacker_comms_alive() {
+        // Anti-regression: the carve-out is a tight allowlist, NOT a
+        // hole that disables CL-008. Common attacker tooling comms
+        // (curl, wget, nc, python, perl, ssh) must STILL be allowed
+        // through to chain matching.
+        for comm in &["curl", "wget", "nc", "python3", "perl", "ssh", "bash"] {
+            let mut ev = make_event(Layer::Network, "network.outbound_connect", "203.0.113.99");
+            ev.details = serde_json::json!({"pid": 999, "comm": comm, "dst_ip": "203.0.113.99"});
+            assert!(
+                !event_comm_is_suppressed("CL-008", &ev),
+                "comm {comm:?} must NOT be suppressed - it is plausible attacker tooling"
+            );
+        }
     }
 }

@@ -255,6 +255,20 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/supervisor/src/health.rs::tests::probe_path_is_livez_not_metrics` - the supervisor probes `<agent_api>/livez`, NOT `/metrics`. Anti-regression for a "let's reuse /metrics" simplification that would re-introduce the AUDIT-005 401 false-alarm against any non-loopback bind.
 
+### CL-008 self-traffic suppression (PR ε - AUDIT-CL008-SELF anchor)
+
+- `crates/agent/src/correlation_engine.rs::tests::cl008_suppressed_when_originating_comm_is_innerwarden_agent` - eBPF events with `comm = innerwarden-age` (the truncated form the kernel actually emits for `innerwarden-agent`) are dropped from CL-008 chain matching. Pinned the 2026-05-04 prod incident where the agent's outbound to AbuseIPDB / threat feeds / Telegram was being correlated as Data Exfiltration and blocked via UFW.
+
+- `crates/agent/src/correlation_engine.rs::tests::cl008_suppressed_when_originating_comm_is_tokio_rt_worker` - eBPF events with `comm = tokio-rt-worker` are dropped. The agent's HTTP / Redis / DNS calls all run on these threads; without this carve-out every outbound call from the agent triggered CL-008.
+
+- `crates/agent/src/correlation_engine.rs::tests::innerwarden_binary_self_traffic_suppression_is_rule_agnostic` - the InnerWarden binary-name carve-out (`innerwarden-age` etc.) applies to EVERY rule. Anti-regression for accidentally scoping the new list to CL-008 only via `rule_comm_suppressions`.
+
+- `crates/agent/src/correlation_engine.rs::tests::tokio_rt_worker_only_suppressed_on_cl008_not_other_rules` - the `tokio-rt-worker` carve-out is CL-008-specific. Anti-regression for promoting `tokio-rt-worker` to `INNERWARDEN_SELF_COMMS`, which would create a workspace-wide blind spot for any Tokio-based malware (the thread name is generic, not InnerWarden-specific).
+
+- `crates/agent/src/correlation_engine.rs::tests::self_traffic_suppression_does_not_match_full_untruncated_names` - the list pins the truncated kernel-truth shape (`innerwarden-age`, NOT `innerwarden-agent`). Anti-regression for someone "fixing" the truncation by adding the full names too.
+
+- `crates/agent/src/correlation_engine.rs::tests::self_traffic_suppression_keeps_real_attacker_comms_alive` - common attacker tooling (`curl`, `wget`, `nc`, `python3`, `perl`, `ssh`, `bash`) is NOT in the suppression list. The carve-out is a tight allowlist, not a hole that disables CL-008.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
