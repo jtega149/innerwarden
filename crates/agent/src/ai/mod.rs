@@ -348,20 +348,26 @@ const OPENAI_COMPATIBLE: &[(&str, &str, &str)] = &[
 
 /// Reject plain HTTP for remote AI provider endpoints.
 /// Only `localhost` / `127.0.0.1` / `[::1]` are allowed over HTTP.
+///
+/// # Wave 4 (AUDIT-WAVE4-AI-IPV6, 2026-05-04 ultrareview)
+///
+/// Pre-fix the host extraction did `.split(':').next()` then
+/// `.split('/').next()` on the post-`http://` slice. That mangled
+/// IPv6 bracket forms: `http://[::1]:8080/path` produced host `[`
+/// (the split-on-`:` cut after the opening bracket), which then
+/// failed every loopback comparison. Operators running a local
+/// IPv6 LLM endpoint (`[::1]:8080`, `[::1]:11434/api/...`) hit
+/// "HTTP is not allowed" even though `::1` is a documented loopback.
+/// The new extractor uses [`extract_url_host`] which understands
+/// the bracket form.
 fn validate_ai_base_url(url: &str) -> Result<()> {
     if url.is_empty() {
         return Ok(());
     }
     if url.starts_with("http://") {
         let host_part = url.strip_prefix("http://").unwrap_or("");
-        let host = host_part
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .split('/')
-            .next()
-            .unwrap_or("");
-        if host != "localhost" && host != "127.0.0.1" && host != "::1" && host != "[::1]" {
+        let host = extract_url_host(host_part);
+        if host != "localhost" && host != "127.0.0.1" && host != "::1" {
             anyhow::bail!(
                 "HTTP is not allowed for remote AI providers (use HTTPS). Got: {}",
                 url
@@ -369,6 +375,54 @@ fn validate_ai_base_url(url: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Wave 4 (AUDIT-WAVE4-AI-IPV6) helper: extract the bare host from a
+/// URL fragment that comes AFTER the scheme (e.g. `[::1]:8080/path` or
+/// `127.0.0.1:8080/path` or `localhost`). Handles four shapes:
+///
+/// * IPv6 bracket form `[host]:port/path` → return `host` (bracket
+///   contents).
+/// * Authority with userinfo `user[:pass]@host[:port]/path` → strip
+///   userinfo first, then re-extract from the remainder. Skipping
+///   this step let `http://localhost:pw@evil.example` masquerade as
+///   loopback because the split-on-`:` returned `"localhost"` even
+///   though the real host is `evil.example`. Caught by Copilot
+///   review on PR #462 (2026-05-05) — the same userinfo-bypass
+///   class that hits naive URL parsers in many ecosystems.
+/// * IPv4 / hostname `host:port/path` → return `host` (everything
+///   before the first `:` or `/`).
+/// * Bare host with no port / path → return as-is.
+///
+/// Path component (after the first `/`) is also stripped first so
+/// that `host/userinfo@evil` never reaches the userinfo branch.
+///
+/// Pure: no allocations, no I/O. Pinned by `extract_url_host_*`
+/// anchor tests.
+fn extract_url_host(host_part: &str) -> &str {
+    // Strip the path first so `/` cannot smuggle a fake `@` past
+    // the userinfo check. Per RFC 3986 the authority ends at `/`,
+    // `?`, or `#`; checking `/` is enough for our HTTP-loopback gate.
+    let authority = host_part.split('/').next().unwrap_or("");
+
+    // Strip userinfo per RFC 3986 §3.2.1: `user[:pass]@host[:port]`.
+    // The LAST `@` separates userinfo from host because userinfo
+    // can itself contain `@` per the percent-encoded grammar
+    // (rare but legal). Use rfind to pin the boundary.
+    let after_userinfo = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+
+    if let Some(rest) = after_userinfo.strip_prefix('[') {
+        // IPv6 bracket form: read until `]`.
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+        // Malformed (no closing bracket) - fall through to the
+        // generic split; the comparison will fail anyway.
+    }
+    after_userinfo.split(':').next().unwrap_or("")
 }
 
 pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
@@ -628,6 +682,152 @@ mod tests {
             recommended_checks: vec![],
             tags: vec![],
             entities: vec![EntityRef::ip(ip)],
+        }
+    }
+
+    // ── Wave 4 anchors (AUDIT-WAVE4-AI-IPV6) ───────────────────────────
+    //
+    // Pre-fix `validate_ai_base_url` rejected loopback IPv6 bracket
+    // forms like `http://[::1]:8080/path` because the host extractor
+    // did `.split(':').next()` on the post-`http://` slice and got
+    // `[`. Operators running a local IPv6 LLM endpoint (Ollama on
+    // `[::1]:11434`, vLLM on `[::1]:8000`) hit "HTTP is not allowed"
+    // even though `::1` is a documented loopback. The new
+    // `extract_url_host` helper understands the bracket form.
+
+    #[test]
+    fn extract_url_host_handles_ipv6_bracket_with_port_and_path() {
+        // The exact prod failure shape (Ollama on IPv6 loopback).
+        assert_eq!(extract_url_host("[::1]:11434/api/generate"), "::1");
+    }
+
+    #[test]
+    fn extract_url_host_handles_ipv6_bracket_no_port() {
+        assert_eq!(extract_url_host("[::1]/api/v1"), "::1");
+        assert_eq!(extract_url_host("[::1]"), "::1");
+    }
+
+    #[test]
+    fn extract_url_host_handles_ipv6_bracket_with_full_address() {
+        // A full-form IPv6 (not just loopback) round-trips through
+        // the bracket extractor too.
+        assert_eq!(extract_url_host("[2001:db8::1]:443/v1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn extract_url_host_handles_ipv4_with_port_and_path() {
+        assert_eq!(extract_url_host("127.0.0.1:8080/v1"), "127.0.0.1");
+        assert_eq!(extract_url_host("203.0.113.42:443"), "203.0.113.42");
+    }
+
+    #[test]
+    fn extract_url_host_handles_bare_hostname() {
+        assert_eq!(extract_url_host("localhost"), "localhost");
+        assert_eq!(
+            extract_url_host("api.example.com:443/v1"),
+            "api.example.com"
+        );
+    }
+
+    #[test]
+    fn validate_ai_base_url_accepts_ipv6_loopback_http_with_port_and_path() {
+        // The headline anchor: every shape an operator running a local
+        // IPv6 LLM endpoint over plain HTTP would write. Pre-fix all
+        // of these errored with "HTTP is not allowed".
+        assert!(validate_ai_base_url("http://[::1]").is_ok());
+        assert!(validate_ai_base_url("http://[::1]:11434").is_ok());
+        assert!(validate_ai_base_url("http://[::1]:11434/api/generate").is_ok());
+        assert!(validate_ai_base_url("http://[::1]/api").is_ok());
+    }
+
+    #[test]
+    fn validate_ai_base_url_still_accepts_existing_loopback_forms() {
+        // Anti-regression for the pre-fix loopback set still working.
+        assert!(validate_ai_base_url("http://localhost").is_ok());
+        assert!(validate_ai_base_url("http://localhost:11434/api/generate").is_ok());
+        assert!(validate_ai_base_url("http://127.0.0.1").is_ok());
+        assert!(validate_ai_base_url("http://127.0.0.1:11434/api").is_ok());
+    }
+
+    #[test]
+    fn validate_ai_base_url_still_rejects_remote_http() {
+        // Anti-regression: tightening the host extractor must NOT
+        // weaken the security gate. Remote HTTP (any non-loopback
+        // host) must still be refused.
+        for evil in &[
+            "http://api.openai.com/v1",
+            "http://10.0.0.5:8080",
+            "http://[2001:db8::1]:443",
+            "http://example.com",
+        ] {
+            assert!(
+                validate_ai_base_url(evil).is_err(),
+                "remote HTTP {evil:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_url_host_strips_userinfo_before_authority_split() {
+        // The Copilot-review anchor on PR #462. Pre-fix
+        // extract_url_host("localhost:pw@evil.example") returned
+        // "localhost" because split-on-`:` ran BEFORE the userinfo
+        // stripper, so `validate_ai_base_url("http://localhost:pw@evil.example")`
+        // accepted the URL as loopback even though the real authority
+        // is `evil.example`. This is the URL-userinfo-bypass class.
+        assert_eq!(
+            extract_url_host("user@example.com"),
+            "example.com",
+            "userinfo with no password"
+        );
+        assert_eq!(
+            extract_url_host("user:pw@example.com"),
+            "example.com",
+            "userinfo with password"
+        );
+        assert_eq!(
+            extract_url_host("localhost:pw@evil.example"),
+            "evil.example",
+            "the headline bypass: real host wins, not the bare userinfo"
+        );
+        assert_eq!(
+            extract_url_host("user:pw@example.com:443/v1"),
+            "example.com",
+            "userinfo + port + path"
+        );
+        // RFC 3986: userinfo can itself contain `@` (rare, percent
+        // encoded). Use rfind so the LAST `@` is the boundary.
+        assert_eq!(
+            extract_url_host("a@b@example.com"),
+            "example.com",
+            "multiple `@`: the LAST one is the userinfo boundary"
+        );
+        // A `/` before any `@` belongs to the path, so the `@` in the
+        // path must NOT be treated as userinfo.
+        assert_eq!(
+            extract_url_host("real.example/spoof@evil.example"),
+            "real.example",
+            "path content with `@` does not get treated as authority"
+        );
+    }
+
+    #[test]
+    fn validate_ai_base_url_rejects_userinfo_bypass_remote() {
+        // End-to-end pin for the bypass: the high-level gate must
+        // refuse `http://localhost:pw@evil.example` even though the
+        // bare `localhost` substring appears in the URL. This is the
+        // Copilot-review concern from PR #462.
+        for evil in &[
+            "http://localhost:pw@evil.example",
+            "http://user@api.openai.com/v1",
+            "http://user:pass@10.0.0.5:8080",
+            "http://127.0.0.1:fake@evil.example/api",
+            "http://[::1]:fake@evil.example/api",
+        ] {
+            assert!(
+                validate_ai_base_url(evil).is_err(),
+                "userinfo-bypass remote HTTP {evil:?} must be rejected"
+            );
         }
     }
 

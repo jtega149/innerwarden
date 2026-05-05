@@ -1713,9 +1713,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             .map(|(ip, _)| ip.clone())
                             .collect();
                         for ip in &expired_ips {
-                            let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else {
-                                // Not parseable — drop from state to avoid a
-                                // poison entry; can't act on kernel anyway.
+                            // Wave 4 (AUDIT-WAVE4-XDP-IPV6, Copilot review on
+                            // PR #462): route through the shared helper so v4
+                            // and v6 entries both reach the matching pin path.
+                            // Pre-fix this only parsed `Ipv4Addr` and dropped
+                            // every v6 entry as "poison", leaving the kernel
+                            // V6 map populated forever after TTL expiry.
+                            let Some((map_pin, key_args)) = crate::skills::builtin::xdp_blocklist_pin_for_ip(ip) else {
+                                // Genuinely unparseable - drop from state to
+                                // avoid a poison entry; can't act on kernel.
                                 warn!(ip, "XDP cleanup: unparseable IP in xdp_block_times, dropping local entry");
                                 state.xdp_block_times.remove(ip);
                                 // Spec 037 PR-1: mirror the remove in SQLite so
@@ -1724,13 +1730,18 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 state.store.remove_xdp_block_time(ip);
                                 continue;
                             };
-                            let b = addr.octets();
                             let ttl_secs = state.xdp_block_times.get(ip).map(|(_, t)| *t).unwrap_or(0);
+                            let mut argv: Vec<String> = vec![
+                                "bpftool".into(),
+                                "map".into(),
+                                "delete".into(),
+                                "pinned".into(),
+                                map_pin.into(),
+                                "key".into(),
+                            ];
+                            argv.extend(key_args);
                             let output = tokio::process::Command::new("sudo")
-                                .args(["bpftool", "map", "delete", "pinned",
-                                    "/sys/fs/bpf/innerwarden/blocklist",
-                                    "key", &b[0].to_string(), &b[1].to_string(),
-                                    &b[2].to_string(), &b[3].to_string()])
+                                .args(&argv[..])
                                 .output().await;
                             match output {
                                 Ok(out) if out.status.success() => {
@@ -3085,6 +3096,57 @@ url = "http://127.0.0.1:9/hooks"
         assert!(
             dirty == "true" || dirty == "false",
             "INNERWARDEN_BUILD_DIRTY={dirty:?} must be exactly \"true\" or \"false\""
+        );
+    }
+
+    /// Wave 4 (AUDIT-WAVE4-XDP-IPV6) anchor: the boot-loop adaptive
+    /// XDP TTL cleanup path (the actual prod path, not the
+    /// `xdp_unblock_ip` helper) must dispatch IPv6 entries to
+    /// `BLOCKLIST_V6_PIN`. Pre-fix it parsed only Ipv4Addr and
+    /// dropped every v6 entry as "poison", leaving the kernel V6
+    /// map populated forever. Caught by Copilot review on PR #462.
+    ///
+    /// Pin via source-grep (same pattern as the `js_*` dashboard
+    /// anchors) because the TTL loop is buried inside a 1500-line
+    /// async fn that is impractical to invoke from a unit test
+    /// without the full `AgentState`. The grep ensures the loop
+    /// routes through the shared `xdp_blocklist_pin_for_ip` helper
+    /// (which is itself unit-tested for v4/v6 dispatch + None on
+    /// garbage). Refactors that bypass the helper fail this test.
+    #[test]
+    fn xdp_ttl_cleanup_calls_v6_pin_for_ipv6_entries() {
+        let src = include_str!("boot.rs");
+
+        // Strip comment lines and lines containing string literals
+        // before the pattern check so the assertion below can talk
+        // about the bad pattern in its own comments / panic messages
+        // without false-positiving on itself.
+        let code_only: String = src
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with("*"))
+            })
+            .filter(|line| !line.contains('"'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Helper must be wired in (active code, not just docs).
+        assert!(
+            code_only.contains("xdp_blocklist_pin_for_ip(ip)"),
+            "boot loop must dispatch XDP cleanup through the shared \
+             xdp_blocklist_pin_for_ip helper — the pre-fix code parsed \
+             only Ipv4Addr and silently dropped v6 entries"
+        );
+
+        // Pre-fix shape must NOT come back as active code. The pre-fix
+        // call site was the IPv4-only parse against an `ip` variable
+        // inside the xdp_block_times expiry loop.
+        assert!(
+            !code_only.contains("ip.parse::<std::net::Ipv4Addr>()"),
+            "boot loop must NOT call the IPv4-only parse against an \
+             xdp_block_times entry — use the shared helper so v6 entries \
+             also reach bpftool"
         );
     }
 }
