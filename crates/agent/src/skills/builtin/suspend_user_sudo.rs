@@ -73,7 +73,24 @@ impl ResponseSkill for SuspendUserSudo {
                 .clamp(MIN_TTL_SECS, MAX_TTL_SECS);
             let created_at = Utc::now();
             let expires_at = created_at + Duration::seconds(ttl_secs as i64);
-            let deny_file = format!("{DENY_FILE_PREFIX}{user}");
+            // Wave 2 (AUDIT-WAVE2-SUDOERS-DOT): sudo's `includedir` for
+            // `/etc/sudoers.d/` SILENTLY ignores any file whose name
+            // contains `.` (period) or ends in `~` (tilde) - per
+            // sudoers(5) "files that contain a `.` (period) or end with
+            // `~` (tilde) are silently ignored". Real Linux usernames
+            // CAN contain `.` (e.g. `john.doe`), and `is_valid_username`
+            // intentionally allows it. The deny file's filename is built
+            // from the username verbatim, so `john.doe` produces
+            // `/etc/sudoers.d/zz-innerwarden-deny-john.doe` which sudo
+            // reads, sees the `.`, and skips - the rule never loads, the
+            // suspension is silently a no-op, and the operator believes
+            // the user was suspended. Sanitize the FILENAME portion only
+            // (the rule body still uses the real username so sudo
+            // matches the right account).
+            let deny_file = format!(
+                "{DENY_FILE_PREFIX}{}",
+                sanitize_sudoers_filename_segment(&user)
+            );
 
             if dry_run {
                 info!(
@@ -305,6 +322,19 @@ fn render_sudo_deny_rule(user: &str, expires_at: DateTime<Utc>) -> String {
     )
 }
 
+/// Wave 2 (AUDIT-WAVE2-SUDOERS-DOT) helper: replace characters that
+/// sudo's `includedir` silently skips (`.` and `~`) with `_` so the
+/// resulting `/etc/sudoers.d/` filename is actually loaded. The rule
+/// body inside the file still uses the real username so sudo matches
+/// the right account; only the on-disk filename is mangled.
+///
+/// Pinned by `sanitize_sudoers_filename_segment_*` anchor tests.
+fn sanitize_sudoers_filename_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '.' || c == '~' { '_' } else { c })
+        .collect()
+}
+
 fn is_valid_username(user: &str) -> bool {
     if user.is_empty() || user.len() > 64 {
         return false;
@@ -325,6 +355,58 @@ fn is_valid_username(user: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Wave 2 anchors (AUDIT-WAVE2-SUDOERS-DOT) ──────────────────────
+    //
+    // sudo's `includedir /etc/sudoers.d` silently skips files containing
+    // `.` or ending in `~` (sudoers(5)). Real Linux usernames may
+    // legitimately contain `.` (e.g. `john.doe`), and `is_valid_username`
+    // accepts them; without filename sanitisation the deny rule never
+    // loads and the suspension is a silent no-op. These tests pin the
+    // fix so the bug cannot recur quietly.
+
+    #[test]
+    fn sanitize_sudoers_filename_segment_replaces_dots() {
+        // The exact prod failure shape: `john.doe` → filename
+        // `zz-innerwarden-deny-john_doe`, NOT `..-deny-john.doe`
+        // (which sudo would silently ignore).
+        assert_eq!(sanitize_sudoers_filename_segment("john.doe"), "john_doe");
+        assert_eq!(
+            sanitize_sudoers_filename_segment("a.b.c.d"),
+            "a_b_c_d",
+            "every dot must be replaced, not just the first"
+        );
+    }
+
+    #[test]
+    fn sanitize_sudoers_filename_segment_replaces_tildes() {
+        // sudo also skips files ending in `~`. Replace anywhere.
+        assert_eq!(sanitize_sudoers_filename_segment("user~"), "user_");
+        assert_eq!(sanitize_sudoers_filename_segment("u~ser"), "u_ser");
+    }
+
+    #[test]
+    fn sanitize_sudoers_filename_segment_passes_safe_chars_through() {
+        // ASCII alphanumeric + `_` + `-` + `$` (SAMBA machine accounts)
+        // are all safe in sudoers.d filenames - must not be touched.
+        for safe in &["alice", "bob_42", "ci-runner-3", "machine$", "x"] {
+            assert_eq!(
+                sanitize_sudoers_filename_segment(safe),
+                *safe,
+                "safe input {safe:?} must pass through unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_sudoers_filename_segment_handles_combined_skip_chars() {
+        // Defense-in-depth: `john.doe~backup` would be doubly skipped
+        // by sudo. Both classes of skip-char get replaced.
+        assert_eq!(
+            sanitize_sudoers_filename_segment("john.doe~backup"),
+            "john_doe_backup"
+        );
+    }
 
     #[tokio::test]
     async fn dry_run_succeeds() {
