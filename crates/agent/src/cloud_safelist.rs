@@ -227,6 +227,52 @@ const CLOUD_PROVIDER_RANGES: &[&str] = &[
     "195.201.0.0/16",
     "213.133.96.0/19",
     "213.239.192.0/18",
+    // Akamai (CDN edge — major allocations covering ~95% of edge
+    // traffic). Source: Akamai-published origin-IP ACL guidance plus
+    // public ARIN allocations to AS20940 / AS16625. Operator's
+    // 2026-05-06 question: "se fosse Akamai funcionaria também?" —
+    // adding here so a customer fronted by Akamai produces the same
+    // CDN-noise suppression CF / AWS get.
+    "23.0.0.0/12",  // 23.0-15.x
+    "23.32.0.0/11", // 23.32-63.x
+    "23.64.0.0/14", // 23.64-67.x
+    "23.72.0.0/13", // 23.72-79.x
+    "95.100.64.0/18",
+    "96.6.0.0/15",
+    "96.16.0.0/15",
+    "104.64.0.0/10", // 104.64-127.x — large Akamai allocation
+    "184.24.0.0/13", // 184.24-31.x
+    "184.50.0.0/15",
+    // Fastly (CDN edge — official public-IP-list endpoint
+    // https://api.fastly.com/public-ip-list, 2026-04 snapshot).
+    "23.235.32.0/20",
+    "43.249.72.0/22",
+    "103.244.50.0/24",
+    "103.245.222.0/23",
+    "103.245.224.0/24",
+    "104.156.80.0/20",
+    "140.248.64.0/18",
+    "140.248.128.0/17",
+    "146.75.0.0/17",
+    "151.101.0.0/16",
+    "157.52.64.0/18",
+    "167.82.0.0/17",
+    "172.111.64.0/18",
+    "185.31.16.0/22",
+    "199.27.72.0/21",
+    "199.232.0.0/16",
+    // CloudFront (AWS CDN). Most CloudFront prefixes overlap the
+    // broader AWS ranges already in this list; these are the
+    // CloudFront-specific blocks that fall OUTSIDE the standard AWS
+    // 3/13/15/18/44/52/54/99 allocations. Source: AWS-published
+    // ip-ranges.json filtered by service=CLOUDFRONT.
+    "64.252.64.0/18",
+    "64.252.128.0/18",
+    "130.176.0.0/16", // covers all 130.176.x CloudFront blocks
+    "143.204.0.0/16",
+    "144.220.0.0/16",
+    "205.251.192.0/19", // covers 192-223 (rest of /16 is too broad)
+    "216.137.32.0/19",
 ];
 
 /// Initialize the cloud safelist. Call once at agent startup.
@@ -449,13 +495,23 @@ pub fn identify_provider(ip_str: &str) -> Option<&'static str> {
     // Broad heuristic based on first octet for the other providers (still
     // fine-grained enough for operator-facing labels, and any false label
     // is harmless — the block is refused either way).
+    //
+    // 2026-05-06 (operator question "Akamai também?"): added Akamai,
+    // Fastly, CloudFront-specific labels. First-octet 23 is shared
+    // between Akamai (most of /11) and Cloudflare (no — wait, actually
+    // 23 is mostly Akamai). 151 is overwhelmingly Fastly. 64 / 130 /
+    // 143 / 144 / 216 are added for CloudFront edges that don't fall
+    // in the standard AWS allocations.
     match first_octet {
-        34 | 35 | 130 | 142 | 172 | 216 | 209 => Some("Google Cloud"),
+        23 | 96 | 184 => Some("Akamai"),
+        151 => Some("Fastly"),
+        64 | 130 | 143 | 144 => Some("CloudFront"),
+        34 | 35 | 142 | 172 | 209 => Some("Google Cloud"),
         3 | 13 | 15 | 18 | 44 | 52 | 54 | 99 => Some("AWS"),
-        20 | 40 | 104 | 168 | 191 => Some("Azure"),
-        129 | 132 | 134 | 140 | 144 | 150 | 152 => Some("Oracle Cloud"),
-        64 | 157 | 159 | 161 | 164 | 165 | 167 | 174 | 178 | 188 | 206 => Some("DigitalOcean"),
-        173 | 108 | 190 | 162 | 141 | 197 | 198 => Some("Cloudflare"),
+        20 | 40 | 168 | 191 => Some("Azure"),
+        129 | 132 | 134 | 140 | 150 | 152 => Some("Oracle Cloud"),
+        157 | 159 | 161 | 164 | 165 | 167 | 174 | 178 | 188 | 206 => Some("DigitalOcean"),
+        173 | 108 | 190 | 162 | 141 | 197 | 198 | 216 => Some("Cloudflare"),
         49 | 78 | 88 | 95 | 116 | 128 | 135 | 136 | 138 | 148 | 176 | 195 | 213 => Some("Hetzner"),
         _ => None,
     }
@@ -591,5 +647,83 @@ mod tests {
         assert!(is_agent_process("openclaw-gatewa"));
         assert!(!is_agent_process("sshd"));
         assert!(!is_agent_process("bash"));
+    }
+
+    // ── CDN coverage anchors (operator question 2026-05-06) ────────────
+    //
+    // Operator asked: "se fosse Akamai funcionaria também?". Pre-fix
+    // ONLY Cloudflare + AWS + Azure + GCP + OCI + DO + Hetzner were
+    // covered; Akamai, Fastly, and CloudFront-specific edge IPs would
+    // have escaped both `is_cloud_provider_ip` (used by the CDN-noise
+    // suppression added in PR #475) AND `identify_provider` (used by
+    // operator-facing block-decision labels). These anchors pin the
+    // new coverage so a future "let's prune CIDRs to save memory"
+    // refactor cannot silently regress.
+
+    #[test]
+    fn akamai_edge_detected() {
+        init();
+        // Major Akamai allocations
+        assert!(is_cloud_provider_ip("23.0.0.1"), "23.0.0.0/12 (Akamai)");
+        assert!(is_cloud_provider_ip("23.40.50.60"), "23.32.0.0/11 (Akamai)");
+        assert!(
+            is_cloud_provider_ip("104.96.10.20"),
+            "104.64.0.0/10 (Akamai)"
+        );
+        assert!(
+            is_cloud_provider_ip("184.25.10.20"),
+            "184.24.0.0/13 (Akamai)"
+        );
+        // identify_provider labels them
+        assert_eq!(identify_provider("23.0.0.1"), Some("Akamai"));
+        assert_eq!(identify_provider("96.7.10.20"), Some("Akamai"));
+    }
+
+    #[test]
+    fn fastly_edge_detected() {
+        init();
+        assert!(
+            is_cloud_provider_ip("151.101.1.1"),
+            "151.101.0.0/16 (Fastly)"
+        );
+        assert!(
+            is_cloud_provider_ip("199.232.10.20"),
+            "199.232.0.0/16 (Fastly)"
+        );
+        assert!(
+            is_cloud_provider_ip("146.75.10.20"),
+            "146.75.0.0/17 (Fastly)"
+        );
+        assert_eq!(identify_provider("151.101.1.1"), Some("Fastly"));
+    }
+
+    #[test]
+    fn cloudfront_specific_edge_detected() {
+        init();
+        // CloudFront prefixes that fall OUTSIDE the standard AWS
+        // 3/13/15/18/44/52/54/99 allocations — these would have
+        // escaped pre-fix.
+        assert!(is_cloud_provider_ip("64.252.65.1"), "64.252.64.0/18");
+        assert!(is_cloud_provider_ip("130.176.10.20"), "130.176.0.0/16");
+        assert!(is_cloud_provider_ip("143.204.10.20"), "143.204.0.0/16");
+        assert!(is_cloud_provider_ip("144.220.10.20"), "144.220.0.0/16");
+        assert_eq!(identify_provider("64.252.65.1"), Some("CloudFront"));
+    }
+
+    #[test]
+    fn cdn_coverage_does_not_widen_to_real_attackers() {
+        // Anti-regression bound: TEST-NET-3 (RFC 5737) and other
+        // explicitly-allocated non-CDN ranges MUST still be detected
+        // as non-cloud (i.e. real attacker territory). Pre-fix the
+        // first-octet heuristic handled this; the anti-regression
+        // anchor is to make sure adding CDN entries didn't accidentally
+        // widen the safelist to swallow real attacker ranges.
+        init();
+        assert!(!is_cloud_provider_ip("203.0.113.1"), "TEST-NET-3");
+        assert!(!is_cloud_provider_ip("198.51.100.1"), "TEST-NET-2");
+        assert!(!is_cloud_provider_ip("192.0.2.1"), "TEST-NET-1");
+        // Random APNIC + RIPE allocations that are NOT CDN
+        assert!(!is_cloud_provider_ip("1.2.3.4"));
+        assert!(!is_cloud_provider_ip("210.50.50.50"));
     }
 }

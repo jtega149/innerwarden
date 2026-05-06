@@ -492,6 +492,13 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/knowledge_graph/detectors.rs::tests::short_lived_process_detector_skips_when_only_internal_connect` - anti-regression: a fast process that connected ONLY to localhost / RFC1918 (health check) MUST NOT trigger. Network I/O alone isn't suspicious; EXTERNAL network I/O during a sub-100ms lifetime is.
 - `crates/agent/src/knowledge_graph/detectors.rs::tests::short_lived_process_detector_skips_when_no_exit_ts` - defensive bound: a process still running (no exit_ts) MUST NOT trigger. We only know a process is "short lived" once it has actually exited.
 
+### CDN coverage extension — Akamai / Fastly / CloudFront (operator question 2026-05-06)
+
+- `crates/agent/src/cloud_safelist.rs::tests::akamai_edge_detected` - operator's safety question anchor ("se fosse Akamai funcionaria também?"): Akamai's major edge allocations (`23.0.0.0/12`, `23.32.0.0/11`, `104.64.0.0/10`, `184.24.0.0/13`) are recognised by `is_cloud_provider_ip` AND labeled "Akamai" by `identify_provider`. Pre-fix Akamai edge IPs would have escaped the CDN-noise suppression added in PR #475 + the cloud-history hardening added in PR #476, leaving the same noise pattern as Cloudflare had pre-Wave 9.
+- `crates/agent/src/cloud_safelist.rs::tests::fastly_edge_detected` - mirror anchor for Fastly (`151.101.0.0/16` is the most common Fastly /16; `199.232.0.0/16`, `146.75.0.0/17` cover the rest).
+- `crates/agent/src/cloud_safelist.rs::tests::cloudfront_specific_edge_detected` - mirror anchor for CloudFront prefixes that fall OUTSIDE the standard AWS 3/13/15/18/44/52/54/99 allocations (`64.252.x`, `130.176.x`, `143.204.x`, `144.220.x`). These would have escaped the existing AWS coverage; pinned so a future "AWS catches all" simplification doesn't drop them.
+- `crates/agent/src/cloud_safelist.rs::tests::cdn_coverage_does_not_widen_to_real_attackers` - anti-regression bound: TEST-NET-3 / TEST-NET-2 / TEST-NET-1 (RFC 5737) and random non-CDN allocations MUST still be detected as non-cloud. Adding 30+ CDN entries to `CLOUD_PROVIDER_RANGES` must not accidentally swallow real attacker territory.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
