@@ -114,6 +114,16 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
         }
     }
 
+    // Spec 043 Phase 1 — KG-derived confidence modifier. Runs AFTER the
+    // existing attacker_profiles + neural boosts so the legacy paths are
+    // untouched during the shadow rollout. Three modes:
+    //   off     -> no-op (early return)
+    //   shadow  -> compute + log to JSONL, do NOT mutate decision
+    //   enforce -> apply modifier to decision.confidence
+    // Critical incidents are protected by `apply_critical_floor` (negative
+    // modifiers clamped to 0) — defensive layering with Phase 7.
+    apply_kg_decide_modifier(incident, cfg, state, decision, _data_dir);
+
     info!(
         incident_id = %incident.incident_id,
         action = ?decision.action,
@@ -122,6 +132,102 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
         reason = %decision.reason,
         "AI decision"
     );
+}
+
+/// Spec 043 Phase 1 — KG modifier wiring. Extracted into its own
+/// function so the integration site stays readable and the unit tests
+/// can exercise the shadow / enforce branches without spinning up the
+/// full decide pipeline.
+fn apply_kg_decide_modifier(
+    incident: &innerwarden_core::incident::Incident,
+    cfg: &config::AgentConfig,
+    state: &AgentState,
+    decision: &mut ai::AiDecision,
+    data_dir: &Path,
+) {
+    use crate::kg_decide_features::{
+        apply_critical_floor, compute_modifier, extract_features, parse_mode, write_shadow_log,
+        DecideModifierMode, ShadowLogRecord,
+    };
+
+    let mode = parse_mode(&cfg.kg.decide_modifier_mode);
+    if matches!(mode, DecideModifierMode::Off) {
+        return;
+    }
+
+    let kg = match state.knowledge_graph.read() {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                "kg_decide_features: knowledge_graph lock poisoned: {e}; skipping modifier"
+            );
+            return;
+        }
+    };
+    let now = chrono::Utc::now();
+    let features = match extract_features(&kg, incident, now) {
+        Some(f) => f,
+        None => return, // no IP entity or entity not yet in graph
+    };
+    drop(kg); // release the read lock before any logging or apply
+
+    let (modifier_raw, reason) = compute_modifier(&features);
+    let modifier_after_floor = apply_critical_floor(modifier_raw, &incident.severity);
+    let new_confidence = (decision.confidence + modifier_after_floor).clamp(0.0, 1.0);
+    let would_change =
+        crate::kg_decide_features::would_change_action(decision.confidence, new_confidence);
+
+    match mode {
+        DecideModifierMode::Off => unreachable!("early-returned above"),
+        DecideModifierMode::Shadow => {
+            // Best-effort log; do not mutate decision.
+            let real_action = format!("{:?}", decision.action);
+            let record = ShadowLogRecord {
+                ts: now.to_rfc3339(),
+                incident_id: incident.incident_id.clone(),
+                real_action,
+                real_confidence: decision.confidence,
+                modifier_raw,
+                modifier_after_floor,
+                new_confidence,
+                would_change_action: would_change,
+                features,
+                reason,
+            };
+            write_shadow_log(data_dir, &record);
+            if would_change {
+                info!(
+                    incident_id = %incident.incident_id,
+                    real_confidence = decision.confidence,
+                    modifier = modifier_after_floor,
+                    new_confidence,
+                    reason,
+                    "kg_decide_modifier: shadow — would_change_action"
+                );
+            }
+        }
+        DecideModifierMode::Enforce => {
+            if modifier_after_floor.abs() > f32::EPSILON {
+                info!(
+                    incident_id = %incident.incident_id,
+                    base_confidence = decision.confidence,
+                    modifier = modifier_after_floor,
+                    new_confidence,
+                    reason,
+                    "kg_decide_modifier: enforce — confidence adjusted"
+                );
+                decision.confidence = new_confidence;
+                decision.reason = format!(
+                    "{} [kg: benign={:.2}, risk={}, age={}d, modifier={:+.2}]",
+                    decision.reason,
+                    features.benign_history_score,
+                    features.risk_score,
+                    features.first_seen_age_days,
+                    modifier_after_floor
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +308,223 @@ mod tests {
         );
         // Score is `take()`'n regardless of whether the threshold was met.
         assert!(state.latest_anomaly_score.is_none());
+    }
+
+    // ── Spec 043 Phase 1 anchors (AUDIT-SPEC043-PHASE1) ────────────────
+    //
+    // Pre-Phase-1 the Decide path consulted only the `attacker_profiles`
+    // sidecar (re-derived from JSONL, separate from the KG). Phase 1
+    // adds a KG-derived modifier that runs AFTER the existing boosts.
+    // Three anchors pin the contract:
+    //
+    //   1. shadow mode does NOT mutate decision.confidence (audit-only)
+    //   2. enforce mode applies the modifier and tags the reason string
+    //   3. Critical incidents NEVER receive a negative modifier even
+    //      when an entity looks pristine (defensive layering with
+    //      Spec 043 Phase 7 — KG-based FP suppression).
+
+    fn seed_kg_with_benign_history(
+        kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+        ip: &str,
+    ) {
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        use chrono::{Duration, Utc};
+        let mut g = kg.write().unwrap();
+        let now = Utc::now();
+        let ip_id = g.add_node(Node::Ip {
+            addr: ip.to_string(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 5,
+            is_tor: false,
+            first_seen: now - Duration::days(60),
+            last_seen: now,
+            attempted_usernames: vec![],
+        });
+        // 10 benign incidents in the last 7d — qualifies for the
+        // strongest -0.30 band when paired with the IP's risk_score=5
+        // and age=60d above.
+        for i in 0..10 {
+            let inc = g.add_node(Node::Incident {
+                incident_id: format!("benign:seed:{i}"),
+                detector: "test".to_string(),
+                severity: "low".to_string(),
+                title: format!("benign #{i}"),
+                summary: String::new(),
+                ts: now - Duration::days(2),
+                mitre_ids: vec![],
+                decision: None,
+                confidence: None,
+                decision_reason: None,
+                decision_target: None,
+                auto_executed: false,
+                is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
+                research_only: false,
+            });
+            g.add_edge(Edge::new(
+                inc,
+                ip_id,
+                Relation::TriggeredBy,
+                now - Duration::days(2),
+            ));
+        }
+    }
+
+    #[test]
+    fn kg_decide_modifier_shadow_mode_logs_but_does_not_apply() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.decide_modifier_mode = "shadow".to_string();
+
+        let ip = "203.0.113.55";
+        seed_kg_with_benign_history(&state.knowledge_graph, ip);
+
+        let trigger = crate::tests::test_incident_with_kind(ip, "ssh_bruteforce");
+        let baseline_confidence = 0.90_f32;
+        let mut decision = ai::AiDecision {
+            action: ai::AiAction::Ignore {
+                reason: "test".into(),
+            },
+            confidence: baseline_confidence,
+            auto_execute: false,
+            reason: "baseline".into(),
+            alternatives: vec![],
+            estimated_threat: "low".into(),
+        };
+
+        apply_correlation_boost_and_log_decision(
+            &trigger,
+            &cfg,
+            &mut state,
+            &mut decision,
+            dir.path(),
+        );
+
+        // Shadow mode MUST NOT mutate decision.confidence via the KG path.
+        // (Other boosts may legitimately change it, but the KG modifier
+        // alone must be audit-only. We assert the KG tag never appears in
+        // the reason string in shadow mode — that tag is enforce-only.)
+        assert!(
+            !decision.reason.contains("[kg:"),
+            "shadow mode must NOT add the [kg: ...] reason tag; got: {}",
+            decision.reason
+        );
+
+        // Shadow log file MUST exist for today's date with at least one
+        // record for the trigger incident.
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let log_path = dir
+            .path()
+            .join(format!("kg_shadow_decide_modifier_{}.jsonl", date));
+        assert!(
+            log_path.exists(),
+            "shadow log {} must exist after a shadow-mode evaluation",
+            log_path.display()
+        );
+        let body = std::fs::read_to_string(&log_path).expect("read shadow log");
+        assert!(
+            body.contains(&trigger.incident_id),
+            "shadow log must record the trigger incident id; got body: {body}"
+        );
+    }
+
+    #[test]
+    fn kg_decide_modifier_enforce_mode_applies_modifier() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.decide_modifier_mode = "enforce".to_string();
+
+        let ip = "203.0.113.56";
+        seed_kg_with_benign_history(&state.knowledge_graph, ip);
+
+        let trigger = crate::tests::test_incident_with_kind(ip, "ssh_bruteforce");
+        let baseline_confidence = 0.90_f32;
+        let mut decision = ai::AiDecision {
+            action: ai::AiAction::Ignore {
+                reason: "test".into(),
+            },
+            confidence: baseline_confidence,
+            auto_execute: false,
+            reason: "baseline".into(),
+            alternatives: vec![],
+            estimated_threat: "low".into(),
+        };
+
+        apply_correlation_boost_and_log_decision(
+            &trigger,
+            &cfg,
+            &mut state,
+            &mut decision,
+            dir.path(),
+        );
+
+        // Enforce mode: the strongest benign band (-0.30) must apply.
+        // baseline 0.90 + (-0.30) = 0.60 (clamped to [0,1]).
+        assert!(
+            (decision.confidence - 0.60).abs() < 0.01,
+            "enforce mode must apply -0.30 modifier (0.90 → 0.60); got {}",
+            decision.confidence
+        );
+        assert!(
+            decision.reason.contains("[kg:"),
+            "enforce mode must tag reason with [kg: ...]; got: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn kg_decide_modifier_critical_severity_floor_holds() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.decide_modifier_mode = "enforce".to_string();
+
+        let ip = "203.0.113.57";
+        seed_kg_with_benign_history(&state.knowledge_graph, ip);
+
+        // Same baseline as above but Severity::Critical.
+        let mut trigger =
+            crate::tests::test_incident_with_kind(ip, "kill_chain:detected:DATA_EXFIL");
+        trigger.severity = innerwarden_core::event::Severity::Critical;
+        let baseline_confidence = 0.90_f32;
+        let mut decision = ai::AiDecision {
+            action: ai::AiAction::BlockIp {
+                ip: ip.to_string(),
+                skill_id: "block-ip-ufw".to_string(),
+            },
+            confidence: baseline_confidence,
+            auto_execute: true,
+            reason: "baseline".into(),
+            alternatives: vec![],
+            estimated_threat: "critical".into(),
+        };
+
+        apply_correlation_boost_and_log_decision(
+            &trigger,
+            &cfg,
+            &mut state,
+            &mut decision,
+            dir.path(),
+        );
+
+        // Critical incident MUST NOT receive negative modifier even though
+        // the entity has a 60-day pristine history. Defensive layering with
+        // Spec 043 Phase 7. Confidence stays at baseline (no [kg: ...] tag
+        // added because the post-floor modifier is exactly 0.0).
+        assert!(
+            (decision.confidence - baseline_confidence).abs() < f32::EPSILON,
+            "Critical incident must NOT receive negative kg modifier; got {}",
+            decision.confidence
+        );
+        assert!(
+            !decision.reason.contains("[kg:"),
+            "no [kg: ...] tag when post-floor modifier is zero on Critical; got: {}",
+            decision.reason
+        );
     }
 }

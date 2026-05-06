@@ -120,6 +120,9 @@ pub struct AgentConfig {
     /// Incident lifecycle flow configuration (spec 028).
     #[serde(default)]
     pub incident_flow: IncidentFlowConfig,
+    /// KG-derived decision modifiers and detectors (spec 043).
+    #[serde(default)]
+    pub kg: KgConfig,
 }
 
 /// Incident lifecycle routing knobs (spec 028).
@@ -156,6 +159,35 @@ pub struct IncidentFlowConfig {
     /// per-tick budget still apply.
     #[serde(default)]
     pub detectors_skip_fase3: Vec<String>,
+}
+
+/// KG-derived decision modifiers and detectors (spec 043). Each
+/// behavior-changing knob ships in `shadow` mode by default so an
+/// operator can observe a JSONL log of "what would have happened" for
+/// at least 7 days before promoting to `enforce`. `off` is the rollback
+/// path without redeploy. Same tri-state pattern as
+/// `[ai].untouchable_override_mode`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct KgConfig {
+    /// Phase 1: pre-decide modifier that nudges AI confidence based on
+    /// the entity's KG-derived history (prior incidents, benign vs
+    /// malicious ratio, related campaigns, AbuseIPDB risk score, age).
+    /// Modes: "off" | "shadow" | "enforce". Default: "shadow".
+    #[serde(default = "default_kg_decide_modifier_mode")]
+    pub decide_modifier_mode: String,
+}
+
+impl Default for KgConfig {
+    fn default() -> Self {
+        Self {
+            decide_modifier_mode: default_kg_decide_modifier_mode(),
+        }
+    }
+}
+
+fn default_kg_decide_modifier_mode() -> String {
+    "shadow".to_string()
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
