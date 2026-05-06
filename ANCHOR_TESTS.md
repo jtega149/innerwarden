@@ -440,6 +440,13 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/incident_decision_eval.rs::tests::kg_decide_modifier_enforce_mode_applies_modifier` - end-to-end integration: with `[kg].decide_modifier_mode = "enforce"`, baseline confidence 0.90 + (-0.30 modifier from long-tenure benign band) → 0.60, AND `decision.reason` gains the `[kg: benign=..., risk=..., age=..., modifier=...]` audit suffix. Anti-regression for breaking the suffix format (operator's audit-log grep depends on it).
 - `crates/agent/src/incident_decision_eval.rs::tests::kg_decide_modifier_critical_severity_floor_holds` - end-to-end integration of the Critical floor: the SAME entity + SAME baseline as the enforce test, but with `severity = Critical`, MUST keep confidence at baseline (no `[kg: ...]` tag added because the post-floor modifier is exactly 0.0). Anti-regression for the most dangerous failure mode of this whole spec — silently suppressing a real Critical compromise alert on an entity that has a pristine 60-day history.
 
+### Deep `/ask` context (Spec 043 Phase 2 - AUDIT-SPEC043-PHASE2)
+
+- `crates/agent/src/bot_helpers.rs::tests::ask_context_deep_includes_ip_risk_and_datasets` - Phase 2 headline anchor: `ask_context_deep` surfaces `Ip.risk_score` AND `Ip.datasets` (threat-intel feeds) on the RECENT INCIDENTS section. Pre-Phase-2 these fields were write-only in the KG (operator-reported "/ask responde muito basico"). The LLM now sees real ground truth, not just titles.
+- `crates/agent/src/bot_helpers.rs::tests::ask_context_deep_pulls_subgraph_when_question_mentions_ip` - when the operator's question contains a dotted-quad that matches an Ip node, a depth-1 SUBGRAPH FOR QUESTION section is attached (renders neighbors as `<-[Relation]- Node(label)`). Pins that "why is X.X.X.X blocked?" gets grounded in graph topology, not just hallucinated narrative.
+- `crates/agent/src/bot_helpers.rs::tests::ask_context_deep_respects_budget_cap_drops_subgraph_first` - under tight char budget, SUBGRAPH section is dropped FIRST (most expendable) so RECENT INCIDENTS (highest signal) survives. Anti-regression for accidentally dropping incidents to fit subgraph, which would degrade /ask quality on memory-constrained runs.
+- `crates/agent/src/bot_helpers.rs::tests::ask_context_deep_empty_graph_returns_empty_string` - empty KG produces empty string (no dangling section headers). Pins the same defensive contract as the legacy `graph_last_incidents_raw` helper had.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

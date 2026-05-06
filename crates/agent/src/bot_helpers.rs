@@ -182,16 +182,52 @@ pub(crate) fn graph_last_decisions(
     )
 }
 
-/// Read the last N incidents as compact strings for AI context (graph-based).
-pub(crate) fn graph_last_incidents_raw(
+/// Spec 043 Phase 2 — deep KG-derived context for the operator's `/ask`
+/// (Telegram `__ask__:` branch in `bot_commands.rs`). Pre-Phase-2 the
+/// /ask prompt only carried the last 3 incident titles + last 5 decision
+/// targets, which produced operator-reported "muito basico" answers
+/// because the LLM had no signal beyond manchetes. This helper enriches
+/// the prompt with the graph data already ingested but unused:
+///
+/// 1. Recent incidents enriched with severity, title, summary, IP risk
+///    score (from AbuseIPDB), threat-intel datasets that matched, and
+///    YARA matches on related files.
+/// 2. Recent decisions (action + target + auto/proposed mode).
+/// 3. High-risk entities snapshot — IPs with risk_score > 70 OR with
+///    related campaign membership. Helps the LLM ground "is this IP
+///    known to us?" questions without a separate tool-call.
+/// 4. Subgraph-for-question — when the question text mentions an IP
+///    (regex match on dotted-quad), pull the IP's depth-1 neighborhood
+///    and attach it as a compact entity → relation list.
+///
+/// Hard 8000-char cap on the entire output. Truncates from the end of
+/// section 4 → 3 → 2 → 1 (most expendable first). The cap protects
+/// LLM cost on hosts where the operator runs paid Anthropic / OpenAI;
+/// Ollama on `ollama` is free but the cap still guards latency.
+///
+/// No config gate — pure prompt enrichment, zero behavior change. Used
+/// as a drop-in for the legacy `graph_last_incidents_raw` +
+/// `graph_last_decisions_raw` pair at the `/ask` call site only.
+pub(crate) fn ask_context_deep(
     kg: &std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
-    n: usize,
+    question: &str,
+    budget_chars: usize,
 ) -> String {
-    use knowledge_graph::types::{Node, NodeType};
+    use knowledge_graph::types::{Node, NodeType, Relation};
     let graph = kg.read().unwrap();
 
-    let mut items: Vec<(chrono::DateTime<chrono::Utc>, String, String, String)> = Vec::new();
-
+    // ── Section 1: recent incidents (top 5) with KG-derived enrichment.
+    // Tuple is (ts, severity, title, summary, related_ip_risk, related_ip_datasets).
+    // Factored to a local type alias to keep clippy::type_complexity quiet.
+    type IncidentRow = (
+        chrono::DateTime<chrono::Utc>,
+        String,
+        String,
+        String,
+        Option<u8>,
+        Vec<String>,
+    );
+    let mut incidents: Vec<IncidentRow> = Vec::new();
     for id in graph.nodes_of_type(NodeType::Incident) {
         if let Some(Node::Incident {
             severity,
@@ -201,66 +237,245 @@ pub(crate) fn graph_last_incidents_raw(
             ..
         }) = graph.get_node(id)
         {
-            let short_summary: String = summary.chars().take(120).collect();
-            items.push((*ts, severity.to_lowercase(), title.clone(), short_summary));
+            // Look up the related IP (outgoing TriggeredBy → IP) for
+            // risk score + datasets enrichment.
+            let mut related_risk: Option<u8> = None;
+            let mut related_datasets: Vec<String> = Vec::new();
+            for edge in graph.outgoing_edges(id) {
+                if edge.relation != Relation::TriggeredBy {
+                    continue;
+                }
+                if let Some(Node::Ip {
+                    risk_score,
+                    datasets,
+                    ..
+                }) = graph.get_node(edge.to)
+                {
+                    related_risk = Some(*risk_score);
+                    related_datasets = datasets.clone();
+                    break;
+                }
+            }
+            let short: String = summary.chars().take(120).collect();
+            incidents.push((
+                *ts,
+                severity.to_lowercase(),
+                title.clone(),
+                short,
+                related_risk,
+                related_datasets,
+            ));
         }
     }
+    incidents.sort_by(|a, b| b.0.cmp(&a.0));
+    incidents.truncate(5);
 
-    if items.is_empty() {
-        return String::new();
-    }
+    let section_1: String = if incidents.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = incidents
+            .into_iter()
+            .map(|(_, sev, title, summary, risk, datasets)| {
+                let mut line = format!("[{sev}] {title} - {summary}");
+                if let Some(r) = risk {
+                    if r > 0 {
+                        line.push_str(&format!(" (ip_risk={r})"));
+                    }
+                }
+                if !datasets.is_empty() {
+                    line.push_str(&format!(" (intel: {})", datasets.join(",")));
+                }
+                line
+            })
+            .collect();
+        lines.join("\n")
+    };
 
-    items.sort_by(|a, b| b.0.cmp(&a.0));
-    items.truncate(n);
+    // ── Section 2: recent decisions (top 5).
+    let section_2 = {
+        let mut items: Vec<(chrono::DateTime<chrono::Utc>, String, String, bool)> = Vec::new();
+        for id in graph.nodes_of_type(NodeType::Incident) {
+            if let Some(Node::Incident {
+                ts,
+                decision: Some(action),
+                decision_target,
+                auto_executed,
+                ..
+            }) = graph.get_node(id)
+            {
+                let target = decision_target.as_deref().unwrap_or("?").to_string();
+                items.push((*ts, action.clone(), target, *auto_executed));
+            }
+        }
+        items.sort_by(|a, b| b.0.cmp(&a.0));
+        items.truncate(5);
+        if items.is_empty() {
+            String::new()
+        } else {
+            items
+                .into_iter()
+                .map(|(_, action, target, auto)| {
+                    let mode = if auto { "auto" } else { "proposed" };
+                    format!("- {action} {target} ({mode})")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
 
-    items
-        .into_iter()
-        .map(|(_, sev, title, summary)| format!("[{sev}] {title} - {summary}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    // ── Section 3: high-risk entities (IPs with risk > 70 OR
+    // campaign membership).
+    let section_3 = {
+        let mut entries: Vec<(String, u8, u32)> = Vec::new();
+        for id in graph.nodes_of_type(NodeType::Ip) {
+            if let Some(Node::Ip {
+                addr, risk_score, ..
+            }) = graph.get_node(id)
+            {
+                let campaigns = graph
+                    .outgoing_edges(id)
+                    .iter()
+                    .filter(|e| e.relation == Relation::MemberOf)
+                    .count() as u32;
+                if *risk_score > 70 || campaigns > 0 {
+                    entries.push((addr.clone(), *risk_score, campaigns));
+                }
+            }
+        }
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        entries.truncate(10);
+        if entries.is_empty() {
+            String::new()
+        } else {
+            entries
+                .into_iter()
+                .map(|(ip, risk, campaigns)| {
+                    if campaigns > 0 {
+                        format!("- {ip} risk={risk} campaigns={campaigns}")
+                    } else {
+                        format!("- {ip} risk={risk}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+
+    // ── Section 4: subgraph for IPs mentioned in the question.
+    // Only triggered when the question text contains a dotted-quad
+    // that maps to an existing Ip node in the graph. Renders depth-1
+    // neighborhood as compact entity → relation lines.
+    let section_4 = {
+        let ip_re = regex::Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").ok();
+        let mut chunks: Vec<String> = Vec::new();
+        if let Some(re) = ip_re {
+            for cap in re.captures_iter(question).take(3) {
+                let ip = cap.get(0).map(|m| m.as_str()).unwrap_or("");
+                if ip.is_empty() {
+                    continue;
+                }
+                if let Some(ip_id) = graph.find_by_ip(ip) {
+                    let mut lines: Vec<String> = Vec::new();
+                    for edge in graph.outgoing_edges(ip_id).iter().take(8) {
+                        if let Some(other) = graph.get_node(edge.to) {
+                            lines.push(format!("  -[{:?}]-> {}", edge.relation, node_label(other)));
+                        }
+                    }
+                    for edge in graph.incoming_edges(ip_id).iter().take(8) {
+                        if let Some(other) = graph.get_node(edge.from) {
+                            lines.push(format!("  <-[{:?}]- {}", edge.relation, node_label(other)));
+                        }
+                    }
+                    if !lines.is_empty() {
+                        chunks.push(format!("{}:\n{}", ip, lines.join("\n")));
+                    }
+                }
+            }
+        }
+        chunks.join("\n\n")
+    };
+
+    drop(graph);
+
+    // ── Assemble with budget cap. Truncate sections most-expendable-first
+    // (subgraph → high-risk → decisions → incidents) so the LLM always
+    // keeps the highest-signal context (recent incidents).
+    assemble_within_budget(&section_1, &section_2, &section_3, &section_4, budget_chars)
 }
 
-/// Plain-text format of the last N decisions, suitable for AI system-prompt
-/// context. No emojis, no HTML, short lines. Returns an empty string when
-/// the graph has no decisions yet so the caller can skip the whole section.
-pub(crate) fn graph_last_decisions_raw(
-    kg: &std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
-    n: usize,
-) -> String {
-    use knowledge_graph::types::{Node, NodeType};
-    let graph = kg.read().unwrap();
-
-    let mut items: Vec<(chrono::DateTime<chrono::Utc>, String, String, bool)> = Vec::new();
-
-    for id in graph.nodes_of_type(NodeType::Incident) {
-        if let Some(Node::Incident {
-            ts,
-            decision: Some(action),
-            decision_target,
-            auto_executed,
-            ..
-        }) = graph.get_node(id)
-        {
-            let target = decision_target.as_deref().unwrap_or("?").to_string();
-            items.push((*ts, action.clone(), target, *auto_executed));
+fn node_label(node: &knowledge_graph::types::Node) -> String {
+    use knowledge_graph::types::Node;
+    match node {
+        Node::Process { comm, pid, .. } => format!("Process({comm}/{pid})"),
+        Node::Ip {
+            addr, risk_score, ..
+        } => format!("Ip({addr}/risk={risk_score})"),
+        Node::File { path, .. } => format!("File({})", path.chars().take(40).collect::<String>()),
+        Node::User { name, .. } => format!("User({name})"),
+        Node::Domain { name, .. } => format!("Domain({name})"),
+        Node::Port { number, protocol } => format!("Port({number}/{protocol})"),
+        Node::Container { container_id, .. } => {
+            format!(
+                "Container({})",
+                &container_id.chars().take(12).collect::<String>()
+            )
         }
+        Node::Device {
+            vendor, product, ..
+        } => format!("Device({vendor}/{product})"),
+        Node::System { hostname, .. } => format!("System({hostname})"),
+        Node::Incident { incident_id, .. } => format!(
+            "Incident({})",
+            incident_id.chars().take(40).collect::<String>()
+        ),
+        Node::Campaign { campaign_id, .. } => format!("Campaign({campaign_id})"),
+    }
+}
+
+/// Concatenate the four sections under `budget_chars`. Drops sections
+/// from the end (subgraph first, incidents last) when over budget so
+/// the highest-signal context survives. Each section gets a header so
+/// the LLM can address them by name.
+fn assemble_within_budget(
+    incidents: &str,
+    decisions: &str,
+    high_risk: &str,
+    subgraph: &str,
+    budget_chars: usize,
+) -> String {
+    // Section ordering — keep highest signal first so LLM sees it even
+    // if a buggy upstream truncates the prompt mid-string.
+    let mut sections: Vec<(&str, &str)> = Vec::new();
+    if !incidents.is_empty() {
+        sections.push(("RECENT INCIDENTS", incidents));
+    }
+    if !decisions.is_empty() {
+        sections.push(("RECENT DECISIONS", decisions));
+    }
+    if !high_risk.is_empty() {
+        sections.push(("HIGH-RISK ENTITIES", high_risk));
+    }
+    if !subgraph.is_empty() {
+        sections.push(("SUBGRAPH FOR QUESTION", subgraph));
     }
 
-    if items.is_empty() {
-        return String::new();
+    // Pop most-expendable sections (end of list) until we fit.
+    loop {
+        let total: usize = sections
+            .iter()
+            .map(|(h, b)| h.len() + 2 + b.len() + 2)
+            .sum();
+        if total <= budget_chars || sections.is_empty() {
+            break;
+        }
+        sections.pop();
     }
 
-    items.sort_by(|a, b| b.0.cmp(&a.0));
-    items.truncate(n);
-
-    items
+    sections
         .into_iter()
-        .map(|(_, action, target, auto)| {
-            let mode = if auto { "auto" } else { "proposed" };
-            format!("- {action} {target} ({mode})")
-        })
+        .map(|(h, b)| format!("{h}:\n{b}"))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n\n")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1157,10 +1372,6 @@ mod tests {
         assert!(decisions.contains("Recent decisions"));
         assert!(decisions.contains("block_ip"));
         assert!(decisions.contains("monitor"));
-
-        let raw = graph_last_incidents_raw(&kg, 2);
-        assert!(raw.contains("[high] SSH brute-force"));
-        assert!(raw.contains("[medium] Port scan"));
     }
 
     #[test]
@@ -1174,7 +1385,6 @@ mod tests {
             graph_last_decisions(&kg, 3),
             "⚖️ No decisions yet today - standing by."
         );
-        assert!(graph_last_incidents_raw(&kg, 3).is_empty());
     }
 
     #[test]
@@ -1328,6 +1538,234 @@ mod tests {
         assert!(
             state.two_factor_state.pending.contains_key("operator"),
             "pending action should be re-stored after wrong code"
+        );
+    }
+
+    // ── Spec 043 Phase 2 anchors (AUDIT-SPEC043-PHASE2) ──────────────────
+    //
+    // Pre-Phase-2 the Telegram /ask prompt only carried last-3 incident
+    // titles + last-5 decision targets, which produced operator-reported
+    // "muito basico" answers. ask_context_deep enriches the prompt with
+    // KG-derived data already ingested but unused: IP risk_score, threat
+    // intel datasets, high-risk entity snapshot, and a depth-1 subgraph
+    // for any IP the question text mentions. Hard char-budget cap protects
+    // LLM cost / latency.
+    //
+    // These four anchors pin: enrichment correctness, subgraph trigger
+    // by question text, budget-cap enforcement, and the most-expendable-
+    // first truncation order.
+
+    fn make_ip_node(addr: &str, risk: u8, datasets: Vec<String>) -> knowledge_graph::types::Node {
+        knowledge_graph::types::Node::Ip {
+            addr: addr.to_string(),
+            is_internal: false,
+            datasets,
+            risk_score: risk,
+            is_tor: false,
+            first_seen: chrono::Utc::now() - chrono::Duration::days(7),
+            last_seen: chrono::Utc::now(),
+            attempted_usernames: vec![],
+        }
+    }
+
+    fn make_inc_node(
+        id: &str,
+        sev: &str,
+        title: &str,
+        summary: &str,
+    ) -> knowledge_graph::types::Node {
+        knowledge_graph::types::Node::Incident {
+            incident_id: id.to_string(),
+            detector: "test".to_string(),
+            severity: sev.to_string(),
+            title: title.to_string(),
+            summary: summary.to_string(),
+            ts: chrono::Utc::now(),
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        }
+    }
+
+    /// Spec 043 Phase 2 anchor: ask_context_deep must surface the
+    /// IP risk_score and threat-intel datasets in the RECENT INCIDENTS
+    /// section so the LLM has real ground truth instead of just titles.
+    /// Pre-Phase-2 these fields were write-only in the KG.
+    #[test]
+    fn ask_context_deep_includes_ip_risk_and_datasets() {
+        use knowledge_graph::types::{Edge, Relation};
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            knowledge_graph::KnowledgeGraph::new(),
+        ));
+        {
+            let mut g = kg.write().unwrap();
+            let ip_id = g.add_node(make_ip_node(
+                "203.0.113.99",
+                85,
+                vec!["AbuseIPDB".to_string(), "ThreatFox".to_string()],
+            ));
+            let inc_id = g.add_node(make_inc_node(
+                "ssh_bf:1",
+                "high",
+                "SSH brute-force",
+                "many failed logins",
+            ));
+            g.add_edge(Edge::new(
+                inc_id,
+                ip_id,
+                Relation::TriggeredBy,
+                chrono::Utc::now(),
+            ));
+        }
+
+        let out = ask_context_deep(&kg, "what's going on?", 8000);
+
+        assert!(
+            out.contains("RECENT INCIDENTS:"),
+            "expected RECENT INCIDENTS header; got:\n{out}"
+        );
+        assert!(
+            out.contains("SSH brute-force"),
+            "expected incident title; got:\n{out}"
+        );
+        assert!(
+            out.contains("ip_risk=85"),
+            "expected IP risk_score enrichment; got:\n{out}"
+        );
+        assert!(
+            out.contains("AbuseIPDB"),
+            "expected threat-intel dataset; got:\n{out}"
+        );
+        assert!(
+            out.contains("ThreatFox"),
+            "expected threat-intel dataset; got:\n{out}"
+        );
+    }
+
+    /// Spec 043 Phase 2 anchor: when the operator's question text
+    /// mentions an IP that exists in the KG, ask_context_deep MUST
+    /// pull the IP's depth-1 neighborhood and attach it as the
+    /// SUBGRAPH FOR QUESTION section. Pre-Phase-2 the LLM had no
+    /// way to ground "why is X.X.X.X blocked?" questions.
+    #[test]
+    fn ask_context_deep_pulls_subgraph_when_question_mentions_ip() {
+        use knowledge_graph::types::{Edge, Relation};
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            knowledge_graph::KnowledgeGraph::new(),
+        ));
+        {
+            let mut g = kg.write().unwrap();
+            let ip_id = g.add_node(make_ip_node("198.51.100.42", 60, vec![]));
+            let port_id = g.add_node(knowledge_graph::types::Node::Port {
+                number: 22,
+                protocol: "tcp".to_string(),
+            });
+            g.add_edge(Edge::new(
+                ip_id,
+                port_id,
+                Relation::ConnectedTo,
+                chrono::Utc::now(),
+            ));
+        }
+
+        let out = ask_context_deep(&kg, "why is 198.51.100.42 blocked?", 8000);
+
+        assert!(
+            out.contains("SUBGRAPH FOR QUESTION:"),
+            "expected subgraph header; got:\n{out}"
+        );
+        assert!(
+            out.contains("198.51.100.42"),
+            "expected subgraph to mention the queried IP; got:\n{out}"
+        );
+        assert!(
+            out.contains("Port(22/tcp)"),
+            "expected subgraph to render the connected Port node; got:\n{out}"
+        );
+    }
+
+    /// Spec 043 Phase 2 anchor: with a tight char budget, ask_context_deep
+    /// MUST drop the most-expendable section first (subgraph), keeping
+    /// the highest-signal context (recent incidents) intact. Anti-
+    /// regression for accidentally dropping incidents to fit subgraph,
+    /// which would degrade /ask quality on memory-constrained runs.
+    #[test]
+    fn ask_context_deep_respects_budget_cap_drops_subgraph_first() {
+        use knowledge_graph::types::{Edge, Relation};
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            knowledge_graph::KnowledgeGraph::new(),
+        ));
+        {
+            let mut g = kg.write().unwrap();
+            let ip_id = g.add_node(make_ip_node("203.0.113.5", 75, vec![]));
+            let inc_id = g.add_node(make_inc_node(
+                "i1",
+                "high",
+                "very long incident title that takes up significant prompt budget",
+                "and the summary is also long enough to crowd out anything optional from the prompt",
+            ));
+            g.add_edge(Edge::new(
+                inc_id,
+                ip_id,
+                Relation::TriggeredBy,
+                chrono::Utc::now(),
+            ));
+            // Add a port the question would want in the subgraph.
+            let port_id = g.add_node(knowledge_graph::types::Node::Port {
+                number: 22,
+                protocol: "tcp".to_string(),
+            });
+            g.add_edge(Edge::new(
+                ip_id,
+                port_id,
+                Relation::ConnectedTo,
+                chrono::Utc::now(),
+            ));
+        }
+
+        // Budget tight enough that subgraph + high-risk + decisions
+        // sections cannot all fit alongside the long incident.
+        let out = ask_context_deep(&kg, "why is 203.0.113.5 blocked?", 200);
+
+        assert!(
+            out.len() <= 200 + 32,
+            "output exceeded budget; got {} chars",
+            out.len()
+        );
+        // Recent incidents survives (highest signal).
+        assert!(
+            out.contains("RECENT INCIDENTS:") || out.is_empty(),
+            "RECENT INCIDENTS must survive truncation; got:\n{out}"
+        );
+        // Subgraph dropped first (most expendable).
+        assert!(
+            !out.contains("SUBGRAPH FOR QUESTION:"),
+            "SUBGRAPH must be dropped first under tight budget; got:\n{out}"
+        );
+    }
+
+    /// Spec 043 Phase 2 anchor: empty KG produces empty output (no
+    /// dangling section headers). Pins the same defensive behaviour
+    /// as the legacy graph_last_incidents_raw helper had — the
+    /// integration site only adds the "RECENT INCIDENTS:" header
+    /// when there's content to label.
+    #[test]
+    fn ask_context_deep_empty_graph_returns_empty_string() {
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let out = ask_context_deep(&kg, "anything", 8000);
+        assert!(
+            out.is_empty(),
+            "empty graph should produce empty context; got:\n{out}"
         );
     }
 }

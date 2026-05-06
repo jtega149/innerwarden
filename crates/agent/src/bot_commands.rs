@@ -623,15 +623,21 @@ pub(crate) async fn handle_telegram_bot_command(
                 .date_naive()
                 .format("%Y-%m-%d")
                 .to_string();
-            // Inject full system context so the AI knows exactly what's configured
+            // Inject full system context so the AI knows exactly what's configured.
+            // Spec 043 Phase 2: replace the title-only `graph_last_incidents_raw`
+            // + `graph_last_decisions_raw` pair with `ask_context_deep`, which
+            // enriches the prompt with IP risk_score, threat-intel datasets,
+            // high-risk entity snapshot, and a depth-1 subgraph for any IP the
+            // operator's question text mentions. Pre-Phase-2 the answer was
+            // operator-reported "muito basico" because the LLM had no signal
+            // beyond manchetes. Hard 8000-char cap protects LLM cost / latency.
             let agent_ctx = build_agent_context(cfg, data_dir, &state.knowledge_graph);
-            let recent_incidents = bot_helpers::graph_last_incidents_raw(&state.knowledge_graph, 3);
-            let recent_decisions = bot_helpers::graph_last_decisions_raw(&state.knowledge_graph, 5);
+            let deep_ctx = bot_helpers::ask_context_deep(&state.knowledge_graph, &question, 8000);
             let system_prompt = crate::agent_context::compose_system_prompt(
                 &cfg.telegram.bot.personality,
                 &agent_ctx,
-                &recent_incidents,
-                &recent_decisions,
+                &deep_ctx,
+                "",
             );
 
             // Spec 029 PR-C.2: `/ask` is operator-facing free-form
