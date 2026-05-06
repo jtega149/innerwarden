@@ -522,6 +522,12 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/process/incidents.rs::tests::try_kg_fp_suppression_critical_severity_never_suppressed_via_wiring` - wiring layer Critical floor anchor: even at likelihood = 1.0 in enforce mode, Critical severity returns false. Mirror of the pure-helper anchor — defends both layers in case one regresses.
 - `crates/agent/src/process/incidents.rs::tests::try_kg_fp_suppression_enforce_mode_passthrough_for_low_likelihood` - wiring layer anchor: enforce mode + IP not in KG (likelihood = 0.0) returns false (PassThrough). Pins the no-handle path so a future refactor that defaults likelihood to >0 doesn't accidentally suppress unknown IPs.
 
+### Honeypot AbuseIPDB-gate KG audit helper (Spec 043 Phase 1b follow-up — scaffolding)
+
+- `crates/agent/src/honeypot_always_on.rs::tests::kg_audit_features_for_block_returns_none_when_kg_absent` - sync anchor for the `kg = None` branch of the audit helper. Pins the no-KG short-circuit so a future caller wiring up the audit hook can rely on it.
+- `crates/agent/src/honeypot_always_on.rs::tests::kg_audit_features_for_block_returns_none_for_unknown_ip` - sync anchor: KG present, IP not yet a node returns `None`. Pins the defensive contract that an unknown IP yields no log spam.
+- `crates/agent/src/honeypot_always_on.rs::tests::kg_audit_features_for_block_returns_features_for_known_ip` - sync anchor: IP seeded as `Node::Ip` with a 10-day-old `first_seen` returns features carrying the seeded `risk_score` and a non-zero `first_seen_age_days`. Pins the field-level contract that a future `tracing::info!` audit log will consume.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

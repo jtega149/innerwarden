@@ -603,6 +603,28 @@ pub(crate) async fn run_always_on_honeypot(
     }
 }
 
+/// Spec 043 Phase 1b follow-up: read KG features for an IP at
+/// block-time, returning `None` when there is no KG, the lock is
+/// poisoned, or the IP has no node yet.
+///
+/// Scaffolding for the planned AbuseIPDB-gate audit hook: a future
+/// PR threads `kg` through `run_always_on_honeypot` and calls this
+/// helper from `always_on_abuseipdb_block` to emit a
+/// `tracing::info!` snapshot of the IP's KG state at block-time.
+/// Audit is observability-only (AbuseIPDB score=100 already maxes
+/// out the modifier; no decision change). Shipped now as a tested
+/// helper so the wiring PR is small and easy to review.
+#[allow(dead_code)]
+pub(crate) fn kg_audit_features_for_block(
+    kg: Option<&Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>>,
+    ip: &str,
+) -> Option<crate::kg_decide_features::KgDecideFeatures> {
+    let kg = kg?;
+    let graph = kg.read().ok()?;
+    let now = chrono::Utc::now();
+    crate::kg_decide_features::extract_features_for_ip(&graph, ip, now)
+}
+
 /// Write an AbuseIPDB-triggered block audit entry and execute the block skill.
 #[allow(clippy::too_many_arguments)]
 async fn always_on_abuseipdb_block(
@@ -1137,5 +1159,54 @@ mod tests {
             captured_str.contains("error="),
             "error field missing, got: {captured_str}"
         );
+    }
+
+    /// Spec 043 Phase 1b follow-up: sync coverage of the audit helper
+    /// with kg=None. Anchor for the no-KG branch.
+    #[test]
+    fn kg_audit_features_for_block_returns_none_when_kg_absent() {
+        let out = kg_audit_features_for_block(None, "198.51.100.50");
+        assert!(out.is_none(), "kg=None must short-circuit to None");
+    }
+
+    /// Spec 043 Phase 1b follow-up: sync coverage of the audit helper
+    /// when the IP has no node yet (KG present, lookup miss).
+    #[test]
+    fn kg_audit_features_for_block_returns_none_for_unknown_ip() {
+        let kg = Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let out = kg_audit_features_for_block(Some(&kg), "203.0.113.99");
+        assert!(out.is_none(), "unknown IP must yield None");
+    }
+
+    /// Spec 043 Phase 1b follow-up: sync coverage of the audit helper
+    /// happy path. IP seeded as Node::Ip with a 10-day-old first_seen
+    /// → features must come back with a non-zero age and the seeded
+    /// risk_score. Pins the field-level contract that the tracing
+    /// macro consumes.
+    #[test]
+    fn kg_audit_features_for_block_returns_features_for_known_ip() {
+        let kg = Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        {
+            let mut g = kg.write().unwrap();
+            g.add_node(crate::knowledge_graph::types::Node::Ip {
+                addr: "198.51.100.42".to_string(),
+                is_internal: false,
+                datasets: vec![],
+                risk_score: 73,
+                is_tor: false,
+                first_seen: chrono::Utc::now() - chrono::Duration::days(10),
+                last_seen: chrono::Utc::now(),
+                attempted_usernames: vec![],
+            });
+        }
+        let features = kg_audit_features_for_block(Some(&kg), "198.51.100.42")
+            .expect("seeded IP must yield Some(features)");
+        assert_eq!(features.risk_score, 73);
+        assert!(features.first_seen_age_days >= 9);
+        assert_eq!(features.prior_incidents_24h, 0);
     }
 }
