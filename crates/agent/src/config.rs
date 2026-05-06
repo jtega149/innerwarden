@@ -221,6 +221,19 @@ pub struct KgConfig {
     /// patterns; raise on slow hardware where legit tools dip below.
     #[serde(default = "default_short_lived_process_threshold_ms")]
     pub short_lived_process_threshold_ms: u64,
+    /// Phase 7: KG-based FP suppression. Same tri-state pattern as
+    /// `decide_modifier_mode`. Default `"shadow"` — the helper writes
+    /// `kg_shadow_fp_suppression_<DATE>.jsonl` records but does NOT
+    /// suppress until operator promotes to `"enforce"`. Critical
+    /// floor is hardcoded (Critical incidents NEVER suppressed).
+    #[serde(default = "default_fp_suppression_mode")]
+    pub fp_suppression_mode: String,
+    /// Phase 7 threshold: incidents with FP likelihood >= this value
+    /// get suppressed (write dismiss decision, skip routing) when
+    /// `fp_suppression_mode = "enforce"`. Default 0.80 per spec.
+    /// Operator-tunable for tighter / looser suppression.
+    #[serde(default = "default_fp_suppress_threshold")]
+    pub fp_suppress_threshold: f32,
 }
 
 impl Default for KgConfig {
@@ -233,6 +246,8 @@ impl Default for KgConfig {
             packed_binary_entropy_threshold: default_packed_binary_entropy_threshold(),
             short_lived_process_detector_enabled: false,
             short_lived_process_threshold_ms: default_short_lived_process_threshold_ms(),
+            fp_suppression_mode: default_fp_suppression_mode(),
+            fp_suppress_threshold: default_fp_suppress_threshold(),
         }
     }
 }
@@ -243,6 +258,14 @@ fn default_packed_binary_entropy_threshold() -> f32 {
 
 fn default_short_lived_process_threshold_ms() -> u64 {
     100
+}
+
+fn default_fp_suppression_mode() -> String {
+    "shadow".to_string()
+}
+
+fn default_fp_suppress_threshold() -> f32 {
+    0.80
 }
 
 fn default_kg_decide_modifier_mode() -> String {

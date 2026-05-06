@@ -347,6 +347,19 @@ pub(crate) async fn process_incidents(
             continue;
         }
 
+        // Spec 043 Phase 7 — KG-based FP suppression (shadow-first).
+        // Generic suppression that runs AFTER the targeted
+        // self-traffic-FP and CDN-noise paths so those keep their
+        // narrow, easily-audited reasons in the JSONL. Phase 7 is
+        // the catch-all: any incident whose primary entity has a
+        // strongly benign KG history gets suppressed (or in shadow,
+        // logged for operator review). Critical floor is hardcoded
+        // in `kg_fp_suppression::classify`.
+        if try_kg_fp_suppression(incident, cfg, state, data_dir) {
+            handled += 1;
+            continue;
+        }
+
         // VirusTotal enrichment: when YARA scanner detects a binary, check its
         // SHA-256 hash against VT. Result logged for operator context.
         if incident.incident_id.starts_with("yara_scan:") {
@@ -730,6 +743,143 @@ pub(crate) async fn process_incidents(
     handled
 }
 
+/// Spec 043 Phase 7 wiring — generic KG-based FP suppression. Runs
+/// AFTER the targeted self-traffic-FP and CDN-noise paths so those
+/// keep their narrow audit-trail reasons. This is the catch-all:
+/// any incident whose primary entity has a strongly benign KG
+/// history gets suppressed.
+///
+/// Returns `true` when the incident was handled (suppressed in
+/// `enforce` mode). Returns `false` for shadow / off / pass-through.
+/// Critical floor is enforced inside `kg_fp_suppression::classify`
+/// — Critical incidents NEVER reach the suppress branch.
+fn try_kg_fp_suppression(
+    incident: &innerwarden_core::incident::Incident,
+    cfg: &crate::config::AgentConfig,
+    state: &mut crate::AgentState,
+    data_dir: &Path,
+) -> bool {
+    use crate::kg_fp_suppression::{
+        classify, fp_likelihood, make_shadow_record, parse_mode, write_shadow_log, FpAction,
+        FpSuppressionMode,
+    };
+
+    let mode = parse_mode(&cfg.kg.fp_suppression_mode);
+    if matches!(mode, FpSuppressionMode::Off) {
+        return false;
+    }
+
+    // Compute likelihood + classify under read lock.
+    let (likelihood, action, features) = {
+        let kg = match state.knowledge_graph.read() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(
+                    "kg_fp_suppression: knowledge_graph lock poisoned: {e}; \
+                     skipping suppression check"
+                );
+                return false;
+            }
+        };
+        let now = chrono::Utc::now();
+        let likelihood = fp_likelihood(&kg, incident, now);
+        let action = classify(likelihood, &incident.severity, cfg.kg.fp_suppress_threshold);
+        // Reach back into kg_decide_features for the same feature set
+        // we'd log; OK to skip if extract_features returns None.
+        let features = crate::kg_decide_features::extract_features(&kg, incident, now).unwrap_or(
+            crate::kg_decide_features::KgDecideFeatures {
+                prior_incidents_24h: 0,
+                benign_history_score: 0.5,
+                related_campaigns: 0,
+                cluster_size: 0,
+                risk_score: 0,
+                first_seen_age_days: 0,
+            },
+        );
+        (likelihood, action, features)
+    };
+
+    // Shadow mode: log + return false (passthrough). Operator inspects
+    // log to validate before promoting.
+    if matches!(mode, FpSuppressionMode::Shadow) {
+        let record = make_shadow_record(incident, likelihood, action, features, chrono::Utc::now());
+        write_shadow_log(data_dir, &record);
+        if matches!(action, FpAction::Suppress) {
+            tracing::info!(
+                incident_id = %incident.incident_id,
+                likelihood,
+                "kg_fp_suppression: shadow — would have suppressed"
+            );
+        }
+        return false;
+    }
+
+    // Enforce mode + Suppress: write dismiss decision, return handled.
+    if !matches!(action, FpAction::Suppress) {
+        return false;
+    }
+
+    let primary_ip = incident
+        .entities
+        .iter()
+        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+        .map(|e| e.value.clone());
+    let reason = format!(
+        "Auto-dismissed by Spec 043 Phase 7 (KG FP suppression): \
+         likelihood={:.2} (threshold {:.2}). Entity has strongly benign \
+         KG history (benign_history={:.2}, prior_24h={}, age={}d, \
+         risk={}). See kg_shadow_fp_suppression_*.jsonl for the \
+         per-evaluation audit trail.",
+        likelihood,
+        cfg.kg.fp_suppress_threshold,
+        features.benign_history_score,
+        features.prior_incidents_24h,
+        features.first_seen_age_days,
+        features.risk_score
+    );
+    let entry = crate::decisions::DecisionEntry {
+        ts: chrono::Utc::now(),
+        incident_id: incident.incident_id.clone(),
+        host: incident.host.clone(),
+        ai_provider: "kg-fp-suppression".to_string(),
+        action_type: "dismiss".to_string(),
+        target_ip: primary_ip,
+        target_user: None,
+        skill_id: None,
+        confidence: likelihood,
+        auto_executed: true,
+        dry_run: false,
+        reason: reason.clone(),
+        estimated_threat: "none".to_string(),
+        execution_result: "dismissed".to_string(),
+        prev_hash: None,
+    };
+    if let Some(writer) = &mut state.decision_writer {
+        if let Err(e) = writer.write(&entry) {
+            tracing::warn!("kg_fp_suppression: failed to write dismiss: {e:#}");
+            return false;
+        }
+    }
+    {
+        let mut graph = state.knowledge_graph.write().unwrap();
+        graph.ingest_decision(
+            &incident.incident_id,
+            "dismiss",
+            None,
+            likelihood,
+            &reason,
+            true,
+            chrono::Utc::now(),
+        );
+    }
+    tracing::info!(
+        incident_id = %incident.incident_id,
+        likelihood,
+        "kg_fp_suppression: enforce — incident suppressed"
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,5 +981,237 @@ mod tests {
             process_incidents(dir.path(), &mut cursor, &cfg, &mut state, &advisory_cache()).await;
 
         assert_eq!(handled, 1);
+    }
+
+    // ── Spec 043 Phase 7 wiring anchors (try_kg_fp_suppression) ────────
+    //
+    // The pure helpers (fp_likelihood, classify, parse_mode,
+    // write_shadow_log) have unit tests in `kg_fp_suppression.rs`.
+    // These integration tests cover the wiring in `try_kg_fp_suppression`:
+    // mode dispatch, KG read-lock recovery, decision write in enforce
+    // mode, log write in shadow mode, no-op when Off / PassThrough.
+
+    fn make_fp_test_incident(
+        ip: &str,
+        sev: innerwarden_core::event::Severity,
+    ) -> innerwarden_core::incident::Incident {
+        use innerwarden_core::entities::EntityRef;
+        innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: format!(
+                "test_phase7:{ip}:{}",
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ),
+            severity: sev,
+            title: "phase 7 wiring test".to_string(),
+            summary: String::new(),
+            evidence: serde_json::Value::Null,
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip(ip)],
+        }
+    }
+
+    /// Seed an IP with N dismissed-Medium incidents so its
+    /// `benign_history_score` is 1.0 (combined with the Phase 1 tweak
+    /// that counts dismiss as benign). Crosses the 0.80 suppress
+    /// threshold cleanly: history * 0.70 = 0.70 ... well actually 0.70
+    /// alone is BELOW 0.80. We need at least one false_positive=true
+    /// edge to push past via the bonus. Adds 5 FP edges to ensure
+    /// likelihood >= 0.95.
+    fn seed_strongly_benign_history(
+        kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+        ip: &str,
+    ) {
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        use chrono::{Duration, Utc};
+        let mut g = kg.write().unwrap();
+        let now = Utc::now();
+        let ip_id = g.add_node(Node::Ip {
+            addr: ip.to_string(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 5,
+            is_tor: false,
+            first_seen: now - Duration::days(30),
+            last_seen: now,
+            attempted_usernames: vec![],
+        });
+        // 10 dismissed-Medium → benign_history_score = 1.0
+        // 5 false_positive=true → bonus capped at 0.30
+        // → likelihood = 1.0 * 0.70 + 0.30 = 1.0 (clamp)
+        for i in 0..10 {
+            let inc = g.add_node(Node::Incident {
+                incident_id: format!("benign:{i}"),
+                detector: "test".to_string(),
+                severity: "medium".to_string(),
+                title: "benign".to_string(),
+                summary: String::new(),
+                ts: now - Duration::hours(6),
+                mitre_ids: vec![],
+                decision: Some("dismiss".to_string()),
+                confidence: None,
+                decision_reason: None,
+                decision_target: None,
+                auto_executed: false,
+                is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
+                research_only: false,
+            });
+            g.add_edge(Edge::new(
+                inc,
+                ip_id,
+                Relation::TriggeredBy,
+                now - Duration::hours(6),
+            ));
+        }
+        for i in 0..5 {
+            let inc = g.add_node(Node::Incident {
+                incident_id: format!("fp:{i}"),
+                detector: "test".to_string(),
+                severity: "high".to_string(),
+                title: "fp".to_string(),
+                summary: String::new(),
+                ts: now - Duration::hours(6),
+                mitre_ids: vec![],
+                decision: None,
+                confidence: None,
+                decision_reason: None,
+                decision_target: None,
+                auto_executed: false,
+                is_allowlisted: false,
+                false_positive: true,
+                fp_reporter: Some("operator".to_string()),
+                fp_reported_at: Some(now - Duration::hours(5)),
+                research_only: false,
+            });
+            g.add_edge(Edge::new(
+                inc,
+                ip_id,
+                Relation::TriggeredBy,
+                now - Duration::hours(6),
+            ));
+        }
+    }
+
+    /// Phase 7 wiring anchor: with `mode = "off"`, the helper returns
+    /// false immediately, no log written, no decision written.
+    #[test]
+    fn try_kg_fp_suppression_off_mode_is_noop() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.fp_suppression_mode = "off".to_string();
+        let inc = make_fp_test_incident("203.0.113.50", innerwarden_core::event::Severity::High);
+        let handled = try_kg_fp_suppression(&inc, &cfg, &mut state, dir.path());
+        assert!(!handled, "off mode must return false");
+        // No shadow log file should have been created.
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let log = dir
+            .path()
+            .join(format!("kg_shadow_fp_suppression_{}.jsonl", date));
+        assert!(!log.exists(), "off mode must not write shadow log");
+    }
+
+    /// Phase 7 wiring anchor: shadow mode writes the JSONL log AND
+    /// returns false (no suppression). Pre-fix this would have been
+    /// the only operator-visible difference — the dismiss decision
+    /// must NOT be written in shadow.
+    #[test]
+    fn try_kg_fp_suppression_shadow_mode_logs_but_does_not_handle() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.fp_suppression_mode = "shadow".to_string();
+        let ip = "203.0.113.51";
+        seed_strongly_benign_history(&state.knowledge_graph, ip);
+        let inc = make_fp_test_incident(ip, innerwarden_core::event::Severity::High);
+        let handled = try_kg_fp_suppression(&inc, &cfg, &mut state, dir.path());
+        assert!(
+            !handled,
+            "shadow mode must NEVER return true (no suppression)"
+        );
+        // Shadow log file MUST exist.
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let log = dir
+            .path()
+            .join(format!("kg_shadow_fp_suppression_{}.jsonl", date));
+        assert!(log.exists(), "shadow mode must write log file");
+        let body = std::fs::read_to_string(&log).expect("read");
+        assert!(body.contains(&inc.incident_id));
+        assert!(body.contains("\"action\":\"suppress\""));
+        assert!(body.contains("\"would_change_action\":true"));
+    }
+
+    /// Phase 7 wiring anchor: enforce mode + likelihood >= threshold +
+    /// non-Critical → writes dismiss decision AND returns true (handled).
+    #[test]
+    fn try_kg_fp_suppression_enforce_mode_writes_dismiss_for_high_likelihood() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.fp_suppression_mode = "enforce".to_string();
+        let ip = "203.0.113.52";
+        seed_strongly_benign_history(&state.knowledge_graph, ip);
+        let inc = make_fp_test_incident(ip, innerwarden_core::event::Severity::Medium);
+        let handled = try_kg_fp_suppression(&inc, &cfg, &mut state, dir.path());
+        assert!(
+            handled,
+            "enforce mode must return true (handled) when likelihood >= threshold"
+        );
+        // Decision JSONL must contain the dismiss with ai_provider="kg-fp-suppression"
+        let decisions_path = dir.path().join(format!(
+            "decisions-{}.jsonl",
+            chrono::Local::now().date_naive().format("%Y-%m-%d")
+        ));
+        assert!(decisions_path.exists(), "decision file must be created");
+        let body = std::fs::read_to_string(&decisions_path).expect("read");
+        assert!(
+            body.contains("\"ai_provider\":\"kg-fp-suppression\""),
+            "decision must be tagged with kg-fp-suppression provider; got: {body}"
+        );
+        assert!(body.contains(&inc.incident_id));
+    }
+
+    /// Phase 7 wiring anchor: the Critical floor holds at the wiring
+    /// layer too. Even with strongly benign history (likelihood == 1.0)
+    /// and enforce mode, a Critical incident MUST return false (not
+    /// handled, not suppressed). Mirror of the pure helper anchor.
+    #[test]
+    fn try_kg_fp_suppression_critical_severity_never_suppressed_via_wiring() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.fp_suppression_mode = "enforce".to_string();
+        let ip = "203.0.113.53";
+        seed_strongly_benign_history(&state.knowledge_graph, ip);
+        let inc = make_fp_test_incident(ip, innerwarden_core::event::Severity::Critical);
+        let handled = try_kg_fp_suppression(&inc, &cfg, &mut state, dir.path());
+        assert!(
+            !handled,
+            "Critical severity MUST NEVER be suppressed even at likelihood=1.0 in enforce mode"
+        );
+    }
+
+    /// Phase 7 wiring anchor: enforce mode + low likelihood (no benign
+    /// history seeded) returns false. Pure helper covers this too but
+    /// the wiring path has its own early-return logic that needs an
+    /// anchor.
+    #[test]
+    fn try_kg_fp_suppression_enforce_mode_passthrough_for_low_likelihood() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.fp_suppression_mode = "enforce".to_string();
+        // No KG seeding → IP is not in graph → likelihood = 0.0
+        let inc = make_fp_test_incident("203.0.113.54", innerwarden_core::event::Severity::High);
+        let handled = try_kg_fp_suppression(&inc, &cfg, &mut state, dir.path());
+        assert!(
+            !handled,
+            "enforce mode must NOT suppress when likelihood is below threshold"
+        );
     }
 }

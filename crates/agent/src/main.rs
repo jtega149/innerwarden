@@ -123,6 +123,7 @@ mod incident_untouchable;
 mod ioc;
 mod ip_reputation;
 mod kg_decide_features;
+mod kg_fp_suppression;
 mod killchain_inline;
 mod knowledge_graph;
 mod loops;
