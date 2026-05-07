@@ -536,4 +536,238 @@ mod tests {
             decision.reason
         );
     }
+
+    // ── Coverage anchors (AUDIT-COVERAGE-INCIDENT-DECISION-EVAL) ───────
+    //
+    // The five tests above pin the spec-043 contract and the existing
+    // anomaly-take-on-low-score behaviour. The four anchors below cover
+    // the other branches of `apply_correlation_boost_and_log_decision`
+    // and `apply_kg_decide_modifier` so a regression that silently
+    // disables one of those legacy enrichment paths gets caught.
+
+    #[test]
+    fn correlation_disabled_skips_cross_detector_boost() {
+        // When `correlation.enabled = false` the function MUST NOT call
+        // into the temporal correlator at all and the boosted_confidence
+        // tuple falls through with the original confidence + empty
+        // detector list. We verify by asserting that no `[correlated:` tag
+        // is added to the reason even though we prime the correlator with
+        // signal that would otherwise trigger a boost.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.correlation.enabled = false;
+        // Disable the kg modifier path too so the test isolates the
+        // correlation toggle (otherwise a stray kg tag could hide the
+        // regression we're trying to anchor).
+        cfg.kg.decide_modifier_mode = "off".to_string();
+
+        let ip = "203.0.113.60";
+        // Prime the correlator. If the early-return is broken these
+        // would yield a `[correlated: ...]` tag downstream.
+        let i1 = crate::tests::test_incident_with_kind(ip, "ssh_bruteforce");
+        let i2 = crate::tests::test_incident_with_kind(ip, "port_scan");
+        let _ = correlation::cross_detector_boost(&mut state.correlator, &i1, 0.6);
+        let _ = correlation::cross_detector_boost(&mut state.correlator, &i2, 0.6);
+
+        let trigger = crate::tests::test_incident_with_kind(ip, "credential_stuffing");
+        let baseline_confidence = 0.5_f32;
+        let mut decision = ai::AiDecision {
+            action: ai::AiAction::Ignore {
+                reason: "test".into(),
+            },
+            confidence: baseline_confidence,
+            auto_execute: false,
+            reason: "baseline".into(),
+            alternatives: vec![],
+            estimated_threat: "low".into(),
+        };
+
+        apply_correlation_boost_and_log_decision(
+            &trigger,
+            &cfg,
+            &mut state,
+            &mut decision,
+            dir.path(),
+        );
+
+        // No correlation tag, no kg tag, no anomaly boost -> reason
+        // remains exactly the baseline string and confidence unchanged.
+        assert_eq!(
+            decision.reason, "baseline",
+            "with correlation disabled and no other enrichments, reason must be untouched"
+        );
+        assert!(
+            (decision.confidence - baseline_confidence).abs() < f32::EPSILON,
+            "with correlation disabled, confidence must NOT move; got {}",
+            decision.confidence
+        );
+    }
+
+    #[test]
+    fn attacker_profile_high_risk_boosts_confidence_and_tags_reason() {
+        // risk_score > 50 with confidence headroom must apply
+        // `(risk - 50) / 500` boost and tag the reason with
+        // `[intel: risk N, <pattern>, <visits> visits]`. Pin the formula
+        // and the tag shape: a regression that drops the boost or the
+        // tag silently demotes a known-attacker decision to AI baseline.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.decide_modifier_mode = "off".to_string();
+
+        let ip = "203.0.113.61";
+        let mut profile = crate::attacker_intel::new_profile(ip, chrono::Utc::now());
+        profile.risk_score = 100; // boost = (100 - 50) / 500 = 0.10
+        profile.visit_count = 7;
+        profile.dna.pattern_class = "regular_scanner".to_string();
+        state.attacker_profiles.insert(ip.to_string(), profile);
+
+        let trigger = crate::tests::test_incident_with_kind(ip, "ssh_bruteforce");
+        let baseline_confidence = 0.5_f32;
+        let mut decision = ai::AiDecision {
+            action: ai::AiAction::Ignore {
+                reason: "test".into(),
+            },
+            confidence: baseline_confidence,
+            auto_execute: false,
+            reason: "baseline".into(),
+            alternatives: vec![],
+            estimated_threat: "low".into(),
+        };
+
+        apply_correlation_boost_and_log_decision(
+            &trigger,
+            &cfg,
+            &mut state,
+            &mut decision,
+            dir.path(),
+        );
+
+        // 0.5 + 0.10 = 0.60 (not clamped).
+        assert!(
+            (decision.confidence - 0.60).abs() < 1e-4,
+            "risk=100 must boost confidence by exactly 0.10; got {}",
+            decision.confidence
+        );
+        assert!(
+            decision.reason.contains("[intel: risk 100"),
+            "intel tag missing the risk value; got: {}",
+            decision.reason
+        );
+        assert!(
+            decision.reason.contains("regular_scanner") && decision.reason.contains("7 visits"),
+            "intel tag must include pattern class and visit count; got: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn anomaly_score_above_threshold_boosts_confidence_and_tags_reason() {
+        // anomaly_score > 0.7 must apply a `(score - 0.7) * 0.33` boost
+        // capped by `min(1.0)` and tag the reason with
+        // `[neural: NN% anomaly]`. Anchor for the autoencoder agreement
+        // path that downstream operators rely on to distinguish "AI
+        // alone said block" vs "AI + anomaly engine agreed".
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.decide_modifier_mode = "off".to_string();
+        // Score 1.0 → boost = 0.099 ≈ 0.10 cap.
+        state.latest_anomaly_score = Some(1.0);
+
+        let trigger = crate::tests::test_incident_with_kind("198.51.100.10", "ssh_bruteforce");
+        let baseline_confidence = 0.5_f32;
+        let mut decision = ai::AiDecision {
+            action: ai::AiAction::Ignore {
+                reason: "test".into(),
+            },
+            confidence: baseline_confidence,
+            auto_execute: false,
+            reason: "baseline".into(),
+            alternatives: vec![],
+            estimated_threat: "low".into(),
+        };
+
+        apply_correlation_boost_and_log_decision(
+            &trigger,
+            &cfg,
+            &mut state,
+            &mut decision,
+            dir.path(),
+        );
+
+        // 0.5 + (1.0 - 0.7) * 0.33 = 0.599
+        assert!(
+            decision.confidence > baseline_confidence,
+            "anomaly_score>0.7 must boost confidence; got {}",
+            decision.confidence
+        );
+        assert!(
+            (decision.confidence - 0.599).abs() < 1e-3,
+            "boost formula drift: expected ~0.599 from score=1.0, got {}",
+            decision.confidence
+        );
+        assert!(
+            decision.reason.contains("[neural:") && decision.reason.contains("% anomaly]"),
+            "reason must carry the [neural: NN% anomaly] tag; got: {}",
+            decision.reason
+        );
+        // Score is consumed regardless of branch.
+        assert!(state.latest_anomaly_score.is_none());
+    }
+
+    #[test]
+    fn kg_decide_modifier_off_mode_is_full_noop() {
+        // mode = "off" must early-return BEFORE acquiring the kg lock or
+        // computing features. Anchor: even with rich KG state seeded the
+        // decision must be untouched and no shadow log file must be
+        // created. This pins the rollback-without-redeploy contract.
+        let dir = TempDir::new().expect("tempdir");
+        let state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.kg.decide_modifier_mode = "off".to_string();
+
+        let ip = "203.0.113.62";
+        seed_kg_with_benign_history(&state.knowledge_graph, ip);
+
+        let trigger = crate::tests::test_incident_with_kind(ip, "ssh_bruteforce");
+        let baseline_confidence = 0.90_f32;
+        let mut decision = ai::AiDecision {
+            action: ai::AiAction::Ignore {
+                reason: "test".into(),
+            },
+            confidence: baseline_confidence,
+            auto_execute: false,
+            reason: "baseline".into(),
+            alternatives: vec![],
+            estimated_threat: "low".into(),
+        };
+
+        apply_kg_decide_modifier(&trigger, &cfg, &state, &mut decision, dir.path());
+
+        // No mutation, no tag.
+        assert!(
+            (decision.confidence - baseline_confidence).abs() < f32::EPSILON,
+            "off mode must NOT change confidence; got {}",
+            decision.confidence
+        );
+        assert!(
+            !decision.reason.contains("[kg:"),
+            "off mode must NOT add the [kg: ...] tag; got: {}",
+            decision.reason
+        );
+
+        // Off mode must NOT create the shadow log file either — the
+        // operator's contract is that flipping mode→off is a true rollback.
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let log_path = dir
+            .path()
+            .join(format!("kg_shadow_decide_modifier_{}.jsonl", date));
+        assert!(
+            !log_path.exists(),
+            "off mode must NOT create the shadow log; found {}",
+            log_path.display()
+        );
+    }
 }

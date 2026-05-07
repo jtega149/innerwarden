@@ -198,6 +198,329 @@ mod tests {
     }
 
     #[test]
+    fn extract_target_ip_returns_none_when_entities_missing() {
+        // Valid JSON but no `entities` field at all → None.
+        let json = serde_json::json!({"summary": "no entities here"}).to_string();
+        assert_eq!(extract_target_ip(&json), None);
+    }
+
+    #[test]
+    fn extract_target_ip_returns_none_when_entities_is_not_array() {
+        // `entities` is present but not an array → None (as_array() fails).
+        let json = serde_json::json!({"entities": "not-an-array"}).to_string();
+        assert_eq!(extract_target_ip(&json), None);
+    }
+
+    #[test]
+    fn extract_target_ip_skips_empty_value_strings() {
+        // The `if !value.is_empty()` guard skips an IP entity with an
+        // empty value and falls through to the next one. Pins the
+        // contract that "first IP entity, but not a blank one" is what
+        // the dismiss-decision rows record as `target_ip`.
+        let json = serde_json::json!({
+            "entities": [
+                {"type": "ip", "value": ""},
+                {"type": "ip", "value": "198.51.100.7"},
+            ]
+        })
+        .to_string();
+        assert_eq!(extract_target_ip(&json), Some("198.51.100.7".to_string()));
+    }
+
+    #[test]
+    fn extract_target_ip_is_case_insensitive_on_kind() {
+        // The store records EntityRef kinds as lowercase ("ip"), but
+        // the orphan-recovery extractor uses `eq_ignore_ascii_case`
+        // so a future schema change that capitalises the type wouldn't
+        // silently drop target_ip from every dismiss row.
+        let json = serde_json::json!({
+            "entities": [{"type": "IP", "value": "203.0.113.99"}]
+        })
+        .to_string();
+        assert_eq!(extract_target_ip(&json), Some("203.0.113.99".to_string()));
+    }
+
+    #[test]
+    fn hostname_prefers_env_var_when_set() {
+        // The function tries HOSTNAME env var first; setting it makes
+        // the result deterministic regardless of /etc/hostname on the
+        // test box. Mirrors the precedent in
+        // `bot_helpers::local_hostname_for_audit_reads_env_var_when_set`
+        // which mutates the same env var the same way.
+        // SAFETY: cargo test parallelises across test cases but no
+        // other test in this binary touches HOSTNAME concurrently
+        // (verified by `rg "HOSTNAME" crates/agent/src/`); we restore
+        // the original below.
+        let prev = std::env::var("HOSTNAME").ok();
+        unsafe {
+            std::env::set_var("HOSTNAME", "orphan-recovery-test-host");
+        }
+        let h = hostname();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOSTNAME", v),
+                None => std::env::remove_var("HOSTNAME"),
+            }
+        }
+        assert_eq!(h, "orphan-recovery-test-host");
+        // Round-trip the contract the DecisionEntry::host field
+        // relies on: never empty.
+        assert!(!h.is_empty());
+    }
+
+    /// Build a minimal AgentState backed by a temp dir + a pre-seeded
+    /// SQLite store. Returns (state, data_dir tempdir handle, store
+    /// handle) so tests can both inspect post-sweep store state and
+    /// keep the tempdir alive for the duration of the test.
+    fn build_state_with_store(
+        tmp: &tempfile::TempDir,
+    ) -> (crate::AgentState, std::sync::Arc<innerwarden_store::Store>) {
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        // triage_test_state leaves sqlite_store = None. Open a real
+        // on-disk store inside the tempdir so the
+        // `decisions::append_chained` JSONL path and the SQLite mirror
+        // both exercise their happy paths under run_sweep.
+        let store = std::sync::Arc::new(
+            innerwarden_store::Store::open(tmp.path()).expect("open sqlite store"),
+        );
+        state.sqlite_store = Some(store.clone());
+        (state, store)
+    }
+
+    fn make_orphan(
+        id: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> innerwarden_core::incident::Incident {
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        innerwarden_core::incident::Incident {
+            ts,
+            host: "h".into(),
+            incident_id: id.into(),
+            severity: Severity::High,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("203.0.113.10")],
+        }
+    }
+
+    #[test]
+    fn run_sweep_returns_zero_when_sqlite_store_is_none() {
+        // Before the agent's slow_loop has finished its boot it can
+        // tick run_sweep with `state.sqlite_store == None` (e.g. the
+        // sqlite-reopen retry path). The function MUST early-return 0
+        // without panicking and without touching disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        assert!(state.sqlite_store.is_none());
+        let written = run_sweep(&mut state, tmp.path());
+        assert_eq!(written, 0, "no store → no decisions written");
+        // The triage_test_state DecisionWriter already creates an
+        // empty decisions-*.jsonl on construction; the early-return
+        // path must NOT have written any new content into it.
+        // (If a future change adds an unconditional write before the
+        // sqlite_store gate, every JSONL we discover here would have
+        // a non-zero size and this assertion would catch it.)
+        for entry in std::fs::read_dir(tmp.path()).unwrap().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("decisions-") && name_str.ends_with(".jsonl") {
+                let len = std::fs::metadata(entry.path()).unwrap().len();
+                assert_eq!(
+                    len, 0,
+                    "decisions JSONL must be empty when run_sweep early-returns: {name_str} has {len} bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_sweep_returns_zero_when_store_has_no_orphans() {
+        // Empty store → the inner `find_orphan_incidents` returns an
+        // empty vec → run_sweep early-returns 0 BEFORE the loop body
+        // and skips the info! log. Pins the empty-bucket fast path so
+        // a future refactor that always allocates a DecisionEntry
+        // shows up as a coverage regression here.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        let written = run_sweep(&mut state, tmp.path());
+        assert_eq!(written, 0);
+        assert_eq!(
+            store.decisions_count().unwrap(),
+            0,
+            "empty store → no decisions appended"
+        );
+    }
+
+    #[test]
+    fn run_sweep_writes_dismiss_decision_for_old_orphan() {
+        // End-to-end happy path:
+        // (1) old orphan inserted, no decision row;
+        // (2) run_sweep returns 1;
+        // (3) the SQLite mirror grew by exactly 1 decision row;
+        // (4) the new decision is for the right incident_id and
+        //     carries the orphan-recovery `ai_provider` label and
+        //     dismiss `action_type` so the audit log is honest about
+        //     who took the action.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan("old:orphan-1", two_hours_ago))
+            .unwrap();
+
+        let written = run_sweep(&mut state, tmp.path());
+
+        assert_eq!(written, 1, "exactly one orphan should have been swept");
+        assert_eq!(store.decisions_count().unwrap(), 1);
+
+        let rows = store.decisions_for_incident("old:orphan-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(
+            parsed.get("ai_provider").and_then(|v| v.as_str()),
+            Some(ORPHAN_AI_PROVIDER),
+            "audit log must label this row as orphan-recovery"
+        );
+        assert_eq!(
+            parsed.get("action_type").and_then(|v| v.as_str()),
+            Some("dismiss"),
+        );
+        // The reason text encodes age in `<H>h<M>m` form; pin the
+        // shape so a future format change is visible.
+        let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            reason.contains("orphan-recovery sweep"),
+            "reason must mention the sweep so the operator can grep for it: {reason}"
+        );
+        assert!(
+            reason.contains("h") && reason.contains("m"),
+            "reason must include the age-human <H>h<M>m fragment: {reason}"
+        );
+        // Decision JSONL file should also exist on disk (the agent
+        // operator-facing audit trail).
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let jsonl = tmp.path().join(format!("decisions-{today}.jsonl"));
+        assert!(jsonl.exists(), "decisions JSONL must be written");
+    }
+
+    #[test]
+    fn run_sweep_extracts_target_ip_from_incident_data() {
+        // The dismiss decision should carry the first IP entity of
+        // the orphan's stored JSON as `target_ip` so attacker-IP
+        // dashboards correctly attribute the auto-dismissed row.
+        // This pins the integration between extract_target_ip + the
+        // data column round-trip via SQLite.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan("old:orphan-with-ip", two_hours_ago))
+            .unwrap();
+
+        let written = run_sweep(&mut state, tmp.path());
+        assert_eq!(written, 1);
+
+        let rows = store.decisions_for_incident("old:orphan-with-ip").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(
+            parsed.get("target_ip").and_then(|v| v.as_str()),
+            Some("203.0.113.10"),
+            "target_ip must round-trip from the orphan's first IP entity"
+        );
+    }
+
+    #[test]
+    fn run_sweep_skips_fresh_and_decided_and_allowlisted_incidents() {
+        // Mirrors the SoT contract on `find_orphan_incidents` from one
+        // layer up: run_sweep must NOT touch incidents that are
+        // (a) fresh, (b) already have a decision, or (c) flagged
+        // is_allowlisted. Without this anchor a future bug that
+        // widens the SQL filter would silently auto-dismiss real
+        // pending-AI work.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        let now = chrono::Utc::now();
+        let two_hours_ago = now - chrono::Duration::hours(2);
+        let two_min_ago = now - chrono::Duration::minutes(2);
+
+        // (a) Fresh, decisionless → must be skipped.
+        store
+            .insert_incident(&make_orphan("fresh:1", two_min_ago))
+            .unwrap();
+
+        // (b) Old, but already has a decision → must be skipped.
+        store
+            .insert_incident(&make_orphan("old:already-decided", two_hours_ago))
+            .unwrap();
+        let pre_existing = innerwarden_store::decisions::DecisionRow {
+            ts: now.to_rfc3339(),
+            incident_id: "old:already-decided".into(),
+            action_type: "block_ip".into(),
+            target_ip: Some("203.0.113.10".into()),
+            target_user: None,
+            confidence: 1.0,
+            auto_executed: true,
+            reason: Some("preexisting".into()),
+            data: "{}".to_string(),
+        };
+        store.insert_decision(&pre_existing).unwrap();
+
+        // (c) Old, decisionless, but allowlisted → must be skipped.
+        store
+            .insert_incident(&make_orphan("old:trusted", two_hours_ago))
+            .unwrap();
+        store.set_incident_allowlisted("old:trusted").unwrap();
+
+        // (d) Old, decisionless, NOT allowlisted → MUST be swept.
+        store
+            .insert_incident(&make_orphan("old:real-orphan", two_hours_ago))
+            .unwrap();
+
+        let written = run_sweep(&mut state, tmp.path());
+        assert_eq!(
+            written, 1,
+            "only the (d) row qualifies; sweep wrote {written} decision(s)"
+        );
+
+        // Verify the decision touched only "old:real-orphan".
+        assert_eq!(
+            store
+                .decisions_for_incident("old:real-orphan")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store.decisions_for_incident("fresh:1").unwrap().is_empty(),
+            "fresh incident must not get a recovery decision"
+        );
+        assert!(
+            store
+                .decisions_for_incident("old:trusted")
+                .unwrap()
+                .is_empty(),
+            "allowlisted incident must not get a recovery decision"
+        );
+        // The pre-existing decision on "old:already-decided" remains
+        // the ONLY decision row for that incident — orphan-recovery
+        // must not stack a second one.
+        assert_eq!(
+            store
+                .decisions_for_incident("old:already-decided")
+                .unwrap()
+                .len(),
+            1,
+        );
+    }
+
+    #[test]
     fn find_orphan_incidents_returns_only_decisionless_old_rows() {
         // The store-level helper is what the slow_loop sweep iterates.
         // Anchor end-to-end here so a future schema change to incidents

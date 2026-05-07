@@ -539,4 +539,253 @@ mod tests {
         assert!(matches_skip_fase3("suspicious_execution:unknown", &skip));
         assert!(!matches_skip_fase3("ssh_bruteforce:1.2.3.4", &skip));
     }
+
+    // ----------------------------------------------------------------
+    // evaluate_pre_ai_flow integration coverage.
+    //
+    // The `decide_pre_ai_guard` truth-table tests above cover the pure
+    // logic. These tests cover the orchestration wrapper that does
+    // entity inspection, allowlist checks, AI-gate evaluation, cooldown
+    // lookups, and (for pipeline-test) writes a synthetic decision.
+    // ----------------------------------------------------------------
+
+    fn make_incident(
+        incident_id: &str,
+        severity: innerwarden_core::event::Severity,
+    ) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: incident_id.to_string(),
+            severity,
+            title: "test".to_string(),
+            summary: "test".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn evaluate_pre_ai_flow_pipeline_test_writes_acknowledgement_decision() {
+        // Invariant: incidents tagged "pipeline-test" must short-circuit to
+        // PipelineTestHandled and write a synthetic decision so `innerwarden
+        // test` operators see a fresh entry on the dashboard.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = crate::config::AgentConfig::default();
+        let mut incident = make_incident(
+            "ssh_bruteforce:8.8.8.7:test",
+            innerwarden_core::event::Severity::High,
+        );
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::ip("8.8.8.7"));
+        incident.tags.push("pipeline-test".to_string());
+
+        let blocked: HashSet<String> = HashSet::new();
+        let decision = evaluate_pre_ai_flow(&incident, &cfg, &mut state, true, &blocked, 0);
+
+        assert!(matches!(decision, PreAiFlowDecision::PipelineTestHandled));
+        // The decision writer should have flushed an entry to disk.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let decisions_path = dir.path().join(format!("decisions-{today}.jsonl"));
+        let body =
+            std::fs::read_to_string(&decisions_path).expect("pipeline-test decision file written");
+        assert!(
+            body.contains("pipeline-test"),
+            "ai_provider tag missing: {body}"
+        );
+        assert!(body.contains("test-ok"), "execution_result missing: {body}");
+        assert!(body.contains("8.8.8.7"), "target_ip missing: {body}");
+    }
+
+    #[test]
+    fn evaluate_pre_ai_flow_skips_when_ip_is_in_static_allowlist() {
+        // Invariant: a trusted IP in the static config allowlist forces
+        // SkipAllowlisted before any AI gate is consulted.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.allowlist.trusted_ips.push("8.8.8.5".to_string());
+        let mut incident = make_incident(
+            "ssh_bruteforce:8.8.8.5:test",
+            innerwarden_core::event::Severity::High,
+        );
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::ip("8.8.8.5"));
+
+        let decision = evaluate_pre_ai_flow(&incident, &cfg, &mut state, true, &HashSet::new(), 0);
+        assert!(matches!(decision, PreAiFlowDecision::SkipAllowlisted));
+    }
+
+    #[test]
+    fn evaluate_pre_ai_flow_skips_when_user_is_in_dynamic_allowlist() {
+        // Invariant: a trusted user in the dynamic (hot-reloaded)
+        // allowlist also routes to SkipAllowlisted. Pins that the
+        // user-allowlist branch is wired into is_allowlisted, not just
+        // the IP path.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.dynamic_trusted_users.push("deploy".to_string());
+        let cfg = crate::config::AgentConfig::default();
+        let mut incident = make_incident(
+            "sudo_abuse:deploy:test",
+            innerwarden_core::event::Severity::High,
+        );
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::user("deploy"));
+
+        let decision = evaluate_pre_ai_flow(&incident, &cfg, &mut state, true, &HashSet::new(), 0);
+        assert!(matches!(decision, PreAiFlowDecision::SkipAllowlisted));
+    }
+
+    #[test]
+    fn evaluate_pre_ai_flow_returns_skip_below_severity_for_low_severity_incidents() {
+        // Invariant: a Low-severity incident with default min_severity
+        // ("medium") is dominated by min_severity and routes to the
+        // dedicated SkipBelowSeverity branch (so the rule-based noise
+        // gate can pick it up).
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = crate::config::AgentConfig::default();
+        let mut incident = make_incident(
+            "port_scan:8.8.8.10:test",
+            innerwarden_core::event::Severity::Low,
+        );
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::ip("8.8.8.10"));
+
+        let decision = evaluate_pre_ai_flow(&incident, &cfg, &mut state, true, &HashSet::new(), 0);
+        assert!(matches!(decision, PreAiFlowDecision::SkipBelowSeverity));
+    }
+
+    #[test]
+    fn evaluate_pre_ai_flow_returns_skip_handled_for_private_ip() {
+        // Invariant: when the AI gate fails for a non-severity reason
+        // (private/loopback IP or already-blocked entity), the
+        // orchestrator returns SkipHandled (mapped from
+        // SkipPrivateOrBlocked).
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = crate::config::AgentConfig::default();
+        let mut incident = make_incident(
+            "ssh_bruteforce:10.0.0.5:test",
+            innerwarden_core::event::Severity::High,
+        );
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::ip("10.0.0.5"));
+
+        let decision = evaluate_pre_ai_flow(&incident, &cfg, &mut state, true, &HashSet::new(), 0);
+        assert!(matches!(decision, PreAiFlowDecision::SkipHandled));
+    }
+
+    #[test]
+    fn evaluate_pre_ai_flow_returns_skip_handled_when_in_decision_cooldown() {
+        // Invariant: when a recent decision exists in the cooldown
+        // table for any of this incident's candidate keys, the
+        // orchestrator returns SkipHandled (mapped from
+        // SkipDecisionCooldown). Pins that the cooldown lookup wires
+        // through `state.store.get_cooldown` correctly.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = crate::config::AgentConfig::default();
+        let mut incident = make_incident(
+            "ssh_bruteforce:8.8.8.20:test",
+            innerwarden_core::event::Severity::High,
+        );
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::ip("8.8.8.20"));
+
+        // Prime one of the candidate cooldown keys with a recent
+        // timestamp (now > now - DECISION_COOLDOWN_SECS).
+        let candidates = crate::decision_cooldown_candidates(&incident);
+        assert!(!candidates.is_empty(), "expected at least one cooldown key");
+        state.store.set_cooldown(
+            state_store::CooldownTable::Decision,
+            &candidates[0],
+            chrono::Utc::now(),
+        );
+
+        let decision = evaluate_pre_ai_flow(&incident, &cfg, &mut state, true, &HashSet::new(), 0);
+        assert!(matches!(decision, PreAiFlowDecision::SkipHandled));
+    }
+
+    #[test]
+    fn evaluate_pre_ai_flow_returns_skip_handled_when_per_tick_budget_exhausted() {
+        // Invariant: when ai_calls_this_tick reaches the configured
+        // max, the orchestrator returns SkipHandled (mapped from
+        // SkipAiCallBudget) so the incident defers to the next tick.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.ai.max_ai_calls_per_tick = 2;
+        let mut incident = make_incident(
+            "ssh_bruteforce:8.8.8.30:test",
+            innerwarden_core::event::Severity::High,
+        );
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::ip("8.8.8.30"));
+
+        let decision = evaluate_pre_ai_flow(
+            &incident,
+            &cfg,
+            &mut state,
+            true,
+            &HashSet::new(),
+            // Already at the budget cap.
+            2,
+        );
+        assert!(matches!(decision, PreAiFlowDecision::SkipHandled));
+    }
+
+    #[test]
+    fn evaluate_pre_ai_flow_proceeds_when_all_gates_pass() {
+        // Invariant: a public-IP, high-severity incident with no
+        // allowlist, no cooldown, AI enabled, and budget room must
+        // return Proceed. Anti-regression for accidentally widening any
+        // skip branch into the happy path.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = crate::config::AgentConfig::default();
+        let mut incident = make_incident(
+            "ssh_bruteforce:8.8.8.40:test",
+            innerwarden_core::event::Severity::High,
+        );
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::ip("8.8.8.40"));
+
+        let decision = evaluate_pre_ai_flow(&incident, &cfg, &mut state, true, &HashSet::new(), 0);
+        assert!(matches!(decision, PreAiFlowDecision::Proceed));
+    }
+
+    #[test]
+    fn evaluate_pre_ai_flow_skip_handled_when_ai_disabled() {
+        // Invariant: with ai_enabled=false the allowlist/AI-gate
+        // section is skipped entirely and the guard returns
+        // SkipAiDisabled, which the orchestrator maps to SkipHandled.
+        // Pins that the `if ai_enabled` block is the only path that
+        // touches dynamic allowlist state.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = crate::config::AgentConfig::default();
+        let mut incident = make_incident(
+            "ssh_bruteforce:8.8.8.50:test",
+            innerwarden_core::event::Severity::High,
+        );
+        incident
+            .entities
+            .push(innerwarden_core::entities::EntityRef::ip("8.8.8.50"));
+
+        let decision = evaluate_pre_ai_flow(&incident, &cfg, &mut state, false, &HashSet::new(), 0);
+        assert!(matches!(decision, PreAiFlowDecision::SkipHandled));
+    }
 }
