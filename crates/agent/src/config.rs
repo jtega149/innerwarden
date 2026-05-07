@@ -42,7 +42,14 @@ pub struct AgentConfig {
     pub crowdsec: CrowdSecConfig,
     #[serde(default)]
     pub abuseipdb: AbuseIpDbConfig,
+    /// Deprecated 2026-05-07: the agent's fail2ban sync was removed
+    /// (see PR #486). The field is preserved here so existing
+    /// operator `agent.toml` files with a `[fail2ban]` section
+    /// continue to deserialize under `deny_unknown_fields`. The
+    /// runtime no longer reads it; future cleanup will drop the
+    /// field once a major-version bump justifies the breaking change.
     #[serde(default)]
+    #[allow(dead_code)]
     pub fail2ban: Fail2BanConfig,
     #[serde(default)]
     pub geoip: GeoIpConfig,

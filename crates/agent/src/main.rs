@@ -88,7 +88,6 @@ mod decision_skill_actions;
 mod decisions;
 mod dna_inline;
 mod environment_profile;
-mod fail2ban;
 mod firmware_tick;
 mod fleet;
 mod forensics;
@@ -494,8 +493,6 @@ struct AgentState {
     crowdsec: Option<crowdsec::CrowdSecState>,
     /// AbuseIPDB client for IP reputation enrichment (None when disabled).
     abuseipdb: Option<abuseipdb::AbuseIpDbClient>,
-    /// Fail2ban sync state (None when fail2ban.enabled = false).
-    fail2ban: Option<fail2ban::Fail2BanState>,
     /// GeoIP client for IP geolocation enrichment via ip-api.com (None when disabled).
     geoip_client: Option<geoip::GeoIpClient>,
     /// Slack client for incident notifications (None when disabled).

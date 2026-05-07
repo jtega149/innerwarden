@@ -263,7 +263,6 @@ function renderStatus(s, collectors) {
     // ── External Services (collapsed) ──
     group('External Services', [
       card(lucideIcon('shield'), 'Cloudflare',   integ.cloudflare,      'Pushes blocked IPs to Cloudflare edge after block-ip fires', integ.cloudflare ? 'ON' : 'OFF', 'external', 'Free plan supports IP Access Rules. Effective for DDoS edge-layer defense.', 'innerwarden integrate cloudflare'),
-      card(lucideIcon('ban'), 'Fail2ban Sync', integ.fail2ban||false, 'Sync blocked IPs with fail2ban jails for unified bans',     integ.fail2ban ? 'ON' : 'OFF', 'external', 'Requires fail2ban installed. InnerWarden reads jails and pushes blocks.', 'innerwarden integrate fail2ban'),
       card(lucideIcon('bar-chart-3'), 'Prometheus',    true,                  'Metrics endpoint at /metrics - scrape with Prometheus/Grafana', 'ON', 'native', 'Always available when dashboard is active. No config needed.', ''),
     ], false) +
 

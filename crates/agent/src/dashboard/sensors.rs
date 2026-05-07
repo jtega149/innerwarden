@@ -365,7 +365,6 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
         "sudo_protection": action_cfg.sudo_protection_enabled,
         "execution_guard": action_cfg.execution_guard_enabled,
         "integrations": {
-            "fail2ban": action_cfg.fail2ban_enabled,
             "geoip": action_cfg.geoip_enabled,
             "abuseipdb": action_cfg.abuseipdb_enabled,
             "abuseipdb_auto_block_threshold": action_cfg.abuseipdb_auto_block_threshold,

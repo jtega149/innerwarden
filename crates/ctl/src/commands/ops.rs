@@ -765,15 +765,59 @@ pub(crate) fn build_fail2ban_running_check(running: bool, is_macos: bool) -> Che
 }
 
 /// Build the nginx error-log path check.
+///
+/// Bug 4 fix (2026-05-06 prod observation): pre-fix this check was a
+/// hard `[fail]` whenever the configured path did not exist on disk.
+/// In prod the operator had a custom nginx writing to
+/// `/home/ubuntu/proxy/data/logs/fallback_error.log`; nginx had not
+/// yet written the log file (no errors in the window) so doctor
+/// reported `[fail] nginx error log not found` even though the
+/// configured path was correct and the log would be created on the
+/// next request. The hint itself read "log is created on first
+/// request or error" — the [fail] severity contradicted the hint.
+///
+/// New behavior: try the configured path first; if absent, discover
+/// the common defaults (`/var/log/nginx/error.log`,
+/// `/var/log/nginx/error_log`). If a default exists but the
+/// configured one does not, surface as `[warn]` with both paths and
+/// suggest aligning the sensor config. If no path exists anywhere,
+/// surface as `[warn]` (NOT `[fail]`): nginx may simply not have
+/// errored yet, which is the happy path on a healthy server.
+#[allow(dead_code)] // backward-compat shim for callers that don't probe alternatives
 pub(crate) fn build_nginx_error_log_check(path: &str, exists: bool) -> Check {
-    if exists {
-        Check::ok(format!("nginx error log exists ({path})"))
-    } else {
-        Check::fail(
-            format!("nginx error log not found ({path})"),
-            "sudo systemctl start nginx  # log is created on first request or error",
-        )
+    build_nginx_error_log_check_with_alternatives(path, exists, &[])
+}
+
+/// Pure helper: build the nginx error-log Check given the configured
+/// path's existence and a list of `(alt_path, alt_exists)` defaults
+/// the caller has already probed. Split out so tests can drive every
+/// branch (configured-exists / alt-exists / neither) without touching
+/// the filesystem.
+pub(crate) fn build_nginx_error_log_check_with_alternatives(
+    configured: &str,
+    configured_exists: bool,
+    alternatives: &[(&str, bool)],
+) -> Check {
+    if configured_exists {
+        return Check::ok(format!("nginx error log exists ({configured})"));
     }
+    let alt_present = alternatives.iter().find(|(_, exists)| *exists);
+    if let Some((alt, _)) = alt_present {
+        return Check::warn(
+            format!("nginx error log not found at configured path ({configured}); a default exists at {alt}"),
+            format!(
+                "Either point sensor config at {alt} or wait for nginx to create {configured} on its first error"
+            ),
+        );
+    }
+    // No path on disk anywhere — but nginx writes the file lazily on
+    // first error, so the absence does not imply a misconfiguration.
+    // Soft `[warn]`, not `[fail]`.
+    Check::warn(
+        format!("nginx error log not yet written ({configured})"),
+        "nginx creates the log on its first error or request — this is OK on a quiet server. \
+         If you expect entries, verify nginx is running and the path matches your nginx.conf",
+    )
 }
 
 /// Map a telemetry-write age (in seconds) to a doctor check.
@@ -2424,10 +2468,21 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
                     Check::fail("nginx binary not found", "sudo apt-get install nginx")
                 });
 
-                // error log path
+                // error log path — Bug 4 (2026-05-06): probe the
+                // configured path AND a small list of common defaults
+                // so a healthy operator with a custom nginx that has
+                // not yet errored does not get a hard [fail].
                 let err_log = collector_str("nginx_error", "path", "/var/log/nginx/error.log");
                 let log_exists = std::path::Path::new(&err_log).exists();
-                nginx_err.push(build_nginx_error_log_check(&err_log, log_exists));
+                let alt_a = "/var/log/nginx/error.log";
+                let alt_b = "/var/log/nginx/error_log";
+                let alt_a_exists = err_log != alt_a && std::path::Path::new(alt_a).exists();
+                let alt_b_exists = err_log != alt_b && std::path::Path::new(alt_b).exists();
+                nginx_err.push(build_nginx_error_log_check_with_alternatives(
+                    &err_log,
+                    log_exists,
+                    &[(alt_a, alt_a_exists), (alt_b, alt_b_exists)],
+                ));
 
                 // readability - can the current user read it?
                 if log_exists {
@@ -4327,11 +4382,84 @@ enabled = true
         assert!(c.label.contains("/var/log/nginx/error.log"));
     }
 
+    /// Bug 4 anchor (2026-05-06): when the configured nginx error log
+    /// does not exist on disk AND no alternative path exists, doctor
+    /// MUST emit `[warn]` (not `[fail]`). nginx writes the log file
+    /// lazily on first error — a quiet server is the happy path.
+    /// Pre-fix doctor printed `[fail] nginx error log not found
+    /// (/home/ubuntu/proxy/data/logs/fallback_error.log)` while the
+    /// hint right beneath it acknowledged the file is "created on
+    /// first request or error" — hard fail contradicting hint.
     #[test]
-    fn build_nginx_error_log_check_missing_fails() {
+    fn build_nginx_error_log_check_missing_warns_not_fails() {
         let c = build_nginx_error_log_check("/var/log/nginx/error.log", false);
-        assert_eq!(c.sev, Sev::Fail);
-        assert!(c.hint.unwrap().contains("systemctl start nginx"));
+        assert_eq!(
+            c.sev,
+            Sev::Warn,
+            "Bug 4 regression: a missing nginx error log must be Warn, not Fail (nginx creates it lazily)"
+        );
+        let hint = c.hint.unwrap();
+        assert!(
+            !hint.contains("sudo systemctl start nginx"),
+            "the old hint suggested starting nginx as if it were down — wrong root cause"
+        );
+        assert!(
+            hint.contains("OK on a quiet server") || hint.contains("verify nginx is running"),
+            "hint should explain the lazy-creation invariant or point at a directly actionable check, got: {hint}"
+        );
+    }
+
+    /// Bug 4 anchor: the present-path branch is unchanged — Ok with
+    /// the path embedded in the label. Anti-regression for the happy
+    /// path that the new helper still reports correctly.
+    #[test]
+    fn build_nginx_error_log_check_present_with_alternatives_is_still_ok() {
+        let c = build_nginx_error_log_check_with_alternatives(
+            "/var/log/nginx/error.log",
+            true,
+            &[("/var/log/nginx/error_log", true)],
+        );
+        assert_eq!(c.sev, Sev::Ok);
+        assert!(c.label.contains("/var/log/nginx/error.log"));
+    }
+
+    /// Bug 4 anchor: configured path missing but a default is present
+    /// → Warn, with both paths surfaced in label/hint so the operator
+    /// can see the misalignment and align the sensor config.
+    #[test]
+    fn build_nginx_error_log_check_alternative_present_warns_with_both_paths() {
+        let c = build_nginx_error_log_check_with_alternatives(
+            "/home/ubuntu/proxy/data/logs/fallback_error.log",
+            false,
+            &[("/var/log/nginx/error.log", true)],
+        );
+        assert_eq!(c.sev, Sev::Warn);
+        assert!(c
+            .label
+            .contains("/home/ubuntu/proxy/data/logs/fallback_error.log"));
+        assert!(c.label.contains("/var/log/nginx/error.log"));
+        let hint = c.hint.unwrap();
+        assert!(
+            hint.contains("Either point sensor config at"),
+            "hint should suggest aligning the sensor path, got: {hint}"
+        );
+    }
+
+    /// Bug 4 anchor: alternative paths that don't exist must NOT
+    /// trigger the "alt-present" branch. Pin that empty alts behave
+    /// the same as no alts.
+    #[test]
+    fn build_nginx_error_log_check_alternatives_all_missing_falls_through_to_warn() {
+        let c = build_nginx_error_log_check_with_alternatives(
+            "/var/log/nginx/error.log",
+            false,
+            &[
+                ("/var/log/nginx/error_log", false),
+                ("/var/log/something_else.log", false),
+            ],
+        );
+        assert_eq!(c.sev, Sev::Warn);
+        assert!(c.label.contains("not yet written"));
     }
 
     // -- 2FA helpers ----------------------------------------------------------

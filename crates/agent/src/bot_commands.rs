@@ -795,18 +795,9 @@ pub(crate) async fn handle_telegram_bot_command(
                 if let Some(ref tg) = tg {
                     tg.send_typing().await;
                 }
-                // fail2ban uses `innerwarden integrate fail2ban` instead of `enable`
                 // honeypot uses `innerwarden enable honeypot` (standard path)
-                let output = if cap_id == "fail2ban" {
-                    run_innerwarden_cli(&["integrate", "fail2ban"]).await
-                } else {
-                    run_innerwarden_cli(&["enable", &cap_id]).await
-                };
-                let cmd_label = if cap_id == "fail2ban" {
-                    format!("innerwarden integrate {cap_id}")
-                } else {
-                    format!("innerwarden enable {cap_id}")
-                };
+                let output = run_innerwarden_cli(&["enable", &cap_id]).await;
+                let cmd_label = format!("innerwarden enable {cap_id}");
                 let text = format!(
                     "🔧 <b>{cmd_label}</b>\n\n<pre>{output}</pre>",
                     output = output.chars().take(2000).collect::<String>()
@@ -877,12 +868,6 @@ pub(crate) fn format_capabilities(cfg: &config::AgentConfig) -> String {
         format!("{off} <b>GeoIP</b>  disabled - <i>/enable geoip</i>")
     };
 
-    let fail2ban_line = if cfg.fail2ban.enabled {
-        format!("{on} <b>Fail2ban</b>  ban sync active")
-    } else {
-        format!("{off} <b>Fail2ban</b>  disabled - <i>/enable fail2ban</i>")
-    };
-
     let slack_line = if cfg.slack.enabled {
         format!("{on} <b>Slack</b>  notifications enabled")
     } else {
@@ -906,7 +891,6 @@ pub(crate) fn format_capabilities(cfg: &config::AgentConfig) -> String {
          <b>Integrations</b>\n\
          {abuseipdb_line}\n\
          {geoip_line}\n\
-         {fail2ban_line}\n\
          {slack_line}\n\
          {cloudflare_line}\n\
          \n\
@@ -957,12 +941,6 @@ pub(crate) fn capabilities_keyboard(cfg: &config::AgentConfig) -> serde_json::Va
             "callback_data": "enable:geoip"
         }));
     }
-    if !cfg.fail2ban.enabled {
-        buttons.push(serde_json::json!({
-            "text": "🔍 Enable Fail2ban",
-            "callback_data": "enable:fail2ban"
-        }));
-    }
     if cfg.honeypot.mode != "listener" {
         buttons.push(serde_json::json!({
             "text": "🪤 Enable Honeypot",
@@ -981,41 +959,6 @@ pub(crate) fn capabilities_keyboard(cfg: &config::AgentConfig) -> serde_json::Va
     // Group buttons into rows of 2
     let rows: Vec<Vec<serde_json::Value>> = buttons.chunks(2).map(|chunk| chunk.to_vec()).collect();
     serde_json::json!(rows)
-}
-
-/// Probe the system at startup and send proactive Telegram suggestions
-/// for tools that are installed but not yet integrated with InnerWarden.
-/// Runs once before the main loop. Fail-silent.
-pub(crate) async fn probe_and_suggest(
-    cfg: &config::AgentConfig,
-    tg: Option<&telegram::TelegramClient>,
-) {
-    // Only if Telegram is configured
-    let Some(tg) = tg else {
-        return;
-    };
-
-    // Check for fail2ban: installed + running but not enabled in config
-    if !cfg.fail2ban.enabled {
-        let is_available = tokio::task::spawn_blocking(|| {
-            std::process::Command::new("fail2ban-client")
-                .arg("ping")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        })
-        .await
-        .unwrap_or(false);
-
-        if is_available {
-            let text = "🔍 <b>Fail2ban detected!</b>\n\nFail2ban is running on this server but not integrated with InnerWarden.\n\nIntegrating it means InnerWarden will automatically sync all fail2ban bans - no duplicate work, full audit trail.\n\n<i>Want me to enable the integration?</i>";
-            let keyboard = serde_json::json!([[
-                {"text": "✅ Enable Fail2ban sync", "callback_data": "enable:fail2ban"},
-                {"text": "❌ Not now", "callback_data": "menu:dismiss"}
-            ]]);
-            let _ = tg.send_text_with_keyboard(text, keyboard).await;
-        }
-    }
 }
 
 /// Strip ANSI escape codes from a string (for clean Telegram display).
@@ -1114,7 +1057,6 @@ mod tests {
         cfg.responder.allowed_skills = vec!["suspend-user".to_string()];
         cfg.abuseipdb.enabled = true;
         cfg.geoip.enabled = true;
-        cfg.fail2ban.enabled = true;
         cfg.honeypot.mode = "listener".to_string();
 
         let kb = capabilities_keyboard(&cfg);

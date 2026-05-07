@@ -51,8 +51,6 @@ pub struct DashboardActionConfig {
     pub ai_provider: String,
     /// AI model in use.
     pub ai_model: String,
-    /// Whether fail2ban integration is enabled.
-    pub fail2ban_enabled: bool,
     /// Whether GeoIP enrichment is enabled.
     pub geoip_enabled: bool,
     /// Whether AbuseIPDB enrichment is enabled.
@@ -116,7 +114,6 @@ impl Default for DashboardActionConfig {
             ai_enabled: false,
             ai_provider: "openai".to_string(),
             ai_model: "gpt-4o-mini".to_string(),
-            fail2ban_enabled: false,
             geoip_enabled: false,
             abuseipdb_enabled: false,
             abuseipdb_auto_block_threshold: 0,

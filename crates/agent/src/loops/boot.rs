@@ -204,6 +204,32 @@ pub(crate) fn build_primary_provider(
 /// unresponsive agent does not delay operator-initiated restarts.
 const GRACEFUL_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Pure decision helper for the slow-loop's "every N seconds, only if
+/// there is something to consolidate" pattern. Extracted from the
+/// inline `should_consolidate = ... && !state.attacker_profiles.is_empty()`
+/// expression at the slow-loop tick body so the time + state interaction
+/// is unit-testable without spinning up the full agent.
+///
+/// Returns true when:
+/// - The interval has elapsed since the last tick (or no tick has run yet), AND
+/// - There is something to consolidate (the state is non-empty).
+///
+/// Pre-extraction every refactor of the slow-loop tick block had to
+/// re-derive this two-condition gate at every call site. The pure
+/// helper pins the contract: skipping the second condition would
+/// schedule pointless empty consolidation work; skipping the first
+/// would consolidate every tick.
+pub(crate) fn should_run_periodic_tick(
+    last_run_at: Option<std::time::Instant>,
+    interval_secs: u64,
+    has_work: bool,
+) -> bool {
+    let due = last_run_at
+        .map(|t| t.elapsed().as_secs() >= interval_secs)
+        .unwrap_or(true);
+    due && has_work
+}
+
 /// Decide how to surface a `ShutdownReport` to the operator log. Pure
 /// function so the emit-level contract is unit-testable without a
 /// tracing subscriber harness (see spec 036 PR-3 tests below).
@@ -430,7 +456,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             ai_enabled: cfg.ai.enabled,
             ai_provider: cfg.ai.provider.clone(),
             ai_model: cfg.ai.model.clone(),
-            fail2ban_enabled: cfg.fail2ban.enabled,
             geoip_enabled: cfg.geoip.enabled,
             abuseipdb_enabled: cfg.abuseipdb.enabled,
             abuseipdb_auto_block_threshold: cfg.abuseipdb.auto_block_threshold,
@@ -907,12 +932,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         } else {
             None
         },
-        fail2ban: if cfg.fail2ban.enabled {
-            info!("Fail2ban integration enabled");
-            Some(fail2ban::Fail2BanState::new(&cfg.fail2ban))
-        } else {
-            None
-        },
         geoip_client: if cfg.geoip.enabled {
             info!("GeoIP enrichment enabled (ip-api.com, free tier)");
             Some(geoip::GeoIpClient::new())
@@ -1312,9 +1331,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             info!("Telegram polling task started (T.2 approvals enabled)");
         }
 
-        // Proactive startup suggestions (fail2ban detected but not integrated, etc.)
-        crate::bot_commands::probe_and_suggest(&cfg, state.telegram_client.as_deref()).await;
-
         // Boot self-test: verify self-awareness is working.
         crate::loops::slow_loop::boot_self_test();
 
@@ -1412,9 +1428,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         let mut crowdsec_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
             cfg.crowdsec.poll_secs.max(10),
         ));
-        let mut fail2ban_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
-            cfg.fail2ban.poll_secs.max(10),
-        ));
         let mut mesh_ticker =
             tokio::time::interval(tokio::time::Duration::from_secs(cfg.mesh.poll_secs.max(10)));
         let mut firmware_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
@@ -1424,15 +1437,19 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             cfg.hypervisor.poll_secs.max(60),
         ));
 
-        // SIGTERM / SIGINT
-        #[cfg(unix)]
+        // SIGTERM / SIGINT. Unix-only — the agent is not currently
+        // shipped on Windows (codename Phantom is "planned" not
+        // active per CLAUDE.md). The pre-cleanup duplicate
+        // `#[cfg(not(unix))]` slow-loop block was 142 lines of
+        // forward-compat scaffolding nobody exercised; deleted on
+        // PR #486 follow-up to stop tarpaulin counting it as
+        // "uncovered" and to drop the dead-code maintenance burden.
         let mut sigterm = {
             use tokio::signal::unix::{signal, SignalKind};
             signal(SignalKind::terminate())?
         };
 
         loop {
-            #[cfg(unix)]
             let shutdown = tokio::select! {
                 _ = incident_ticker.tick() => {
                     crate::loops::fast_loop::run_incident_tick(
@@ -2124,11 +2141,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
                         // ── Attacker intelligence consolidation (every 5 min) ──
                         const INTEL_INTERVAL_SECS: u64 = 300;
-                        let should_consolidate = state
-                            .last_intel_consolidation_at
-                            .map(|t| t.elapsed().as_secs() >= INTEL_INTERVAL_SECS)
-                            .unwrap_or(true);
-                        if should_consolidate && !state.attacker_profiles.is_empty() {
+                        if should_run_periodic_tick(
+                            state.last_intel_consolidation_at,
+                            INTEL_INTERVAL_SECS,
+                            !state.attacker_profiles.is_empty(),
+                        ) {
                             // Backfill enrichment for profiles missing GeoIP/AbuseIPDB
                             incident_enrichment::backfill_enrichment(&mut state).await;
                             // Scan honeypot sessions for known attacker IPs
@@ -2285,21 +2302,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     }
                     false
                 }
-                _ = fail2ban_ticker.tick() => {
-                    if let Some(ref mut fb) = state.fail2ban {
-                        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
-                        fail2ban::sync_tick(
-                            fb,
-                            &mut state.blocklist,
-                            &state.skill_registry,
-                            &cfg,
-                            &mut state.decision_writer,
-                            &host,
-                            state.telegram_client.as_ref(),
-                        ).await;
-                    }
-                    false
-                }
                 _ = mesh_ticker.tick() => {
                     info!("mesh ticker fired");
                     if let Some(ref mut m) = state.mesh {
@@ -2375,149 +2377,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 }
                 _ = sigterm.recv() => {
                     info!("SIGTERM received - shutting down");
-                    true
-                }
-            };
-
-            #[cfg(not(unix))]
-            let shutdown = tokio::select! {
-                _ = incident_ticker.tick() => {
-                    crate::loops::fast_loop::run_incident_tick(
-                        &cli.data_dir,
-                        &mut cursor,
-                        &cfg,
-                        &mut state,
-                        &advisory_cache,
-                    ).await;
-                    false
-                }
-                _ = narrative_ticker.tick() => {
-                    match crate::loops::slow_loop::process_narrative_tick(
-                        &cli.data_dir,
-                        &mut cursor,
-                        &cfg,
-                        &mut state,
-                    ).await {
-                        Ok(n) => {
-                            if n > 0 {
-                                info!(new_events = n, "narrative tick");
-                            }
-                        }
-                        Err(e) => {
-                            state.telemetry.observe_error("narrative_tick");
-                            warn!("narrative tick error: {e:#}");
-                        }
-                    }
-                    // Tick notification pipeline — emit group summaries.
-                    {
-                        let summaries = state.grouping_engine.tick();
-                        if !summaries.is_empty() {
-                            let tg_level = cfg.telegram.channel_notifications.notification_level;
-                            let tg_summaries: Vec<String> = summaries
-                                .iter()
-                                .filter(|s| notification_pipeline::should_notify_summary(s, tg_level))
-                                .filter(|s| notification_pipeline::is_immediate_threat_summary(s))
-                                .map(|s| s.format_html())
-                                .collect();
-                            if !tg_summaries.is_empty() {
-                                if let Some(ref tg) = state.telegram_client {
-                                    let digest = tg_summaries.join("\n");
-                                    if let Err(e) = tg.send_raw_html(&digest).await {
-                                        warn!("Telegram group summary failed: {e:#}");
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Trim in-memory structures to prevent unbounded memory growth
-                    state.blocklist.trim_if_needed(10_000);
-                    let cutoff_2h = chrono::Utc::now() - chrono::Duration::hours(2);
-                    state.store.retain_cooldowns(state_store::CooldownTable::Decision, cutoff_2h);
-                    state.store.retain_cooldowns(state_store::CooldownTable::Notification, cutoff_2h);
-                    // Cap block_counts to 5000 entries
-                    if state.store.block_counts_len() > 5000 {
-                        state.store.clear_block_counts();
-                    }
-                    // Cap ip_reputations and persist to disk for dashboard
-                    if state.ip_reputations.len() > 10000 {
-                        let mut entries: Vec<_> = state.ip_reputations.drain().collect();
-                        entries.sort_by(|a, b| b.1.reputation_score.partial_cmp(&a.1.reputation_score).unwrap_or(std::cmp::Ordering::Equal));
-                        entries.truncate(5000);
-                        state.ip_reputations = entries.into_iter().collect();
-                    }
-                    persist_ip_reputations(
-                        &cli.data_dir,
-                        &state.ip_reputations,
-                        Some(&state.store),
-                    );
-                    let removed = data_retention::cleanup(&cli.data_dir, &cfg.data);
-                    if removed > 0 {
-                        info!(removed, "data_retention: cleaned up old files");
-                    }
-                    let (fs_removed, fs_bytes) =
-                        data_retention::cleanup_filestore(&cli.data_dir, &cfg.data);
-                    if fs_removed > 0 {
-                        info!(
-                            files = fs_removed,
-                            bytes = fs_bytes,
-                            "data_retention: pruned filestore"
-                        );
-                    }
-                    false
-                }
-                _ = crowdsec_ticker.tick() => {
-                    if let Some(ref mut cs) = state.crowdsec {
-                        crowdsec::sync_threat_list(cs).await;
-                    }
-                    false
-                }
-                _ = fail2ban_ticker.tick() => {
-                    if let Some(ref mut fb) = state.fail2ban {
-                        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
-                        fail2ban::sync_tick(
-                            fb,
-                            &mut state.blocklist,
-                            &state.skill_registry,
-                            &cfg,
-                            &mut state.decision_writer,
-                            &host,
-                            state.telegram_client.as_ref(),
-                        ).await;
-                    }
-                    false
-                }
-                _ = mesh_ticker.tick() => {
-                    if let Some(ref mut m) = state.mesh {
-                        m.rediscover_if_needed().await;
-                        let result = m.tick();
-                        for (ip, ttl) in &result.block_ips {
-                            info!(ip, ttl, "mesh: new block from peer network");
-                            state.blocklist.insert(ip.clone());
-                            // Mesh blocks are contained -> daily briefing via gate.
-                            *state.telegram_deferred.entry("mesh".to_string()).or_insert(0) += 1;
-                            let _ = state.notification_burst_tracker.record_contained();
-                        }
-                        m.persist().ok();
-                    }
-                    false
-                }
-                _ = firmware_ticker.tick() => {
-                    if cfg.firmware.enabled {
-                        firmware_tick::process_firmware_tick(&cli.data_dir, &cfg, &mut state)
-                            .await;
-                    }
-                    false
-                }
-                _ = hypervisor_ticker.tick() => {
-                    if cfg.hypervisor.enabled {
-                        hypervisor_tick::process_hypervisor_tick(&cli.data_dir, &cfg, &mut state)
-                            .await;
-                    }
-                    false
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("SIGINT received - shutting down");
                     true
                 }
             };
@@ -2757,6 +2616,305 @@ mod tests {
         assert!(
             result.is_ok(),
             "run_agent dashboard once-mode failed: {result:?}"
+        );
+    }
+
+    /// Pin the four-corner truth table of `should_run_periodic_tick`:
+    /// (no prior tick × any-work) and (elapsed × any-work). The
+    /// "no prior tick" arm is the boot path — extracting this helper
+    /// from inline let bindings in the slow-loop tick was prompted by
+    /// the boot.rs coverage push (PR #486 follow-up); the assertions
+    /// below pin the post-extraction contract that the slow-loop
+    /// callers now depend on.
+    #[test]
+    fn should_run_periodic_tick_truth_table() {
+        // Boot path: no prior tick yet, work is empty → still skip
+        // (would have been a wasted no-op tick).
+        assert!(!should_run_periodic_tick(None, 300, false));
+
+        // Boot path with work present → run.
+        assert!(should_run_periodic_tick(None, 300, true));
+
+        // Recent prior tick (well under interval) + work → skip.
+        // Pin the time gate.
+        let recent = std::time::Instant::now();
+        assert!(!should_run_periodic_tick(Some(recent), 300, true));
+
+        // Prior tick has elapsed past the interval, no work → skip.
+        // Pin the work gate (the second condition the inline code
+        // used to enforce separately at the call site).
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .expect("instant arithmetic");
+        assert!(!should_run_periodic_tick(Some(long_ago), 300, false));
+
+        // Prior tick has elapsed past the interval AND work present
+        // → run.
+        assert!(should_run_periodic_tick(Some(long_ago), 300, true));
+    }
+
+    /// Bug 4 follow-up coverage anchor (2026-05-07): exercise the
+    /// `cli.cleanup_015_graph_signal_quality` dispatch branch of
+    /// `run_agent`. The branch returns the underlying error verbatim
+    /// when no snapshot exists. Pins the dispatch wiring (without a
+    /// snapshot the function bails with "No dated snapshot found").
+    #[tokio::test]
+    async fn run_agent_dispatches_cleanup_015_flag() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut cli = once_cli(dir.path().to_path_buf());
+        cli.cleanup_015_graph_signal_quality = true;
+        let err = run_agent(cli)
+            .await
+            .expect_err("empty data_dir must surface the snapshot-missing error");
+        assert!(format!("{err:#}").contains("No dated snapshot"));
+    }
+
+    /// Bug 4 follow-up coverage anchor: same as above for the
+    /// `backfill_015_research_only` dispatch branch.
+    #[tokio::test]
+    async fn run_agent_dispatches_backfill_015_flag() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut cli = once_cli(dir.path().to_path_buf());
+        cli.backfill_015_research_only = true;
+        let err = run_agent(cli)
+            .await
+            .expect_err("empty data_dir must surface the snapshot-missing error");
+        assert!(format!("{err:#}").contains("No dated snapshot"));
+    }
+
+    /// Bug 4 follow-up coverage anchor: exercise the
+    /// `cli.retrain_anomaly` dispatch branch of `run_agent`. With an
+    /// empty data_dir the underlying `run_retrain_anomaly` returns
+    /// "insufficient data"; what matters here is that `run_agent`
+    /// routes the flag at all (the flag dispatch was previously
+    /// uncovered because the standalone function tests bypassed
+    /// `run_agent`).
+    #[tokio::test]
+    async fn run_agent_dispatches_retrain_anomaly_flag() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut cli = once_cli(dir.path().to_path_buf());
+        cli.retrain_anomaly = true;
+        let err = run_agent(cli).await.expect_err("empty dir must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("insufficient") || msg.contains("autoencoder"),
+            "should surface training error, got: {msg}"
+        );
+    }
+
+    /// Bug 4 follow-up coverage anchor: report-mode WITH a
+    /// `report_dir` set hits the `create_dir_all` branch of
+    /// `run_agent`'s report dispatch (the existing
+    /// `run_agent_report_mode_generates_trial_report_files` test
+    /// passes `report_dir = None` so the Some-branch was uncovered).
+    #[tokio::test]
+    async fn run_agent_report_mode_with_explicit_report_dir_creates_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let report_out = dir.path().join("reports");
+        let mut cli = once_cli(dir.path().to_path_buf());
+        cli.report = true;
+        cli.once = false;
+        cli.report_dir = Some(report_out.clone());
+        let result = run_agent(cli).await;
+        assert!(result.is_ok(), "report-mode must succeed: {result:?}");
+        assert!(
+            report_out.exists(),
+            "run_agent must create the configured report_dir"
+        );
+    }
+
+    /// Bug 4 follow-up coverage anchor (2026-05-07): the four
+    /// run_agent integration tests above all use `cli.once = true`,
+    /// which short-circuits the entire `else` branch of the
+    /// once/non-once split. That branch contains 700+ lines of
+    /// orchestration: telegram polling spawn, honeypot always-on,
+    /// kill-chain inline, DNA inline, mesh listener, threat-feed
+    /// init, and the slow-loop `tokio::select!` block — i.e. the
+    /// production hot path for a long-running agent. Without an
+    /// integration test exercising that branch the file's line
+    /// coverage stalls at the once-mode floor (~34%).
+    ///
+    /// Approach: drive `run_agent` with `cli.once = false` and the
+    /// feature-rich config used by the once-mode test below, but
+    /// wrap it in a `tokio::time::timeout` so the test cancels the
+    /// future after the spawn phase completes. The timeout drop
+    /// propagates to tokio's runtime, aborts the slow-loop, and
+    /// returns. We only assert the run did not panic — coverage of
+    /// the spawn paths is the actual deliverable.
+    ///
+    /// Multi-thread runtime is required because honeypot-always-on
+    /// uses `block_in_place` for the AbuseIPDB lookup, which panics
+    /// on the single-thread current-thread runtime that
+    /// `#[tokio::test]` defaults to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_agent_non_once_spawns_orchestration_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let cfg_path = dir.path().join("agent.toml");
+        let mut cfg_file = std::fs::File::create(&cfg_path).expect("create config");
+        // Same feature-rich config shape as the once-mode test below,
+        // but with [honeypot] mode=always_on so the non-once branch's
+        // honeypot spawn fires (the once test cannot reach that code).
+        writeln!(
+            cfg_file,
+            r#"
+[ai]
+enabled = true
+provider = "ollama"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434"
+
+[responder]
+enabled = true
+dry_run = true
+block_backend = "ufw"
+allowed_skills = ["block-ip-ufw", "honeypot", "suspend-user-sudo", "kill-process", "block-container"]
+
+[telegram]
+enabled = false
+bot_token = ""
+chat_id = ""
+
+[slack]
+enabled = true
+webhook_url = ""
+
+[cloudflare]
+enabled = true
+api_token = ""
+zone_id = ""
+
+[abuseipdb]
+enabled = false
+api_key = ""
+
+[crowdsec]
+enabled = true
+
+[geoip]
+enabled = true
+
+[fail2ban]
+enabled = true
+
+[mesh]
+enabled = true
+bind = "127.0.0.1:0"
+peers = []
+
+[threat_feeds]
+ioc_feed_urls = []
+
+[webhook]
+enabled = true
+url = "http://127.0.0.1:9/hooks"
+
+[honeypot]
+mode = "always_on"
+port = 0
+bind_addr = "127.0.0.1"
+ssh_max_auth_attempts = 1
+interaction = "reject"
+"#
+        )
+        .expect("write config");
+
+        // Seed a minimal events JSONL so the slow-loop's narrative
+        // tick has something to read (covers the
+        // `events.is_empty() == false` branch and the downstream
+        // ingest paths).
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        let events_path = dir.path().join(format!("events-{today}.jsonl"));
+        std::fs::write(
+            &events_path,
+            r#"{"ts":"2026-05-07T00:00:00Z","host":"h","source":"t","kind":"shell.command_exec","severity":"Info","summary":"","details":{"src_ip":"203.0.113.1"}}
+{"ts":"2026-05-07T00:00:01Z","host":"h","source":"t","kind":"network.outbound_connect","severity":"Info","summary":"","details":{"src_ip":"203.0.113.1"}}
+"#,
+        )
+        .expect("seed events");
+        // Seed a minimal incidents JSONL so the grouping engine has
+        // input on the slow-loop's first tick (covers the non-empty
+        // group-summary path).
+        let incidents_path = dir.path().join(format!("incidents-{today}.jsonl"));
+        std::fs::write(
+            &incidents_path,
+            r#"{"ts":"2026-05-07T00:00:00Z","host":"h","incident_id":"ssh_bruteforce:1","severity":"Medium","title":"SSH brute","summary":"","tags":["ssh_bruteforce"],"entities":[{"r#type":"Ip","value":"203.0.113.1"}],"evidence":{},"recommended_checks":[]}
+"#,
+        )
+        .expect("seed incidents");
+
+        let mut cli = once_cli(dir.path().to_path_buf());
+        cli.config = Some(cfg_path);
+        cli.once = false;
+        // Dashboard on a random local port — exercises the dashboard
+        // spawn block (lines 423-538) AND its serve body in non-once
+        // mode where the spawned task gets polled long enough to start.
+        cli.dashboard = true;
+        cli.dashboard_bind = "127.0.0.1:0".to_string();
+        cli.insecure_no_tls = true;
+        // Fast interval so the slow-loop body fires multiple times
+        // within the timeout window.
+        cli.interval = 1;
+
+        let data_dir = dir.path().to_path_buf();
+
+        // 8s budget: enough to clear the synchronous spawn block,
+        // let the slow-loop tick several times (interval=1s), and
+        // fire the per-tick paths (narrative ingest, grouping engine
+        // tick, snapshot persist, allowlist hot-reload, operator IPs
+        // refresh). Short enough that the overall workspace test
+        // run is not noticeably slower.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), run_agent(cli)).await;
+
+        // The loop is designed to run forever, so a timeout Err is
+        // the expected shape. If run_agent returned Ok within 8s
+        // something cut the loop short — likely a spawn-time panic
+        // in dry-run mode that should be surfaced.
+        assert!(
+            outcome.is_err(),
+            "run_agent must keep running until cancelled — got early Ok/Err: {outcome:?}"
+        );
+
+        // Useful behavioural assertions: the slow-loop must have
+        // executed at least one full tick AND persisted the
+        // operator-visible state-of-the-loop snapshot to disk.
+        // These were the operator-observable side effects the
+        // pre-PR run did NOT prove: the test ran the loop for 8s
+        // and only asserted "no panic", which is filler. The
+        // assertions below pin specific paths the slow-loop body
+        // wrote to disk.
+
+        // 1) `incident-groups.json` is written on every grouping-engine
+        //    tick (boot.rs:1527). Its presence proves the slow-loop
+        //    select! arm fired and the group-snapshot path executed
+        //    end-to-end.
+        let groups_snapshot = data_dir.join("incident-groups.json");
+        assert!(
+            groups_snapshot.exists(),
+            "slow-loop must write incident-groups.json at least once during the 8s window — \
+             missing file means the grouping-engine tick never executed"
+        );
+        let groups_body = std::fs::read_to_string(&groups_snapshot).expect("read snapshot");
+        assert!(
+            groups_body.starts_with('{') || groups_body.starts_with('['),
+            "incident-groups.json must be JSON, got: {groups_body:.80}"
+        );
+        // The dashboard reads this file directly; if it's not valid
+        // JSON the dashboard's /api/incident-groups endpoint breaks
+        // for the operator.
+        serde_json::from_str::<serde_json::Value>(&groups_body)
+            .expect("incident-groups.json must parse as JSON");
+
+        // 2) After 8s with the dashboard enabled, the SQLite store
+        //    file must be open and on disk. `Store::open` is called
+        //    early in run_agent (boot.rs:315) and creates
+        //    innerwarden.db inside data_dir. Confirms the SQLite
+        //    init path executed end-to-end (it can fail silently
+        //    when the data_dir is not writable; this assertion catches
+        //    the silent-fail regression where slot logs "sqlite store
+        //    unavailable" but the run otherwise looks healthy).
+        assert!(
+            data_dir.join("innerwarden.db").exists(),
+            "Store::open must materialise innerwarden.db on first boot"
         );
     }
 

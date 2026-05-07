@@ -68,11 +68,6 @@ pub(crate) fn build_agent_context(
     } else {
         "DISABLED"
     };
-    let fail2ban_status = if cfg.fail2ban.enabled {
-        "ENABLED"
-    } else {
-        "DISABLED"
-    };
     let slack_status = if cfg.slack.enabled {
         "ENABLED"
     } else {
@@ -100,7 +95,6 @@ pub(crate) fn build_agent_context(
          Telegram bot: {telegram_status}\n\
          AbuseIPDB enrichment: {abuseipdb_status}\n\
          GeoIP enrichment: {geoip_status}\n\
-         Fail2ban integration: {fail2ban_status}\n\
          Slack notifications: {slack_status}\n\
          Cloudflare edge blocking: {cloudflare_status}\n\
          \n\
@@ -127,7 +121,6 @@ pub(crate) fn build_agent_context(
          innerwarden notify slack                # setup Slack webhook\n\
          innerwarden integrate abuseipdb         # IP reputation enrichment\n\
          innerwarden integrate geoip             # GeoIP enrichment (free)\n\
-         innerwarden integrate fail2ban          # sync with fail2ban bans\n\
          innerwarden block <ip> --reason <r>     # manual IP block\n\
          innerwarden unblock <ip>                # remove IP block\n\
          innerwarden incidents --days 7          # list recent incidents\n\
@@ -221,7 +214,6 @@ mod tests {
         cfg.telegram.enabled = true;
         cfg.abuseipdb.enabled = true;
         cfg.geoip.enabled = true;
-        cfg.fail2ban.enabled = true;
         cfg.slack.enabled = true;
         cfg.cloudflare.enabled = true;
 
@@ -355,7 +347,6 @@ mod tests {
         assert!(context.contains("Telegram bot: DISABLED"));
         assert!(context.contains("AbuseIPDB enrichment: DISABLED"));
         assert!(context.contains("GeoIP enrichment: DISABLED"));
-        assert!(context.contains("Fail2ban integration: DISABLED"));
         assert!(context.contains("Slack notifications: DISABLED"));
         assert!(context.contains("Cloudflare edge blocking: DISABLED"));
     }
