@@ -1,6 +1,34 @@
 use super::env::HardenEnv;
 use super::types::{CheckResult, Finding, Severity};
 
+/// Bug 8 (2026-05-06 prod observation): the prior code did
+/// `command_stdout("systemctl", ["is-active", ...]) == "active"` and
+/// any other shape (including `unknown` from `Failed to connect to
+/// bus`) became "agent is not running". Harden then created a real
+/// finding that lowered the score even though the agent was alive.
+///
+/// This helper distinguishes the three cases. On `Unknown` we do not
+/// produce a finding — `harden` is an advisor and would rather be
+/// silent than wrong. The companion fix in `crates/ctl/src/systemd.rs`
+/// gives the same tri-state to `cmd_doctor`'s Services section.
+pub(super) fn classify_service_active(stdout: Option<&str>) -> ServicePresence {
+    match stdout {
+        None => ServicePresence::Unknown,
+        Some(line) => match line.trim() {
+            "active" => ServicePresence::Active,
+            "" | "unknown" => ServicePresence::Unknown,
+            _ => ServicePresence::Inactive,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ServicePresence {
+    Active,
+    Inactive,
+    Unknown,
+}
+
 pub(super) fn is_service_exposure_line_safe(line: &str) -> bool {
     line.contains(":22 ")
         || line.contains(":80 ")
@@ -44,26 +72,96 @@ pub(super) fn check_services(env: &impl HardenEnv) -> CheckResult {
         }
     }
 
-    // Check fail2ban or equivalent
-    let has_iw = env
-        .command_stdout("systemctl", &["is-active", "innerwarden-agent"])
-        .map(|stdout| stdout.trim() == "active")
-        .unwrap_or(false);
-
-    if has_iw {
-        passed.push("Inner Warden agent is active".into());
-    } else {
-        findings.push(Finding {
-            category: cat,
-            severity: Severity::Medium,
-            title: "Inner Warden agent is not running".into(),
-            fix: "Run: sudo systemctl start innerwarden-agent".into(),
-        });
+    // Bug 8 fix (2026-05-06): tri-state instead of bool. `Active`
+    // adds a passed line, `Inactive` produces the finding, `Unknown`
+    // is silent — we cannot reliably tell from this session whether
+    // the agent is up, and the operator's `innerwarden doctor` Agent
+    // health section uses telemetry-freshness to answer the question
+    // honestly. Producing a false "is not running" finding here
+    // double-tanks the score in that case.
+    let stdout_owned = env.command_stdout("systemctl", &["is-active", "innerwarden-agent"]);
+    let presence = classify_service_active(stdout_owned.as_deref());
+    match presence {
+        ServicePresence::Active => {
+            passed.push("Inner Warden agent is active".into());
+        }
+        ServicePresence::Inactive => {
+            findings.push(Finding {
+                category: cat,
+                severity: Severity::Medium,
+                title: "Inner Warden agent is not running".into(),
+                fix: "Run: sudo systemctl start innerwarden-agent".into(),
+            });
+        }
+        ServicePresence::Unknown => {
+            // Silent — we do not know. Doctor's Agent health section
+            // is the source of truth via telemetry-freshness.
+        }
     }
 
     CheckResult {
         category: cat,
         passed,
         findings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bug 8 anchor (2026-05-06): "active" stdout means active.
+    #[test]
+    fn classify_service_active_active_string_maps_to_active() {
+        assert_eq!(
+            classify_service_active(Some("active\n")),
+            ServicePresence::Active
+        );
+    }
+
+    /// Bug 8 anchor: "inactive" / "failed" / arbitrary other strings
+    /// (that are NOT the bus-failure shape) classify as Inactive so
+    /// harden DOES produce the finding when the agent is genuinely
+    /// down.
+    #[test]
+    fn classify_service_active_inactive_strings_map_to_inactive() {
+        assert_eq!(
+            classify_service_active(Some("inactive\n")),
+            ServicePresence::Inactive
+        );
+        assert_eq!(
+            classify_service_active(Some("failed\n")),
+            ServicePresence::Inactive
+        );
+    }
+
+    /// Bug 8 headline anchor: "unknown" stdout (the `Failed to
+    /// connect to bus` shape) maps to Unknown — NOT Inactive — so
+    /// harden does not create a false finding when the operator's
+    /// session lacks `DBUS_SESSION_BUS_ADDRESS`.
+    #[test]
+    fn classify_service_active_unknown_stdout_maps_to_unknown() {
+        assert_eq!(
+            classify_service_active(Some("unknown\n")),
+            ServicePresence::Unknown
+        );
+    }
+
+    /// Bug 8 anchor: empty stdout (the bus-failure shape on some
+    /// distros) also maps to Unknown.
+    #[test]
+    fn classify_service_active_empty_stdout_maps_to_unknown() {
+        assert_eq!(classify_service_active(Some("")), ServicePresence::Unknown);
+        assert_eq!(
+            classify_service_active(Some("   \n")),
+            ServicePresence::Unknown
+        );
+    }
+
+    /// Bug 8 anchor: when the command did not even run (None from
+    /// `command_stdout`), classification is Unknown.
+    #[test]
+    fn classify_service_active_none_maps_to_unknown() {
+        assert_eq!(classify_service_active(None), ServicePresence::Unknown);
     }
 }

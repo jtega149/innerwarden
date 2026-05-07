@@ -642,6 +642,27 @@ pub(crate) fn build_service_running_check(unit: &str, running: bool, is_macos: b
     }
 }
 
+/// Bug 2 fix (2026-05-06): build a service-status check that knows
+/// the difference between "definitely Inactive" and "could not query
+/// the bus". The Unknown case emits an OK-coloured info line that
+/// defers to the Agent health (telemetry-freshness) section below
+/// instead of the previous false-positive `[warn] is not running`.
+pub(crate) fn build_service_status_check_linux(
+    unit: &str,
+    status: systemd::ServiceStatus,
+) -> Check {
+    match status {
+        systemd::ServiceStatus::Active => Check::ok(format!("{unit} is running")),
+        systemd::ServiceStatus::Inactive => Check::warn(
+            format!("{unit} is not running"),
+            format!("sudo systemctl start {unit}"),
+        ),
+        systemd::ServiceStatus::Unknown => Check::ok(format!(
+            "{unit}: status unknown (no systemd bus in this session) — see Agent health"
+        )),
+    }
+}
+
 /// Build the dashboard `--dashboard` flag-in-service check.
 pub(crate) fn build_dashboard_flag_check(flag_in_service: bool) -> Check {
     if flag_in_service {
@@ -672,19 +693,29 @@ pub(crate) fn build_dashboard_credentials_checks(has_user: bool, has_hash: bool)
 /// Build the dashboard reachability check from a pre-computed reach flag.
 /// Returns `None` if neither informational message applies (e.g. dashboard
 /// is not enabled and not reachable: caller decides what to print).
+///
+/// Bug 3 (2026-05-06): when the dashboard probe failed but the agent
+/// was already known active (via `systemctl is-active` or telemetry
+/// freshness), the previous hint "Start the agent" was wrong — the
+/// agent was already running; the operator needed a hint about the
+/// dashboard binding (port / TLS / config). Pass `agent_alive` so the
+/// hint can adapt.
 pub(crate) fn build_dashboard_reachability_check(
     reachable: bool,
     flag_in_service: bool,
+    agent_alive: bool,
 ) -> Option<Check> {
     if reachable {
         Some(Check::ok(
             "Dashboard is reachable at http://YOUR_SERVER_IP:8787",
         ))
     } else if flag_in_service {
-        Some(Check::warn(
-            "Dashboard port 8787 is not responding",
-            "Start the agent:  sudo systemctl start innerwarden-agent",
-        ))
+        let hint = if agent_alive {
+            "Agent is running; check the dashboard binding (port/TLS/listen address) — sudo journalctl -u innerwarden-agent -n 100 | grep -i dashboard"
+        } else {
+            "Start the agent:  sudo systemctl start innerwarden-agent"
+        };
+        Some(Check::warn("Dashboard port 8787 is not responding", hint))
     } else {
         None
     }
@@ -1866,8 +1897,12 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
         }
     } else {
         for unit in &["innerwarden-sensor", "innerwarden-agent"] {
-            let running = systemd::is_service_active(unit);
-            svc.push(build_service_running_check(unit, running, false));
+            // Bug 2 (2026-05-06): use the tri-state status so a
+            // session without DBUS_SESSION_BUS_ADDRESS does not get
+            // a false `[warn] is not running` while the agent is
+            // alive. Unknown defers to Agent health below.
+            let status = systemd::service_status(unit);
+            svc.push(build_service_status_check_linux(unit, status));
         }
     }
     run_section(svc, &mut total_issues);
@@ -2243,8 +2278,22 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             .build()
             .call()
             .is_ok();
+        // Bug 3 (2026-05-06): pass agent-alive so the hint adapts
+        // when the dashboard is unreachable but the agent itself is
+        // running. `service_status::Active` is one signal; the
+        // pragmatic OR with the telemetry-freshness check below would
+        // be ideal but doctor's section ordering puts dashboard
+        // BEFORE Agent health. service_status::Active alone covers
+        // the bus-OK case; the bus-failure case (Unknown) yields
+        // `agent_alive = false` here, but on a bus-failure session
+        // doctor cannot reach the dashboard's HTTP probe either, so
+        // the hint mismatch is benign in that scenario.
+        let agent_alive = matches!(
+            systemd::service_status("innerwarden-agent"),
+            systemd::ServiceStatus::Active
+        );
         if let Some(check) =
-            build_dashboard_reachability_check(dashboard_up, dashboard_flag_in_service)
+            build_dashboard_reachability_check(dashboard_up, dashboard_flag_in_service, agent_alive)
         {
             db.push(check);
         }
@@ -4183,20 +4232,48 @@ enabled = true
 
     #[test]
     fn build_dashboard_reachability_check_reachable_is_ok() {
-        let c = build_dashboard_reachability_check(true, true).unwrap();
+        // agent_alive value irrelevant on the reachable path.
+        let c = build_dashboard_reachability_check(true, true, false).unwrap();
         assert_eq!(c.sev, Sev::Ok);
     }
 
+    /// Pre-Bug-3 behavior: agent down, dashboard down → "Start the agent".
     #[test]
-    fn build_dashboard_reachability_check_unreachable_with_flag_warns() {
-        let c = build_dashboard_reachability_check(false, true).unwrap();
+    fn build_dashboard_reachability_check_agent_down_suggests_start() {
+        let c = build_dashboard_reachability_check(false, true, false).unwrap();
         assert_eq!(c.sev, Sev::Warn);
-        assert!(c.hint.unwrap().contains("systemctl start"));
+        let hint = c.hint.unwrap();
+        assert!(hint.contains("systemctl start"));
+        assert!(hint.contains("Start the agent"));
+    }
+
+    /// Bug 3 anchor (2026-05-06): when agent IS alive but dashboard
+    /// probe fails, the hint MUST NOT tell the operator to start the
+    /// agent (that hint is wrong — agent is running). Instead point
+    /// at the dashboard binding / journal.
+    #[test]
+    fn build_dashboard_reachability_check_agent_alive_dashboard_down_does_not_say_start_agent() {
+        let c = build_dashboard_reachability_check(false, true, true).unwrap();
+        assert_eq!(c.sev, Sev::Warn);
+        let hint = c.hint.unwrap();
+        assert!(
+            !hint.contains("Start the agent"),
+            "Bug 3 regression: hint must not tell operator to start an agent that is already alive. got: {hint}"
+        );
+        assert!(
+            hint.contains("Agent is running"),
+            "hint should explicitly disclose the agent is alive so the operator does not double-take. got: {hint}"
+        );
+        assert!(
+            hint.contains("dashboard"),
+            "hint should redirect attention to the dashboard binding/config. got: {hint}"
+        );
     }
 
     #[test]
     fn build_dashboard_reachability_check_unreachable_without_flag_returns_none() {
-        assert!(build_dashboard_reachability_check(false, false).is_none());
+        assert!(build_dashboard_reachability_check(false, false, false).is_none());
+        assert!(build_dashboard_reachability_check(false, false, true).is_none());
     }
 
     #[test]

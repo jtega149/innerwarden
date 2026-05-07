@@ -766,6 +766,65 @@ LISTEN 0 128 :::3307 users:(\"custom\")\n\
             .any(|passed| passed == "Inner Warden agent is active"));
     }
 
+    /// Bug 8 anchor (2026-05-06): when the operator's session lacks
+    /// `DBUS_SESSION_BUS_ADDRESS`, `systemctl is-active` prints
+    /// `unknown` to stdout while the agent is in fact alive. Harden
+    /// MUST NOT emit "Inner Warden agent is not running" in that
+    /// case — the observed effect was a 16/100 "Critical" score
+    /// driven partly by this false-positive while the agent was up.
+    /// Anchor the silence: no finding, no passed line, no false signal.
+    #[test]
+    fn check_services_silent_when_systemctl_returns_unknown() {
+        let env = TestEnv::default()
+            .with_command(
+                "ss",
+                &["-tlnp"],
+                "LISTEN 0 128 0.0.0.0:22 users:(\"sshd\")\n",
+            )
+            .with_command(
+                "systemctl",
+                &["is-active", "innerwarden-agent"],
+                "unknown\n",
+            );
+
+        let result = check_services(&env);
+
+        assert!(
+            !has_title(&result, "Inner Warden agent is not running"),
+            "Bug 8 regression: harden must not claim the agent is down on a bus-failure shape"
+        );
+        assert!(
+            !result
+                .passed
+                .iter()
+                .any(|passed| passed == "Inner Warden agent is active"),
+            "Bug 8: harden also must not claim the agent IS active when the bus is unreachable — defer to doctor's freshness check"
+        );
+    }
+
+    /// Bug 8 anchor: same rule when stdout is empty (the bus-failure
+    /// shape on some distros — the bus error goes to stderr, stdout
+    /// is empty, exit non-zero). The classifier returns Unknown so
+    /// no finding fires.
+    #[test]
+    fn check_services_silent_when_systemctl_stdout_is_empty() {
+        let env = TestEnv::default()
+            .with_command(
+                "ss",
+                &["-tlnp"],
+                "LISTEN 0 128 0.0.0.0:22 users:(\"sshd\")\n",
+            )
+            .with_command("systemctl", &["is-active", "innerwarden-agent"], "");
+
+        let result = check_services(&env);
+
+        assert!(!has_title(&result, "Inner Warden agent is not running"));
+        assert!(!result
+            .passed
+            .iter()
+            .any(|passed| passed == "Inner Warden agent is active"));
+    }
+
     #[test]
     fn suspicious_crontab_reason_detects_download_execute_patterns() {
         // Exercises malware-stager detection for curl/wget piped into shell interpreters.
