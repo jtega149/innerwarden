@@ -878,6 +878,13 @@ The fix lifts the inline path's verdict to canonical: whoever lands the first de
 - `crates/agent/src/incident_flow.rs::tests::evaluate_pre_ai_flow_returns_skip_handled_when_inline_decision_already_landed` — when SQLite has a `dismiss` row for the incident's id (seeded via the test as if `killchain_inline` had just written it), the gate returns `SkipHandled` and the AI router is not invoked. Anti-regression for the prod two-decision race that surfaced operator git-fetch traffic as a high-risk attacker.
 - `crates/agent/src/incident_flow.rs::tests::evaluate_pre_ai_flow_does_not_short_circuit_when_no_existing_decision_for_incident` — fresh incident_id (with an UNRELATED row already in the table) does NOT trigger the new short-circuit. Pins the cheap-exit contract so a future LIKE-based over-match doesn't accidentally suppress the AI router on incidents whose ids happen to substring-match an unrelated row.
 
+### Profiles cloud-provider badge (fix/profiles-cloud-provider-badge — 2026-05-08)
+
+PR #492 closed the write-side of the inline-decision-vs-AI-router race so no new wrongly-credited "cloud-provider IP as high-risk attacker" rows can appear. This PR closes the read-side: the Profiles tab API enriches every row with a `cloud_provider` field that uses the SAME `cloud_safelist::identify_provider` predicate the autoblock gate consults, and accepts `?exclude_cloud=true` to drop those rows from the response. Pre-fix the operator's audit page listed Microsoft Azure / AWS edge IPs as risk-71+ attackers with no indication that the agent's own gate would have refused to block them — the dashboard contradicted the gate, and operator trust suffered.
+
+- `crates/agent/src/dashboard/intelligence.rs::tests::enrich_with_cloud_provider_tags_known_clouds_and_leaves_others_null` — `enrich_with_cloud_provider` adds `cloud_provider = Some(label)` for AWS / Azure / Cloudflare IPs (uses the prod-data IPs `34.253.181.30`, `20.26.156.215`, `104.26.12.38`) and `null` for real attacker IPs. Pins the contract that the dashboard view never disagrees with the autoblock gate.
+- `crates/agent/src/dashboard/intelligence.rs::tests::enrich_then_filter_exclude_cloud_drops_only_cloud_rows` — when the API caller passes `?exclude_cloud=true`, the response retains only rows where `cloud_provider` is null. Pins the operator-opt-in filter so the page can render a clean "real attackers only" view without losing the underlying data (the unfiltered view stays available by default).
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

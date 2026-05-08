@@ -5,6 +5,22 @@ use super::*;
 // ── Attacker Intelligence & Monthly Reports ────────────────────────
 
 /// `GET /api/attacker-profiles` - list attacker profiles sorted by risk.
+///
+/// 2026-05-08 (fix/profiles-cloud-provider-badge): every profile in the
+/// response is enriched with a `cloud_provider` field — `Some(label)`
+/// when the IP belongs to a known CDN / cloud / bulletproof-host range
+/// (Cloudflare, AWS, Azure, GCP, OCI, DO, Hetzner, Akamai, Fastly,
+/// CloudFront, …), `null` otherwise. The same predicate that gates
+/// auto-blocks (`cloud_safelist::identify_provider`) is used here so
+/// the dashboard view never disagrees with the autoblock gate. This
+/// is purely additive — pre-fix consumers still get the legacy fields.
+///
+/// Operators can filter cloud-provider rows out of the list by passing
+/// `?exclude_cloud=true`. Operator's prod 2026-05-08 audit found 99
+/// "high-risk" profiles, several of which were Microsoft Azure /
+/// AWS edge IPs surfaced by the inline-decision-vs-AI-router race
+/// (PR #492 closed the write side; this PR closes the read side so
+/// existing wrongly-credited rows stop dominating the page).
 pub(super) async fn api_attacker_profiles(
     State(state): State<DashboardState>,
     Query(query): Query<AttackerProfilesQuery>,
@@ -13,6 +29,7 @@ pub(super) async fn api_attacker_profiles(
     let offset = query.offset.unwrap_or(0);
     let min_risk = query.min_risk.unwrap_or(0);
     let sort = query.sort.as_deref().unwrap_or("risk_score");
+    let exclude_cloud = query.exclude_cloud.unwrap_or(false);
 
     let profiles: Vec<serde_json::Value> = state
         .sqlite_store
@@ -22,7 +39,11 @@ pub(super) async fn api_attacker_profiles(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let filtered = sort_attacker_profiles(profiles, min_risk, sort);
+    let enriched = enrich_with_cloud_provider(profiles);
+    let mut filtered = sort_attacker_profiles(enriched, min_risk, sort);
+    if exclude_cloud {
+        filtered.retain(|p| p.get("cloud_provider").is_some_and(|v| v.is_null()));
+    }
 
     let total = filtered.len();
     let page: Vec<serde_json::Value> = filtered.into_iter().skip(offset).take(limit).collect();
@@ -41,6 +62,38 @@ pub(super) struct AttackerProfilesQuery {
     offset: Option<usize>,
     sort: Option<String>,
     min_risk: Option<u8>,
+    exclude_cloud: Option<bool>,
+}
+
+/// Add a `cloud_provider` field to every profile in `profiles`.
+///
+/// The value is `Some(provider_label)` when
+/// `cloud_safelist::identify_provider` returns a label for the
+/// profile's `ip` field, otherwise `null`. Pure-input → pure-output
+/// helper kept separate from `api_attacker_profiles` so the contract
+/// is unit-testable without a full dashboard state.
+pub(super) fn enrich_with_cloud_provider(
+    profiles: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    profiles
+        .into_iter()
+        .map(|mut p| {
+            let provider = p
+                .get("ip")
+                .and_then(|v| v.as_str())
+                .and_then(crate::cloud_safelist::identify_provider);
+            if let Some(obj) = p.as_object_mut() {
+                obj.insert(
+                    "cloud_provider".to_string(),
+                    match provider {
+                        Some(label) => serde_json::Value::String(label.to_string()),
+                        None => serde_json::Value::Null,
+                    },
+                );
+            }
+            p
+        })
+        .collect()
 }
 
 pub(super) fn sort_attacker_profiles(
@@ -82,7 +135,12 @@ pub(super) async fn api_attacker_profile_detail(
 
     let profile = profiles.into_iter().find(|p| p["ip"].as_str() == Some(&ip));
     match profile {
-        Some(p) => Json(p),
+        Some(p) => {
+            // Enrich with cloud_provider so the drill-down detail view
+            // matches the list view's labelling (operator-honesty).
+            let mut enriched = enrich_with_cloud_provider(vec![p]);
+            Json(enriched.pop().unwrap_or(serde_json::Value::Null))
+        }
         None => Json(serde_json::json!({"error": "profile not found"})),
     }
 }
@@ -785,6 +843,63 @@ mod tests {
         assert!(!is_valid_month(""));
     }
 
+    /// 2026-05-08 anchor (fix/profiles-cloud-provider-badge): every
+    /// profile in the Profiles tab must carry a `cloud_provider`
+    /// label that matches what `cloud_safelist::identify_provider`
+    /// would say for its IP. Pre-fix the dashboard listed Microsoft
+    /// Azure / AWS edge IPs as "high-risk attacker" rows with no
+    /// indication that the agent's own autoblock gate would have
+    /// refused to block them. The mismatch made the page look
+    /// paranoid (and the operator distrust every other row).
+    ///
+    /// The contract: the field is `Some(label)` for any IP in a
+    /// known cloud range, `null` for unaffiliated IPs. The dashboard
+    /// JS uses this to badge / filter / sort rows; even without UI
+    /// changes the JSON consumer can grep for the label.
+    #[test]
+    fn enrich_with_cloud_provider_tags_known_clouds_and_leaves_others_null() {
+        crate::cloud_safelist::init();
+        let profiles = vec![
+            // The exact prod IP from the 2026-05-08 audit (AWS Ireland).
+            serde_json::json!({"ip": "34.253.181.30", "risk_score": 87}),
+            // Microsoft Azure UK (the git-fetch FP).
+            serde_json::json!({"ip": "20.26.156.215", "risk_score": 71}),
+            // Cloudflare edge.
+            serde_json::json!({"ip": "104.26.12.38", "risk_score": 60}),
+            // Real attacker (TEST-NET-3, RFC 5737, never on a CDN).
+            serde_json::json!({"ip": "203.0.113.42", "risk_score": 80}),
+        ];
+        let enriched = enrich_with_cloud_provider(profiles);
+        assert_eq!(enriched[0]["cloud_provider"], "AWS");
+        assert_eq!(enriched[1]["cloud_provider"], "Azure");
+        assert_eq!(enriched[2]["cloud_provider"], "Cloudflare");
+        assert!(
+            enriched[3]["cloud_provider"].is_null(),
+            "203.0.113.42 (real-attacker test net) must have null cloud_provider"
+        );
+    }
+
+    /// Mirror anchor: when `?exclude_cloud=true` is passed, the API
+    /// must drop every row with a non-null `cloud_provider`. Pins
+    /// the operator-opt-in filter so the Profiles tab can render a
+    /// clean "real attackers only" view without losing the data
+    /// (the unfiltered view is still available by default).
+    #[test]
+    fn enrich_then_filter_exclude_cloud_drops_only_cloud_rows() {
+        crate::cloud_safelist::init();
+        let profiles = vec![
+            serde_json::json!({"ip": "34.253.181.30", "risk_score": 87}),
+            serde_json::json!({"ip": "203.0.113.42", "risk_score": 80}),
+            serde_json::json!({"ip": "20.26.156.215", "risk_score": 71}),
+            serde_json::json!({"ip": "203.0.113.99", "risk_score": 65}),
+        ];
+        let mut enriched = enrich_with_cloud_provider(profiles);
+        enriched.retain(|p| p.get("cloud_provider").is_some_and(|v| v.is_null()));
+        assert_eq!(enriched.len(), 2);
+        assert_eq!(enriched[0]["ip"], "203.0.113.42");
+        assert_eq!(enriched[1]["ip"], "203.0.113.99");
+    }
+
     #[test]
     fn test_sort_attacker_profiles_missing_fields() {
         // Missing score fields default safely and still sort/filter deterministically.
@@ -809,6 +924,7 @@ mod tests {
             offset: None,
             sort: None,
             min_risk: None,
+            exclude_cloud: None,
         };
         let response = api_attacker_profiles(State(state), Query(query)).await;
 
