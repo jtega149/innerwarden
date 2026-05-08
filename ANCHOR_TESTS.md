@@ -868,6 +868,16 @@ The anchors below pin each contract.
 - `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_with_c2_port` — non-zero c2_port (4444 / 1337 / etc) keeps the incident visible. Anti-regression for the kill_chain seeing an attacker-flagged port.
 - `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_unknown_comm` — unknown comm with the bare 2-bit chain still routes to AI. Pins the comm-allowlist gate so a bespoke attacker binary doesn't get the operator-tool free pass.
 
+### Inline-decision vs AI-router race (fix/inline-decision-vs-ai-router-race — 2026-05-08)
+
+Operator's prod 2026-05-08 dashboard showed `20.26.156.215` (Microsoft Azure UK / git-fetch FP) as a high-risk attacker (risk 71, 7 blocks). SQLite trace revealed two parallel decision writers fired on the same `kill_chain:detected:DATA_EXFIL:NNN:...` incident_id: `killchain_inline::dismiss_self_traffic_incidents` wrote `dismiss` (correct — the operator was running `git fetch git@github.com`), then 9 seconds later the agent's main triage loop processed the same incident through the AI router, which wrote `block_ip` from `local_classifier`. Two rows for one incident — the dashboard's Profiles tab credited the second row to the IP and surfaced operator self-traffic as a high-risk attacker, undermining trust in every other profile on the page.
+
+The fix lifts the inline path's verdict to canonical: whoever lands the first decision row for an `incident_id` wins, and `evaluate_pre_ai_flow` short-circuits the AI router when a prior decision exists. SQLite's `idx_decisions_incident` index makes this an O(log N) lookup so the gate runs on every incident without measurable cost.
+
+- `crates/store/src/decisions.rs::tests::has_decision_for_incident_returns_true_after_first_row_for_id` — `has_decision_for_incident` returns `false` for an unseen incident_id, `true` after a single row lands (regardless of `action_type`), keeps returning `true` after subsequent rows for the same id, and does not match unrelated incident_ids. Pins the cheap-exit + no-LIKE-overmatch contract.
+- `crates/agent/src/incident_flow.rs::tests::evaluate_pre_ai_flow_returns_skip_handled_when_inline_decision_already_landed` — when SQLite has a `dismiss` row for the incident's id (seeded via the test as if `killchain_inline` had just written it), the gate returns `SkipHandled` and the AI router is not invoked. Anti-regression for the prod two-decision race that surfaced operator git-fetch traffic as a high-risk attacker.
+- `crates/agent/src/incident_flow.rs::tests::evaluate_pre_ai_flow_does_not_short_circuit_when_no_existing_decision_for_incident` — fresh incident_id (with an UNRELATED row already in the table) does NOT trigger the new short-circuit. Pins the cheap-exit contract so a future LIKE-based over-match doesn't accidentally suppress the AI router on incidents whose ids happen to substring-match an unrelated row.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

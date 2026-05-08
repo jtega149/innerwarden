@@ -4,7 +4,7 @@
 //! and `row_hash` (SHA-256 of `prev_hash || data`). This enables tamper
 //! detection: if any row is modified, the chain breaks.
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, StoreError};
@@ -438,6 +438,42 @@ impl Store {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    /// Cheap existence check: is there ANY decision row in the table
+    /// for this `incident_id`? Returns `true` after the first match.
+    ///
+    /// 2026-05-08 (fix/inline-decision-vs-ai-router-race): the agent
+    /// has multiple parallel decision writers for kill_chain incidents.
+    /// `killchain_inline::dismiss_self_traffic_incidents` writes a
+    /// `dismiss` decision synchronously when the sensor's killchain
+    /// stream reports a 2-bit chain on a known operator/system tool.
+    /// The agent's main triage loop reads incidents-*.jsonl on a 2s
+    /// poll cadence, runs the AI router on the same incident, and
+    /// writes a SECOND decision (often `block_ip`) milliseconds to
+    /// seconds later.
+    ///
+    /// Operator-visible: a `kill_chain DATA_EXFIL` incident would land
+    /// a `dismiss` row from `self-traffic-fp` AND a `block_ip` row from
+    /// `local_classifier` for the same `incident_id`, making the
+    /// dashboard report the IP as both "auto-dismissed" and "auto-
+    /// blocked". Operator's prod 2026-05-08 had this exact shape on
+    /// 20.26.156.215 (Microsoft Azure UK / git-fetch FP).
+    ///
+    /// The fix: `evaluate_pre_ai_flow` calls this helper at the top of
+    /// the gate. If a decision already exists for the incident_id, the
+    /// AI router is skipped — the inline path's verdict stands. Indexed
+    /// by `idx_decisions_incident` so the lookup is O(log N).
+    pub fn has_decision_for_incident(&self, incident_id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM decisions WHERE incident_id = ?1 LIMIT 1",
+                params![incident_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
     }
 
     /// Count total decisions.
@@ -924,5 +960,58 @@ mod tests {
 
         let for_inc2 = store.decisions_for_incident("inc-2").unwrap();
         assert_eq!(for_inc2.len(), 1);
+    }
+
+    /// 2026-05-08 anchor (fix/inline-decision-vs-ai-router-race):
+    /// `has_decision_for_incident` is the gate that prevents a second
+    /// decision-writer (the AI router) from racing the inline killchain
+    /// dismiss path. Pre-fix, two decision rows for the same incident_id
+    /// would land — `dismiss` from `self-traffic-fp` and `block_ip` from
+    /// `local_classifier` — and the dashboard's Profiles tab credited
+    /// the second row to the IP, surfacing operator self-traffic
+    /// (Microsoft Azure UK / git-fetch) as a "high-risk attacker". The
+    /// gate's contract is: `true` after ANY prior decision row for the
+    /// `incident_id`. This anchor pins both arms of that contract — a
+    /// single dismiss must be enough to short-circuit the AI router,
+    /// AND a previously-unseen incident_id must cleanly return false.
+    #[test]
+    fn has_decision_for_incident_returns_true_after_first_row_for_id() {
+        let store = Store::open_memory().unwrap();
+
+        // Cold path: no prior decisions → must return false.
+        assert!(
+            !store.has_decision_for_incident("inc-fresh").unwrap(),
+            "missing incident_id must return false (cheap-exit)"
+        );
+
+        // Single dismiss landed: must return true even though it's not
+        // a block. The contract is "any decision wins" — the gate does
+        // not need to inspect action_type.
+        store
+            .insert_decision(&sample_decision("inc-killchain", "dismiss"))
+            .unwrap();
+        assert!(
+            store.has_decision_for_incident("inc-killchain").unwrap(),
+            "first dismiss must short-circuit the AI router race"
+        );
+
+        // Different incident_id stays uncovered — anti-regression for
+        // accidentally globbing the LIKE pattern.
+        assert!(
+            !store
+                .has_decision_for_incident("inc-killchain-other")
+                .unwrap(),
+            "different incident_id must not match"
+        );
+
+        // Multiple rows for the same incident_id keep returning true
+        // (idempotent — the gate doesn't need to count).
+        store
+            .insert_decision(&sample_decision("inc-killchain", "block_ip"))
+            .unwrap();
+        assert!(
+            store.has_decision_for_incident("inc-killchain").unwrap(),
+            "two rows must still report true"
+        );
     }
 }
