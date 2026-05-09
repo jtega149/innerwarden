@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::Timelike as _;
-use innerwarden_core::event::Severity;
-use innerwarden_core::incident::Incident;
 use tracing::{info, warn};
 
 use crate::{bot_helpers, config, narrative, telegram, AgentState};
@@ -77,10 +75,19 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                             for inc in &state.narrative_acc.incidents {
                                 incidents_today += 1;
                                 let det = telegram::extract_detector_pub(&inc.incident_id);
-                                // Effective severity: downgrade contained/noise
-                                // detectors so the health score reflects real risk,
-                                // not internet noise that was already handled.
-                                let effective = effective_severity(inc, det);
+                                // Effective severity: posture-aware downgrade
+                                // (spec 044 Phase 3). Demote alerts that hit
+                                // already-hardened controls (e.g. ssh_bruteforce
+                                // when PasswordAuthentication=no), keep alerts
+                                // at original severity when posture is
+                                // permissive or unknown, and never demote when
+                                // a real-landing tag is present.
+                                let (effective, _reason) =
+                                    crate::posture::downgrade::effective_severity(
+                                        inc,
+                                        det,
+                                        &state.host_posture,
+                                    );
                                 match effective {
                                     innerwarden_core::event::Severity::Critical => {
                                         critical_count += 1;
@@ -144,170 +151,11 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
     }
 }
 
-/// Compute effective severity for health score purposes.
-///
-/// Raw detector severity reflects what the detector saw, not the actual risk
-/// to the server. Internet noise (scanners, bots) that was already contained
-/// or that has zero chance of success should not tank the health score.
-fn effective_severity(inc: &Incident, detector: &str) -> Severity {
-    let raw = inc.severity.clone();
-
-    // SSH brute-force on a key-only server cannot succeed. The harden/scan
-    // module confirms PasswordAuthentication=no, so anything below Critical
-    // (which would mean the attacker got past auth) is Low-impact noise.
-    if detector == "ssh_bruteforce" && !matches!(raw, Severity::Critical) {
-        return Severity::Low;
-    }
-
-    // Proto anomaly scanners: malformed SSH, HTTP on wrong port from external
-    // scanners — these fail at protocol level. Already Low in the sensor for
-    // SshVersionAnomaly, but ProtocolMismatch is High. For health score
-    // purposes, external scanner traffic that triggered no further chain is
-    // Medium at most.
-    if detector == "proto_anomaly" && matches!(raw, Severity::High) {
-        return Severity::Medium;
-    }
-
-    // Kill chain unknown: pattern not matched = incomplete sequence. Not a
-    // confirmed attack chain. Medium is more accurate than the default.
-    if detector == "killchain" {
-        if let Some(pattern) = inc
-            .evidence
-            .get("pattern")
-            .or_else(|| inc.evidence.get(0).and_then(|e| e.get("pattern")))
-            .and_then(|p| p.as_str())
-        {
-            if pattern == "unknown" && matches!(raw, Severity::High | Severity::Medium) {
-                return Severity::Low;
-            }
-        }
-    }
-
-    // Correlated anomaly is advisory (baseline+neural convergence).
-    // Now Medium in the emitter but guard against older incidents.
-    if detector == "correlated_anomaly" && matches!(raw, Severity::High) {
-        return Severity::Medium;
-    }
-
-    // Threat intel hits that were auto-blocked are successes, not threats.
-    if detector == "threat_intel" {
-        if let Some(tags) = inc.tags.as_slice().iter().find(|t| *t == "auto_blocked") {
-            let _ = tags;
-            return Severity::Low;
-        }
-    }
-
-    raw
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use innerwarden_core::event::Severity;
-
-    fn make_incident(
-        detector: &str,
-        severity: Severity,
-        tags: Vec<&str>,
-        evidence: serde_json::Value,
-    ) -> Incident {
-        Incident {
-            ts: chrono::Utc::now(),
-            host: "test".into(),
-            incident_id: format!("{}:1.2.3.4:test", detector),
-            severity,
-            title: "Test".into(),
-            summary: "".into(),
-            evidence,
-            recommended_checks: vec![],
-            tags: tags.into_iter().map(|s| s.to_string()).collect(),
-            entities: vec![],
-        }
-    }
-
-    // SSH brute-force on key-only server: anything below Critical → Low
-    #[test]
-    fn effective_severity_ssh_bruteforce_high_becomes_low() {
-        let inc = make_incident(
-            "ssh_bruteforce",
-            Severity::High,
-            vec![],
-            serde_json::json!({}),
-        );
-        assert_eq!(effective_severity(&inc, "ssh_bruteforce"), Severity::Low);
-    }
-
-    // SSH brute-force at Critical stays Critical (attacker got past auth)
-    #[test]
-    fn effective_severity_ssh_bruteforce_critical_stays() {
-        let inc = make_incident(
-            "ssh_bruteforce",
-            Severity::Critical,
-            vec![],
-            serde_json::json!({}),
-        );
-        assert_eq!(
-            effective_severity(&inc, "ssh_bruteforce"),
-            Severity::Critical
-        );
-    }
-
-    // Proto anomaly: High → Medium
-    #[test]
-    fn effective_severity_proto_anomaly_high_to_medium() {
-        let inc = make_incident(
-            "proto_anomaly",
-            Severity::High,
-            vec![],
-            serde_json::json!({}),
-        );
-        assert_eq!(effective_severity(&inc, "proto_anomaly"), Severity::Medium);
-    }
-
-    // Proto anomaly: Medium stays Medium (only High is clamped)
-    #[test]
-    fn effective_severity_proto_anomaly_medium_unchanged() {
-        let inc = make_incident(
-            "proto_anomaly",
-            Severity::Medium,
-            vec![],
-            serde_json::json!({}),
-        );
-        assert_eq!(effective_severity(&inc, "proto_anomaly"), Severity::Medium);
-    }
-
-    // Killchain with unknown pattern: High → Low
-    #[test]
-    fn effective_severity_killchain_unknown_high_to_low() {
-        let evidence = serde_json::json!({"pattern": "unknown"});
-        let inc = make_incident("killchain", Severity::High, vec![], evidence);
-        assert_eq!(effective_severity(&inc, "killchain"), Severity::Low);
-    }
-
-    // Threat intel auto_blocked → Low
-    #[test]
-    fn effective_severity_threat_intel_auto_blocked_to_low() {
-        let inc = make_incident(
-            "threat_intel",
-            Severity::High,
-            vec!["auto_blocked"],
-            serde_json::json!({}),
-        );
-        assert_eq!(effective_severity(&inc, "threat_intel"), Severity::Low);
-    }
-
-    // Correlated anomaly: High → Medium
-    #[test]
-    fn effective_severity_correlated_anomaly_high_to_medium() {
-        let inc = make_incident(
-            "correlated_anomaly",
-            Severity::High,
-            vec![],
-            serde_json::json!({}),
-        );
-        assert_eq!(
-            effective_severity(&inc, "correlated_anomaly"),
-            Severity::Medium
-        );
-    }
-}
+// 2026-05-09 spec 044 Phase 3: the previous in-file `effective_severity`
+// function assumed `PasswordAuthentication=no` globally and demoted every
+// `ssh_bruteforce` regardless of the host's actual sshd config. That
+// assumption was right on this prod host but wrong as a generic policy.
+// The replacement lives in `crates/agent/src/posture/downgrade.rs` and
+// reads the live posture snapshot via `state.host_posture`. Tests moved
+// with it (see posture::downgrade::tests). The pre-spec-044 commit
+// history preserves the original rule reasoning if you need to see it.

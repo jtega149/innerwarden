@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+pub(crate) mod downgrade;
 pub(crate) mod firewall;
 pub(crate) mod services;
 pub(crate) mod sshd;
