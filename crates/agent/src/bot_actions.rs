@@ -115,7 +115,34 @@ pub(crate) async fn handle_telegram_action_callback(
             ai_provider: state.ai_router.any_llm(),
         };
 
-        let exec_result = skill.execute(&ctx, cfg.responder.dry_run).await;
+        // 2026-05-10 (skill_gate): even operator-driven Telegram quick-blocks
+        // route through `skill_gate::gate_block_ip`. Stops an accidental
+        // tap from putting a `trusted_ips` IP or a Cloudflare CDN edge
+        // into the firewall just because the operator clicked the inline
+        // button on the wrong alert.
+        let exec_result = match crate::skill_gate::gate_block_ip(&ip, &cfg.allowlist.trusted_ips) {
+            Ok(gate) => {
+                crate::skill_gate::execute_block_skill_gated(
+                    skill,
+                    &ctx,
+                    cfg.responder.dry_run,
+                    &gate,
+                )
+                .await
+            }
+            Err(refusal) => {
+                warn!(
+                    ip = %ip,
+                    skill_id = %skill_id,
+                    reason = %refusal,
+                    "Telegram quick-block refused by gate (allowlist / safelist / shape)"
+                );
+                skills::SkillResult {
+                    success: false,
+                    message: format!("{refusal}"),
+                }
+            }
+        };
 
         if exec_result.success {
             state.blocklist.insert(ip.clone());
@@ -284,7 +311,36 @@ pub(crate) async fn handle_telegram_action_callback(
                         honeypot: honeypot_runtime(cfg),
                         ai_provider: state.ai_router.any_llm(),
                     };
-                    let exec_result = skill.execute(&ctx, cfg.responder.dry_run).await;
+                    // 2026-05-10 (skill_gate): operator-driven block from
+                    // the honeypot suggestion flow also routes through
+                    // the gate. Same rationale as the quick-block above:
+                    // an inline-keyboard tap on the wrong IP must not
+                    // bypass the operator's `trusted_ips` allowlist or
+                    // the cloud-provider safelist.
+                    let exec_result =
+                        match crate::skill_gate::gate_block_ip(&ip, &cfg.allowlist.trusted_ips) {
+                            Ok(gate) => {
+                                crate::skill_gate::execute_block_skill_gated(
+                                    skill,
+                                    &ctx,
+                                    cfg.responder.dry_run,
+                                    &gate,
+                                )
+                                .await
+                            }
+                            Err(refusal) => {
+                                warn!(
+                                    ip = %ip,
+                                    skill_id = %skill_id,
+                                    reason = %refusal,
+                                    "Telegram operator-honeypot block refused by gate"
+                                );
+                                skills::SkillResult {
+                                    success: false,
+                                    message: format!("{refusal}"),
+                                }
+                            }
+                        };
                     if exec_result.success {
                         state.blocklist.insert(ip.clone());
                     }

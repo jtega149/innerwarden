@@ -1425,6 +1425,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             let block_backend = cfg.responder.block_backend.clone();
             let allowed_skills = cfg.responder.allowed_skills.clone();
             let interaction = cfg.honeypot.interaction.clone();
+            // 2026-05-10 (skill_gate): plumb operator trusted_ips into the
+            // honeypot listener so its auto-block paths route through
+            // `skill_gate::gate_block_ip` and respect
+            // `cfg.allowlist.trusted_ips` just like the canonical
+            // `decision_block_ip` path.
+            let trusted_ips = cfg.allowlist.trusted_ips.clone();
             let token = state.task_group.token();
 
             state.task_group.spawn_or_log(
@@ -1447,6 +1453,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         block_backend,
                         allowed_skills,
                         interaction,
+                        trusted_ips,
                         token,
                     )
                     .await;

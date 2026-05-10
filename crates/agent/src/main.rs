@@ -155,6 +155,7 @@ mod report;
 mod response_lifecycle;
 mod scoring;
 mod shield_inline;
+mod skill_gate;
 mod skills;
 mod slack;
 #[allow(dead_code)]

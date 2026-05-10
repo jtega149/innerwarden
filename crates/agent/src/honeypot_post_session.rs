@@ -119,6 +119,7 @@ pub(crate) async fn spawn_post_session_tasks(
     dry_run: bool,
     block_backend: &str,
     allowed_skills: &[String],
+    trusted_ips: &[String],
     blocklist_already_has_ip: bool,
 ) {
     // Give the honeypot listener time to collect evidence (wait for session to end).
@@ -224,7 +225,36 @@ pub(crate) async fn spawn_post_session_tasks(
                 _ => Some(Box::new(skills::builtin::BlockIpUfw)),
             };
             if let Some(skill) = skill_box {
-                let result = skill.execute(&ctx, dry_run).await;
+                // 2026-05-10 (skill_gate): post-session auto-block routes
+                // through `skill_gate::gate_block_ip` so it respects
+                // `cfg.allowlist.trusted_ips` + cloud_safelist. Same
+                // class of bypass as `handle_always_on_connection` —
+                // operator's trusted endpoints (loopback, internal
+                // Oracle IPs) were getting firewall-blocked when the
+                // honeypot finally ended a session.
+                let result = match crate::skill_gate::gate_block_ip(ip, trusted_ips) {
+                    Ok(gate) => {
+                        crate::skill_gate::execute_block_skill_gated(
+                            skill.as_ref(),
+                            &ctx,
+                            dry_run,
+                            &gate,
+                        )
+                        .await
+                    }
+                    Err(refusal) => {
+                        tracing::warn!(
+                            ip,
+                            skill_id = %skill_id,
+                            reason = %refusal,
+                            "honeypot post-session block refused by gate"
+                        );
+                        skills::SkillResult {
+                            success: false,
+                            message: format!("{refusal}"),
+                        }
+                    }
+                };
                 if result.success {
                     // Write decision to audit trail (hash-chained)
                     let entry = decisions::DecisionEntry {

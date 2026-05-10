@@ -158,17 +158,44 @@ async fn execute_block_skill_or_warn(
     dry_run: bool,
     ip: &str,
     skill_id: &str,
-) {
-    let result = skill.execute(ctx, dry_run).await;
+    trusted_ips: &[String],
+) -> skills::SkillResult {
+    // Architectural gate (2026-05-10): every honeypot block-ip path
+    // routes through `skill_gate::gate_block_ip` before
+    // `ResponseSkill::execute`. Closes the bypass graphify surfaced
+    // where `handle_always_on_connection`/`always_on_abuseipdb_block`
+    // called `BlockIpUfw.execute()` directly, bypassing the operator
+    // `cfg.allowlist.trusted_ips` allowlist and the cloud-provider
+    // safelist. Gate refusals are surfaced as a `success=false`
+    // SkillResult so existing audit-trail and `auto_blocked` callers
+    // observe the same shape they did for legitimate skill failures.
+    let gate = match crate::skill_gate::gate_block_ip(ip, trusted_ips) {
+        Ok(g) => g,
+        Err(refusal) => {
+            warn!(
+                ip,
+                skill_id,
+                dry_run,
+                reason = %refusal,
+                "honeypot block-ip refused by gate (allowlist / safelist / shape)"
+            );
+            return skills::SkillResult {
+                success: false,
+                message: format!("{refusal}"),
+            };
+        }
+    };
+    let result = crate::skill_gate::execute_block_skill_gated(skill, ctx, dry_run, &gate).await;
     if !result.success {
         warn!(
             ip,
             skill_id,
             dry_run,
             reason = result.message,
-            "honeypot abuseipdb gate: block skill execution failed"
+            "honeypot block skill execution failed"
         );
     }
+    result
 }
 
 /// Handle a single always-on honeypot connection end-to-end:
@@ -190,6 +217,7 @@ async fn handle_always_on_connection(
     dry_run: bool,
     block_backend: String,
     allowed_skills: Vec<String>,
+    trusted_ips: Vec<String>,
 ) -> AlwaysOnSessionOutcome {
     use skills::builtin::honeypot::ssh_interact::{
         handle_connection, SshConnectionEvidence, SshInteractionMode,
@@ -330,7 +358,22 @@ async fn handle_always_on_connection(
             _ => Some(Box::new(skills::builtin::BlockIpUfw)),
         };
         if let Some(skill) = skill_box {
-            let result = skill.execute(&ctx, dry_run).await;
+            // Architectural gate (2026-05-10) — see
+            // `execute_block_skill_or_warn` doc-comment for full rationale.
+            // The honeypot auto-block path previously called
+            // `skill.execute` directly, bypassing
+            // `cfg.allowlist.trusted_ips` + cloud_safelist. Routing
+            // through `execute_block_skill_or_warn` (which calls
+            // `skill_gate::gate_block_ip` first) closes the bypass.
+            let result = execute_block_skill_or_warn(
+                skill.as_ref(),
+                &ctx,
+                dry_run,
+                &ip,
+                &skill_id,
+                &trusted_ips,
+            )
+            .await;
             if result.success {
                 let entry = decisions::DecisionEntry {
                     ts: chrono::Utc::now(),
@@ -470,6 +513,7 @@ pub(crate) async fn run_always_on_honeypot(
     block_backend: String,
     allowed_skills: Vec<String>,
     interaction: String,
+    trusted_ips: Vec<String>,
     token: tokio_util::sync::CancellationToken,
 ) {
     use skills::builtin::honeypot::ssh_interact::build_ssh_config;
@@ -529,6 +573,7 @@ pub(crate) async fn run_always_on_honeypot(
                                 let dd = data_dir.clone();
                                 let bb = block_backend.clone();
                                 let sk = allowed_skills.clone();
+                                let ti = trusted_ips.clone();
                                 let score = rep.confidence_score;
                                 let threshold = abuseipdb_threshold;
                                 let re = responder_enabled;
@@ -537,7 +582,7 @@ pub(crate) async fn run_always_on_honeypot(
                                 tokio::spawn(async move {
                                     always_on_abuseipdb_block(
                                         &ip_c, score, threshold, &dd, store_c.as_ref(), re, dr,
-                                        &bb, &sk,
+                                        &bb, &sk, &ti,
                                     )
                                     .await;
                                 });
@@ -563,6 +608,7 @@ pub(crate) async fn run_always_on_honeypot(
                 let intr = interaction.clone();
                 let bb = block_backend.clone();
                 let sk = allowed_skills.clone();
+                let ti = trusted_ips.clone();
                 let re = responder_enabled;
                 let dr = dry_run;
                 let bl_ref = filter_blocklist.clone();
@@ -583,6 +629,7 @@ pub(crate) async fn run_always_on_honeypot(
                         dr,
                         bb,
                         sk,
+                        ti,
                     )
                     .await;
                     // After real interaction (or successful auto-block), mark IP as seen
@@ -637,6 +684,7 @@ async fn always_on_abuseipdb_block(
     dry_run: bool,
     block_backend: &str,
     allowed_skills: &[String],
+    trusted_ips: &[String],
 ) {
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
@@ -706,7 +754,20 @@ async fn always_on_abuseipdb_block(
             // with structured context. The decision audit row is
             // already written upstream; this closes the loop on
             // whether the auto-block actually applied.
-            execute_block_skill_or_warn(skill.as_ref(), &ctx, dry_run, ip, &skill_id).await;
+            //
+            // 2026-05-10 (skill_gate): the helper now also runs the
+            // architectural block-ip gate (trusted_ips + cloud safelist
+            // + shape) before invoking the skill, so this AbuseIPDB
+            // path no longer bypasses operator allowlist either.
+            let _ = execute_block_skill_or_warn(
+                skill.as_ref(),
+                &ctx,
+                dry_run,
+                ip,
+                &skill_id,
+                trusted_ips,
+            )
+            .await;
         }
     }
 }
@@ -819,6 +880,7 @@ mod tests {
                 "ufw".to_string(),    // block_backend
                 vec![],               // allowed_skills
                 "reject".to_string(), // interaction
+                vec![],               // trusted_ips
                 token_for_task,
             )
             .await;
@@ -901,6 +963,7 @@ mod tests {
                     "ufw".to_string(),
                     vec![],
                     "medium".to_string(),
+                    vec![],
                     token_for_task,
                 )
                 .await;
@@ -961,9 +1024,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_password_attempt_writes_autoblock_audit_and_blocklist() {
+    async fn listener_password_attempt_loopback_refused_by_skill_gate() {
+        // Regression anchor for the 2026-05-10 honeypot bypass bug
+        // (SESSION_LOG 04:47 UTC entry): operator's
+        // `cfg.allowlist.trusted_ips` and the cloud_safelist's
+        // `127.0.0.0/8` LINK_LOCAL range BOTH protected loopback, but
+        // `handle_always_on_connection` called `BlockIpUfw.execute()`
+        // directly, blocking 127.0.0.1 at the firewall anyway.
+        //
+        // With `skill_gate::gate_block_ip` wired into the helper, a
+        // password attempt from 127.0.0.1 must:
+        //   1. Still record the session evidence + grow filter_blocklist
+        //      via the `had_interaction` path (out-of-scope for the
+        //      block decision — that's a separate filter mechanism).
+        //   2. NEVER write an auto-block decision row, because the
+        //      gate refuses loopback at the cloud_safelist check.
+        //
+        // We force cloud_safelist init() so the safelist gate is
+        // deterministic regardless of parallel test ordering.
         use std::time::Duration;
         use tokio_util::sync::CancellationToken;
+
+        crate::cloud_safelist::init();
 
         let token = CancellationToken::new();
         let token_for_task = token.clone();
@@ -993,6 +1075,12 @@ mod tests {
                     "ufw".to_string(),
                     vec!["block-ip-ufw".to_string()],
                     "medium".to_string(),
+                    // Also pin trusted_ips: belt + suspenders. Either
+                    // check (trusted_ips OR cloud_safelist) is enough
+                    // to refuse loopback at the gate, but the operator
+                    // bug had loopback in trusted_ips, so this mirrors
+                    // the prod config that originally tripped the bug.
+                    vec!["127.0.0.1".to_string()],
                     token_for_task,
                 )
                 .await;
@@ -1030,21 +1118,17 @@ mod tests {
             .await;
         let _ = tokio::time::timeout(Duration::from_secs(1), client).await;
 
-        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
-        let decision_path = tmpdir.path().join(format!("decisions-{today}.jsonl"));
-        let mut decision = None;
+        // Wait for the session-end path to run. filter_blocklist gets
+        // the IP via the had_interaction filter regardless of whether
+        // the block decision fired, so we poll on that to know the
+        // session-end handler completed.
         for _ in 0..40 {
             if filter_blocklist
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .contains("127.0.0.1")
             {
-                if let Ok(content) = std::fs::read_to_string(&decision_path) {
-                    if !content.trim().is_empty() {
-                        decision = Some(content);
-                        break;
-                    }
-                }
+                break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1055,20 +1139,35 @@ mod tests {
             .expect("listener exits after cancellation")
             .expect("listener task");
 
-        let decision = decision.expect("password attempt should write auto-block decision");
-        let row: serde_json::Value =
-            serde_json::from_str(decision.lines().next().expect("decision row")).expect("json");
-        assert_eq!(row["ai_provider"], "honeypot:always-on");
-        assert_eq!(row["action_type"], "block_ip");
-        assert_eq!(row["target_ip"], "127.0.0.1");
-        assert_eq!(row["skill_id"], "block-ip-ufw");
-        assert_eq!(row["execution_result"], "ok");
+        // Decision file must NOT exist (gate refused before audit-write).
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let decision_path = tmpdir.path().join(format!("decisions-{today}.jsonl"));
+        match std::fs::read_to_string(&decision_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Happy: no decision file at all — gate refused before write.
+            }
+            Ok(content) => {
+                assert!(
+                    content.trim().is_empty(),
+                    "loopback auto-block was refused by gate; the decision \
+                     file must not contain a block_ip row. Got: {content}"
+                );
+            }
+            Err(e) => panic!("unexpected error reading decision file: {e}"),
+        }
+
+        // Filter blocklist still grew via had_interaction, which is a
+        // separate de-dup mechanism (drops quick reconnects from this
+        // IP) and not a firewall rule. This stays intact across the
+        // gate change.
         assert!(
-            row["reason"]
-                .as_str()
-                .expect("reason")
-                .contains("interacted with always-on honeypot session"),
-            "auto-block reason must explain the honeypot interaction: {row}"
+            filter_blocklist
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains("127.0.0.1"),
+            "filter_blocklist must still record loopback after interaction \
+             so the listener drops fast reconnects — this is independent \
+             of the firewall-level block the gate refused"
         );
     }
 
@@ -1240,7 +1339,7 @@ mod tests {
         let ctx = make_block_skill_ctx(Some("203.0.113.42"));
         let skill = skills::builtin::BlockIpUfw;
 
-        execute_block_skill_or_warn(&skill, &ctx, true, "203.0.113.42", "block-ip-ufw").await;
+        execute_block_skill_or_warn(&skill, &ctx, true, "203.0.113.42", "block-ip-ufw", &[]).await;
 
         let captured_str = crate::test_util::drain_capture();
         assert!(
@@ -1251,16 +1350,21 @@ mod tests {
 
     #[tokio::test]
     async fn execute_block_skill_or_warn_emits_warn_on_failure() {
-        // Failure path: BlockIpUfw with target_ip=None forces
-        // success=false ("block-ip-ufw: no target IP in context").
-        // Helper must emit the warn carrying ip + skill_id +
-        // dry_run + reason.
+        // Failure path: ctx has no target_ip so the skill_gate runtime
+        // invariant (`ctx.target_ip` must match gate IP) fires inside
+        // `execute_block_skill_gated`. Pre-skill-gate the failure
+        // surfaced as `BlockIpUfw`'s own "no target IP in context"
+        // SkillResult; post-skill-gate the gate-ctx mismatch
+        // short-circuits first. Either way the helper's `!success`
+        // branch must emit a structured warn carrying ip + skill_id
+        // + dry_run + reason — operator-facing diagnostics stay the
+        // same shape across the contract change.
         let _guard = crate::test_util::arm_capture();
 
         let ctx = make_block_skill_ctx(None);
         let skill = skills::builtin::BlockIpUfw;
 
-        execute_block_skill_or_warn(&skill, &ctx, true, "198.51.100.1", "block-ip-ufw").await;
+        execute_block_skill_or_warn(&skill, &ctx, true, "198.51.100.1", "block-ip-ufw", &[]).await;
 
         let captured_str = crate::test_util::drain_capture();
 
@@ -1285,11 +1389,87 @@ mod tests {
             captured_str.contains("dry_run=true"),
             "dry_run field missing — got: {captured_str}"
         );
-        // reason carries the SkillResult.message — needed to
-        // diagnose WHY the skill rejected the input.
+        // reason carries the SkillResult.message — the gate-ctx
+        // mismatch path emits "does not match ctx.target_ip", which
+        // tells the operator the call site handed a SkillContext
+        // with the wrong target IP relative to the gate token.
         assert!(
-            captured_str.contains("no target IP in context"),
-            "reason field missing skill-provided message — got: {captured_str}"
+            captured_str.contains("does not match ctx.target_ip"),
+            "reason field missing gate-ctx mismatch diagnostic — got: {captured_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_block_skill_or_warn_refuses_when_ip_in_trusted_allowlist() {
+        // Operator-reported bug (2026-05-10 SESSION_LOG): honeypot
+        // auto-block invoked `BlockIpUfw.execute()` directly and
+        // blocked `127.0.0.1` even though loopback was in
+        // `cfg.allowlist.trusted_ips`. With the skill_gate wired,
+        // the helper must short-circuit on the trusted_ips check
+        // and never reach the firewall backend.
+        let _guard = crate::test_util::arm_capture();
+
+        let ctx = make_block_skill_ctx(Some("127.0.0.1"));
+        let skill = skills::builtin::BlockIpUfw;
+        let trusted = vec!["127.0.0.1".to_string()];
+
+        let result =
+            execute_block_skill_or_warn(&skill, &ctx, true, "127.0.0.1", "block-ip-ufw", &trusted)
+                .await;
+
+        assert!(
+            !result.success,
+            "trusted-IP block must be refused at the gate, never executed"
+        );
+        assert!(
+            result.message.contains("trusted_ips allowlist"),
+            "refusal must cite the operator allowlist: {}",
+            result.message
+        );
+
+        let captured_str = crate::test_util::drain_capture();
+        assert!(
+            captured_str.contains("refused by gate"),
+            "gate-refusal warn missing — got: {captured_str}"
+        );
+        // Must NOT see the regular skill-execution-failed warn —
+        // the gate refused BEFORE we reached the skill, so the
+        // operator log distinguishes "we refused" from "skill failed".
+        assert!(
+            !captured_str.contains("skill execution failed"),
+            "gate-refusal must not also emit the skill-failure warn — got: {captured_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_block_skill_or_warn_refuses_cloudflare_cloud_safelist() {
+        // 2026-04-18 prod incident: repeat-offender cascade auto-blocked
+        // Cloudflare ranges (104.16/12, 104.26/15, 172.66/15). Operator
+        // trusted_ips alone wouldn't have caught this — only the cloud
+        // safelist does. Honeypot paths must also consult the safelist
+        // before invoking the firewall backend.
+        crate::cloud_safelist::init();
+        let _guard = crate::test_util::arm_capture();
+
+        let ctx = make_block_skill_ctx(Some("104.16.0.1"));
+        let skill = skills::builtin::BlockIpUfw;
+
+        let result =
+            execute_block_skill_or_warn(&skill, &ctx, true, "104.16.0.1", "block-ip-ufw", &[])
+                .await;
+
+        assert!(!result.success, "Cloudflare IP must be refused at the gate");
+        assert!(
+            result.message.to_lowercase().contains("cloudflare")
+                || result.message.contains("cloud provider safelist"),
+            "refusal must cite the cloud safelist: {}",
+            result.message
+        );
+
+        let captured_str = crate::test_util::drain_capture();
+        assert!(
+            captured_str.contains("refused by gate"),
+            "gate-refusal warn missing — got: {captured_str}"
         );
     }
 
@@ -1308,6 +1488,7 @@ mod tests {
             true,
             "ufw",
             &allowed,
+            &[],
         )
         .await;
 
@@ -1547,6 +1728,7 @@ mod tests {
                 "ufw".to_string(),
                 vec![],                  // allowed_skills
                 "llm_shell".to_string(), // <-- LlmShell mode
+                vec![],                  // trusted_ips
                 token_for_task,
             )
             .await;

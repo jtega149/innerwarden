@@ -49,6 +49,10 @@ pub(crate) async fn execute_honeypot_decision(
             let post_dry_run = cfg.responder.dry_run;
             let post_block_backend = cfg.responder.block_backend.clone();
             let post_allowed_skills = cfg.responder.allowed_skills.clone();
+            // 2026-05-10 (skill_gate): pass operator trusted_ips to
+            // post-session auto-block so it respects the same allowlist
+            // the canonical decision path honours.
+            let post_trusted_ips = cfg.allowlist.trusted_ips.clone();
             let post_blocklist_has = state.blocklist.contains(ip);
             tokio::spawn(async move {
                 crate::honeypot_post_session::spawn_post_session_tasks(
@@ -63,6 +67,7 @@ pub(crate) async fn execute_honeypot_decision(
                     post_dry_run,
                     &post_block_backend,
                     &post_allowed_skills,
+                    &post_trusted_ips,
                     post_blocklist_has,
                 )
                 .await;

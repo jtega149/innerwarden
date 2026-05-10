@@ -492,7 +492,31 @@ pub(super) async fn execute_block_ip(
         "nftables" => Box::new(BlockIpNftables),
         _ => Box::new(BlockIpUfw),
     };
-    let result = skill.execute(&ctx, cfg.dry_run).await;
+    // 2026-05-10 (skill_gate): dashboard manual block also routes
+    // through `skill_gate::gate_block_ip`. Operator hitting "Block"
+    // on a Cloudflare-fronted IP or a `trusted_ips` endpoint must
+    // not commit a firewall rule that breaks their own infrastructure.
+    // The gate refuses BEFORE `skill.execute` so the audit trail
+    // records a clean "skipped: ..." execution_result instead of a
+    // half-applied rule.
+    let result = match crate::skill_gate::gate_block_ip(ip, &cfg.trusted_ips) {
+        Ok(gate) => {
+            crate::skill_gate::execute_block_skill_gated(skill.as_ref(), &ctx, cfg.dry_run, &gate)
+                .await
+        }
+        Err(refusal) => {
+            warn!(
+                ip = %ip,
+                skill_id = %skill_id,
+                reason = %refusal,
+                "dashboard manual block refused by gate (allowlist / safelist / shape)"
+            );
+            crate::skills::SkillResult {
+                success: false,
+                message: format!("{refusal}"),
+            }
+        }
+    };
     let (success, message) = (result.success, result.message);
 
     let result_str = if success {
@@ -1745,6 +1769,70 @@ mod tests {
         }
         cfg.allowed_skills = allowed;
         cfg
+    }
+
+    #[tokio::test]
+    async fn execute_block_ip_refuses_trusted_ip_via_skill_gate() {
+        // Regression anchor for the 2026-05-10 skill_gate wire-in.
+        // Operator hitting "Block" on the dashboard for an IP listed
+        // in `cfg.trusted_ips` must NOT commit a firewall rule. The
+        // gate refuses BEFORE `skill.execute`, so:
+        //   - return value: success=false, message cites trusted_ips
+        //   - audit-trail row: execution_result starts with "skipped:"
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = enabled_dry_run_cfg(&[]);
+        cfg.trusted_ips = vec!["8.8.4.4".to_string()];
+        let (success, message) =
+            execute_block_ip(dir.path(), None, &cfg, "8.8.4.4", "operator-tap", None)
+                .await
+                .expect("dashboard execute_block_ip returns Ok even when gate refuses");
+        assert!(!success, "trusted_ip must not be auto-blocked");
+        assert!(
+            message.to_lowercase().contains("trusted_ips"),
+            "refusal must cite trusted_ips: {message}"
+        );
+
+        // Audit row carries the gate-refusal message in execution_result.
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let audit = std::fs::read_to_string(dir.path().join(format!("decisions-{today}.jsonl")))
+            .expect("audit row written");
+        let row: serde_json::Value =
+            serde_json::from_str(audit.lines().next().expect("at least one row"))
+                .expect("audit row is JSON");
+        assert_eq!(row["target_ip"], "8.8.4.4");
+        let exec_result = row["execution_result"].as_str().unwrap_or("");
+        assert!(
+            exec_result.contains("skipped:"),
+            "audit row must record the gate refusal in execution_result: {exec_result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_block_ip_refuses_cloud_safelisted_ip_via_skill_gate() {
+        // Cloud-safelist branch of the gate (Cloudflare CDN). Closes
+        // the 2026-04-18 prod incident where the agent auto-blocked
+        // Cloudflare ranges; dashboard manual-block surface inherits
+        // the same protection now that `skill_gate::gate_block_ip`
+        // sits in front of `BlockIpUfw.execute`.
+        crate::cloud_safelist::init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = enabled_dry_run_cfg(&[]);
+        let (success, message) = execute_block_ip(
+            dir.path(),
+            None,
+            &cfg,
+            "104.16.0.1", // Cloudflare 104.16.0.0/13
+            "operator-tap",
+            None,
+        )
+        .await
+        .expect("ok");
+        assert!(!success, "Cloudflare IP must be refused by gate");
+        assert!(
+            message.to_lowercase().contains("cloudflare")
+                || message.contains("cloud provider safelist"),
+            "refusal must cite the cloud safelist: {message}"
+        );
     }
 
     #[tokio::test]
