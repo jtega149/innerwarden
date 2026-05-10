@@ -254,7 +254,16 @@ jobs:
           mkdir -p /tmp/gpg-home
           chmod 700 /tmp/gpg-home
           export GNUPGHOME=/tmp/gpg-home
-          echo "$RELEASE_GPG_KEY" | gpg --batch --import
+          # Write the key to a temp file via printf (not echo) so the
+          # multi-line ASCII-armored block is preserved verbatim. The
+          # initial release.yml used `echo "$RELEASE_GPG_KEY" | gpg`,
+          # which mangled the BEGIN/END lines and caused `gpg: no
+          # valid OpenPGP data found` on v0.13.2 release run. Caught
+          # 2026-05-10. Reverting to the file-based form.
+          umask 077
+          printf '%s\n' "$RELEASE_GPG_KEY" > /tmp/gpg-home/key.asc
+          gpg --batch --import /tmp/gpg-home/key.asc
+          shred -u /tmp/gpg-home/key.asc
           gpg --batch --yes --pinentry-mode loopback --detach-sign --armor --output dist/SHA256SUMS.sig dist/SHA256SUMS
           rm -rf /tmp/gpg-home
           echo "=== SHA256SUMS.sig ==="
