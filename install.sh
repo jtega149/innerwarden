@@ -385,6 +385,86 @@ detect_platform() {
   esac
 }
 
+# ── Spec 048 — Ed25519 release public key (PEM, embedded inline) ─────────────
+#
+# Same key as crates/ctl/src/upgrade.rs::RELEASE_PUBLIC_KEY_B64. The DER
+# prefix `MCowBQYDK2VwAyEA` is the standard Ed25519 SubjectPublicKeyInfo
+# header (12 bytes = `30 2a 30 05 06 03 2b 65 70 03 21 00`); appending the
+# 32-byte raw key gives a valid PEM that openssl pkeyutl can verify.
+#
+# SHA-256 of the raw 32-byte key (operator-facing fingerprint):
+#   9cba21f2d6a45e7f58edd9b840e152b5c7d0ee6e511bb6835037088c6a89143f
+#
+# Documented at /docs/supply-chain-security.md and on the public release
+# page. Rotating this key requires a coordinated installer + ctl release.
+INNERWARDEN_RELEASE_PEM=$'-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAyf58o+MQluj7MwTlW+hB9tfLQk9df0iUeGxPbmAIFM8=\n-----END PUBLIC KEY-----\n'
+
+# ── Spec 048 — check that openssl can verify Ed25519 signatures ──────────────
+#
+# Ed25519 in `openssl pkeyutl -verify -rawin` requires openssl >= 3.0.
+# Ubuntu 22.04+, Rocky 9+, Fedora 36+, Debian 12+ all have it. Older
+# distros (Ubuntu 20.04 stock 1.1.x) hit this precondition and get a
+# clear actionable error instead of silently falling back to SHA-only.
+check_openssl_ed25519_support() {
+  if ! command -v openssl >/dev/null 2>&1; then
+    return 1
+  fi
+  # `openssl version` prints e.g. `OpenSSL 3.0.2 15 Mar 2022`.
+  # We only accept 3.x or LibreSSL >= 3.5 (untested but plausible).
+  local v
+  v="$(openssl version 2>/dev/null | awk '{print $2}')"
+  case "$v" in
+    3.*) return 0 ;;
+    *)   return 1 ;;
+  esac
+}
+
+# ── Spec 048 — verify Ed25519 signature for a binary ─────────────────────────
+#
+# Args: binary_path, sig_b64_string
+# Returns 0 on valid signature, non-zero otherwise.
+#
+# IMPORTANT: the release workflow signs SHA-256(binary), NOT the raw
+# binary. See `.github/workflows/release.yml` (the signing step uses
+# `key.sign(hashlib.sha256(...).digest())`) and `crates/ctl/src/upgrade.rs::verify_signature`
+# (which calls `verifying_key.verify(&Sha256::digest(binary_bytes), &sig)`).
+# Verification has to mirror that — feed the 32-byte digest to openssl,
+# NOT the binary itself. Caught by CodeRabbit on PR #512 review;
+# pre-fix the installer would have rejected every valid stable
+# signature.
+#
+# Uses openssl pkeyutl with -rawin (Ed25519 native pure-EdDSA mode).
+# .sig files on releases are base64-encoded raw 64-byte Ed25519 sigs;
+# we base64-decode then feed as binary.
+verify_ed25519_signature() {
+  local binary="$1"
+  local sig_b64="$2"
+  local tmp_pem tmp_sig tmp_digest
+  tmp_pem="$(mktemp)" || return 1
+  tmp_sig="$(mktemp)" || { rm -f "$tmp_pem"; return 1; }
+  tmp_digest="$(mktemp)" || { rm -f "$tmp_pem" "$tmp_sig"; return 1; }
+  printf '%s' "$INNERWARDEN_RELEASE_PEM" > "$tmp_pem"
+  printf '%s' "$sig_b64" | base64 -d > "$tmp_sig" 2>/dev/null || {
+    rm -f "$tmp_pem" "$tmp_sig" "$tmp_digest"
+    return 1
+  }
+  # Compute SHA-256(binary) → 32 raw bytes. openssl is already
+  # required (we just used it via pkeyutl), so use openssl dgst
+  # rather than depending on `xxd` (not always present on minimal
+  # images) or platform-specific `sha256sum` vs `shasum`.
+  if ! openssl dgst -sha256 -binary "$binary" > "$tmp_digest" 2>/dev/null; then
+    rm -f "$tmp_pem" "$tmp_sig" "$tmp_digest"
+    return 1
+  fi
+  if openssl pkeyutl -verify -pubin -inkey "$tmp_pem" \
+      -rawin -in "$tmp_digest" -sigfile "$tmp_sig" >/dev/null 2>&1; then
+    rm -f "$tmp_pem" "$tmp_sig" "$tmp_digest"
+    return 0
+  fi
+  rm -f "$tmp_pem" "$tmp_sig" "$tmp_digest"
+  return 1
+}
+
 # ── Download a binary from GitHub Releases and validate its SHA-256 ──────────
 download_asset() {
   local binary="$1"    # e.g. innerwarden-sensor
@@ -427,6 +507,44 @@ download_asset() {
   else
     rm -f "${sha_tmpfile}"
     log "warning: no SHA-256 sidecar for ${asset} - skipping integrity check"
+  fi
+
+  # Spec 048 — Ed25519 signature verification (fail-closed for stable).
+  # Pre-Spec-048 the installer claimed "signed binary" without verifying
+  # signatures; this branch closes the gap. Stable: signature MUST verify.
+  # Canary: signature is best-effort because canary signing infrastructure
+  # is not yet in place. Override via env vars (deliberately scary names).
+  if [[ "${INNERWARDEN_INSECURE_SKIP_SIG_VERIFY:-0}" == "1" ]]; then
+    log "WARN: INNERWARDEN_INSECURE_SKIP_SIG_VERIFY=1 — bypassing Ed25519 signature check for ${asset}"
+    log "  This defeats supply-chain verification. Only use during emergency migration."
+    return 0
+  fi
+  local sig_tmpfile
+  sig_tmpfile="$(mktemp)" || fail "failed to create temp file for sig"
+  if curl -fsSL "${base_url}/${asset}.sig" -o "${sig_tmpfile}" 2>/dev/null && [[ -s "${sig_tmpfile}" ]]; then
+    if ! check_openssl_ed25519_support; then
+      rm -f "${sig_tmpfile}"
+      fail "openssl >= 3.0 is required to verify Ed25519 signatures.\n  Detected: $(openssl version 2>/dev/null || echo 'openssl missing')\n  On Ubuntu 20.04, upgrade to 22.04+ or set INNERWARDEN_INSECURE_SKIP_SIG_VERIFY=1 (not recommended).\n  See https://github.com/${GITHUB_REPO}/blob/main/docs/supply-chain-security.md"
+    fi
+    local sig_b64
+    sig_b64="$(cat "${sig_tmpfile}")"
+    rm -f "${sig_tmpfile}"
+    if verify_ed25519_signature "${dest}" "${sig_b64}"; then
+      log "Ed25519 signature ok"
+    else
+      fail "Ed25519 signature verification FAILED for ${asset}.\n  This means the binary or signature was tampered with, or the release was published with a different key.\n  Expected key fingerprint: 9cba21f2...c6a89143f\n  See https://github.com/${GITHUB_REPO}/blob/main/docs/supply-chain-security.md"
+    fi
+  else
+    rm -f "${sig_tmpfile}"
+    if [[ "${version}" == "canary" ]]; then
+      if [[ "${INNERWARDEN_ALLOW_UNSIGNED_CANARY:-0}" == "1" ]]; then
+        log "WARN: canary release has no .sig for ${asset} — proceeding because INNERWARDEN_ALLOW_UNSIGNED_CANARY=1"
+      else
+        fail "canary release has no .sig for ${asset}.\n  Canary signing is on the spec 048 follow-up roadmap.\n  Set INNERWARDEN_ALLOW_UNSIGNED_CANARY=1 to proceed (not recommended)."
+      fi
+    else
+      fail "stable release ${version} has no .sig for ${asset}.\n  Spec 048 requires every stable release to ship Ed25519 signatures.\n  If you are migrating from a pre-spec-048 release, set INNERWARDEN_INSECURE_SKIP_SIG_VERIFY=1 (not recommended; logged as a deliberate override).\n  See https://github.com/${GITHUB_REPO}/blob/main/docs/supply-chain-security.md"
+    fi
   fi
 }
 

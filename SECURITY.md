@@ -29,6 +29,17 @@ Include:
 - Fix and release a patched version
 - Credit the reporter (unless they prefer anonymity)
 
+## Supply Chain
+
+Detailed in [docs/supply-chain-security.md](docs/supply-chain-security.md): release flow, embedded Ed25519 release-key fingerprint, manual verification recipe (`SHA-256` + `.sig` + `gh attestation verify`), and an honest list of current limits (no `.deb`/`.rpm` yet, no SBOM yet, no hardware-backed signing yet).
+
+The short version:
+
+- Stable releases ship per-binary `.sha256` and `.sig` (Ed25519). The installer (`install.sh`) and the updater (`innerwarden upgrade`) fail-closed when signatures are missing or invalid (Spec 048).
+- The 6 release **binaries** (sensor + agent + ctl × x86_64/aarch64) carry a [GitHub Artifact Attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) (SLSA v1 provenance) verifiable via `gh attestation verify`. The sidecar files (`.sha256`, `.sig`, `SHA256SUMS`, `install.sh`) are not currently attested individually.
+- Stable tags publish an aggregate `SHA256SUMS` + `SHA256SUMS.sig` (GPG) for the manual-verification path. Prerelease/canary tags publish `SHA256SUMS` only; the GPG signature is gated to stable.
+- Active Ed25519 fingerprint: `9cba21f2d6a45e7f58edd9b840e152b5c7d0ee6e511bb6835037088c6a89143f` (also in `crates/ctl/src/upgrade.rs::RELEASE_PUBLIC_KEY_B64` and `install.sh::INNERWARDEN_RELEASE_PEM`).
+
 ## Security Features
 
 Inner Warden includes:
@@ -38,5 +49,6 @@ Inner Warden includes:
 - **Automated dependency updates** - Dependabot weekly
 - **GitHub Actions pinned to SHA** - prevents supply chain attacks
 - **Branch protection** - CI + Security checks required before merge
+- **Release signing** - Ed25519 per-binary signatures + SHA-256 sidecars + GitHub Artifact Attestations; install/upgrade paths fail-closed on missing/invalid signatures for stable releases (Spec 048)
 - **Append-only audit trail** - every decision logged to JSONL, immutable
 - **Safe defaults** - dry_run = true, responder disabled, confidence threshold above max on install

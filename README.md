@@ -569,12 +569,16 @@ $ innerwarden system scan
 curl -fsSL https://innerwarden.com/install | sudo bash
 ```
 
-No API key required. What it does:
+No API key required. What the installer does:
 - Creates a dedicated `innerwarden` service user
-- Downloads SHA-256 verified binaries for your architecture (x86_64 / aarch64)
-- Writes config to `/etc/innerwarden/`, creates data directory
+- Downloads sensor + agent + ctl binaries for your architecture (`x86_64` / `aarch64`)
+- Verifies each binary's **SHA-256 sidecar** against the canonical release
+- Verifies each binary's **Ed25519 signature** against the embedded release public key (Spec 048; requires `openssl >= 3.0`)
+- Writes config to `/etc/innerwarden/`, creates the data directory
 - Starts sensor + agent via systemd (Linux) or launchd (macOS)
 - Safe posture: detection active, no response skills enabled, `dry_run = true`
+
+The installer fail-closes for stable releases when signatures are missing or invalid. Override env vars exist for migration / air-gapped scenarios. See [Supply Chain Security](docs/supply-chain-security.md) for the manual verification recipe (`SHA256SUMS` + `.sig` + `gh attestation verify`), the active key fingerprint, and an honest list of what is and is not guaranteed.
 
 With external integrations:
 ```bash

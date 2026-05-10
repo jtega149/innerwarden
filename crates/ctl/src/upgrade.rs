@@ -35,6 +35,21 @@ pub struct GithubRelease {
     pub published_at: Option<String>,
     /// Release description body (Markdown). May be null for empty releases.
     pub body: Option<String>,
+    /// Spec 048 — GitHub API returns `prerelease: bool` on every release.
+    /// We use it to discriminate stable vs canary at update time so the
+    /// fail-closed signature policy applies only to stable.
+    /// `Option` so a future API shape change does not break parsing.
+    #[serde(default)]
+    pub prerelease: Option<bool>,
+}
+
+impl GithubRelease {
+    /// Spec 048 — true when this release is a prerelease/canary. The
+    /// updater's signature policy is fail-closed for stable releases
+    /// and best-effort for canary.
+    pub fn is_canary(&self) -> bool {
+        self.prerelease.unwrap_or(false)
+    }
 }
 
 impl GithubRelease {
@@ -423,6 +438,7 @@ mod tests {
             html_url: "https://github.com/...".to_string(),
             published_at: None,
             body: None,
+            prerelease: None,
             assets: vec![
                 GithubAsset {
                     name: "innerwarden-sensor-linux-aarch64".to_string(),
@@ -451,6 +467,7 @@ mod tests {
             html_url: String::new(),
             published_at: None,
             body: None,
+            prerelease: None,
             assets: vec![],
         };
         assert!(find_asset(&release, "innerwarden-sensor-linux-aarch64").is_none());
@@ -463,6 +480,7 @@ mod tests {
             html_url: String::new(),
             published_at: None,
             body: None,
+            prerelease: None,
             assets: vec![],
         };
         let plan = build_plan(&release, "aarch64");
@@ -484,6 +502,7 @@ mod tests {
             html_url: String::new(),
             published_at: None,
             body: None,
+            prerelease: None,
             assets,
         };
         let plan = build_plan(&release, "x86_64");
@@ -539,6 +558,7 @@ mod tests {
             html_url: String::new(),
             published_at: Some("2026-03-16T01:40:05Z".to_string()),
             body: None,
+            prerelease: None,
             assets: vec![],
         };
         assert_eq!(r.release_date(), Some("2026-03-16"));
@@ -551,9 +571,53 @@ mod tests {
             html_url: String::new(),
             published_at: None,
             body: None,
+            prerelease: None,
             assets: vec![],
         };
         assert!(r.release_date().is_none());
+    }
+
+    /// Spec 048 anchor #10 — Inv. 5 (supply-chain doc carries the
+    /// active fingerprint that matches the embedded release key).
+    /// Anti-drift guard: the embedded `RELEASE_PUBLIC_KEY_B64` and
+    /// the published fingerprint MUST agree, otherwise the doc lies
+    /// about what the binary verifies. Test reads the doc file from
+    /// the source tree and matches the SHA-256 of the raw 32-byte
+    /// public key against the hex string in the doc.
+    #[test]
+    fn supply_chain_doc_carries_active_ed25519_fingerprint() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(RELEASE_PUBLIC_KEY_B64)
+            .expect("embedded key decodes");
+        assert_eq!(raw.len(), 32, "Ed25519 public key must be 32 bytes");
+        let fp_hex = format!("{:x}", Sha256::digest(&raw));
+        // The doc lives at docs/supply-chain-security.md relative to
+        // the workspace root. CARGO_MANIFEST_DIR for this crate is
+        // crates/ctl, so we walk up two levels.
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let doc_path = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|root| root.join("docs/supply-chain-security.md"))
+            .expect("workspace root exists");
+        let doc =
+            std::fs::read_to_string(&doc_path).unwrap_or_else(|e| panic!("read {doc_path:?}: {e}"));
+        assert!(
+            doc.contains(&fp_hex),
+            "docs/supply-chain-security.md must carry the active Ed25519 \
+             fingerprint {fp_hex} that matches the embedded \
+             RELEASE_PUBLIC_KEY_B64; if you rotated the key, the doc \
+             must rotate with it"
+        );
+        // Also assert the base64 form is documented (operators paste
+        // this into the manual-verification recipe).
+        assert!(
+            doc.contains(RELEASE_PUBLIC_KEY_B64),
+            "docs/supply-chain-security.md must document the base64 form \
+             of the embedded RELEASE_PUBLIC_KEY_B64"
+        );
     }
 
     #[test]
@@ -564,6 +628,7 @@ mod tests {
             published_at: None,
             body: Some("## What's Changed\n* fix(dashboard): add cache header by @bot\n\n## Full Changelog\nhttps://github.com/...".to_string()),
             assets: vec![],
+            prerelease: None,
         };
         let preview = r.changelog_preview().unwrap_or_default();
         assert!(!preview.contains("What's Changed"));
@@ -577,6 +642,7 @@ mod tests {
             html_url: String::new(),
             published_at: None,
             body: Some(String::new()),
+            prerelease: None,
             assets: vec![],
         };
         assert!(r.changelog_preview().is_none());
@@ -590,6 +656,7 @@ mod tests {
             html_url: String::new(),
             published_at: None,
             body: Some(long_body),
+            prerelease: None,
             assets: vec![],
         };
         let preview = r.changelog_preview().unwrap_or_default();
@@ -622,6 +689,7 @@ mod tests {
             html_url: String::new(),
             published_at: None,
             body: None,
+            prerelease: None,
             assets,
         };
         let plan = build_plan(&release, "x86_64");
@@ -655,6 +723,7 @@ mod tests {
             html_url: String::new(),
             published_at: None,
             body: None,
+            prerelease: None,
             assets,
         };
         let plan = build_plan(&release, "x86_64");

@@ -249,6 +249,19 @@ enum Command {
         /// Directory where binaries are installed
         #[arg(long, default_value = "/usr/local/bin")]
         install_dir: PathBuf,
+
+        /// Spec 048 escape hatch. Allow stable releases that ship without
+        /// a .sig file. NOT recommended; defeats supply-chain verification.
+        /// Use only when migrating from a pre-spec-048 release that lacks
+        /// signatures, or in air-gapped builds without GitHub access.
+        #[arg(long)]
+        allow_unsigned_stable: bool,
+
+        /// Spec 048 escape hatch. Allow canary/prerelease tags that ship
+        /// without .sig files. Canary signing is on the spec 048 follow-up
+        /// roadmap; until then this flag is required to install any canary.
+        #[arg(long)]
+        allow_unsigned_canary: bool,
     },
 
     /// Generate shell completions for bash, zsh, or fish.
@@ -2413,7 +2426,17 @@ fn main() -> Result<()> {
             yes,
             notify,
             ref install_dir,
-        } => commands::update::cmd_upgrade(&cli, check, yes, notify, install_dir),
+            allow_unsigned_stable,
+            allow_unsigned_canary,
+        } => commands::update::cmd_upgrade(
+            &cli,
+            check,
+            yes,
+            notify,
+            install_dir,
+            allow_unsigned_stable,
+            allow_unsigned_canary,
+        ),
         Command::Completions { ref shell } => commands::ops::cmd_completions(shell),
         Command::Enable {
             ref capability,

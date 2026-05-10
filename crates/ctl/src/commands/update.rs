@@ -61,12 +61,15 @@ fn classify_service_action(is_active: bool, unit_exists: bool) -> ServiceAction 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_upgrade(
     cli: &Cli,
     check_only: bool,
     yes: bool,
     notify: bool,
     install_dir: &Path,
+    allow_unsigned_stable: bool,
+    allow_unsigned_canary: bool,
 ) -> Result<()> {
     use crate::upgrade::*;
 
@@ -75,9 +78,19 @@ pub(crate) fn cmd_upgrade(
     let release =
         fetch_latest_release().context("could not reach GitHub - check network and try again")?;
 
-    cmd_upgrade_with_release(cli, check_only, yes, notify, install_dir, release)
+    cmd_upgrade_with_release(
+        cli,
+        check_only,
+        yes,
+        notify,
+        install_dir,
+        release,
+        allow_unsigned_stable,
+        allow_unsigned_canary,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_upgrade_with_release(
     cli: &Cli,
     check_only: bool,
@@ -85,6 +98,8 @@ fn cmd_upgrade_with_release(
     notify: bool,
     install_dir: &Path,
     release: crate::upgrade::GithubRelease,
+    allow_unsigned_stable: bool,
+    allow_unsigned_canary: bool,
 ) -> Result<()> {
     use crate::upgrade::*;
 
@@ -271,16 +286,59 @@ fn cmd_upgrade_with_release(
             print!("{}  (no sha256 sidecar)", fmt_bytes(bytes));
         }
 
-        // Verify Ed25519 signature if .sig sidecar is present
-        if let Some(sig_asset) = dp.sig_asset {
-            let sig_b64 = fetch_signature(&sig_asset.browser_download_url)?;
-            let binary_bytes =
-                std::fs::read(&tmp_path).context("cannot read downloaded binary for sig check")?;
-            verify_signature(&binary_bytes, &sig_b64)?;
-            println!("  sig ok");
-        } else {
-            println!();
-            println!("  [warn] unsigned release - signature verification skipped for {binary}");
+        // Spec 048 — fail-closed signature policy. Stable releases MUST
+        // carry a `.sig`; canary releases are best-effort until canary
+        // signing infrastructure ships. The pre-Spec 048 behaviour
+        // ("warn and continue" on every missing sig) was the gap that
+        // let "the website says signed but the installer doesn't
+        // verify" persist for as long as it did. Override only via the
+        // explicit operator-visible flags.
+        match dp.sig_asset {
+            Some(sig_asset) => {
+                let sig_b64 = fetch_signature(&sig_asset.browser_download_url)?;
+                let binary_bytes = std::fs::read(&tmp_path)
+                    .context("cannot read downloaded binary for sig check")?;
+                verify_signature(&binary_bytes, &sig_b64)?;
+                println!("  sig ok");
+            }
+            None if release.is_canary() && allow_unsigned_canary => {
+                println!();
+                println!(
+                    "  [warn] unsigned canary release - signature verification skipped \
+                     for {binary} (--allow-unsigned-canary set)"
+                );
+            }
+            None if !release.is_canary() && allow_unsigned_stable => {
+                println!();
+                println!(
+                    "  [WARN] STABLE release {} has no .sig for {binary}; proceeding \
+                     because --allow-unsigned-stable was passed. This is the kind of \
+                     override that defeats the policy — every invocation should be \
+                     auditable.",
+                    release.tag_name
+                );
+            }
+            None => {
+                println!();
+                if release.is_canary() {
+                    anyhow::bail!(
+                        "canary release {} has no .sig for {binary}; pass \
+                         --allow-unsigned-canary to proceed (canary signing is on the \
+                         spec 048 follow-up roadmap)",
+                        release.tag_name
+                    );
+                } else {
+                    anyhow::bail!(
+                        "stable release {} has no .sig for {binary}; refusing to \
+                         install. The Ed25519 release signing key is embedded in this \
+                         binary and verifies signatures shipped with stable releases. \
+                         If you absolutely must install an unsigned stable release, \
+                         pass --allow-unsigned-stable (NOT recommended; logged in CI \
+                         release-anchor reviews).",
+                        release.tag_name
+                    );
+                }
+            }
         }
 
         // Install to all target names
@@ -393,7 +451,14 @@ mod tests {
             assets,
             published_at: Some("2026-04-17T12:34:56Z".to_string()),
             body: Some("release notes".to_string()),
+            prerelease: Some(false),
         }
+    }
+
+    fn canary_release(tag_name: &str, assets: Vec<GithubAsset>) -> GithubRelease {
+        let mut r = release(tag_name, assets);
+        r.prerelease = Some(true);
+        r
     }
 
     fn asset(name: impl Into<String>, size: u64) -> GithubAsset {
@@ -549,7 +614,7 @@ mod tests {
         let fixture = write_release_fixture(&dir, &format!("v{CURRENT_VERSION}"));
 
         with_latest_release_fixture(&fixture, || {
-            cmd_upgrade(&cli, false, true, false, dir.path()).unwrap();
+            cmd_upgrade(&cli, false, true, false, dir.path(), false, false).unwrap();
         });
     }
 
@@ -565,6 +630,8 @@ mod tests {
             false,
             dir.path(),
             release(CURRENT_VERSION, Vec::new()),
+            false, // allow_unsigned_stable
+            false, // allow_unsigned_canary
         )
         .unwrap();
     }
@@ -581,6 +648,8 @@ mod tests {
             false,
             dir.path(),
             release("v999.0.0", Vec::new()),
+            false,
+            false,
         )
         .unwrap();
     }
@@ -603,6 +672,8 @@ mod tests {
             true,
             dir.path(),
             release("v999.0.0", Vec::new()),
+            false,
+            false,
         )
         .unwrap();
     }
@@ -618,6 +689,8 @@ mod tests {
             false,
             dir.path(),
             release("v999.0.0", vec![asset("innerwarden-ctl-linux-riscv64", 10)]),
+            false,
+            false,
         )
         .unwrap_err();
 
@@ -639,8 +712,142 @@ mod tests {
             false,
             dir.path(),
             release("v999.0.0", matching_assets_with_sidecars(arch)),
+            false,
+            false,
         )
         .unwrap();
+    }
+
+    // ── Spec 048 — fail-closed signature policy anchors ──
+    //
+    // Pre-Spec-048 the updater warned-and-continued when a stable
+    // release shipped without `.sig` files. That was the policy gap
+    // that let "the website says signed but the installer doesn't
+    // verify" persist. Anchors below pin the new fail-closed contract.
+
+    /// Spec 048 anchor #6 — Inv. 1 (stable release without sig MUST
+    /// fail). The fixture release has the binary asset but no `.sig`
+    /// sidecar; the updater MUST refuse to install. The current
+    /// architecture matters: pre-Spec-048 the same fixture printed a
+    /// warning and proceeded. `test_cli(&dir, false)` disables
+    /// dry_run so the sig-gate code path actually runs (dry_run
+    /// would short-circuit upstream).
+    #[test]
+    fn update_fails_closed_when_stable_release_has_no_sig() {
+        let Some(arch) = detect_arch() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+        // Build assets with binary ONLY — no .sha256, no .sig. The
+        // sig gate runs AFTER the SHA gate, so omitting .sha256 lets
+        // us reach the sig branch under test without forging a SHA.
+        let url = local_http_server(vec!["binary-content".to_string()]);
+        let assets_with_url = vec![asset_with_url(
+            format!("innerwarden-ctl-linux-{arch}"),
+            format!("{url}/bin"),
+            14,
+        )];
+        let err = cmd_upgrade_with_release(
+            &cli,
+            false,
+            true,
+            false,
+            dir.path(),
+            release("v999.0.0", assets_with_url),
+            false, // allow_unsigned_stable: NO override
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no .sig") || msg.contains("refusing to install"),
+            "stable release without .sig must error before install — got: {msg}"
+        );
+    }
+
+    /// Spec 048 anchor #7 — escape hatch (emergency override).
+    /// `--allow-unsigned-stable` exists for migration / air-gapped
+    /// builds. It MUST allow install but emit a noisy warn block.
+    /// We can only assert the gate runs (full install path requires
+    /// /usr/local/bin permissions); the precondition is that no
+    /// "no .sig" anyhow::bail fires. Dry_run OFF so the sig-gate
+    /// path runs.
+    #[test]
+    fn update_with_allow_unsigned_stable_flag_proceeds_past_sig_gate() {
+        let Some(arch) = detect_arch() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+        // Binary only — flag is true so the override is exercised.
+        let url = local_http_server(vec!["binary-content".to_string()]);
+        let assets = vec![asset_with_url(
+            format!("innerwarden-ctl-linux-{arch}"),
+            format!("{url}/bin"),
+            14,
+        )];
+        // The full install will fail downstream (write to /usr/local/bin
+        // without root) but we only care that the sig gate passed.
+        let err = cmd_upgrade_with_release(
+            &cli,
+            false,
+            true,
+            false,
+            dir.path(),
+            release("v999.0.0", assets),
+            true, // allow_unsigned_stable: override ON
+            false,
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(
+            !err.contains("no .sig") && !err.contains("refusing to install"),
+            "with --allow-unsigned-stable, the sig gate must NOT abort. \
+             Other downstream errors (sha mismatch, install perms) are \
+             allowed. Got: {err}"
+        );
+    }
+
+    /// Spec 048 anchor #8 — Inv. 6 (canary without flag aborts).
+    /// Canary releases ship without `.sig` today; until canary
+    /// signing infrastructure lands, the operator MUST opt in via
+    /// `--allow-unsigned-canary` to install one. Dry_run OFF so the
+    /// sig-gate path runs.
+    #[test]
+    fn update_canary_without_allow_unsigned_canary_aborts() {
+        let Some(arch) = detect_arch() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+        // Binary only (no .sha256, no .sig) — sig gate runs after
+        // SHA gate, so omitting .sha256 reaches the sig branch under
+        // test without forging a SHA.
+        let url = local_http_server(vec!["binary-content".to_string()]);
+        let assets = vec![asset_with_url(
+            format!("innerwarden-ctl-linux-{arch}"),
+            format!("{url}/bin"),
+            14,
+        )];
+        let err = cmd_upgrade_with_release(
+            &cli,
+            false,
+            true,
+            false,
+            dir.path(),
+            canary_release("v999.0.0-canary", assets),
+            false,
+            false, // allow_unsigned_canary OFF
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("canary release") && msg.contains("--allow-unsigned-canary"),
+            "canary without --allow-unsigned-canary must error with the \
+             specific guidance message — got: {msg}"
+        );
     }
 
     #[test]
@@ -658,6 +865,9 @@ mod tests {
             false,
             dir.path(),
             release("v999.0.0", matching_assets_without_sidecars(arch)),
+            true, // pre-spec-048 fixture has no .sig — needs override to assert prior
+            // happy-path semantics (download path completes; sig gate bypassed)
+            false,
         )
         .unwrap();
     }
@@ -690,6 +900,9 @@ mod tests {
             false,
             dir.path(),
             release("v999.0.0", assets),
+            true, // sig override: this test asserts the SHA mismatch error fires
+            // FIRST (before sig gate would even run)
+            false,
         )
         .unwrap_err();
 
@@ -714,6 +927,9 @@ mod tests {
             false,
             &dir.path().join("missing-install-dir"),
             release("v999.0.0", assets),
+            true, // sig override: this test asserts the install-failure
+            // error path; sig gate is upstream and not under test here
+            false,
         )
         .unwrap_err();
 

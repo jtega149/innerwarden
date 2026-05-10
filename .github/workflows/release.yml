@@ -167,7 +167,16 @@ jobs:
           ls dist/*.sig 2>/dev/null
 
       # ── Verify asset names match what upgrade.rs expects ──────────────────
+      #
+      # Spec 048: stable releases (tags without '-' like v0.13.1) MUST ship
+      # a `.sig` per binary. Pre-Spec-048 the workflow allowed the optional
+      # signing step to silently skip when RELEASE_SIGNING_KEY was absent,
+      # which let stable releases land without signatures and broke the
+      # supply-chain promise on the public site. The check below makes that
+      # condition a hard release failure.
       - name: Verify asset manifest
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           expected=(
             innerwarden-sensor-linux-x86_64
@@ -178,6 +187,13 @@ jobs:
             innerwarden-ctl-linux-aarch64
           )
           missing=0
+          # Stable when the tag has no '-' suffix (e.g. v0.13.1 stable;
+          # v0.13.1-rc.1 prerelease). Same predicate the GitHub Release
+          # step uses to set `prerelease: true` below.
+          is_stable=1
+          if [[ "$REF_NAME" == *-* ]]; then
+            is_stable=0
+          fi
           for name in "${expected[@]}"; do
             if [[ ! -f "dist/$name" ]]; then
               echo "MISSING: $name"
@@ -187,22 +203,62 @@ jobs:
               echo "MISSING: ${name}.sha256"
               missing=1
             fi
+            if [[ "$is_stable" -eq 1 ]] && [[ ! -f "dist/${name}.sig" ]]; then
+              echo "MISSING: ${name}.sig (stable release REQUIRES Ed25519 signatures, Spec 048)"
+              missing=1
+            fi
           done
           if [[ $missing -ne 0 ]]; then
             echo "Asset manifest verification failed."
             exit 1
           fi
-          # install.sh
           if [[ ! -f "dist/install.sh" ]]; then
             echo "MISSING: install.sh"
-            missing=1
-          fi
-
-          if [[ $missing -ne 0 ]]; then
-            echo "Asset manifest verification failed."
             exit 1
           fi
-          echo "All 13 assets present (6 binaries + 6 SHA-256 sidecars + install.sh)."
+          if [[ "$is_stable" -eq 1 ]]; then
+            echo "All 19 stable assets present (6 binaries + 6 SHA-256 + 6 .sig + install.sh)."
+          else
+            echo "All 13 prerelease assets present (6 binaries + 6 SHA-256 + install.sh; .sig optional)."
+          fi
+
+      # ── Spec 048: aggregate SHA256SUMS + GPG signature ────────────────────
+      #
+      # The aggregate manifest is what an operator uses for manual
+      # verification (`sha256sum -c SHA256SUMS` + `gpg --verify
+      # SHA256SUMS.sig SHA256SUMS`). Documented in
+      # docs/supply-chain-security.md. The GPG step is gated on the
+      # RELEASE_GPG_KEY secret; if it is missing the workflow fails for
+      # stable tags so the manifest signature gap cannot regress silently.
+      - name: Generate aggregate SHA256SUMS
+        run: |
+          cd dist
+          # Pinned filename order so the file is deterministic across runs.
+          : > SHA256SUMS
+          for f in $(ls -1 | grep -vE '^(SHA256SUMS|SHA256SUMS\.sig)$' | sort); do
+            sha256sum "$f" >> SHA256SUMS
+          done
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Sign SHA256SUMS with GPG (stable releases require this)
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+        run: |
+          if [[ -z "$RELEASE_GPG_KEY" ]]; then
+            echo "RELEASE_GPG_KEY secret missing; stable releases require a signed SHA256SUMS.sig (Spec 048)."
+            echo "Either set the secret or tag a prerelease (e.g. v0.13.1-rc.1)."
+            exit 1
+          fi
+          mkdir -p /tmp/gpg-home
+          chmod 700 /tmp/gpg-home
+          export GNUPGHOME=/tmp/gpg-home
+          echo "$RELEASE_GPG_KEY" | gpg --batch --import
+          gpg --batch --yes --pinentry-mode loopback --detach-sign --armor --output dist/SHA256SUMS.sig dist/SHA256SUMS
+          rm -rf /tmp/gpg-home
+          echo "=== SHA256SUMS.sig ==="
+          ls -lh dist/SHA256SUMS.sig
 
       # ── SLSA v1 build provenance attestation ──────────────────────────────
       # Publishes a cryptographic attestation tying each Linux binary back to
