@@ -28,7 +28,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 ![eBPF Hooks](https://img.shields.io/badge/eBPF%20hooks-40-blueviolet)
 ![Detectors](https://img.shields.io/badge/detectors-49-blue)
 ![Correlation Rules](https://img.shields.io/badge/correlation%20rules-47-purple)
-![Tests](https://img.shields.io/badge/tests-3689-brightgreen)
+![Tests](https://img.shields.io/badge/tests-6632-brightgreen)
 ![MITRE Coverage](https://img.shields.io/badge/MITRE%20ATT%26CK-65%20mappings-red)
 ![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-208-blueviolet)
 ![Memory](https://img.shields.io/badge/memory-~250MB%20(full%20stack)-green)
@@ -154,9 +154,15 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │              │ GeoIP, CrowdSec    │                               │
 │              └────────┬───────────┘                               │
 │                       ▼                                           │
-│              ┌─────────────────┐                                  │
-│              │ AI Triage (opt) │  OpenAI / Anthropic / Ollama     │
-│              └────────┬────────┘                                  │
+│              ┌──────────────────────┐                             │
+│              │   Local Warden       │  on-device ONNX classifier  │
+│              │   (warden default,   │  ~91 MB, 61 ms p50, runs    │
+│              │    securebert opt)   │  before any cloud LLM call  │
+│              └──────────┬───────────┘                             │
+│                         ▼                                         │
+│              ┌─────────────────────┐                              │
+│              │ AI Triage (opt LLM) │  OpenAI / Anthropic / Ollama │
+│              └────────┬────────────┘  via AI Capability Router    │
 │                       ▼                                           │
 │              ┌─────────────────┐     ┌──────────────┐             │
 │              │ Skill Executor  │────►│ LSM enforce  │             │
@@ -719,7 +725,7 @@ Pre-built binaries: `x86_64` and `aarch64` for both platforms.
 ## Build and test
 
 ```bash
-make test       # 2556 tests
+make test       # 6632 tests across the workspace
 make build      # debug build (sensor + agent + ctl)
 make replay-qa  # end-to-end integration test
 ```

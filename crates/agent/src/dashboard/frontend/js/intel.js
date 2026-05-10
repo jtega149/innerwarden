@@ -511,6 +511,28 @@ function baselineHeroCard(b, deviations24h) {
 let _loginHeatmapPage = 0;
 const LOGIN_HEATMAP_PAGE_SIZE = 20;
 const LOGIN_HEATMAP_LS_KEY = 'innerwarden.baseline.showServices';
+// 2026-05-10: persist the "What I consider normal here" <details>
+// open state so pagination re-renders don't collapse the section
+// the operator was actively reading. Operator complaint: clicking
+// Next on the user-list pagination collapsed the entire learned-
+// baseline section. The HTML <details> default is closed, and
+// loadBaseline() re-renders intelContent.innerHTML on every page
+// change, so the open attribute was never preserved.
+const BASELINE_LEARNED_OPEN_LS_KEY = 'innerwarden.baseline.learnedOpen';
+
+function baselineLearnedIsOpen() {
+  try {
+    return localStorage.getItem(BASELINE_LEARNED_OPEN_LS_KEY) === '1';
+  } catch (_) {
+    return false;
+  }
+}
+
+function baselineLearnedSetOpen(v) {
+  try {
+    localStorage.setItem(BASELINE_LEARNED_OPEN_LS_KEY, v ? '1' : '0');
+  } catch (_) {}
+}
 
 function loginHeatmapShowServices() {
   try {
@@ -541,6 +563,12 @@ window.loginHeatmapNextPage = function () {
 window.loginHeatmapPrevPage = function () {
   _loginHeatmapPage = Math.max(0, _loginHeatmapPage - 1);
   loadBaseline();
+};
+// 2026-05-10: persist <details open> state for the learned-baseline
+// section so re-renders triggered by user-list pagination do not
+// collapse the section the operator was actively reading.
+window.baselineLearnedOnToggle = function (el) {
+  baselineLearnedSetOpen(el && el.open);
 };
 
 function loginHeatmap(logins, userClasses) {
@@ -735,8 +763,9 @@ async function loadBaseline() {
       · ${(b.total_observations || 0).toLocaleString('en-US')} events observed
       · ${lineageCount} known process lineages
     `;
+    const learnedOpenAttr = baselineLearnedIsOpen() ? 'open' : '';
     html += `
-      <details class="baseline-learned" id="baselineLearnedSection">
+      <details class="baseline-learned" id="baselineLearnedSection" ${learnedOpenAttr} ontoggle="window.baselineLearnedOnToggle && window.baselineLearnedOnToggle(this)">
         <summary class="baseline-learned-summary">
           <span>What I consider normal here</span>
           <span class="baseline-learned-meta">${learnedSummary.replace(/\s+/g, ' ').trim()}</span>

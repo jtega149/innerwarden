@@ -9,6 +9,29 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-05-10
+
+Dashboard UX + AI explainer clarity + architecture-diagram honesty bundle. Three small operator-surfaced fixes from the post-v0.13.1 dashboard review, packaged as the next stable release so the v0.13.x line keeps moving.
+
+### Fixed
+
+- **Baseline tab: pagination collapsed the "What I consider normal here" section.** Operator-surfaced 2026-05-10. Repro: Intel → Baseline → expand the learned-baseline `<details>` → click Next on the user-list pagination → section collapses unexpectedly. Root cause: `loadBaseline()` rebuilds `intelContent.innerHTML` from scratch on every pagination click, and the `<details>` element was recreated without the `open` attribute. Fix persists the open state in `localStorage` (mirroring the existing "Show system accounts" toggle pattern) and re-applies the attribute on every render. (`crates/agent/src/dashboard/frontend/js/intel.js`)
+- **AI Explainer: "No incidents on record" was confusing on baseline pages.** Operator clicked "Ask AI to explain" for an IP shown on the Baseline tab (50 deviations attributed to the IP) and got "No incidents on record". Technically correct (baseline deviations are not `Node::Incident`), but the operator read this as "the entity is unknown" rather than "the explainer covers a different signal class". Message rewritten to spell out the boundary: the explainer summarises incident-grade events that reached the decision pipeline (block / dismiss / escalate / honeypot), NOT baseline deviations / process-trust drift / threat-intel hits / honeypot probes that did not produce an incident. (`crates/agent/src/dashboard/data_api.rs::build_explain_context`)
+
+### Changed
+
+- **README architecture diagram now shows the Local Warden classifier.** Pre-fix the diagram listed only "AI Triage (opt) — OpenAI / Anthropic / Ollama" as the AI block, which understated reality: Spec 029 (PR #258) made the on-device Local Warden ONNX classifier the canonical Decide path; cloud LLMs are the optional fallback / Explain capability via the AI Capability Router. The diagram now shows Local Warden first (with the model name, on-disk size, and p50 latency) and the cloud LLMs as a second tier behind the router. Reflects what every install with the default `local-classifier` feature actually does at runtime.
+
+### Release pipeline note
+
+- **v0.13.1 macOS binaries are intentionally absent.** Release workflow #113 hit a tag-pointing race (the v0.13.1 tag was force-pushed from the prep-PR commit to the post-merge squash commit while the macOS job was still running, so the macOS runner saw a checkout mismatch and aborted). Linux x86_64 / aarch64 + Docker + GitHub Artifact Attestations all shipped clean for v0.13.1. v0.13.2 is cut from a stable main HEAD so the same race cannot recur; macOS binaries return on the v0.13.2 release.
+
+### Tests
+
+- `cargo test --workspace`: **6632 passed + 5 ignored** across 35 test suites in 94 s.
+
+---
+
 ## [0.13.1] - 2026-05-10
 
 Honeypot effectiveness, posture-aware alerting, and infrastructure honesty release. The headline shift is the honeypot turning from a credential mirror with the door always open into a real behavioural trap that captures Mirai-class bots, manual brute-forcers, and human-direct attackers, without giving away what it is. 50 commits since 0.13.0.

@@ -1639,15 +1639,24 @@ pub(super) fn build_explain_context(
 
     // Final fallback: still nothing → return a useful message instead
     // of the generic "No data found" (which is what operator hit on
-    // 2026-05-10).
+    // 2026-05-10). Operator follow-up 2026-05-10: even the clarified
+    // version was confusing when the page that triggered the click
+    // shows baseline deviations or process-trust drift — those are
+    // not incidents in the KG sense and never reach this explainer.
+    // Spell out the boundary so the operator does not read the
+    // message as "the entity is unknown" when it might be perfectly
+    // visible elsewhere on the same dashboard.
     if incident_lines.is_empty() {
         return ExplainContext::NoData(format!(
-            "No incidents on record for {subject_type} {subject_value}. The \
-             threats list may be showing this entity because an incident was \
-             very recent and hasn't been ingested into the knowledge graph \
-             yet, or because the entity was already auto-dismissed. Refresh \
-             in a minute and try again, or click the incident row to see \
-             the raw data."
+            "No incidents on record for {subject_type} {subject_value}. \
+             This explainer only summarises incident-grade events that \
+             reached the agent's decision pipeline (block / dismiss / \
+             escalate / honeypot). It does NOT cover baseline deviations, \
+             process-trust drift, threat-intel hits, or honeypot probes \
+             that did not produce an incident — those signals are visible \
+             on their own dashboard sections. If you expected an incident \
+             here, it may be very recent and not yet ingested, or it was \
+             already auto-dismissed. Refresh in a minute and try again."
         ));
     }
 
