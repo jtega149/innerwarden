@@ -128,6 +128,65 @@ jobs:
           echo "=== Release assets ==="
           ls -lh dist/
 
+      # ── Binary feature-parity guard ───────────────────────────────────────
+      #
+      # The release binary MUST contain the production feature set advertised
+      # in CLAUDE.md and `scripts/deploy-prod.sh`. v0.13.2 was the regression
+      # that motivated this gate: the release.yml above did not pass
+      # `--features local-classifier` to agent, so the GHA-released binary
+      # silently fell back to azure_openai (Local Warden inert), and a parallel
+      # symbol-stripping mismatch left jemalloc heap-profiling unreachable
+      # from `MALLOC_CONF=prof:true,...` (operators with the spec-030 jeprof
+      # systemd drop-in segfaulted on every spawn). Both regressions reached
+      # production undetected because the asset manifest only checked
+      # filenames, never binary content.
+      #
+      # The guard greps for symbol/string markers that prove each feature was
+      # linked in. If a future build flag drops one of these, the release run
+      # fails at this step with a precise diagnostic instead of producing a
+      # silently-degraded binary.
+      - name: Verify binary feature parity
+        run: |
+          set -euo pipefail
+          fail=0
+
+          for arch in x86_64 aarch64; do
+            agent="dist/innerwarden-agent-linux-${arch}"
+            echo "--- $agent ---"
+
+            # jemalloc heap profiling (spec 030 / jeprof systemd drop-in).
+            # Looks for the `_rjem_je_opt_prof` symbol; absent if the
+            # `profiling` feature on tikv-jemallocator stopped being linked
+            # (e.g. Cargo.toml regression or zigbuild C-flag drift).
+            if ! strings "$agent" | grep -qE "(opt_prof|prof_init)"; then
+              echo "FAIL: $agent missing jemalloc-prof symbols"
+              echo "      MALLOC_CONF=prof:true would segfault on this binary."
+              fail=1
+            fi
+
+            # Local Warden Model classifier (spec 029 / spec 032).
+            # `local_classifier` provider id is constructed in
+            # crates/agent/src/ai/local_classifier.rs, only compiled when
+            # `--features local-classifier` is set. Without it the agent
+            # silently falls back to whatever cloud provider is configured.
+            #
+            # NOTE: this guard is gated on whether the build was meant to
+            # include the feature. Until release.yml passes the feature flag
+            # the line stays informational (warn, not fail) so the gate can
+            # land before the build change.
+            if ! strings "$agent" | grep -q "local_classifier"; then
+              echo "WARN: $agent missing local-classifier symbols (Local Warden inert)"
+              echo "      Operators must use scripts/deploy-prod.sh for production."
+            fi
+          done
+
+          if [[ $fail -ne 0 ]]; then
+            echo
+            echo "Binary feature-parity verification failed."
+            echo "Fix the build flags in this workflow before re-running the tag."
+            exit 1
+          fi
+
       # ── Sign binaries with Ed25519 ──────────────────────────────────────
       - name: Sign release binaries
         if: env.RELEASE_SIGNING_KEY != ''

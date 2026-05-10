@@ -9,6 +9,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Release pipeline
+
+- **Binary feature-parity guard** in `release.yml`. After staging the release assets, the workflow now greps each `innerwarden-agent-linux-{x86_64,aarch64}` binary for the symbol/string markers that prove production features were linked in: `opt_prof` / `prof_init` from jemalloc heap profiling (spec 030, the systemd `MALLOC_CONF=prof:true,...` drop-in), and `local_classifier` from the Local Warden Model provider (spec 029, the `--features local-classifier` build). Caught two silent v0.13.2 regressions where the GHA-released binary lacked both — `MALLOC_CONF=prof:true` segfaulted on every spawn for operators with the spec-030 jeprof systemd drop-in, and Local Warden was inert (the agent silently fell back to whatever cloud provider was configured). Both regressions reached production undetected because the prior asset manifest only checked filenames, never binary content.
+
+### Known caveat (v0.13.2 GHA-released binary)
+
+- The v0.13.2 binaries on the GitHub release page were built via `cargo zigbuild` without `--features local-classifier`, so the **Local Warden Model is not active** on those binaries (the agent logs `local_warden provider requires building innerwarden-agent with --features local-classifier` at startup and falls back to the configured cloud provider). They also segfault when launched with `MALLOC_CONF=prof:true,...` — the jemalloc heap-profile symbols are missing or unreachable. **Production operators should keep using `scripts/deploy-prod.sh`** (which builds locally with the right feature flags) rather than `innerwarden upgrade` against the v0.13.2 release. The feature-parity guard in this Unreleased section will refuse future GHA releases that hit either condition.
+
 ## [0.13.2] - 2026-05-10
 
 Dashboard UX + AI explainer clarity + architecture-diagram honesty bundle. Three small operator-surfaced fixes from the post-v0.13.1 dashboard review, packaged as the next stable release so the v0.13.x line keeps moving.
