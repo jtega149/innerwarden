@@ -15,7 +15,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Config, Handler, Session};
-use russh::{ChannelId, SshId};
+use russh::{ChannelId, MethodSet, SshId};
 use serde::Serialize;
 use tracing::{debug, info};
 
@@ -287,11 +287,27 @@ impl Handler for HoneypotSshHandler {
                 // CodeRabbit on PR #508 review. The
                 // `weak_credential_on_second_attempt_still_rejects` anchor
                 // below pins the corrected semantics.
+                //
+                // CRITICAL: every reject path MUST send
+                // `proceed_with_methods: Some(MethodSet::all())`.
+                // russh's default `Auth::Reject { proceed_with_methods:
+                // None, .. }` causes the server to STRIP the failed
+                // method (Password) from the advertised method list
+                // (russh-0.60.1 src/server/encrypted.rs:215 —
+                // `auth_request.methods.remove(MethodKind::Password)`).
+                // After the first reject, the client sees only
+                // `publickey,hostbased,keyboard-interactive` and
+                // disconnects because none of those work — the
+                // dropper bot can never reach attempt #2 on the same
+                // connection. Caught during prod smoke test of PR
+                // #508. Sending `Some(MethodSet::all())` keeps
+                // password available for retry. Anchor:
+                // `auth_password_reject_keeps_password_method_advertised`.
                 if attempt_n <= MIN_ATTEMPTS_BEFORE_ACCEPT {
                     debug!(user, attempt_n, "honeypot: rejected under threshold");
                     tokio::time::sleep(Duration::from_millis(AUTH_REJECT_DELAY_MS)).await;
                     return Ok(Auth::Reject {
-                        proceed_with_methods: None,
+                        proceed_with_methods: Some(MethodSet::all()),
                         partial_success: false,
                     });
                 }
@@ -299,7 +315,7 @@ impl Handler for HoneypotSshHandler {
                     debug!(user, "honeypot: rejected non-weak credential");
                     tokio::time::sleep(Duration::from_millis(AUTH_REJECT_DELAY_MS)).await;
                     return Ok(Auth::Reject {
-                        proceed_with_methods: None,
+                        proceed_with_methods: Some(MethodSet::all()),
                         partial_success: false,
                     });
                 }
@@ -1093,6 +1109,62 @@ mod tests {
             banner_dbg.contains("SSH-2.0-OpenSSH"),
             "banner must advertise OpenSSH: got {banner_dbg}"
         );
+    }
+
+    /// Spec 046 anchor #3c — Inv. 2 (regression: keep password method
+    /// advertised across rejects). Caught during prod smoke test of
+    /// PR #508: russh-0.60.1 strips `MethodKind::Password` from the
+    /// auth request when the handler returns `Auth::Reject {
+    /// proceed_with_methods: None, .. }` (see russh src/server/
+    /// encrypted.rs:215). The client then sees only `publickey,
+    /// hostbased, keyboard-interactive` and disconnects — the
+    /// dropper bot can never reach attempt #2. The fix sends
+    /// `Some(MethodSet::all())` on every reject, keeping password
+    /// retriable. This anchor pins the contract: every reject in
+    /// LlmShell mode MUST carry `proceed_with_methods: Some(...)`
+    /// containing `MethodKind::Password`.
+    #[tokio::test]
+    async fn auth_password_reject_keeps_password_method_advertised() {
+        use russh::MethodKind;
+        let bucket = empty_bucket();
+        let mut h = make_llm_shell_handler(&bucket);
+
+        // Under-threshold reject branch.
+        let r1 = h.auth_password("admin", "admin").await.unwrap();
+        match r1 {
+            Auth::Reject {
+                proceed_with_methods: Some(methods),
+                ..
+            } => {
+                assert!(
+                    methods.contains(&MethodKind::Password),
+                    "under-threshold reject MUST advertise Password — \
+                     otherwise russh strips it from the method list and \
+                     the client disconnects without reaching attempt #2"
+                );
+            }
+            other => panic!("under-threshold reject must carry Some(methods); got {other:?}"),
+        }
+
+        // Pump past threshold; non-weak credential reject branch.
+        for _ in 0..MIN_ATTEMPTS_BEFORE_ACCEPT {
+            let _ = h.auth_password("nobody", "ignore").await.unwrap();
+        }
+        let r3 = h.auth_password("nobody", "qP9wKzLm8ntx").await.unwrap();
+        match r3 {
+            Auth::Reject {
+                proceed_with_methods: Some(methods),
+                ..
+            } => {
+                assert!(
+                    methods.contains(&MethodKind::Password),
+                    "non-weak-credential reject MUST advertise Password — \
+                     otherwise the dropper sees `keyboard-interactive` only \
+                     and disconnects before hitting a weak credential"
+                );
+            }
+            other => panic!("non-weak reject must carry Some(methods); got {other:?}"),
+        }
     }
 
     /// Spec 046 anchor #8b — `max_auth_attempts` floor enforcement.
