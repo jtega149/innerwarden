@@ -2,7 +2,8 @@
 
 **Feature Branch**: `028-incident-lifecycle-bugs`
 **Created**: 2026-04-19
-**Status**: Draft
+**Status**: CLOSED 2026-05-11
+**Closeout note**: Code shipped in PRs #196 / #197 / #212 (2026-04-19/20) with `incident_flow.escalate_to_decide = true` and `detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]` enabled in prod. Validation gate met after 22 days of shadow data on Oracle Cloud London: 3055 entries, local-block precision 89.7% (at spec 028-b target), 94.3% of ignore→block_ip disagreements were cloud_safelist matches (Azure would have over-blocked own/CDN infra), 0 of 159 ground-truth-checked cases turned out to be real attackers missed by local. Full evidence in `ideias/detection/securebert-poc/RESULTS_V3.md`. Post-validation, shadow sampling reduced from 100% to 10% via PR #526 (`[ai.shadow] sample_rate = 0.1`) — deployed to prod 2026-05-11 06:06 UTC alongside agent v0.13.3. The remaining `escalate_to_decide` feature flag could be removed (its `false` branch is dead) as a one-line follow-up; 028-d (`/24` subnet correlation) was marked optional and never opened.
 **Input**: Production audit of the InnerWarden agent on Oracle Cloud London (v0.12.2) surfaced a cluster of bugs where detectors fire, the AI classifies correctly, but no action gets executed. Similar pattern to the autonomy gap fixed in spec 018, but on different code paths.
 
 ## Origin
