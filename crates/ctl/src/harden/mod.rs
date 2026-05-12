@@ -353,14 +353,6 @@ mod tests {
         }
     }
 
-    fn titles(result: &types::CheckResult) -> Vec<&str> {
-        result
-            .findings
-            .iter()
-            .map(|finding| finding.title.as_str())
-            .collect()
-    }
-
     fn has_title(result: &types::CheckResult, needle: &str) -> bool {
         result
             .findings
@@ -484,11 +476,7 @@ mod tests {
 
         let result = check_ssh(&env);
 
-        assert!(
-            result.findings.is_empty(),
-            "unexpected findings: {:?}",
-            titles(&result)
-        );
+        assert!(result.findings.is_empty());
         assert!(result
             .passed
             .iter()
@@ -606,6 +594,15 @@ LISTEN 0 128 0.0.0.0:6379 users:(\"redis\")\n";
             .iter()
             .any(|passed| passed == "Default zone: public"));
 
+        let firewalld_without_zone = TestEnv::default()
+            .with_command("firewall-cmd", &["--state"], "running\n")
+            .with_command("ss", &["-tlnp"], "");
+        let firewalld_without_zone_result = check_firewall(&firewalld_without_zone);
+        assert!(firewalld_without_zone_result
+            .passed
+            .iter()
+            .any(|passed| passed == "firewalld is active"));
+
         let ufw_env = TestEnv::default()
             .with_command(
                 "sudo",
@@ -615,6 +612,19 @@ LISTEN 0 128 0.0.0.0:6379 users:(\"redis\")\n";
             .with_command("ss", &["-tlnp"], "");
         let ufw_result = check_firewall(&ufw_env);
         assert!(has_title(&ufw_result, "Default incoming policy"));
+
+        let hardened_ufw = TestEnv::default()
+            .with_command(
+                "sudo",
+                &["ufw", "status", "verbose"],
+                "Status: active\nDefault: deny (incoming), allow (outgoing)\n",
+            )
+            .with_command("ss", &["-tlnp"], "");
+        let hardened_ufw_result = check_firewall(&hardened_ufw);
+        assert!(hardened_ufw_result
+            .passed
+            .iter()
+            .any(|passed| passed == "Default incoming policy: deny"));
 
         let ufw_inactive_env = TestEnv::default()
             .with_command("sudo", &["ufw", "status", "verbose"], "Status: inactive\n")
@@ -982,6 +992,14 @@ LISTEN 0 128 :::3307 users:(\"custom\")\n\
             .passed
             .iter()
             .any(|passed| passed.contains("Scanned 1 crontab file")));
+
+        let unreadable =
+            TestEnv::default().with_dir("/etc/cron.d", vec![file_entry("/etc/cron.d/unreadable")]);
+        let unreadable_result = check_crontabs(&unreadable);
+        assert!(unreadable_result
+            .passed
+            .iter()
+            .any(|passed| passed == "No crontab files found to scan"));
     }
 
     #[test]
@@ -1066,11 +1084,7 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" alway
         let mut findings = Vec::new();
         check_tls_nginx_files(&files, &mut passed, &mut findings);
 
-        assert!(
-            findings.is_empty(),
-            "Expected no findings, got: {:?}",
-            findings.iter().map(|f| &f.title).collect::<Vec<_>>()
-        );
+        assert!(findings.is_empty());
         assert!(passed.iter().any(|p| p.contains("ciphers look good")));
         assert!(passed
             .iter()
@@ -1120,11 +1134,7 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" alway
             .iter()
             .filter(|f| f.title.contains("weak cipher"))
             .collect();
-        assert!(
-            cipher_findings.len() >= 2,
-            "Expected at least 2 weak cipher findings (RC4, DES), got {}",
-            cipher_findings.len()
-        );
+        assert!(cipher_findings.len() >= 2);
     }
 
     #[test]
@@ -1233,11 +1243,7 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" alway
         let mut findings = Vec::new();
         check_tls_apache_files(&files, &mut passed, &mut findings);
 
-        assert!(
-            findings.is_empty(),
-            "Expected no findings, got: {:?}",
-            findings.iter().map(|f| &f.title).collect::<Vec<_>>()
-        );
+        assert!(findings.is_empty());
         assert!(passed.iter().any(|p| p.contains("ciphers look good")));
         assert!(passed.iter().any(|p| p.contains("HSTS header present")));
     }
@@ -1262,11 +1268,7 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" alway
             .iter()
             .filter(|f| f.title.contains("weak cipher"))
             .collect();
-        assert!(
-            weak.len() >= 3,
-            "Expected at least 3 weak cipher findings (RC4, NULL, EXPORT), got {}",
-            weak.len()
-        );
+        assert!(weak.len() >= 3);
     }
 
     #[test]
@@ -1397,6 +1399,16 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" alway
         assert!(has_title(&result, "/home/alice/.ssh too permissive"));
         assert!(has_title(&result, "authorized_keys too permissive"));
         assert!(has_title(&result, "/tmp missing sticky bit"));
+
+        let missing_ssh_metadata = TestEnv::default()
+            .with_dir("/home", vec![dir_entry("/home/bob")])
+            .with_path("/home/bob/.ssh");
+        let missing_ssh_metadata_result = check_permissions(&missing_ssh_metadata);
+        assert!(missing_ssh_metadata_result.findings.is_empty());
+
+        let no_ssh_dir = TestEnv::default().with_dir("/home", vec![dir_entry("/home/charlie")]);
+        let no_ssh_dir_result = check_permissions(&no_ssh_dir);
+        assert!(no_ssh_dir_result.findings.is_empty());
     }
 
     #[test]
@@ -1474,6 +1486,15 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" alway
             );
         let non_security_result = check_updates(&non_security);
         assert!(has_title(&non_security_result, "package update"));
+
+        let unavailable_listing = TestEnv::default()
+            .with_path("/usr/bin/apt")
+            .with_path("/etc/apt/apt.conf.d/20auto-upgrades");
+        let unavailable_listing_result = check_updates(&unavailable_listing);
+        assert!(unavailable_listing_result
+            .passed
+            .iter()
+            .any(|passed| passed == "Automatic security updates configured"));
     }
 
     #[test]
@@ -1541,6 +1562,22 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" alway
             .with_command("docker", &["ps", "-q"], "");
         let empty_result = check_docker(&empty);
         assert!(empty_result.findings.is_empty());
+
+        let inventory_unavailable =
+            TestEnv::default().with_command("docker", &["--version"], "Docker version 28\n");
+        let inventory_unavailable_result = check_docker(&inventory_unavailable);
+        assert!(inventory_unavailable_result.findings.is_empty());
+
+        let inspect_unavailable = TestEnv::default()
+            .with_command("docker", &["--version"], "Docker version 28\n")
+            .with_command(
+                "docker",
+                &["ps", "--format", "{{.Names}} {{.Status}}"],
+                "worker Up\n",
+            )
+            .with_command("docker", &["ps", "-q"], "ghi789\n");
+        let inspect_unavailable_result = check_docker(&inspect_unavailable);
+        assert!(inspect_unavailable_result.findings.is_empty());
     }
 
     #[test]
@@ -1640,6 +1677,12 @@ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" alway
         assert!(title.contains("force-unloaded module"));
         assert!(title.contains("ACPI table overridden"));
         assert!(title.contains("out-of-tree module"));
+
+        let medium_only_taint = TestEnv::default().with_file("/proc/sys/kernel/tainted", "4107\n");
+        let medium_only_result = check_firmware(&medium_only_taint);
+        assert!(medium_only_result.findings.iter().any(|finding| {
+            finding.severity == Severity::Medium && finding.title.contains("Kernel is tainted")
+        }));
     }
 
     #[test]
