@@ -4,15 +4,15 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-/// Restart a systemd service unit.
-/// In dry_run mode, prints the command without executing.
-pub fn restart_service(unit: &str, dry_run: bool) -> Result<()> {
+fn restart_service_with<F>(unit: &str, dry_run: bool, mut run: F) -> Result<()>
+where
+    F: FnMut(&str, &[String]) -> std::io::Result<std::process::Output>,
+{
     if dry_run {
         return Ok(());
     }
-    let out = Command::new("systemctl")
-        .args(["restart", unit])
-        .output()
+    let args = vec!["restart".to_string(), unit.to_string()];
+    let out = run("systemctl", &args)
         .with_context(|| format!("failed to run systemctl restart {unit}"))?;
 
     if !out.status.success() {
@@ -22,15 +22,24 @@ pub fn restart_service(unit: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// Restart a launchd service (macOS).
+/// Restart a systemd service unit.
 /// In dry_run mode, prints the command without executing.
-pub fn restart_launchd(label: &str, dry_run: bool) -> Result<()> {
+pub fn restart_service(unit: &str, dry_run: bool) -> Result<()> {
+    restart_service_with(unit, dry_run, |program, args| {
+        Command::new(program).args(args).output()
+    })
+}
+
+fn restart_launchd_with<F>(label: &str, dry_run: bool, mut run: F) -> Result<()>
+where
+    F: FnMut(&str, &[String]) -> std::io::Result<std::process::Output>,
+{
     if dry_run {
         return Ok(());
     }
-    let out = Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("system/{label}")])
-        .output()
+    let target = format!("system/{label}");
+    let args = vec!["kickstart".to_string(), "-k".to_string(), target];
+    let out = run("launchctl", &args)
         .with_context(|| format!("failed to run launchctl kickstart -k system/{label}"))?;
 
     if !out.status.success() {
@@ -38,6 +47,14 @@ pub fn restart_launchd(label: &str, dry_run: bool) -> Result<()> {
         bail!("launchctl kickstart system/{label} failed: {stderr}");
     }
     Ok(())
+}
+
+/// Restart a launchd service (macOS).
+/// In dry_run mode, prints the command without executing.
+pub fn restart_launchd(label: &str, dry_run: bool) -> Result<()> {
+    restart_launchd_with(label, dry_run, |program, args| {
+        Command::new(program).args(args).output()
+    })
 }
 
 /// Result of querying a systemd service's runtime status.
@@ -128,6 +145,10 @@ pub fn is_service_active(unit: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn shell_output(script: &str) -> std::io::Result<std::process::Output> {
+        Command::new("sh").arg("-c").arg(script).output()
+    }
+
     #[test]
     fn restart_in_dry_run_does_not_error() {
         // Should succeed without actually calling systemctl
@@ -137,6 +158,44 @@ mod tests {
     #[test]
     fn restart_launchd_in_dry_run_does_not_error() {
         assert!(restart_launchd("com.innerwarden.agent", true).is_ok());
+    }
+
+    #[test]
+    fn restart_service_with_accepts_success_and_reports_stderr_on_failure() {
+        assert!(
+            restart_service_with("innerwarden-agent", false, |_program, _args| {
+                shell_output("exit 0")
+            })
+            .is_ok()
+        );
+
+        let err = restart_service_with("innerwarden-agent", false, |_program, _args| {
+            shell_output("printf service-down >&2; exit 1")
+        })
+        .expect_err("failed systemctl should surface stderr");
+        assert!(err.to_string().contains("service-down"));
+    }
+
+    #[test]
+    fn restart_launchd_with_covers_dry_run_success_and_failure_paths() {
+        assert!(
+            restart_launchd_with("com.innerwarden.agent", true, |_program, _args| {
+                shell_output("exit 1")
+            })
+            .is_ok()
+        );
+        assert!(
+            restart_launchd_with("com.innerwarden.agent", false, |_program, _args| {
+                shell_output("exit 0")
+            })
+            .is_ok()
+        );
+
+        let err = restart_launchd_with("com.innerwarden.agent", false, |_program, _args| {
+            shell_output("printf launchd-down >&2; exit 1")
+        })
+        .expect_err("launchctl failure should be reported");
+        assert!(err.to_string().contains("launchd-down"));
     }
 
     /// Bug 2 anchor (2026-05-06): "active" stdout maps to Active.

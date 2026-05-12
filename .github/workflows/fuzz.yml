@@ -33,13 +33,11 @@ jobs:
           toolchain: nightly
 
       - name: Install cargo-fuzz
-        # cargo-fuzz 0.12.0 pulls rustix v0.36.5 which uses
-        # `#[rustc_layout_scalar_valid_range_start(...)]` — a compiler-
-        # internal attribute that recent nightlies (≥ 2026-04) reject
-        # for non-rustc crates, breaking the install step. 0.13.1 ships
-        # with a new-enough rustix that compiles on current nightly.
-        # Re-pin if/when rustix MSRV churn breaks this again.
-        run: cargo +nightly install cargo-fuzz --locked --version 0.13.1
+        # Keep cargo-fuzz pinned, but allow Cargo to refresh compatible
+        # transitive dependencies. The published 0.13.1 lockfile still
+        # freezes rustix v0.36.5, which current nightlies reject because
+        # it uses compiler-reserved rustc_* attributes.
+        run: cargo +nightly install cargo-fuzz --version 0.13.1
 
       - name: Cache fuzz corpus
         uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4

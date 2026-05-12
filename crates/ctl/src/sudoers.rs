@@ -228,4 +228,43 @@ mod tests {
         let d = SudoersDropIn::new("foo;bar", "# test\n");
         assert!(d.path().is_err());
     }
+
+    #[test]
+    fn drop_in_dry_run_install_and_uninstalled_lookup_are_safe() {
+        let drop_in = SudoersDropIn::new("innerwarden-dry-run", "# test\n");
+        assert!(!drop_in.is_installed());
+        assert!(drop_in.install(true).is_ok());
+    }
+
+    #[test]
+    fn remove_missing_drop_in_is_a_noop() {
+        let drop_in = SudoersDropIn::new("innerwarden-missing", "# test\n");
+        assert!(drop_in.remove(false).is_ok());
+    }
+
+    #[test]
+    fn block_ip_rules_keep_expected_backends_scoped() {
+        let ufw = block_ip_rule("ufw").expect("ufw rule");
+        assert!(ufw.contains("/usr/sbin/ufw deny from *"));
+        assert!(!ufw.contains("ufw disable"));
+
+        let iptables = block_ip_rule("iptables").expect("iptables rule");
+        assert!(iptables.contains("/sbin/iptables -A INPUT -s * -j DROP"));
+        assert!(iptables.contains("/sbin/iptables -L INPUT -n"));
+
+        let nft = block_ip_rule("nftables").expect("nft rule");
+        assert!(nft.contains("/usr/sbin/nft add element inet innerwarden-blocked"));
+        assert!(nft.contains("/usr/sbin/nft list set inet innerwarden-blocked"));
+    }
+
+    #[test]
+    fn search_and_suspend_rules_include_expected_commands() {
+        let nginx = search_protection_nginx_rule();
+        assert!(nginx.contains("/usr/sbin/nginx -t"));
+        assert!(nginx.contains("/usr/sbin/nginx -s reload"));
+
+        let suspend = suspend_user_sudo_rule();
+        assert!(suspend.contains("/usr/sbin/visudo -cf /tmp/innerwarden-sudoers-*"));
+        assert!(suspend.contains("/bin/rm -f /etc/sudoers.d/zz-innerwarden-deny-*"));
+    }
 }
