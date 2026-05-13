@@ -1063,12 +1063,24 @@ pub(super) async fn api_overview(
                 top_detectors: Vec::new(),
             }
         });
+        // PR23: events_count for the date comes from SQLite, the only
+        // source that gives an honest "events today" number.
+        // graph.total_events_ingested is uptime-cumulative (zero after
+        // restart, multi-million after weeks); metrics.edge_count was
+        // ~30× inflated. SQLite's `events` table is the ground truth.
+        let date_for_events = c
+            .snapshot
+            .as_ref()
+            .map(|s| s.date.clone())
+            .unwrap_or_else(|| date.clone());
+        let events_today_count = state
+            .sqlite_store
+            .as_ref()
+            .and_then(|s| s.events_count_for_date(&date_for_events).ok())
+            .unwrap_or(0) as usize;
         return Json(OverviewResponse {
             date,
-            // PR22: replaced legacy `metrics.edge_count` proxy with the
-            // canonical event counter so this surface agrees with
-            // /api/sensors.total_events (same KG source).
-            events_count: graph.total_events_ingested,
+            events_count: events_today_count,
             incidents_count: c.incidents_count,
             decisions_count: c.decisions_count,
             ai_confirmed: c.ai_confirmed,
@@ -1287,13 +1299,13 @@ pub(super) async fn api_overview(
         filtered_out: filtered_out_count,
         needs_review: attention_count,
     };
+    // PR23: KG fallback path — when SQLite is unreachable. Use the
+    // in-memory ingestion counter (uptime-cumulative) since no SQL
+    // source is available here; the response is best-effort.
+    let events_count_fallback = graph.total_events_ingested;
     Json(OverviewResponse {
         date,
-        // PR22: edges are NOT events — each event creates multiple
-        // edges (incident → ip, incident → process, etc) so the proxy
-        // inflated this surface ~30×. Read the canonical counter so
-        // /api/overview agrees with /api/sensors.total_events.
-        events_count: graph.total_events_ingested,
+        events_count: events_count_fallback,
         incidents_count: incident_nodes.len(),
         decisions_count,
         ai_confirmed,
@@ -2067,12 +2079,11 @@ pub(super) fn compute_overview_from_graph(
         filtered_out: filtered_out_count,
         needs_review: attention_count,
     };
+    // PR23: graph-only test/legacy path — no SQL store. Best-effort.
+    let events_count_legacy = graph.total_events_ingested;
     OverviewResponse {
         date: date.to_string(),
-        // PR22: edge_count proxy was inflating events_count by ~30×.
-        // Source of truth: graph.total_events_ingested, matching the
-        // /api/sensors path.
-        events_count: graph.total_events_ingested,
+        events_count: events_count_legacy,
         incidents_count: incident_nodes.len(),
         decisions_count,
         ai_confirmed,

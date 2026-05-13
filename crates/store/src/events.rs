@@ -204,6 +204,27 @@ impl Store {
         Ok(count as u64)
     }
 
+    /// Spec 049 PR23 — count events whose `ts` starts with `date`
+    /// (`YYYY-MM-DD`). Used by `/api/overview.events_count` so the
+    /// number agrees with the SQLite source of truth instead of a
+    /// counter that's either uptime-cumulative (post-PR22 path) or
+    /// graph-edge-count (pre-PR22 proxy, ~30× inflated).
+    ///
+    /// Operator-reported on 2026-05-13:
+    /// * pre-PR22:   130k (KG edges, wrong)
+    /// * post-PR22:  26M (lifetime counter, more wrong)
+    /// * post-PR23:  213k (the actual events written today, ground truth)
+    pub fn events_count_for_date(&self, date: &str) -> Result<u64> {
+        let conn = self.conn()?;
+        let pattern = format!("{date}%");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE ts LIKE ?1",
+            params![pattern],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Delete events with ts < `before_ts` (ISO 8601). Returns rows deleted.
     pub fn delete_events_before(&self, before_ts: &str) -> Result<u64> {
         let conn = self.conn()?;

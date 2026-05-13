@@ -7040,24 +7040,34 @@ mod tests {
 
     #[test]
     fn pr22_overview_events_count_reads_canonical_counter_not_edge_count() {
-        // The biggest operator-visible gap: /api/overview said 130k
-        // events while /api/sensors said 3.7k. Same KG, different
-        // proxies. PR22 collapses both onto `graph.total_events_ingested`.
-        // Anti-regression: no surface may go back to `metrics.edge_count`
-        // as a proxy for events.
+        // The biggest operator-visible gap:
+        //   pre-PR22:  130k    (KG edges, ~30× inflated)
+        //   post-PR22:  26M    (lifetime ingestion counter, wrong scope)
+        //   post-PR23: 213k    (SQLite events table for the date, ground truth)
+        //
+        // Anti-regression: no surface may go back to either proxy.
+        // The HONEST source is the `events` SQLite table filtered by
+        // ts, exposed via `Store::events_count_for_date(date)`.
         const DATA_API_SRC: &str = include_str!("data_api.rs");
         assert!(
             !DATA_API_SRC.contains("events_count: metrics.edge_count"),
-            "PR22 — `events_count: metrics.edge_count` is the legacy \
-             ~30× inflation proxy. Read `graph.total_events_ingested` \
-             so every events surface (Home, Cases strip, Sensors HUD) \
-             agrees."
+            "PR22/PR23 — `metrics.edge_count` is the ~30× inflation \
+             proxy; never reuse for `events_count`."
+        );
+        const STORE_EVENTS_SRC: &str = include_str!("../../../store/src/events.rs");
+        assert!(
+            STORE_EVENTS_SRC
+                .contains("pub fn events_count_for_date(&self, date: &str) -> Result<u64>"),
+            "PR23 — `Store::events_count_for_date` must exist as the \
+             canonical date-scoped events counter. /api/overview reads \
+             from this, not from any in-memory counter that can be \
+             zero-after-restart or lifetime-cumulative."
         );
         assert!(
-            DATA_API_SRC.contains("events_count: graph.total_events_ingested"),
-            "PR22 — at least one `events_count` field must read from \
-             `graph.total_events_ingested` (the canonical counter the \
-             sensor increments)."
+            DATA_API_SRC.contains("s.events_count_for_date(&date_for_events)"),
+            "PR23 — the api_overview SQLite path must call \
+             `events_count_for_date` so the events surface agrees \
+             with the canonical source."
         );
     }
 
