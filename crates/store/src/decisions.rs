@@ -483,6 +483,45 @@ impl Store {
         Ok(count as u64)
     }
 
+    /// Spec 049 PR20 — return EVERY decision whose `ts` falls on the
+    /// given UTC date (action_type is NOT filtered), in
+    /// `(ts_iso, incident_id, data_json)` form, ordered by id ascending.
+    ///
+    /// Used by the dashboard's `compute_incidents_blocking` to fold in
+    /// decisions from the Wave-10b non-incident-pipeline prefixes
+    /// (`honeypot:always-on:abuseipdb:`, `repeat-offender:`,
+    /// `proto_anomaly:` direct, etc.). Those paths emit a decision
+    /// without ever creating a sensor incident row; reading them via
+    /// this helper lets the operator-visible audit trail surface
+    /// every action regardless of which path emitted it.
+    pub fn decisions_for_date(
+        &self,
+        date: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT ts, incident_id, data \
+             FROM decisions \
+             WHERE ts LIKE ?1 \
+             ORDER BY id \
+             LIMIT ?2",
+        )?;
+        let pattern = format!("{date}%");
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     /// Return `block_ip` decisions whose `ts` falls on the given UTC date,
     /// in `(ts_iso, target_ip, incident_id, data_json)` form, ordered by
     /// id ascending so the caller sees them in append order.

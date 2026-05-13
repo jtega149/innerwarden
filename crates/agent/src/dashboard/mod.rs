@@ -18,6 +18,7 @@ mod audit_export_signing;
 mod auth;
 mod case_metrics;
 mod case_recurrence;
+mod cases_from_sqlite;
 mod compliance;
 mod data_api;
 mod decision_provenance;
@@ -2089,13 +2090,17 @@ mod tests {
         // Both band labels must be present, and the kpi-card IDs
         // for each band must be distinct (live IDs prefixed
         // `kpi-now-`, period IDs use the legacy `kpi-*` names).
+        // Spec 049 PR20 renamed both labels for operator-readability;
+        // see `pr20_cases_band_labels_distinguish_live_from_period`
+        // for the exact-string anchors. This older test pins only
+        // the structural invariant: two distinct band labels exist.
         assert!(
-            INDEX_HTML.contains(">Current state · now<"),
-            "Cases tab must label the live band `Current state · now` (spec 049 PR6 §8.2.A)"
+            INDEX_HTML.contains("Live state · enforced right now"),
+            "Cases tab must label the live band (PR20 rename)"
         );
         assert!(
-            INDEX_HTML.contains(">Selected period<"),
-            "Cases tab must label the picker-scoped band `Selected period` (spec 049 PR6 §8.2.A)"
+            INDEX_HTML.contains("Decisions in selected period"),
+            "Cases tab must label the picker-scoped band (PR20 rename)"
         );
         for id in [
             "kpi-now-blocked",
@@ -6819,5 +6824,160 @@ mod tests {
                  back to the heuristic for this code path."
             );
         }
+    }
+
+    // ── Spec 049 PR20 — Cases tab from SQLite + UX cleanup ──────────
+    //
+    // PR20 was operator-driven on 2026-05-13: after 17 prior PRs the
+    // operator's gripe was "nunca fica bom" (it never gets good). The
+    // reason was architectural: every prior PR fixed a symptom of the
+    // same root cause — the Cases tab reading from a memory-capped
+    // KG. PR20 cuts the architectural root + four UX bugs the operator
+    // pointed at in the same pass.
+
+    #[test]
+    fn pr20_cases_handler_reads_sqlite_not_kg() {
+        // The biggest architectural win of PR20. Source-grep that the
+        // Cases handler calls `cases_from_sqlite::build_cases_for_date`
+        // and does NOT walk `graph.nodes_of_type(Incident)` for the
+        // listing. The KG path is preserved for journey/drill-down
+        // queries (different read patterns), just not for the list.
+        const DATA_API_SRC: &str = include_str!("data_api.rs");
+        assert!(
+            DATA_API_SRC.contains("super::cases_from_sqlite::build_cases_for_date("),
+            "PR20 — compute_incidents_blocking must read from SQLite \
+             via `cases_from_sqlite::build_cases_for_date`. The legacy \
+             KG-walk path was bounded by the 50 MB cap; SQLite is \
+             unbounded for the audit listing."
+        );
+        // Anti-regression: the old KG-walk pattern must NOT be present
+        // inside `compute_incidents_blocking` anymore. We grep for the
+        // distinctive `nodes_of_type(NodeType::Incident)` call paired
+        // with the Cases-listing comment context.
+        assert!(
+            !DATA_API_SRC.contains("fn compute_incidents_blocking(state: &DashboardState, query: ListQuery) -> IncidentListResponse {\n    let date = resolve_date(query.date.as_deref());\n    let explicit_date ="),
+            "PR20 — the legacy KG-walk implementation of \
+             compute_incidents_blocking must not return. If you need \
+             to revert the SQLite path, leave the new helper in place \
+             behind a feature flag rather than restoring this body."
+        );
+    }
+
+    #[test]
+    fn pr20_overview_counts_filter_cloudflare_self_traffic() {
+        // Operator-reported 2026-05-13: strip shows "1 Currently
+        // observing" but the panel list shows zero observing rows.
+        // Cause: the 1 IP was 172.70.80.132 (Cloudflare), which the
+        // panel correctly hides as agent self-traffic but the strip
+        // counted because the backend overview filter only excluded
+        // RFC1918. PR20 wires `cloud_safelist::is_self_traffic_ip`
+        // into the same filter so the strip + panel agree.
+        const DATA_API_SRC: &str = include_str!("data_api.rs");
+        assert!(
+            DATA_API_SRC.contains("crate::cloud_safelist::is_self_traffic_ip(value)"),
+            "PR20 — overview counts must skip Cloudflare / self-traffic \
+             IPs (the `cloud_safelist::is_self_traffic_ip` set), not \
+             just RFC1918. Without this the strip overcounts \
+             observing/blocked vs the panel."
+        );
+    }
+
+    #[test]
+    fn pr20_cases_band_labels_distinguish_live_from_period() {
+        // Operator-reported: "Current state · now" vs "Selected
+        // period" were too similar — both showed 34/1/0 when scope=
+        // today and the operator read the same 3 numbers twice. The
+        // labels now make the semantic distinction obvious without
+        // needing a hover tooltip.
+        assert!(
+            INDEX_HTML.contains("Live state · enforced right now"),
+            "PR20 — the top band's label must read 'Live state · \
+             enforced right now' so the operator sees `state` (not \
+             `decisions`) at a glance"
+        );
+        assert!(
+            INDEX_HTML.contains("Decisions in selected period"),
+            "PR20 — the bottom band's label must read 'Decisions in \
+             selected period' so the operator sees `flow` (not \
+             `state`) at a glance. The two-band distinction is \
+             load-bearing for the audit story when scope=past."
+        );
+        // Anti-regression: the old labels should be gone.
+        assert!(
+            !INDEX_HTML.contains(">Current state · now<"),
+            "PR20 — the legacy 'Current state · now' label must not \
+             survive the rename"
+        );
+        assert!(
+            !INDEX_HTML.contains(">Selected period<"),
+            "PR20 — the legacy 'Selected period' label must not \
+             survive the rename"
+        );
+    }
+
+    #[test]
+    fn pr20_pivot_picker_lives_inside_advanced_filters() {
+        // Operator-reported: IP / User / Detector pivot picker was a
+        // primary control next to date/hour but 95% of operator flows
+        // are IP-centric. PR20 moves it below the "Advanced filters"
+        // toggle so the picker is one collapse away — still
+        // accessible, no longer dominating the sidebar.
+        let adv_block_start = INDEX_HTML
+            .find("id=\"advFilters\"")
+            .expect("advFilters block must exist in index.html");
+        let adv_block_end = INDEX_HTML[adv_block_start..]
+            .find("</div>\n      <div class=\"search-wrap\"")
+            .expect("advFilters block must close before search-wrap");
+        let adv_block = &INDEX_HTML[adv_block_start..adv_block_start + adv_block_end];
+        assert!(
+            adv_block.contains("data-pivot=\"ip\""),
+            "PR20 — the pivot picker (IP/User/Detector) must live \
+             INSIDE the #advFilters block. Without this it sits at \
+             the top of the sidebar dominating the operator's \
+             attention for a feature 95% of flows never use."
+        );
+        assert!(
+            adv_block.contains("data-pivot=\"user\""),
+            "PR20 — the User pivot must also be inside advanced filters"
+        );
+        assert!(
+            adv_block.contains("data-pivot=\"detector\""),
+            "PR20 — the Detector pivot must also be inside advanced filters"
+        );
+    }
+
+    #[test]
+    fn pr20_sensors_status_drops_dead_jsonl_probes() {
+        // The events-*.jsonl and incidents-*.jsonl sinks were removed
+        // by spec-016 (commit 8bd59990 on 2026-04-12). The Sensors
+        // HUD kept probing for them, surfacing a misleading "events:
+        // not found, size: 0" that looked like a regression. PR20
+        // drops both keys from /api/status.files.
+        const SENSORS_SRC: &str = include_str!("sensors.rs");
+        // Match the literal API-response form `"events": { "exists":`
+        // (with surrounding context) so the test does not falsely fire
+        // on the docstring mentions or the new anchor test below.
+        assert!(
+            !SENSORS_SRC.contains("\"events\": { \"exists\":"),
+            "PR20 — /api/status.files must drop the dead `events` \
+             probe. Spec-016 removed the events-*.jsonl sink in \
+             2026-04-12; probing for the file forever after surfaces \
+             a misleading 'not found' on the Sensors HUD."
+        );
+        assert!(
+            !SENSORS_SRC.contains("\"incidents\": { \"exists\":"),
+            "PR20 — /api/status.files must drop the dead `incidents` \
+             probe (same spec-016 cleanup as the events sink)"
+        );
+        // The live probes must stay — they're not docstring-only,
+        // they're the actual response keys.
+        assert!(
+            SENSORS_SRC.contains("\"decisions\": { \"exists\":"),
+            "PR20 — /api/status.files must keep the live `decisions` probe"
+        );
+        assert!(
+            SENSORS_SRC.contains("\"telemetry\": { \"exists\":"),
+            "PR20 — /api/status.files must keep the live `telemetry` probe"
+        );
     }
 }

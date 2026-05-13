@@ -608,6 +608,32 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::pr17_every_prod_writer_sets_decision_layer` — cross-file source-grep across 20 prod writer files (incident_obvious, incident_autodismiss, killchain_inline, correlation_response, narrative_observation_verify, honeypot_always_on, honeypot_post_session, bot_actions, dashboard/actions, process/incidents, etc.). Each must pin `decision_layer` via struct-literal field, `.decision_layer = ` assignment, or routing through `decisions::build_entry` (which auto-pins from the AI provider name). A new writer landing without any of these forms fails this anchor at CI.
 
+- `crates/agent/src/dashboard/cases_from_sqlite.rs::tests::cases_returns_every_sensor_incident_for_the_date` — spec 049 PR20 hot-path anchor. The Cases tab MUST show every today-row from SQLite, no eviction. Pinned the 2026-05-13 prod regression: 480 in `/api/overview` (SQLite) vs 68 in `/api/incidents` (KG-walked, capped at 50 MB).
+
+- `crates/agent/src/dashboard/cases_from_sqlite.rs::tests::cases_synthesises_view_for_honeypot_abuseipdb_orphan_decision` — Wave-10b anchor. A decision with `incident_id = "honeypot:always-on:abuseipdb:<ip>"` and NO matching `incidents` row must still surface in Cases. Pre-PR20 these were invisible to the operator dashboard while the site counted them.
+
+- `crates/agent/src/dashboard/cases_from_sqlite.rs::tests::cases_does_not_synthesise_for_unknown_orphan_prefix` — defensive: future writer shipping a new non-incident path with an unrecognised prefix must NOT silently spawn implausible rows. Operator can file an issue; new prefix gets added to the allow-list deliberately.
+
+- `crates/agent/src/dashboard/cases_from_sqlite.rs::tests::cases_attaches_decision_to_sensor_incident_when_both_exist` — standard prod path: sensor wrote the incident, AI router wrote a decision pointing at the same `incident_id`. The Cases row must reflect the action, not "Awaiting analysis".
+
+- `crates/agent/src/dashboard/cases_from_sqlite.rs::tests::cases_excludes_prior_day_incidents` — boundary anchor: scope is a single calendar day (UTC). Yesterday's 23:59 must not bleed into today.
+
+- `crates/agent/src/dashboard/cases_from_sqlite.rs::tests::is_non_incident_pipeline_prefix_covers_wave_10b_set` — allow-list anchor for the six documented prefixes (honeypot:always-on:abuseipdb:, honeypot:abuseipdb:, repeat-offender:, proto_anomaly:, suspicious_archive:, logging_config_change:). Adding a new prefix means adding it here AND in the function in lockstep.
+
+- `crates/agent/src/dashboard/cases_from_sqlite.rs::tests::synth_severity_defaults_to_high_for_block_actions` — a block_ip auto-decision without `estimated_threat` is never "low" — the blocked IP is by definition something the system felt strongly about enough to enforce a kernel rule.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr20_cases_handler_reads_sqlite_not_kg` — source-grep on `data_api.rs` asserting `compute_incidents_blocking` calls `cases_from_sqlite::build_cases_for_date` and does NOT walk `graph.nodes_of_type(NodeType::Incident)` for the listing. The KG path is preserved for journey/drill-down queries.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr20_overview_counts_filter_cloudflare_self_traffic` — spec 049 PR20 fix for the operator-reported 2026-05-13 strip/panel mismatch: "1 Currently observing" with no row to drill into because the 1 IP (172.70.80.132) was Cloudflare. Overview counts must call `cloud_safelist::is_self_traffic_ip` so strip and panel agree.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr20_cases_band_labels_distinguish_live_from_period` — operator-readability: "Live state · enforced right now" vs "Decisions in selected period". Pre-PR20 labels were "Current state · now" vs "Selected period" which the operator read as duplicate when scope=today.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr20_pivot_picker_lives_inside_advanced_filters` — UX cleanup: the IP/User/Detector pivot picker moves from primary sidebar control into `#advFilters` collapsed block. 95% of operator flows are IP-centric; this reclaims sidebar real estate.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr20_sensors_status_drops_dead_jsonl_probes` — `/api/status.files` must NOT advertise the events / incidents JSONL probes that spec-016 (commit 8bd59990, 2026-04-12) removed. Probing for them surfaced a misleading "events: not found" on the Sensors HUD.
+
+- `crates/agent/src/dashboard/sensors.rs::tests::api_status_files_no_longer_advertises_dead_jsonl_streams` — same contract, struct-level. Replaces the legacy `test_sensors_system_status_mapping` test which pinned the OPPOSITE direction (asserting the dead probes existed).
+
 - `crates/agent/src/dashboard/mod.rs::tests::threats_kpi_tile_label_is_blocks_not_blocked` (extended in Wave 10) - the Threats KPI tile reads "Block actions" / "today" (aggregate, decisions) and the sidebar group reads "Currently blocked attackers" (snapshot, unique IPs). Pre-Wave-10 the labels read "Blocks · Today" and "Blocked attackers" — same page, different answers, no copy disclosing the snapshot-vs-aggregate axis. Operator's hard rule (2026-05-05): every label must explicitly disclose window + scope + cardinality unit. The test name predates Wave 10 (kept for git-blame continuity); the docstring has been updated to reflect the new disambiguation pair.
 - `crates/agent/src/dashboard/mod.rs::tests::wave10_live_feed_clips_to_rolling_24h_matching_site_label` - the public live-feed builder (`build_live_feed_response`) clips `real_incidents` to `now - 24h` so the site's hardcoded "(24h)" labels (`Live.tsx:415,422,429`) match the underlying data. Source-grep anchor: pins `cutoff_24h = now - chrono::Duration::hours(24)` AND `i.ts >= cutoff_24h` filter in active code. A future "remove the cutoff for performance" PR fails CI loudly.
 

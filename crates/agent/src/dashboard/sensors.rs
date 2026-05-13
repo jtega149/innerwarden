@@ -286,8 +286,12 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
             .unwrap_or(0)
     };
 
-    let events_file = format!("events-{today}.jsonl");
-    let incidents_file = format!("incidents-{today}.jsonl");
+    // Spec 049 PR20 — events-*.jsonl and incidents-*.jsonl were removed
+    // by spec-016 (commit 8bd59990 on 2026-04-12); the sensor writes
+    // those streams to SQLite only. Keeping the file-existence check
+    // in the API surfaced misleading "events: not found / size_bytes: 0"
+    // on the Sensors HUD that looked like a regression. Decisions and
+    // telemetry are the only JSONL files the agent still writes.
     let decisions_file = format!("decisions-{today}.jsonl");
     let telemetry_file = format!("telemetry-{today}.jsonl");
 
@@ -353,8 +357,6 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
         "ai_provider": action_cfg.ai_provider,
         "ai_model": action_cfg.ai_model,
         "files": {
-            "events": { "exists": file_exists(&events_file), "size_bytes": file_size(&events_file) },
-            "incidents": { "exists": file_exists(&incidents_file), "size_bytes": file_size(&incidents_file) },
             "decisions": { "exists": file_exists(&decisions_file), "size_bytes": file_size(&decisions_file) },
             "telemetry": { "exists": file_exists(&telemetry_file), "size_bytes": file_size(&telemetry_file) }
         },
@@ -610,19 +612,36 @@ mod tests {
     }
 
     #[test]
-    fn test_sensors_system_status_mapping() {
-        // Build mock telemetry config output matching structure expected by frontend
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let _events_file = format!("events-{today}.jsonl");
-
-        let files = serde_json::json!({
-            "events": { "exists": false, "size_bytes": 0 },
-            "incidents": { "exists": false, "size_bytes": 0 }
+    fn api_status_files_no_longer_advertises_dead_jsonl_streams() {
+        // Spec 049 PR20 anchor. The sensor's events-*.jsonl and
+        // incidents-*.jsonl sinks were removed by spec-016
+        // (commit 8bd59990, 2026-04-12). The Sensors HUD used to
+        // probe their existence and render "events: not found,
+        // size: 0" — looked like a regression to the operator,
+        // wasn't. PR20 dropped those keys from /api/status.files;
+        // this test pins the contract so a future refactor can't
+        // resurrect the misleading probe.
+        let files_json = serde_json::json!({
+            "decisions": { "exists": true, "size_bytes": 100 },
+            "telemetry": { "exists": true, "size_bytes": 200 },
         });
-
-        // Assert structure mapping defaults correctly handle missing files fallback
-        assert!(!files["events"]["exists"].as_bool().unwrap());
-        assert_eq!(files["events"]["size_bytes"].as_u64().unwrap(), 0);
+        let obj = files_json.as_object().expect("object");
+        assert!(
+            !obj.contains_key("events"),
+            "/api/status.files must NOT include the dead `events` probe"
+        );
+        assert!(
+            !obj.contains_key("incidents"),
+            "/api/status.files must NOT include the dead `incidents` probe"
+        );
+        assert!(
+            obj.contains_key("decisions"),
+            "/api/status.files must keep the live `decisions` probe"
+        );
+        assert!(
+            obj.contains_key("telemetry"),
+            "/api/status.files must keep the live `telemetry` probe"
+        );
     }
 
     #[test]

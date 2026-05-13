@@ -339,7 +339,7 @@
            Both bands carry the same three outcome buckets so the
            operator's mental model stays stable across them. -->
       <div class="cases-band-label cases-band-current">
-        <span>Current state · now</span>
+        <span>Live state · enforced right now</span>
         <!-- Spec 049 PR8 — Live toggle. The band auto-refreshes
              via SSE today; the toggle gives the operator opt-out
              during audit work (freeze the band so screenshots stay
@@ -359,7 +359,7 @@
         <div class="kpi-card" title="Attackers Warden is observing right now. Live state."><div class="kpi-value" id="kpi-now-observing" style="color:var(--accent)">0</div><div class="kpi-label">Currently observing</div><div class="kpi-window">now</div></div>
         <div class="kpi-card" title="Incidents that need your decision right now. Live state."><div class="kpi-value" id="kpi-now-needs-review" style="color:var(--muted)">0</div><div class="kpi-label">Needs review</div><div class="kpi-window">now</div></div>
       </div>
-      <div class="cases-band-label cases-band-period">Selected period</div>
+      <div class="cases-band-label cases-band-period">Decisions in selected period</div>
       <div class="kpi-grid" style="grid-template-columns: repeat(3,1fr)">
         <div class="kpi-card" title="Block actions in the selected period: each block decision counts once, even if the same IP triggered multiple. See 'Currently blocked attackers' below for the unique-IP count."><div class="kpi-value" id="kpi-confirmed" style="color:var(--ok)">0</div><div class="kpi-label">Block actions</div><div class="kpi-window">period</div></div>
         <div class="kpi-card" title="Attackers Warden observed in the selected period."><div class="kpi-value" id="kpi-responded" style="color:var(--accent)">0</div><div class="kpi-label">Observing</div><div class="kpi-window">period</div></div>
@@ -465,12 +465,19 @@
             <option value="honeypot">honeypot</option>
           </datalist>
           <button id="flt-apply" class="full" type="button">Apply</button>
+          <!-- Spec 049 PR20 — pivot picker moved INSIDE advanced
+               filters. Operator-reported on 2026-05-13: this picker
+               sat as a primary control next to date/hour but 95% of
+               operator flows are IP-centric. Moving it below
+               "Advanced filters" reclaims sidebar real estate for
+               the things operators actually click. User and Detector
+               pivots are still available — just one collapse deeper. -->
+          <div class="pivot-tabs full" style="grid-column:1/-1">
+            <button type="button" class="pivot-tab active" data-pivot="ip">IP</button>
+            <button type="button" class="pivot-tab" data-pivot="user">User</button>
+            <button type="button" class="pivot-tab" data-pivot="detector">Detector</button>
+          </div>
         </div>
-      </div>
-      <div class="pivot-tabs">
-        <button type="button" class="pivot-tab active" data-pivot="ip">IP</button>
-        <button type="button" class="pivot-tab" data-pivot="user">User</button>
-        <button type="button" class="pivot-tab" data-pivot="detector">Detector</button>
       </div>
       <div class="search-wrap">
         <input id="entitySearch" type="search" placeholder="search threats…" autocomplete="off" spellcheck="false" />

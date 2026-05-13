@@ -353,7 +353,18 @@ pub(super) fn compute_overview_counts_from_sqlite(
                             return None;
                         }
                         let value = e.get("value").and_then(|v| v.as_str())?;
-                        if value.is_empty() || crate::incident_auto_rules::is_internal_ip_pub(value)
+                        // Spec 049 PR20 — exclude both RFC1918 (private)
+                        // AND `cloud_safelist::is_self_traffic_ip` (Cloudflare
+                        // + agent's own bound interface IPs). The frontend
+                        // panel already filters Cloudflare via `isIpTrusted`;
+                        // without matching that here the strip / Current
+                        // state tile counted Cloudflare hits the list
+                        // panel correctly hid, leaving the operator with a
+                        // "1 Currently observing" they could never drill
+                        // into. Operator-reported 2026-05-13: `172.70.80.132`.
+                        if value.is_empty()
+                            || crate::incident_auto_rules::is_internal_ip_pub(value)
+                            || crate::cloud_safelist::is_self_traffic_ip(value)
                         {
                             return None;
                         }
@@ -1321,102 +1332,29 @@ pub(super) async fn api_incidents(
 
 fn compute_incidents_blocking(state: &DashboardState, query: ListQuery) -> IncidentListResponse {
     let date = resolve_date(query.date.as_deref());
-    let explicit_date =
-        crate::dashboard::investigation::explicit_date_filter(query.date.as_deref());
     let limit = normalize_limit(query.limit);
 
-    use crate::knowledge_graph::types::{Node, NodeType};
-    let arc_graph = crate::dashboard::investigation::graph_for_date(state, explicit_date);
-    let graph = arc_graph.read().unwrap();
+    // Spec 049 PR20 — Cases tab reads from SQLite, not the in-memory
+    // KG. Pre-PR20 this body walked `nodes_of_type(Incident)` off the
+    // KG, which is capped at 50 MB with LRU eviction. On a busy day
+    // (or after a restart) the cap caused the Cases tab to shrink vs
+    // the canonical `incidents` SQLite table. Operator-reported on
+    // 2026-05-13: 480 incidents in `/api/overview` (SQLite) vs 68 in
+    // `/api/incidents` (KG). PR18 added a boot-time replay that
+    // closes the gap immediately after restart; PR20 closes it
+    // permanently. See `cases_from_sqlite` for the new builder.
+    let (total, mut items) = match state.sqlite_store.as_deref() {
+        Some(store) => {
+            super::cases_from_sqlite::build_cases_for_date(store, &date, chrono::Utc::now())
+        }
+        None => (0, Vec::new()),
+    };
 
-    let date_filter: Option<chrono::NaiveDate> =
-        explicit_date.and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
-
-    let mut incident_views: Vec<IncidentView> = graph
-        .nodes_of_type(NodeType::Incident)
-        .iter()
-        .filter_map(|&id| {
-            if let Some(Node::Incident {
-                incident_id,
-                severity,
-                title,
-                summary,
-                ts,
-                mitre_ids,
-                decision,
-                confidence,
-                is_allowlisted,
-                research_only,
-                ..
-            }) = graph.get_node(id)
-            {
-                if *research_only {
-                    return None;
-                }
-                if let Some(target) = date_filter {
-                    if ts.naive_utc().date() != target {
-                        return None;
-                    }
-                }
-                // Collect entities from TriggeredBy edges
-                let entities: Vec<String> = graph
-                    .outgoing_edges(id)
-                    .iter()
-                    .filter(|e| e.relation == crate::knowledge_graph::types::Relation::TriggeredBy)
-                    .filter_map(|e| {
-                        graph.get_node(e.to).map(|n| {
-                            let ntype = format!("{:?}", n.node_type()).to_lowercase();
-                            format!("{}:{}", ntype, n.label())
-                        })
-                    })
-                    .collect();
-
-                // 2026-04-29: outcome string normalised via
-                // `threat_contract::classify_decision` so this view
-                // agrees with `/api/overview.blocked_count`,
-                // `/api/pivots`, and the journey verdict. Pre-fix
-                // this site emitted "suspended"/"killed"/"contained"
-                // for the action variants of containment, "monitored"
-                // (singular vs "monitoring" everywhere else), and
-                // "resolved" as a catch-all for unknown decisions
-                // -- five strings that disagreed with five other
-                // sites. The granular skill-kind information is
-                // still preserved on `IncidentView.action_taken`
-                // (which mirrors the raw `decision` string).
-                let outcome = super::threat_contract::classify_decision(decision.as_deref(), None);
-
-                // Effective severity: downgrade for handled incidents
-                let sev_lower = severity.to_lowercase();
-                let effective_severity = effective_severity(outcome, severity);
-
-                Some(IncidentView {
-                    ts: *ts,
-                    incident_id: incident_id.clone(),
-                    severity: sev_lower,
-                    effective_severity,
-                    title: title.clone(),
-                    summary: summary.clone(),
-                    entities,
-                    tags: mitre_ids.clone(),
-                    outcome: outcome.to_string(),
-                    action_taken: decision.clone(),
-                    confidence: *confidence,
-                    is_allowlisted: *is_allowlisted,
-                    // PR15 — populated in a single batch after the
-                    // initial filter_map walk so we pay one
-                    // xdp_block_times lookup per unique IP, not per
-                    // row.
-                    still_active_now: None,
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    incident_views.sort_by(|a, b| b.ts.cmp(&a.ts));
-    let total = incident_views.len();
-    let mut items: Vec<IncidentView> = incident_views.into_iter().take(limit).collect();
+    // Apply caller-side limit AFTER computing the unbounded total so
+    // the "N attackers · M cases" subtitle stays honest.
+    if items.len() > limit {
+        items.truncate(limit);
+    }
 
     // PR15 — decorate rows with `still_active_now` when the operator
     // is auditing a past date. We skip the lookup entirely for
@@ -4227,17 +4165,115 @@ mod tests {
         g
     }
 
+    /// Spec 049 PR20 — populate SQLite with the same fixture shape
+    /// `make_incidents_kg` produced. Replaces the legacy KG-walk path
+    /// for the api_incidents tests since `compute_incidents_blocking`
+    /// reads SQLite now.
+    fn populate_incidents_sqlite(state: &mut crate::dashboard::state::DashboardState) {
+        use innerwarden_core::entities::{EntityRef, EntityType};
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("memory store"));
+
+        let now = chrono::Utc::now();
+        let earlier = now - chrono::Duration::seconds(120);
+
+        let mk = |id: &str,
+                  ts: chrono::DateTime<chrono::Utc>,
+                  sev: Severity,
+                  ip: &str,
+                  tags: Vec<String>| Incident {
+            ts,
+            host: "test".into(),
+            incident_id: id.into(),
+            severity: sev,
+            title: "fixture".into(),
+            summary: "fixture".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags,
+            entities: vec![EntityRef {
+                r#type: EntityType::Ip,
+                value: ip.into(),
+            }],
+        };
+
+        store
+            .insert_incident(&mk(
+                "ssh_bruteforce:1",
+                now,
+                Severity::High,
+                "203.0.113.10",
+                vec!["T1110".into()],
+            ))
+            .unwrap();
+        store
+            .insert_incident(&mk(
+                "port_scan:1",
+                earlier,
+                Severity::Low,
+                "203.0.113.10",
+                vec![],
+            ))
+            .unwrap();
+
+        // Attach decisions so outcome strings flow through.
+        let dec_block = innerwarden_store::decisions::DecisionRow {
+            ts: now.to_rfc3339(),
+            incident_id: "ssh_bruteforce:1".into(),
+            action_type: "block_ip".into(),
+            target_ip: Some("203.0.113.10".into()),
+            target_user: None,
+            confidence: 0.95,
+            auto_executed: true,
+            reason: Some("intel".into()),
+            data: serde_json::json!({
+                "ts": now.to_rfc3339(),
+                "incident_id": "ssh_bruteforce:1",
+                "action_type": "block_ip",
+                "target_ip": "203.0.113.10",
+                "confidence": 0.95,
+                "estimated_threat": "high",
+                "reason": "intel"
+            })
+            .to_string(),
+        };
+        store.insert_decision(&dec_block).unwrap();
+        let dec_monitor = innerwarden_store::decisions::DecisionRow {
+            ts: earlier.to_rfc3339(),
+            incident_id: "port_scan:1".into(),
+            action_type: "monitor".into(),
+            target_ip: Some("203.0.113.10".into()),
+            target_user: None,
+            confidence: 0.6,
+            auto_executed: true,
+            reason: None,
+            data: serde_json::json!({
+                "ts": earlier.to_rfc3339(),
+                "incident_id": "port_scan:1",
+                "action_type": "monitor",
+                "target_ip": "203.0.113.10",
+                "confidence": 0.6
+            })
+            .to_string(),
+        };
+        store.insert_decision(&dec_monitor).unwrap();
+
+        state.sqlite_store = Some(store);
+    }
+
     #[tokio::test]
     async fn api_incidents_returns_visible_items_sorted_newest_first() {
-        // Walks compute_incidents_blocking through the spawn_blocking
-        // wrapper. Asserts:
-        //  - research_only filtered out
-        //  - sort by ts descending (newest first)
-        //  - entities populated from TriggeredBy edges (ip:<addr>)
-        //  - effective_severity is computed from outcome+severity
+        // Spec 049 PR20: compute_incidents_blocking now reads SQLite
+        // (was KG). The contract is unchanged — research_only filtered
+        // out, newest-first, entities populated, effective_severity
+        // computed — but the fixture has to populate the store
+        // instead of the in-memory graph.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
-        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(make_incidents_kg()));
+        populate_incidents_sqlite(&mut state);
         let q = ListQuery {
             limit: None,
             date: None,
@@ -4247,13 +4283,12 @@ mod tests {
             hour_to: None,
         };
         let Json(out) = api_incidents(State(state), Query(q)).await;
-        // Research-only filtered out → 2 items.
-        assert_eq!(out.total, 2, "research_only must not appear in incidents");
+        assert_eq!(out.total, 2);
         assert_eq!(out.items.len(), 2);
-        // Newest first: ssh_bruteforce:1 (ts=now) then port_scan:1 (ts=now-120s)
+        // Newest first: ssh_bruteforce:1 (ts=now) then port_scan:1 (ts=now-120s).
         assert_eq!(out.items[0].incident_id, "ssh_bruteforce:1");
         assert_eq!(out.items[1].incident_id, "port_scan:1");
-        // Entities populated from outgoing TriggeredBy edges.
+        // Entities flow from the incident's `entities` field.
         assert!(out.items[0].entities.iter().any(|e| e == "ip:203.0.113.10"));
         // mitre_ids → tags
         assert_eq!(out.items[0].tags, vec!["T1110".to_string()]);
@@ -4263,7 +4298,7 @@ mod tests {
         assert_eq!(out.items[0].action_taken.as_deref(), Some("block_ip"));
         // Effective severity downgrade: blocked + high → low.
         assert_eq!(out.items[0].effective_severity, "low");
-        // monitor → "monitored" outcome.
+        // monitor → "monitoring" outcome.
         assert_eq!(out.items[1].outcome, "monitoring");
     }
 
@@ -4273,7 +4308,7 @@ mod tests {
         // full pre-truncation count so the front-end can show "X of Y".
         let dir = tempfile::tempdir().expect("tempdir");
         let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
-        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(make_incidents_kg()));
+        populate_incidents_sqlite(&mut state);
         let q = ListQuery {
             limit: Some(1),
             date: None,
