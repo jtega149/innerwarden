@@ -17,6 +17,7 @@ mod auth;
 mod case_metrics;
 mod compliance;
 mod data_api;
+mod decision_provenance;
 mod fleet;
 mod helpers;
 mod intelligence;
@@ -1427,6 +1428,97 @@ mod tests {
             !INDEX_HTML.contains("Unresolved Threats"),
             "Cases panel header MUST NOT revert to `Unresolved Threats`"
         );
+    }
+
+    // ── Spec 049 PR9 anchors ────────────────────────────────────────
+    // Decision provenance drill-down. Journey decision rows carry
+    // an explicit `decision_layer` label derived at read time from
+    // `ai_provider` + `reason` + `confidence` (classifier in
+    // `decision_provenance.rs`). Frontend renders a dedicated
+    // provenance block in the decision card.
+
+    #[test]
+    fn journey_js_renders_decision_provenance_block() {
+        // The render helper + layer label map MUST be present, and
+        // the decision card MUST call the helper. Without these,
+        // the spec 049 §8.2.E item 3 contract ("Decision provenance:
+        // camada que decidiu") goes invisible.
+        assert!(
+            JS_JOURNEY.contains("function renderDecisionProvenance("),
+            "journey.js must define renderDecisionProvenance helper (spec 049 PR9)"
+        );
+        assert!(
+            JS_JOURNEY.contains("var DECISION_LAYER_LABELS = {"),
+            "journey.js must define DECISION_LAYER_LABELS map for human-readable layer names"
+        );
+        assert!(
+            JS_JOURNEY.contains("(entry.kind === 'decision') ? renderDecisionProvenance(d) : ''"),
+            "decision card MUST invoke renderDecisionProvenance (spec 049 PR9)"
+        );
+    }
+
+    #[test]
+    fn journey_js_decision_layer_labels_cover_every_backend_variant() {
+        // Wire-format strings emitted by `DecisionLayer` (Rust)
+        // MUST all have a human-readable label in the frontend map.
+        // A new variant without a label would render the raw
+        // snake_case string — operator-unfriendly.
+        for wire in [
+            "algorithm_gate",
+            "killchain_fast_path",
+            "correlation_rule",
+            "ai_local_warden",
+            "ai_llm",
+            "auto_rule",
+            "honeypot_post_session",
+            "observation_verifier",
+            "manual_operator",
+            "unknown",
+        ] {
+            let needle = format!("{wire}:");
+            assert!(
+                JS_JOURNEY.contains(&needle),
+                "DECISION_LAYER_LABELS must define `{wire}:` (spec 049 PR9 wire contract)"
+            );
+        }
+    }
+
+    #[test]
+    fn investigation_journey_decision_entry_carries_provenance_fields() {
+        // Both production paths (SQLite + KG fallback) push decision
+        // JourneyEntries that include `decision_layer` and
+        // `decision_layer_detail`. Pin both call sites so a future
+        // refactor cannot drop the provenance from one path and
+        // leave it on the other (the "Dashboard count != Site count"
+        // recurring-bug pattern but for the drill-down).
+        let src = include_str!("investigation.rs");
+        let occurrences = src.matches("\"decision_layer\": provenance.layer").count();
+        assert_eq!(
+            occurrences, 2,
+            "investigation.rs MUST inject `decision_layer` in BOTH SQLite and KG decision paths (saw {occurrences})"
+        );
+        let detail_occurrences = src
+            .matches("\"decision_layer_detail\": provenance.detail")
+            .count();
+        assert_eq!(
+            detail_occurrences, 2,
+            "investigation.rs MUST inject `decision_layer_detail` in BOTH paths (saw {detail_occurrences})"
+        );
+    }
+
+    #[test]
+    fn app_css_defines_decision_provenance_block_styles() {
+        for selector in [
+            ".decision-provenance",
+            ".decision-provenance-label",
+            ".decision-provenance-badge",
+            ".decision-provenance-detail",
+        ] {
+            assert!(
+                APP_CSS.contains(selector),
+                "app.css must define {selector} (spec 049 PR9 provenance block styling)"
+            );
+        }
     }
 
     // ── Spec 049 PR8 anchors ────────────────────────────────────────

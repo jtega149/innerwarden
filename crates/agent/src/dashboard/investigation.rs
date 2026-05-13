@@ -1950,14 +1950,24 @@ pub(super) fn build_journey_from_sqlite(
         // blocked, or where the dry_run flag prevented the actual call.
         // The real values stored by `DecisionWriter` are "ok",
         // "skipped", "skipped: <why>", or "failed: <why>".
-        let real_execution_result = decision_data
+        //
+        // Spec 049 PR9: extract `ai_provider` from the same parsed
+        // decision JSON so the journey decision row can carry an
+        // explicit `decision_layer` label (instead of forcing the
+        // operator to infer it from the reason string).
+        let parsed_decision = decision_data
             .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .and_then(|v| {
-                v.get("execution_result")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string())
-            });
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let real_execution_result = parsed_decision.as_ref().and_then(|v| {
+            v.get("execution_result")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        });
+        let decision_ai_provider = parsed_decision
+            .as_ref()
+            .and_then(|v| v.get("ai_provider").and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string();
 
         // Decision entry (if present). Outcome is computed via the
         // canonical contract so the verdict line agrees with the
@@ -1975,6 +1985,18 @@ pub(super) fn build_journey_from_sqlite(
                     "skipped".to_string()
                 }
             });
+            // Spec 049 PR9: classify the decision provenance from the
+            // already-parsed fields and inject the operator-facing
+            // labels into the journey row. Pure read-time derivation —
+            // see `decision_provenance::classify_decision_layer_from_fields`.
+            let reason_str = reason.clone().unwrap_or_default();
+            let confidence_f32 = confidence.map(|c| c as f32);
+            let provenance =
+                crate::dashboard::decision_provenance::classify_decision_layer_from_fields(
+                    &decision_ai_provider,
+                    &reason_str,
+                    confidence_f32,
+                );
             entries.push(JourneyEntry {
                 ts,
                 kind: "decision".to_string(),
@@ -1982,10 +2004,14 @@ pub(super) fn build_journey_from_sqlite(
                     "action_type": action,
                     "confidence": confidence.unwrap_or(0.0),
                     "auto_executed": auto_executed.unwrap_or(0) != 0,
-                    "reason": reason.unwrap_or_default(),
+                    "reason": reason_str,
                     "target_ip": target_ip,
                     "incident_id": incident_id,
                     "execution_result": execution_result,
+                    // Spec 049 PR9 fields.
+                    "ai_provider": decision_ai_provider,
+                    "decision_layer": provenance.layer,
+                    "decision_layer_detail": provenance.detail,
                 }),
             });
         } else {
@@ -2207,6 +2233,22 @@ pub(super) fn build_journey_from_graph(
                                 "skipped".to_string()
                             }
                         });
+                // Spec 049 PR9: classify provenance. The KG Incident
+                // node does NOT carry `ai_provider`, so this path
+                // relies on the reason-string heuristics in the
+                // classifier. When the reason is generic, the layer
+                // falls through to `unknown` (honest — no provider
+                // recorded). The SQLite path (production primary)
+                // has the provider and produces precise labels.
+                let reason_str = decision_reason.as_deref().unwrap_or("").to_string();
+                // KG path: confidence is already `Option<f32>` on the
+                // Incident node — no cast required.
+                let provenance =
+                    crate::dashboard::decision_provenance::classify_decision_layer_from_fields(
+                        "",
+                        &reason_str,
+                        *confidence,
+                    );
                 entries.push(JourneyEntry {
                     ts: *ts,
                     kind: "decision".to_string(),
@@ -2214,10 +2256,16 @@ pub(super) fn build_journey_from_graph(
                         "action_type": action,
                         "confidence": confidence.unwrap_or(0.0),
                         "auto_executed": auto_executed,
-                        "reason": decision_reason.as_deref().unwrap_or(""),
+                        "reason": reason_str,
                         "target_ip": decision_target,
                         "incident_id": incident_id,
                         "execution_result": execution_result,
+                        // Spec 049 PR9 fields. ai_provider is empty
+                        // on the KG path (the Incident node does not
+                        // store it).
+                        "ai_provider": "",
+                        "decision_layer": provenance.layer,
+                        "decision_layer_detail": provenance.detail,
                     }),
                 });
             } else {

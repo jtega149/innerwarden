@@ -1547,6 +1547,49 @@
     .cases-band-label.cases-band-period {
       margin-top: 14px;
     }
+    /* Spec 049 PR9 — Decision provenance block on the journey
+       decision-card drill-down. Sits between title and meta so the
+       operator reads "who decided" first. Each layer carries the
+       same neutral chrome — operator's eye should land on the
+       layer label first, then the detail. The layer-specific
+       modifier classes (`.decision-provenance-ai_local_warden`,
+       etc.) are reserved for per-layer styling in a future PR;
+       PR9 keeps the chrome uniform. */
+    .decision-provenance {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 8px 0;
+      padding: 6px 10px;
+      border-radius: 8px;
+      background: rgba(120, 229, 255, 0.05);
+      border-left: 3px solid var(--accent);
+      font-size: 0.78rem;
+    }
+    .decision-provenance-label {
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-size: 0.62rem;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .decision-provenance-badge {
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      color: var(--text);
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.7rem;
+    }
+    .decision-provenance-detail {
+      color: var(--muted);
+      flex: 1;
+      min-width: 0;
+    }
+
     /* Spec 049 PR8 — Live toggle on the Current state band. The
        label becomes flex so the toggle sits flush right. */
     .cases-band-label.cases-band-current {

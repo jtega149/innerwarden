@@ -464,6 +464,22 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_live_toggle_styles` — `.live-toggle` + `.live-toggle-on` + `.live-dot` + `@keyframes liveTogglePulse`. The pulsing dot is the operator's visual signal that the band is live.
 
+- `crates/agent/src/dashboard/decision_provenance.rs::tests::decision_layer_serializes_as_snake_case_strings` — spec 049 PR9 wire-format contract. All 10 `DecisionLayer` variants serialize to fixed snake_case strings that the frontend keys on (`algorithm_gate` / `killchain_fast_path` / `correlation_rule` / `ai_local_warden` / `ai_llm` / `auto_rule` / `honeypot_post_session` / `observation_verifier` / `manual_operator` / `unknown`). Changing any string is a breaking change for the drill-down UI.
+
+- `crates/agent/src/dashboard/decision_provenance.rs::tests::provider_takes_precedence_over_reason_heuristic` — anti-misclassification guard. When provider matches a specific path (e.g. `honeypot:*`) AND reason contains a heuristic keyword (e.g. `allowlist`), the provider wins. Pinned so a future "simplify the if-chain" refactor cannot accidentally flip precedence and misclassify honeypot decisions.
+
+- `crates/agent/src/dashboard/decision_provenance.rs::tests::local_classifier_classifies_as_ai_local_warden` — spec 049 PR9 brand contract. Both `local_classifier` (legacy) and `local_warden` (PR3 rename) classify as `AiLocalWarden`. Detail line includes confidence when present.
+
+- `crates/agent/src/dashboard/decision_provenance.rs::tests::empty_provider_falls_back_to_unknown_with_no_provider_recorded_note` — honesty contract. An empty `ai_provider` (KG-path decisions don't carry it) falls back to `Unknown` with an explicit "no provider recorded" detail. Anti-regression for a future "default to AI Local Warden" shortcut that would silently misclassify the KG path.
+
+- `crates/agent/src/dashboard/mod.rs::tests::journey_js_renders_decision_provenance_block` — frontend invokes `renderDecisionProvenance` from the decision card and defines the `DECISION_LAYER_LABELS` map.
+
+- `crates/agent/src/dashboard/mod.rs::tests::journey_js_decision_layer_labels_cover_every_backend_variant` — every backend `DecisionLayer` wire variant has a human-readable label in the frontend map. A new variant without a label renders the raw snake_case string (operator-unfriendly) — anchor catches that drift.
+
+- `crates/agent/src/dashboard/mod.rs::tests::investigation_journey_decision_entry_carries_provenance_fields` — BOTH production journey paths (SQLite + KG fallback) inject `decision_layer` + `decision_layer_detail` on every decision JourneyEntry. Pinned by match count == 2 to prevent the "fixed in one path only" recurring-bug pattern.
+
+- `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_decision_provenance_block_styles` — `.decision-provenance` + label/badge/detail selectors. Without them the block renders unstyled.
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).

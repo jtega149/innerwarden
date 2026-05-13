@@ -349,6 +349,9 @@ function renderEvidenceCard(entry, idx) {
     : '';
   const obsVerifyHtml = (d.reason && d.reason.startsWith('obs-verify'))
     ? renderObsVerifyScore(d.reason) : '';
+  // Spec 049 PR9: provenance block for decision rows. Rendered
+  // ABOVE the legacy meta so the operator reads "who decided" first.
+  const provHtml = (entry.kind === 'decision') ? renderDecisionProvenance(d) : '';
   return `
     <div class="evidence-card" id="tl-entry-${idx}">
       <div class="evidence-header">
@@ -357,10 +360,51 @@ function renderEvidenceCard(entry, idx) {
         <button type="button" class="evidence-raw-toggle" onclick="toggleRaw(${idx})">Raw JSON</button>
       </div>
       <div class="evidence-title">${esc(entrySummary(entry))}</div>
+      ${provHtml}
       ${metaHtml}
       ${obsVerifyHtml}
       <pre class="evidence-raw" id="raw-${idx}" data-json="${esc(JSON.stringify(entry.data))}"></pre>
     </div>`;
+}
+
+// Spec 049 PR9 — Decision provenance block. Renders WHICH layer
+// decided (algorithm gate / killchain fast-path / correlation rule
+// / AI Local Warden / AI LLM / auto-rule / honeypot post-session /
+// observation verifier / manual operator / unknown) plus the
+// operator-facing detail line backend derived from the persisted
+// `ai_provider` + `reason` + `confidence`.
+//
+// Renders the `unknown` layer too — surfacing it honestly is the
+// PR9 contract. An "unknown (provider: X)" badge gives the operator
+// a starting point for investigation rather than hiding the gap.
+var DECISION_LAYER_LABELS = {
+  algorithm_gate:        'Algorithm gate',
+  killchain_fast_path:   'Killchain fast-path',
+  correlation_rule:      'Correlation rule',
+  ai_local_warden:       'AI · Local Warden',
+  ai_llm:                'AI · LLM',
+  auto_rule:             'Auto-rule',
+  honeypot_post_session: 'Honeypot post-session',
+  observation_verifier:  'Observation verifier',
+  manual_operator:       'Manual operator',
+  unknown:               'Unknown'
+};
+
+function renderDecisionProvenance(d) {
+  if (!d || !d.decision_layer) return '';
+  var layerKey = String(d.decision_layer);
+  var label = DECISION_LAYER_LABELS[layerKey] || layerKey;
+  var detail = String(d.decision_layer_detail || '');
+  var safeKey = layerKey.replace(/[^a-z0-9_]/gi, '');
+  return (
+    '<div class="decision-provenance decision-provenance-' + esc(safeKey) + '">' +
+      '<span class="decision-provenance-label">Decision provenance</span>' +
+      '<span class="decision-provenance-badge">' + esc(label) + '</span>' +
+      (detail
+        ? '<span class="decision-provenance-detail">' + esc(detail) + '</span>'
+        : '') +
+    '</div>'
+  );
 }
 
 function toggleTimeline() {
