@@ -11,7 +11,13 @@ const state = {
     // Audit 2.6 partial: outcome bucket filter (blocked / monitoring /
     // honeypot / needs_attention / dismissed / allowlisted). Empty
     // string keeps every bucket visible (default).
-    status: ''
+    status: '',
+    // Spec 049 PR5: hour-of-day scope picker. Strings (not numbers)
+    // so the empty default ('') passes through buildQuery's trim/
+    // empty check without sending a stray `hour_from=NaN`. Backend
+    // PR4 validates: both must be present, both 0-23, lo <= hi.
+    hour_from: '',
+    hour_to: ''
   },
   clusters: [],
   knownItemValues: new Set(),  // D7: tracks rendered entity values for diff
@@ -67,6 +73,22 @@ function syncFiltersFromUi() {
   state.filters.detector = (document.getElementById('flt-detector').value || '').trim();
   state.filters.window_seconds = document.getElementById('flt-window').value || '';
   state.filters.status = document.getElementById('flt-status').value || '';
+  // Spec 049 PR5: hour-of-day picker. Validate at the UI boundary so
+  // a malformed value (e.g. typed "99") never reaches the backend.
+  // Same contract as `parse_hour_filter` in `data_api.rs`: both must
+  // be in 0-23 and `from <= to`, otherwise treat as no filter.
+  var hourFromEl = document.getElementById('flt-hour-from');
+  var hourToEl = document.getElementById('flt-hour-to');
+  var hf = hourFromEl ? parseInt(hourFromEl.value, 10) : NaN;
+  var ht = hourToEl ? parseInt(hourToEl.value, 10) : NaN;
+  if (Number.isInteger(hf) && Number.isInteger(ht)
+      && hf >= 0 && hf <= 23 && ht >= 0 && ht <= 23 && hf <= ht) {
+    state.filters.hour_from = String(hf);
+    state.filters.hour_to = String(ht);
+  } else {
+    state.filters.hour_from = '';
+    state.filters.hour_to = '';
+  }
 }
 
 function hydrateStateFromQuery() {
@@ -89,6 +111,10 @@ function hydrateStateFromQuery() {
   state.filters.detector = (qs.get('detector') || '').trim();
   state.filters.window_seconds = (qs.get('window_seconds') || '').trim();
   state.filters.status = (qs.get('status') || '').trim();
+  // Spec 049 PR5: hydrate hour-of-day filter from URL so deep links
+  // ("share me the case you saw at 15h yesterday") survive a reload.
+  state.filters.hour_from = (qs.get('hour_from') || '').trim();
+  state.filters.hour_to = (qs.get('hour_to') || '').trim();
 
   const subjectType = (qs.get('subject_type') || '').trim();
   const subject = (qs.get('subject') || '').trim();
@@ -106,6 +132,10 @@ function syncUrl() {
     detector: state.filters.detector,
     window_seconds: state.filters.window_seconds,
     status: state.filters.status,
+    // Spec 049 PR5: hour-of-day flows through the URL so the scope
+    // survives reloads + deep-link shares between MSSP operators.
+    hour_from: state.filters.hour_from,
+    hour_to: state.filters.hour_to,
     subject_type: state.selected.value ? state.selected.type : '',
     subject: state.selected.value ? state.selected.value : '',
   });

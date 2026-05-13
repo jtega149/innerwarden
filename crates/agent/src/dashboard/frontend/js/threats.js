@@ -1,3 +1,14 @@
+// Spec 049 PR5: write the operator timezone into the scope-picker
+// label. Defensive against an absent label element (some test
+// fixtures inject only part of the HTML) and against a missing
+// `overview.timezone` field (older API responses default to UTC).
+function renderTzLabel(tz) {
+  var el = document.getElementById('flt-tz-label');
+  if (!el) return;
+  var label = (typeof tz === 'string' && tz.trim()) ? tz.trim() : 'UTC';
+  el.textContent = 'TZ: ' + label;
+}
+
 var DETECTOR_PRIORITY = {
   reverse_shell: 100, fileless_exec: 95, container_escape: 90,
   rootkit: 85, data_exfil_cmd: 80, sudo_abuse: 75,
@@ -535,7 +546,14 @@ function clearThreatsFilters() {
 async function refreshLeftLive() {
   try {
     syncFiltersFromUi();
-    const overviewQs = buildQuery({ date: state.filters.date });
+    // Spec 049 PR5: scope picker hour range flows through every
+    // Cases-tab query so the counters reconcile with the list under
+    // the same window.
+    const overviewQs = buildQuery({
+      date: state.filters.date,
+      hour_from: state.filters.hour_from,
+      hour_to: state.filters.hour_to,
+    });
     const entityQs = buildQuery({
       date: state.filters.date,
       severity_min: state.filters.severity_min,
@@ -556,6 +574,12 @@ async function refreshLeftLive() {
 
     window._lastOverview = ov;
     window._lastEntityItems = items;
+
+    // Spec 049 PR5: render operator TZ on the scope picker label so
+    // the operator never has to guess what timezone "yesterday at
+    // 15h" refers to. Backend-emitted (env TZ or /etc/timezone),
+    // never browser-derived (which drifts across analysts).
+    renderTzLabel(ov && ov.timezone);
 
     // 2026-04-29 (audit Phase 2): KPIs read from `/api/overview`
     // backend-computed fields, identical to `refreshLeft`. The live
@@ -610,7 +634,15 @@ async function refreshLeft(forceRefreshJourney = false) {
   try {
     syncFiltersFromUi();
 
-    const overviewQs = buildQuery({ date: state.filters.date });
+    // Spec 049 PR5: same scope-picker plumbing as `refreshLeftLive`.
+    // Both paths must pass the same query params or the live + manual
+    // refresh paths would show different counts under the same picker
+    // — exactly the "Dashboard count != Site count" recurring-bug class.
+    const overviewQs = buildQuery({
+      date: state.filters.date,
+      hour_from: state.filters.hour_from,
+      hour_to: state.filters.hour_to,
+    });
     const entityQs = buildQuery({
       date: state.filters.date,
       severity_min: state.filters.severity_min,
@@ -656,6 +688,9 @@ async function refreshLeft(forceRefreshJourney = false) {
 
     window._lastOverview = ov;
     window._lastEntityItems = items;
+
+    // Spec 049 PR5: render operator TZ on the scope picker label.
+    renderTzLabel(ov && ov.timezone);
 
     // Spec 037 Threats UX bundle: read the three KPIs from the
     // backend-computed `/api/overview` fields instead of summing

@@ -1531,6 +1531,48 @@
       .activity-strip .activity-cell { flex-basis: calc(50% - 5px); }
     }
 
+    /* Spec 049 PR5 — hour-of-day scope picker on Cases tab. Sits
+       directly under the date input so the operator does not have
+       to dig under "Advanced filters" to answer their primary audit
+       question ("o que aconteceu ontem às 15h?"). */
+    .flt-hour-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 4px;
+      font-size: 0.74rem;
+      color: var(--muted);
+    }
+    .flt-hour-row .flt-hour-label {
+      flex-shrink: 0;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .flt-hour-row input[type="number"] {
+      width: 4.5em;
+      padding: 2px 6px;
+      border: 1px solid var(--line);
+      background: var(--card);
+      color: var(--text);
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+    }
+    .flt-hour-row input[type="number"]:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+    .flt-hour-row .flt-hour-sep {
+      color: var(--dim);
+    }
+    .flt-hour-row .flt-tz-label {
+      margin-left: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--muted);
+      cursor: help;
+    }
+
     /* Spec 049 sub-breakdown row under the activity strip.
        Three small chips (Contained · Observing · Filtered out) that
        sum to homeActStopped. Same data path, finer grain — the

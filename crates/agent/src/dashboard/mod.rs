@@ -1429,6 +1429,151 @@ mod tests {
         );
     }
 
+    // ── Spec 049 PR5 anchors ────────────────────────────────────────
+    // Scope picker on Cases tab. Operator picks date + hour-from +
+    // hour-to and the Cases tab queries `/api/overview` with the
+    // matching `hour_from` / `hour_to` query params (backed by PR4).
+    // TZ label flows from `overview.timezone` (backend-emitted), so
+    // operators / analysts / clients always read the same TZ.
+
+    #[test]
+    fn cases_tab_has_hour_scope_picker_inputs() {
+        // Both hour inputs must be present in the Cases tab filter
+        // row, ABOVE the Advanced filters toggle (operator's primary
+        // audit question "what happened yesterday at 15h?" deserves
+        // visible controls, not a buried sub-menu).
+        for id in ["flt-hour-from", "flt-hour-to", "flt-tz-label"] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "Cases scope picker requires id={id} (spec 049 PR5)"
+            );
+        }
+        // Both must be `type="number"` with the 0-23 range, so the
+        // browser's default validation rejects out-of-range values
+        // before they ever reach the backend.
+        for id in ["flt-hour-from", "flt-hour-to"] {
+            let snippet = format!("id=\"{id}\" type=\"number\" min=\"0\" max=\"23\"");
+            assert!(
+                INDEX_HTML.contains(&snippet),
+                "Cases scope picker {id} must be type=number min=0 max=23 (browser-side validation matches `parse_hour_filter` backend contract)"
+            );
+        }
+    }
+
+    #[test]
+    fn state_js_carries_hour_filter_in_state_filters() {
+        // The filter state object must declare both hour fields with
+        // empty-string defaults so `buildQuery` treats them as absent
+        // (no stray `hour_from=` in the URL when picker is empty).
+        assert!(
+            JS_STATE.contains("hour_from: ''"),
+            "state.filters must declare hour_from with empty-string default (spec 049 PR5)"
+        );
+        assert!(
+            JS_STATE.contains("hour_to: ''"),
+            "state.filters must declare hour_to with empty-string default (spec 049 PR5)"
+        );
+    }
+
+    #[test]
+    fn state_js_sync_validates_hour_range_at_ui_boundary() {
+        // syncFiltersFromUi must validate the picker pair at the UI
+        // boundary so a malformed value (e.g. typed "99") never
+        // reaches the backend. Mirrors the backend `parse_hour_filter`
+        // contract: both 0-23 AND hour_from <= hour_to.
+        assert!(
+            JS_STATE.contains("flt-hour-from") && JS_STATE.contains("flt-hour-to"),
+            "syncFiltersFromUi must read both hour inputs"
+        );
+        assert!(
+            JS_STATE.contains("hf >= 0 && hf <= 23 && ht >= 0 && ht <= 23 && hf <= ht"),
+            "syncFiltersFromUi must enforce 0-23 AND hour_from <= hour_to (spec 049 PR5 — matches `parse_hour_filter` backend contract)"
+        );
+    }
+
+    #[test]
+    fn state_js_persists_hour_filter_via_url() {
+        // Hydrate + syncUrl must include hour_from/hour_to so a deep
+        // link ("look at the case I saw at 15h yesterday") survives a
+        // reload and shares cleanly across MSSP analysts.
+        assert!(
+            JS_STATE.contains("qs.get('hour_from')") && JS_STATE.contains("qs.get('hour_to')"),
+            "hydrateStateFromQuery must read hour_from/hour_to from URL (spec 049 PR5)"
+        );
+        assert!(
+            JS_STATE.contains("hour_from: state.filters.hour_from")
+                && JS_STATE.contains("hour_to: state.filters.hour_to"),
+            "syncUrl must write hour_from/hour_to back into the URL (spec 049 PR5)"
+        );
+    }
+
+    #[test]
+    fn threats_js_passes_hour_filter_on_overview_queries() {
+        // BOTH refresh paths (`refreshLeft` manual + `refreshLeftLive`
+        // SSE) must pass hour_from/hour_to to `/api/overview`. If only
+        // one path threads them through, the operator sees different
+        // counts on live vs manual refresh — the exact
+        // "Dashboard count != Site count" recurring-bug pattern.
+        // We assert both calls are wrapped in a `buildQuery({...})`
+        // that includes `hour_from` AND `hour_to`.
+        let occurrences = JS_THREATS
+            .matches("hour_from: state.filters.hour_from")
+            .count();
+        assert_eq!(
+            occurrences, 2,
+            "Cases tab must pass hour_from in both refreshLeft and refreshLeftLive (saw {occurrences})"
+        );
+        let occurrences_to = JS_THREATS.matches("hour_to: state.filters.hour_to").count();
+        assert_eq!(
+            occurrences_to, 2,
+            "Cases tab must pass hour_to in both refresh paths (saw {occurrences_to})"
+        );
+    }
+
+    #[test]
+    fn threats_js_renders_tz_label_from_overview_response() {
+        // renderTzLabel must read `overview.timezone` and write it
+        // into `#flt-tz-label`. NEVER falls back to browser TZ
+        // (`Intl.DateTimeFormat().resolvedOptions().timeZone`) — that
+        // drifts across analyst / client / MSSP operator and breaks
+        // the multi-tenant TZ contract from spec 049 §7.1.
+        assert!(
+            JS_THREATS.contains("function renderTzLabel("),
+            "renderTzLabel helper must be defined (spec 049 PR5)"
+        );
+        assert!(
+            JS_THREATS.contains("getElementById('flt-tz-label')"),
+            "renderTzLabel must target the picker label element"
+        );
+        assert!(
+            !JS_THREATS.contains("Intl.DateTimeFormat()"),
+            "renderTzLabel must NOT fall back to browser TZ — backend `overview.timezone` is the single source (spec 049 §7.1)"
+        );
+        // Called from both refresh paths.
+        let renders = JS_THREATS
+            .matches("renderTzLabel(ov && ov.timezone)")
+            .count();
+        assert_eq!(
+            renders, 2,
+            "renderTzLabel must be invoked from BOTH refreshLeft and refreshLeftLive (saw {renders})"
+        );
+    }
+
+    #[test]
+    fn app_css_defines_hour_scope_picker_styles() {
+        for selector in [
+            ".flt-hour-row",
+            ".flt-hour-row .flt-hour-label",
+            ".flt-hour-row input[type=\"number\"]",
+            ".flt-hour-row .flt-tz-label",
+        ] {
+            assert!(
+                APP_CSS.contains(selector),
+                "app.css must define {selector} (spec 049 PR5 scope picker styling)"
+            );
+        }
+    }
+
     // ── Spec 049 PR2 anchors ────────────────────────────────────────
     // Home strip migrated from frontend bucket-sum math to backend-
     // emitted counters (`flagged_by_system_count`, `warden_decisions_count`,

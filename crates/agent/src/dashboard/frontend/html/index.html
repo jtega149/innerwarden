@@ -331,6 +331,21 @@
       </div>
       <div class="filters" style="grid-template-columns:1fr auto;margin-bottom:6px">
         <input id="flt-date" type="date" class="full" style="grid-column:1/-1" title="Pick a date with on-disk graph snapshot. Empty = full graph (today)." />
+        <!-- Spec 049 PR5: hour-of-day scope picker. Operator's primary
+             audit question is "what happened yesterday at 15h?" — the
+             two hour inputs live ABOVE the Advanced toggle so the
+             operator does not have to dig. Both empty = full day.
+             Values 0-23 inclusive, UTC (matches backend semantics in
+             PR4); a follow-up may convert to operator-local TZ at
+             render time. TZ label flows from `overview.timezone`
+             (backend-emitted, never browser-derived). -->
+        <div class="flt-hour-row" style="grid-column:1/-1">
+          <label class="flt-hour-label" for="flt-hour-from">Hour</label>
+          <input id="flt-hour-from" type="number" min="0" max="23" placeholder="from" title="Hour-of-day lower bound, 0-23 inclusive (UTC)" />
+          <span class="flt-hour-sep" aria-hidden="true">–</span>
+          <input id="flt-hour-to" type="number" min="0" max="23" placeholder="to" title="Hour-of-day upper bound, 0-23 inclusive (UTC)" />
+          <span id="flt-tz-label" class="flt-tz-label" title="Operator timezone (from server config — env TZ or /etc/timezone). The hour range above is interpreted in UTC; this label is informational.">TZ: …</span>
+        </div>
         <button id="flt-adv-toggle" type="button" class="full" style="background:transparent;border:none;color:var(--muted);font-size:0.68rem;cursor:pointer;text-align:left;padding:2px 0" onclick="toggleAdvFilters()">▸ Advanced filters</button>
       </div>
       <div id="advFilters" style="display:none">

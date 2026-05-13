@@ -2328,12 +2328,36 @@ mod tests {
 
     #[test]
     fn operator_timezone_trims_whitespace_in_env_var() {
+        // Trim path: a TZ value with surrounding whitespace must
+        // resolve to the trimmed name. Does NOT cover the fallback
+        // chain — `/etc/timezone` content varies per CI runner
+        // (Ubuntu's docker image carries `Etc/UTC`, not bare `UTC`)
+        // so a fallback assertion is non-deterministic. Coverage for
+        // the fallback chain lives in `operator_timezone_falls_back`.
         let original = std::env::var("TZ").ok();
-        unsafe { std::env::set_var("TZ", "  UTC  ") };
-        assert_eq!(operator_timezone(), "UTC");
-        // Whitespace-only TZ falls through to next resolver. We can
-        // not deterministically assert what comes from `/etc/timezone`
-        // on every CI runner, so only assert the trim path.
+        // SAFETY: tests run single-threaded inside the test mod.
+        unsafe { std::env::set_var("TZ", "  America/Sao_Paulo  ") };
+        assert_eq!(operator_timezone(), "America/Sao_Paulo");
+        match original {
+            Some(prev) => unsafe { std::env::set_var("TZ", prev) },
+            None => unsafe { std::env::remove_var("TZ") },
+        }
+    }
+
+    #[test]
+    fn operator_timezone_falls_back_when_env_var_blank() {
+        // When `TZ` is unset OR whitespace-only, `operator_timezone`
+        // falls through to `/etc/timezone` (which the test cannot
+        // deterministically pin) and then to `"UTC"`. Anchor only
+        // checks that the helper returns a non-empty string — never
+        // panics, never returns `""`.
+        let original = std::env::var("TZ").ok();
+        unsafe { std::env::set_var("TZ", "   ") };
+        let resolved = operator_timezone();
+        assert!(
+            !resolved.is_empty(),
+            "operator_timezone() must always return a non-empty TZ string (got empty)"
+        );
         match original {
             Some(prev) => unsafe { std::env::set_var("TZ", prev) },
             None => unsafe { std::env::remove_var("TZ") },

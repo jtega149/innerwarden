@@ -430,6 +430,20 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/data_api.rs::tests::operator_timezone_prefers_env_var` — `TZ` env var wins over `/etc/timezone`. Spec 049 PR4 contract: operator-config TZ flows through to the picker label, never browser-derived.
 
+- `crates/agent/src/dashboard/mod.rs::tests::cases_tab_has_hour_scope_picker_inputs` — spec 049 PR5 UI surface. Cases tab carries `flt-hour-from`, `flt-hour-to`, `flt-tz-label` IDs above the Advanced toggle (operator's primary audit question deserves visible controls). Both hour inputs declare `type=number min=0 max=23` so browser validation matches the backend `parse_hour_filter` contract.
+
+- `crates/agent/src/dashboard/mod.rs::tests::state_js_carries_hour_filter_in_state_filters` — `state.filters` declares `hour_from: ''` and `hour_to: ''` with empty-string defaults so `buildQuery` skips them when the picker is empty (no stray `hour_from=` in the URL).
+
+- `crates/agent/src/dashboard/mod.rs::tests::state_js_sync_validates_hour_range_at_ui_boundary` — `syncFiltersFromUi` mirrors the backend `parse_hour_filter` contract: both 0-23 AND `hour_from <= hour_to`. Validation at the UI boundary stops malformed values from reaching the backend.
+
+- `crates/agent/src/dashboard/mod.rs::tests::state_js_persists_hour_filter_via_url` — `hydrateStateFromQuery` + `syncUrl` round-trip `hour_from`/`hour_to` through the URL so deep links survive a reload and share cleanly across MSSP analysts.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_passes_hour_filter_on_overview_queries` — BOTH refresh paths (`refreshLeft` + `refreshLeftLive`) pass `hour_from`/`hour_to` to `/api/overview`. Counts agreed by construction; if only one path threaded them through, the operator would see live vs manual numbers diverge (the recurring "Dashboard count != Site count" pattern).
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_renders_tz_label_from_overview_response` — `renderTzLabel` reads `overview.timezone` (backend-emitted) and writes to `#flt-tz-label`. NEVER falls back to `Intl.DateTimeFormat()` (browser TZ drifts across analyst / client / MSSP operator).
+
+- `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_hour_scope_picker_styles` — `.flt-hour-row` + chip / label / number / TZ-label selectors must exist. Without them the picker renders as inline plain text.
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).
