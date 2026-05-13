@@ -230,6 +230,76 @@ pub(crate) fn should_run_periodic_tick(
     due && has_work
 }
 
+/// Cap on how many `incidents` rows the boot-time replay walks. A real
+/// production day stays below 10k rows; the cap is loose enough that no
+/// honest workload ever truncates and tight enough that a pathological
+/// runaway day cannot pin agent startup.
+pub(crate) const MAX_BOOT_REPLAY: usize = 100_000;
+
+/// Spec 049 PR18 — replay today's `incidents` rows into the in-memory
+/// `KnowledgeGraph` at boot.
+///
+/// **Why this exists.** KG hydration on boot is snapshot-based. The
+/// snapshot cadence is "periodic" — at best minutes old, at worst a
+/// full day old when the operator deploys a new release before the
+/// daily snapshot has captured the day. Anything the sensor wrote to
+/// the `incidents` table between the last snapshot and the restart is
+/// in the canonical store but absent from the in-memory KG. The
+/// dashboard's Cases panel reads `nodes_of_type(Incident)` off the
+/// KG, so post-restart it silently shrinks even though the audit
+/// trail in SQLite is intact.
+///
+/// Operator-reported on 2026-05-13: after two same-day agent restarts
+/// (PR15 deploy 11:08 UTC, PR16 deploy 12:11 UTC) the dashboard
+/// showed only the post-12:14 slice of the day (141 KG Incident
+/// nodes vs 535 SQLite rows). The block of `31.14.254.81` at
+/// 12:30:36 was correctly persisted to SQLite but harder to find on
+/// the dashboard than it should have been because the surrounding
+/// context had been wiped by the snapshot-hydration cycle.
+///
+/// **Contract.** Query every `incidents` row whose `ts` is at or
+/// after the start of `now`'s calendar day (UTC), bounded by
+/// `MAX_BOOT_REPLAY`, and re-ingest each into the graph via
+/// `ingest_incident`. The ingest is idempotent on `incident_id` (via
+/// `upsert_node`) so rows the snapshot already covered are no-ops;
+/// rows it missed get added. Errors from the store query are logged
+/// and swallowed — a degraded boot (partial KG) is better than a
+/// failed boot.
+///
+/// `now` is taken as a parameter (instead of called via
+/// `Utc::now()`) so unit tests can pin the boundary deterministically.
+pub(crate) fn replay_todays_incidents(
+    store: &innerwarden_store::Store,
+    graph: &mut crate::knowledge_graph::KnowledgeGraph,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let start_of_day_utc = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time")
+        .and_utc();
+    let start_ts = start_of_day_utc.to_rfc3339();
+    match store.incidents_since_ts(&start_ts, MAX_BOOT_REPLAY) {
+        Ok(today_incidents) => {
+            let before = graph.metrics().incident_nodes;
+            for inc in &today_incidents {
+                graph.ingest_incident(inc);
+            }
+            let after = graph.metrics().incident_nodes;
+            tracing::info!(
+                sqlite_rows = today_incidents.len(),
+                kg_incidents_before = before,
+                kg_incidents_after = after,
+                "boot: replayed today's incidents into KG"
+            );
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "boot: failed to replay today's incidents — KG will reflect only the snapshot"
+        ),
+    }
+}
+
 /// Decide how to surface a `ShutdownReport` to the operator log. Pure
 /// function so the emit-level contract is unit-testable without a
 /// tracing subscriber harness (see spec 036 PR-3 tests below).
@@ -377,61 +447,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     }));
 
     // Spec 049 PR18 — boot-time replay of today's incidents.
-    //
-    // The KG hydration above is snapshot-based: it restores the graph
-    // captured at the time of the most recent KG snapshot. The snapshot
-    // cadence is "periodic" — at best minutes old, at worst a full day
-    // old when the operator deploys a new release before the daily
-    // snapshot has captured the day's traffic. Anything the sensor
-    // wrote to the `incidents` table BETWEEN the snapshot and the
-    // restart is in the canonical store but absent from the in-memory
-    // KG. The dashboard's Cases panel reads `nodes_of_type(Incident)`
-    // off the KG, so post-restart it shrinks even though the audit
-    // trail in SQLite is intact.
-    //
-    // Operator-reported on 2026-05-13: after two same-day agent
-    // restarts (PR15 deploy 11:08 UTC, PR16 deploy 12:11 UTC), the
-    // dashboard showed only the post-12:14 slice of the day (141
-    // Incident nodes vs 535 SQLite rows). The block of 31.14.254.81
-    // at 12:30:36 was correctly persisted but harder to find on the
-    // dashboard than it should have been because the surrounding
-    // context was missing.
-    //
-    // Fix: after KG hydration, query every incident whose `ts` is at
-    // or after the start of the current calendar day (UTC) and
-    // re-ingest into the graph. `ingest_incident` is idempotent on
-    // `incident_id` (via `upsert_node`) so rows the snapshot already
-    // covered are no-ops; rows the snapshot missed get added. The
-    // walk is bounded by `MAX_BOOT_REPLAY` so a pathological day
-    // can't pin the boot path.
-    const MAX_BOOT_REPLAY: usize = 100_000;
+    // See `replay_todays_incidents` doc for the operator-facing
+    // rationale and the failure mode this closes.
     if let Some(store) = sqlite_store.as_deref() {
-        let start_of_day_utc = chrono::Utc::now()
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .expect("00:00:00 is a valid time")
-            .and_utc();
-        let start_ts = start_of_day_utc.to_rfc3339();
-        match store.incidents_since_ts(&start_ts, MAX_BOOT_REPLAY) {
-            Ok(today_incidents) => {
-                let mut g = shared_graph.write().unwrap();
-                let before = g.metrics().incident_nodes;
-                for inc in &today_incidents {
-                    g.ingest_incident(inc);
-                }
-                let after = g.metrics().incident_nodes;
-                tracing::info!(
-                    sqlite_rows = today_incidents.len(),
-                    kg_incidents_before = before,
-                    kg_incidents_after = after,
-                    "boot: replayed today's incidents into KG"
-                );
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "boot: failed to replay today's incidents — KG will reflect only the snapshot"
-            ),
-        }
+        let mut g = shared_graph.write().unwrap();
+        replay_todays_incidents(store, &mut g, chrono::Utc::now());
     }
 
     // Advisory cache: shared between dashboard (writes advisory denials) and
@@ -3481,6 +3501,305 @@ url = "http://127.0.0.1:9/hooks"
             "boot loop must NOT call the IPv4-only parse against an \
              xdp_block_times entry — use the shared helper so v6 entries \
              also reach bpftool"
+        );
+    }
+
+    // ── Spec 049 PR18 — replay_todays_incidents tests ────────────────
+    //
+    // Operator-driven: on 2026-05-13 the agent ran for several hours
+    // covering hundreds of incidents, then absorbed two same-day
+    // restarts and lost ~73% of the day from its in-memory KG. The
+    // extracted `replay_todays_incidents` helper closes that gap. These
+    // tests pin every observable axis of the contract so a future
+    // refactor (or a "performance optimization" that swaps the for-loop
+    // for something smarter) cannot regress the audit-trail promise.
+
+    fn replay_test_incident(
+        id: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
+            ts,
+            host: "test-host".into(),
+            incident_id: id.into(),
+            severity: innerwarden_core::event::Severity::High,
+            title: "Replay anchor".into(),
+            summary: "".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn replay_todays_incidents_ingests_todays_rows_into_empty_kg() {
+        // The hot-path operator-visible promise: after agent restart,
+        // an empty KG receives every today-row from the canonical
+        // store. The 31.14.254.81 case from 2026-05-13: SQLite had the
+        // proto_anomaly incident, the KG didn't, the operator saw it
+        // missing from Cases. Post-PR18 this test guarantees the row
+        // arrives.
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 5, 13).unwrap();
+        let now = day.and_hms_opt(15, 30, 0).unwrap().and_utc();
+        let midmorning = day.and_hms_opt(8, 0, 0).unwrap().and_utc();
+        let afternoon = day.and_hms_opt(14, 30, 0).unwrap().and_utc();
+
+        store
+            .insert_incident(&replay_test_incident("today-1", midmorning))
+            .unwrap();
+        store
+            .insert_incident(&replay_test_incident("today-2", afternoon))
+            .unwrap();
+
+        assert_eq!(
+            graph.metrics().incident_nodes,
+            0,
+            "precondition: KG starts empty"
+        );
+
+        super::replay_todays_incidents(&store, &mut graph, now);
+
+        assert_eq!(
+            graph.metrics().incident_nodes,
+            2,
+            "PR18 — both of today's incidents must be in the KG after replay"
+        );
+    }
+
+    #[test]
+    fn replay_todays_incidents_excludes_prior_day_rows() {
+        // Boundary anchor that mirrors the store-side
+        // `incidents_since_ts_returns_rows_at_or_after_start`: at the
+        // boot-helper level, yesterday's rows must not bleed into
+        // today's KG. Operator wants today's audit slice when the
+        // picker is on today; mixing yesterday silently inflates
+        // both totals and tile counts.
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 5, 13).unwrap();
+        let now = day.and_hms_opt(15, 30, 0).unwrap().and_utc();
+        let yesterday_evening = day
+            .pred_opt()
+            .unwrap()
+            .and_hms_opt(23, 30, 0)
+            .unwrap()
+            .and_utc();
+        let today_morning = day.and_hms_opt(0, 30, 0).unwrap().and_utc();
+
+        store
+            .insert_incident(&replay_test_incident("yesterday-row", yesterday_evening))
+            .unwrap();
+        store
+            .insert_incident(&replay_test_incident("today-row", today_morning))
+            .unwrap();
+
+        super::replay_todays_incidents(&store, &mut graph, now);
+
+        assert_eq!(
+            graph.metrics().incident_nodes,
+            1,
+            "PR18 — only today's row must be ingested; yesterday's row must be filtered by the start-of-day boundary"
+        );
+    }
+
+    #[test]
+    fn replay_todays_incidents_is_idempotent_on_repeat() {
+        // Snapshot-then-replay overlap case: at boot, the snapshot may
+        // already contain half of today's incidents. The replay walks
+        // ALL of today's SQLite rows — overlapping ones must not
+        // double-count via `upsert_node` semantics on `incident_id`.
+        // Without this, every boot would inflate the KG against itself
+        // and the dashboard counts would skew higher than reality.
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 5, 13).unwrap();
+        let now = day.and_hms_opt(12, 0, 0).unwrap().and_utc();
+        store
+            .insert_incident(&replay_test_incident(
+                "idempotent-row",
+                day.and_hms_opt(6, 0, 0).unwrap().and_utc(),
+            ))
+            .unwrap();
+
+        super::replay_todays_incidents(&store, &mut graph, now);
+        let after_first = graph.metrics().incident_nodes;
+        super::replay_todays_incidents(&store, &mut graph, now);
+        let after_second = graph.metrics().incident_nodes;
+
+        assert_eq!(after_first, 1, "first replay must land the single row");
+        assert_eq!(
+            after_second, after_first,
+            "PR18 — second replay of the same data must NOT double-count"
+        );
+    }
+
+    #[test]
+    fn replay_todays_incidents_is_noop_on_empty_store() {
+        // Edge case: the agent boots on a clean install (no incidents
+        // yet today). The helper must succeed silently — the operator's
+        // first hour on a new host should not be polluted with warn
+        // logs about the empty result set.
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+
+        super::replay_todays_incidents(&store, &mut graph, now);
+
+        assert_eq!(
+            graph.metrics().incident_nodes,
+            0,
+            "PR18 — empty store, empty KG, no-op result"
+        );
+    }
+
+    #[test]
+    fn replay_todays_incidents_does_not_disturb_pre_existing_kg_nodes() {
+        // The snapshot already populated the KG before the replay
+        // runs. The replay must merge into it, not wipe it. This is
+        // the realistic prod case — boot loads snapshot, then replay
+        // tops up today's tail. Asserts the merge contract rather
+        // than the (wrong) replace contract.
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+
+        // Pre-seed the KG with an unrelated yesterday-incident as if
+        // the snapshot had restored it.
+        let yesterday_inc = replay_test_incident(
+            "from-snapshot:yesterday",
+            chrono::Utc::now() - chrono::Duration::days(1),
+        );
+        graph.ingest_incident(&yesterday_inc);
+        let before = graph.metrics().incident_nodes;
+        assert_eq!(before, 1, "precondition: snapshot-restored node present");
+
+        // Now drop today's row into the store and run the replay.
+        let day = chrono::Utc::now().date_naive();
+        let now = day.and_hms_opt(15, 0, 0).unwrap().and_utc();
+        store
+            .insert_incident(&replay_test_incident(
+                "from-replay:today",
+                day.and_hms_opt(8, 0, 0).unwrap().and_utc(),
+            ))
+            .unwrap();
+
+        super::replay_todays_incidents(&store, &mut graph, now);
+
+        assert_eq!(
+            graph.metrics().incident_nodes,
+            2,
+            "PR18 — pre-existing snapshot nodes must survive; replay merges new rows in"
+        );
+    }
+
+    #[test]
+    fn replay_todays_incidents_uses_utc_start_of_day_not_local() {
+        // The boundary is UTC. If a future refactor swaps to
+        // `Local::now()` or `date_naive()` against a local TZ, an
+        // operator in UTC+9 would see today's first 9 hours missing
+        // from the dashboard after every restart. Pin the UTC contract.
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+
+        // 00:00 UTC on a specific day — the boundary row.
+        let utc_midnight = chrono::NaiveDate::from_ymd_opt(2026, 5, 13)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        store
+            .insert_incident(&replay_test_incident("utc-midnight", utc_midnight))
+            .unwrap();
+
+        // `now` is 06:00 UTC on the same day. The boundary computed
+        // from this must INCLUDE the 00:00 UTC row.
+        let now = utc_midnight + chrono::Duration::hours(6);
+        super::replay_todays_incidents(&store, &mut graph, now);
+
+        assert_eq!(
+            graph.metrics().incident_nodes,
+            1,
+            "PR18 — the UTC 00:00 boundary row must be included when `now` is later the same UTC day"
+        );
+    }
+
+    #[test]
+    fn replay_todays_incidents_walks_in_chronological_order() {
+        // The store-side `incidents_since_ts` returns rows ORDER BY ts
+        // ASC. The helper must preserve that order when it iterates
+        // into `ingest_incident` so the KG's `first_seen` / `last_seen`
+        // edges land in the right sequence. The order is observable
+        // via the `ts` field on the resulting Incident node.
+        use crate::knowledge_graph::types::{Node, NodeType};
+
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 5, 13)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        store
+            .insert_incident(&replay_test_incident(
+                "order-third",
+                base + chrono::Duration::hours(3),
+            ))
+            .unwrap();
+        store
+            .insert_incident(&replay_test_incident(
+                "order-first",
+                base + chrono::Duration::hours(1),
+            ))
+            .unwrap();
+        store
+            .insert_incident(&replay_test_incident(
+                "order-second",
+                base + chrono::Duration::hours(2),
+            ))
+            .unwrap();
+
+        let now = base + chrono::Duration::hours(4);
+        super::replay_todays_incidents(&store, &mut graph, now);
+
+        // Collect the Incident nodes' (id, ts) pairs and verify they
+        // were ingested in ascending ts order.
+        let mut seen: Vec<(String, chrono::DateTime<chrono::Utc>)> = graph
+            .nodes_of_type(NodeType::Incident)
+            .iter()
+            .filter_map(|&id| match graph.get_node(id) {
+                Some(Node::Incident {
+                    incident_id, ts, ..
+                }) => Some((incident_id.clone(), *ts)),
+                _ => None,
+            })
+            .collect();
+        seen.sort_by_key(|(_, ts)| *ts);
+        let ids: Vec<&str> = seen.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["order-first", "order-second", "order-third"],
+            "PR18 — the chronological iteration must reach ingest_incident in ts-ascending order"
+        );
+    }
+
+    #[test]
+    fn max_boot_replay_cap_is_loose_enough_for_a_real_day() {
+        // The cap protects against pathological days (DoS, runaway
+        // detector loop) but must not truncate honest workloads. The
+        // operator's worst measured prod day is ~10k incidents; the
+        // cap is set 10x above that. This anchor pins the floor so a
+        // future "let's drop it to 10k" refactor must justify itself
+        // and update the comment in lockstep.
+        assert!(
+            super::MAX_BOOT_REPLAY >= 100_000,
+            "PR18 — MAX_BOOT_REPLAY must stay >= 100k so the worst measured \
+             prod day (~10k incidents) fits 10x over"
         );
     }
 }

@@ -6536,29 +6536,47 @@ mod tests {
 
     #[test]
     fn pr18_boot_path_replays_todays_incidents_into_kg() {
-        // The boot path is hard to exercise from a unit test (it owns
-        // the runtime, the dashboard task, the responder, etc.). What
-        // we CAN pin is the source-level contract: boot.rs must call
-        // `incidents_since_ts` AND iterate the result into
-        // `ingest_incident`. If either drops, the gap operator caught
-        // on 2026-05-13 comes back.
+        // The boot path is hard to exercise as a whole (it owns the
+        // runtime, the dashboard task, the responder, etc.). What we
+        // CAN pin is the source-level contract that survived the
+        // PR18-internal refactor: the logic lives in an extracted
+        // helper `replay_todays_incidents` (so the runtime cases
+        // become unit-testable, see boot.rs tests) AND the boot fn
+        // body still invokes it after KG hydration. Defining the
+        // helper without calling it would ship zero operator value.
         const BOOT_SRC: &str = include_str!("../loops/boot.rs");
         assert!(
-            BOOT_SRC.contains("store.incidents_since_ts("),
-            "PR18 — boot.rs must call store.incidents_since_ts to \
-             enumerate today's incidents from the canonical store"
+            BOOT_SRC.contains("pub(crate) fn replay_todays_incidents("),
+            "PR18 — boot.rs must define `replay_todays_incidents` as \
+             an extracted helper. Inlining the logic back into the \
+             boot fn body removes the only test surface that pins \
+             the contract."
         );
         assert!(
-            BOOT_SRC.contains("g.ingest_incident(inc)"),
+            BOOT_SRC.contains("replay_todays_incidents(store, &mut g, chrono::Utc::now())"),
+            "PR18 — the boot fn must actually invoke the helper after \
+             KG hydration. Defining the helper without calling it \
+             regresses to pre-PR18 behaviour silently."
+        );
+        assert!(
+            BOOT_SRC.contains("store.incidents_since_ts(&start_ts, MAX_BOOT_REPLAY)"),
+            "PR18 — the helper must call store.incidents_since_ts \
+             with the boot-replay cap. Without the call the KG never \
+             gets today's rows; without the cap a pathological day \
+             pins agent startup."
+        );
+        assert!(
+            BOOT_SRC.contains("graph.ingest_incident(inc)"),
             "PR18 — the replay must re-ingest each row into the \
-             shared KG. Without the iteration the call returns \
+             shared KG. Without the iteration the helper returns \
              rows but the operator-visible Cases panel still \
              shrinks on restart."
         );
         assert!(
-            BOOT_SRC.contains("MAX_BOOT_REPLAY"),
-            "PR18 — the walk must carry the boot-replay cap so a \
-             pathological day does not pin agent startup."
+            BOOT_SRC.contains("pub(crate) const MAX_BOOT_REPLAY: usize"),
+            "PR18 — the cap must be a visible constant so a future \
+             tuning PR shows up in diff review, not buried in a \
+             magic number."
         );
     }
 
