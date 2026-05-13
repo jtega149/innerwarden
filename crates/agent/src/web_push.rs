@@ -348,6 +348,80 @@ pub async fn notify_incident(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
+    fn web_push_config() -> WebPushConfig {
+        let (private_key, public_key) = generate_vapid_keys().expect("vapid keys");
+        let mut config = WebPushConfig::default();
+        config.enabled = true;
+        config.vapid_subject = "mailto:ops@example.com".to_string();
+        config.vapid_private_key = private_key;
+        config.vapid_public_key = public_key;
+        config
+    }
+
+    fn subscription_for_endpoint(endpoint: String) -> WebPushSubscription {
+        let receiver_secret = EphemeralSecret::random(&mut OsRng);
+        let receiver_public = receiver_secret.public_key();
+        let receiver_public_bytes = EncodedPoint::from(receiver_public).to_bytes();
+        WebPushSubscription {
+            endpoint,
+            keys: WebPushKeys {
+                p256dh: URL_SAFE_NO_PAD.encode(receiver_public_bytes),
+                auth: URL_SAFE_NO_PAD.encode([7_u8; 16]),
+            },
+        }
+    }
+
+    fn request_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + 4 + content_length
+    }
+
+    fn spawn_push_server(status: &'static str, body: &'static str) -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind push test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request_complete(&request) {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{addr}"), handle)
+    }
 
     #[test]
     fn generate_vapid_keys_produces_valid_pair() {
@@ -460,5 +534,120 @@ mod tests {
         let loaded = load_subscriptions(dir.path());
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].endpoint, fresh.endpoint);
+    }
+
+    #[test]
+    fn build_vapid_auth_signs_audience_and_includes_public_key() {
+        let config = web_push_config();
+        let auth = build_vapid_auth("https://push.example.test/send/abc", &config)
+            .expect("vapid auth should build");
+
+        let token = auth
+            .strip_prefix("vapid t=")
+            .expect("vapid prefix")
+            .split(",k=")
+            .next()
+            .expect("token segment");
+        assert!(auth.ends_with(&config.vapid_public_key));
+        let mut parts = token.split('.');
+        let header: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(parts.next().expect("header"))
+                .expect("header base64"),
+        )
+        .expect("header json");
+        let payload: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(parts.next().expect("payload"))
+                .expect("payload base64"),
+        )
+        .expect("payload json");
+
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(payload["aud"], "https://push.example.test");
+        assert_eq!(payload["sub"], "mailto:ops@example.com");
+        assert!(payload["exp"].as_i64().expect("exp") > chrono::Utc::now().timestamp());
+    }
+
+    #[test]
+    fn encrypt_payload_builds_aes128gcm_record_header() {
+        let subscription = subscription_for_endpoint("https://push.example.test/send".to_string());
+        let encrypted =
+            encrypt_payload(br#"{"title":"Alert"}"#, &subscription).expect("encrypt payload");
+
+        assert!(encrypted.len() > 16 + 4 + 1 + 65);
+        assert_eq!(&encrypted[16..20], &4096_u32.to_be_bytes());
+        assert_eq!(encrypted[20], 65);
+        assert_eq!(encrypted[21], 0x04);
+    }
+
+    #[test]
+    fn encrypt_payload_rejects_invalid_subscription_keys() {
+        let subscription = WebPushSubscription {
+            endpoint: "https://push.example.test/send".to_string(),
+            keys: WebPushKeys {
+                p256dh: "not base64".to_string(),
+                auth: "also not base64".to_string(),
+            },
+        };
+
+        let err = encrypt_payload(b"payload", &subscription).expect_err("invalid key should fail");
+        assert!(err.to_string().contains("base64-decode subscriber p256dh"));
+    }
+
+    #[tokio::test]
+    async fn send_push_posts_encrypted_payload_with_vapid_headers() {
+        let (base_url, handle) = spawn_push_server("201 Created", "{}");
+        let subscription = subscription_for_endpoint(format!("{base_url}/push"));
+        let config = web_push_config();
+
+        send_push(&subscription, "Title", "Body", &config)
+            .await
+            .expect("send push");
+
+        let request = handle.join().expect("server thread should finish");
+        let lower = request.to_ascii_lowercase();
+        assert!(request.starts_with("POST /push HTTP/1.1"));
+        assert!(lower.contains("authorization: vapid t="));
+        assert!(lower.contains("content-encoding: aes128gcm"));
+        assert!(lower.contains("ttl: 86400"));
+    }
+
+    #[tokio::test]
+    async fn notify_incident_prunes_expired_subscription() {
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let (base_url, handle) = spawn_push_server("410 Gone", "expired");
+        let subscription = subscription_for_endpoint(format!("{base_url}/expired"));
+        save_subscriptions(dir.path(), std::slice::from_ref(&subscription))
+            .expect("subscriptions should save");
+        let config = web_push_config();
+        let mut incident = crate::tests::test_incident("203.0.113.30");
+        incident.severity = innerwarden_core::event::Severity::High;
+
+        notify_incident(&incident, dir.path(), &config).await;
+
+        let request = handle.join().expect("server thread should finish");
+        assert!(request.starts_with("POST /expired HTTP/1.1"));
+        assert!(load_subscriptions(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn notify_incident_skips_disabled_config_and_below_minimum_severity() {
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let subscription = subscription_for_endpoint("http://127.0.0.1:9/not-called".to_string());
+        save_subscriptions(dir.path(), std::slice::from_ref(&subscription))
+            .expect("subscriptions should save");
+        let mut incident = crate::tests::test_incident("203.0.113.31");
+
+        let mut disabled = web_push_config();
+        disabled.enabled = false;
+        notify_incident(&incident, dir.path(), &disabled).await;
+
+        let mut critical_only = web_push_config();
+        critical_only.min_severity = "critical".to_string();
+        incident.severity = innerwarden_core::event::Severity::High;
+        notify_incident(&incident, dir.path(), &critical_only).await;
+
+        assert_eq!(load_subscriptions(dir.path()).len(), 1);
     }
 }

@@ -267,6 +267,25 @@ pub(crate) fn is_eligible_for_abuseipdb_autoblock(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    fn reputation(score: u8) -> abuseipdb::IpReputation {
+        abuseipdb::IpReputation {
+            confidence_score: score,
+            total_reports: 42,
+            distinct_users: 7,
+            country_code: Some("US".to_string()),
+            isp: Some("test isp".to_string()),
+            is_tor: false,
+        }
+    }
+
+    fn cfg_with_threshold(threshold: u8) -> config::AgentConfig {
+        let mut cfg = config::AgentConfig::default();
+        cfg.abuseipdb.auto_block_threshold = threshold;
+        cfg.responder.enabled = false;
+        cfg
+    }
 
     // Test 7: Valid block scenario — score exceeds threshold
     #[test]
@@ -353,5 +372,151 @@ mod tests {
             is_eligible_for_abuseipdb_autoblock("5.6.7.8", 100, 90, &protected, &HashMap::new()),
             Some(AbuseIpDbBlockResult::Eligible)
         );
+    }
+
+    #[test]
+    fn cloud_provider_ip_is_not_auto_block_eligible() {
+        cloud_safelist::init();
+        let operators = HashMap::new();
+        let protected: Vec<String> = vec![];
+        assert_eq!(
+            is_eligible_for_abuseipdb_autoblock("104.16.0.1", 100, 90, &protected, &operators),
+            Some(AbuseIpDbBlockResult::SkipCloudSafelist)
+        );
+    }
+
+    #[tokio::test]
+    async fn autoblock_returns_false_when_incident_has_no_ip_entity() {
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = cfg_with_threshold(90);
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut incident = crate::tests::test_incident("203.0.113.77");
+        incident.entities.clear();
+        let mut blocked_set = HashSet::new();
+
+        let handled = try_handle_abuseipdb_autoblock(
+            &incident,
+            dir.path(),
+            &cfg,
+            &mut state,
+            Some(&reputation(100)),
+            &mut blocked_set,
+        )
+        .await;
+
+        assert!(!handled);
+        assert!(blocked_set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn autoblock_skip_reasons_return_before_execution() {
+        let dir = TempDir::new().expect("tempdir");
+        let incident = crate::tests::test_incident("203.0.113.77");
+        let mut blocked_set = HashSet::new();
+
+        let mut cfg = cfg_with_threshold(90);
+        let mut state = crate::tests::triage_test_state(dir.path());
+        assert!(
+            !try_handle_abuseipdb_autoblock(
+                &incident,
+                dir.path(),
+                &cfg,
+                &mut state,
+                Some(&reputation(80)),
+                &mut blocked_set,
+            )
+            .await
+        );
+
+        cfg.ai.protected_ips = vec!["203.0.113.77".to_string()];
+        let mut state = crate::tests::triage_test_state(dir.path());
+        assert!(
+            !try_handle_abuseipdb_autoblock(
+                &incident,
+                dir.path(),
+                &cfg,
+                &mut state,
+                Some(&reputation(100)),
+                &mut blocked_set,
+            )
+            .await
+        );
+
+        let cfg = cfg_with_threshold(90);
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state
+            .operator_ips
+            .insert("203.0.113.77".to_string(), std::time::Instant::now());
+        assert!(
+            !try_handle_abuseipdb_autoblock(
+                &incident,
+                dir.path(),
+                &cfg,
+                &mut state,
+                Some(&reputation(100)),
+                &mut blocked_set,
+            )
+            .await
+        );
+
+        let cfg = cfg_with_threshold(90);
+        let mut state = crate::tests::triage_test_state(dir.path());
+        cloud_safelist::init();
+        let cloud_incident = crate::tests::test_incident("104.16.0.1");
+        assert!(
+            !try_handle_abuseipdb_autoblock(
+                &cloud_incident,
+                dir.path(),
+                &cfg,
+                &mut state,
+                Some(&reputation(100)),
+                &mut blocked_set,
+            )
+            .await
+        );
+
+        assert!(blocked_set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn autoblock_responder_disabled_records_decision_without_marking_blocked() {
+        let dir = TempDir::new().expect("tempdir");
+        let ip = "203.0.113.77";
+        let incident = crate::tests::test_incident(ip);
+        let cfg = cfg_with_threshold(90);
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.attacker_profiles.insert(
+            ip.to_string(),
+            attacker_intel::new_profile(ip, chrono::Utc::now()),
+        );
+        let mut blocked_set = HashSet::new();
+
+        let handled = try_handle_abuseipdb_autoblock(
+            &incident,
+            dir.path(),
+            &cfg,
+            &mut state,
+            Some(&reputation(100)),
+            &mut blocked_set,
+        )
+        .await;
+
+        assert!(handled);
+        assert!(blocked_set.is_empty());
+        assert!(!state.blocklist.contains(ip));
+        assert_eq!(state.attacker_profiles[ip].total_decisions, 1);
+        assert_eq!(state.attacker_profiles[ip].total_blocks, 1);
+
+        if let Some(writer) = &mut state.decision_writer {
+            writer.flush();
+        }
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let decisions_path = dir.path().join(format!("decisions-{today}.jsonl"));
+        let contents = std::fs::read_to_string(decisions_path).expect("decision log");
+        assert!(contents.contains("\"ai_provider\":\"abuseipdb\""));
+        assert!(contents.contains("skipped: responder disabled"));
     }
 }
