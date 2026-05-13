@@ -1429,6 +1429,129 @@ mod tests {
         );
     }
 
+    // ── Spec 049 PR8 anchors ────────────────────────────────────────
+    // Live toggle on the Current state band. Default ON (matches
+    // pre-PR8 implicit always-live behaviour); operator opts OUT
+    // for audit screenshots or "freeze the wall" moments. Toggle
+    // state persists across reloads via localStorage.
+
+    #[test]
+    fn cases_tab_has_live_toggle_button() {
+        // Toggle lives on the Current state band label so the
+        // operator sees "this band is live" without scrolling.
+        // The default class is `live-toggle-on` (matches the JS
+        // default; localStorage 'off' overrides on hydrate).
+        assert!(
+            INDEX_HTML.contains("id=\"cases-live-toggle\""),
+            "Cases tab must carry id=cases-live-toggle (spec 049 PR8)"
+        );
+        assert!(
+            INDEX_HTML.contains("class=\"live-toggle live-toggle-on\""),
+            "Live toggle must default to live-toggle-on class (default ON, matches pre-PR8 implicit behaviour)"
+        );
+        assert!(
+            INDEX_HTML.contains("onclick=\"toggleCasesLive()\""),
+            "Live toggle must wire to toggleCasesLive() handler"
+        );
+        assert!(
+            INDEX_HTML.contains("aria-pressed=\"true\""),
+            "Live toggle must declare aria-pressed=true at default (a11y)"
+        );
+    }
+
+    #[test]
+    fn cases_band_label_uses_flex_layout_for_live_toggle() {
+        // The `.cases-band-current` modifier on the band label turns
+        // it into a flex container so the toggle button sits flush
+        // right. Without the modifier, the toggle would stack below
+        // the label text.
+        assert!(
+            INDEX_HTML.contains("class=\"cases-band-label cases-band-current\""),
+            "Current state band label must carry the .cases-band-current modifier (spec 049 PR8 flex layout)"
+        );
+    }
+
+    #[test]
+    fn threats_js_live_toggle_persists_to_localstorage() {
+        // Toggle state survives reloads — the operator's choice is
+        // sticky. Pin the localStorage key + the on/off discipline
+        // so a future "simplify localStorage usage" refactor cannot
+        // silently drop persistence.
+        assert!(
+            JS_THREATS.contains("CASES_LIVE_STORAGE_KEY = 'iw_cases_live_toggle'"),
+            "Live toggle must persist under stable key `iw_cases_live_toggle`"
+        );
+        assert!(
+            JS_THREATS.contains("function isCasesLiveEnabled("),
+            "Live toggle must expose `isCasesLiveEnabled` read-side helper"
+        );
+        assert!(
+            JS_THREATS.contains("function toggleCasesLive("),
+            "Live toggle must expose `toggleCasesLive` click handler"
+        );
+    }
+
+    #[test]
+    fn threats_js_render_current_state_band_is_gated_by_live_toggle() {
+        // When toggle is OFF, `renderCurrentStateBand` MUST early-
+        // return. This is the freeze contract — the operator's
+        // audit screenshot stays stable while they explain to a
+        // client. Anti-regression for a future "always render"
+        // simplification that would break the freeze.
+        let render_start = JS_THREATS
+            .find("function renderCurrentStateBand(")
+            .expect("renderCurrentStateBand defined");
+        let render_end = JS_THREATS[render_start..]
+            .find("\n}\n")
+            .expect("end of renderCurrentStateBand")
+            + render_start;
+        let body = &JS_THREATS[render_start..render_end];
+        assert!(
+            body.contains("if (!isCasesLiveEnabled())"),
+            "renderCurrentStateBand must early-return when toggle is OFF (spec 049 PR8 freeze contract)"
+        );
+    }
+
+    #[test]
+    fn threats_js_live_toggle_renders_catchup_on_reenable() {
+        // When the operator re-enables the toggle (was OFF, click
+        // turns ON), the band should immediately jump to the latest
+        // value instead of waiting for the next SSE event. Smooth
+        // UX — no stale-looking gap.
+        let toggle_start = JS_THREATS
+            .find("function toggleCasesLive(")
+            .expect("toggleCasesLive defined");
+        let toggle_end = JS_THREATS[toggle_start..]
+            .find("\n}\n")
+            .expect("end of toggleCasesLive")
+            + toggle_start;
+        let body = &JS_THREATS[toggle_start..toggle_end];
+        assert!(
+            body.contains("if (next && window._lastOverview)")
+                && body.contains("renderCurrentStateBand(window._lastOverview.current_state)"),
+            "toggleCasesLive must catch-up render when re-enabling (spec 049 PR8 UX)"
+        );
+    }
+
+    #[test]
+    fn app_css_defines_live_toggle_styles() {
+        for selector in [
+            ".live-toggle",
+            ".live-toggle .live-dot",
+            ".live-toggle.live-toggle-on",
+            ".live-toggle.live-toggle-on .live-dot",
+        ] {
+            assert!(
+                APP_CSS.contains(selector),
+                "app.css must define {selector} (spec 049 PR8 Live toggle styling)"
+            );
+        }
+        assert!(
+            APP_CSS.contains("@keyframes liveTogglePulse"),
+            "app.css must define @keyframes liveTogglePulse — the pulsing dot is the operator's visual signal that the band is live"
+        );
+    }
+
     // ── Spec 049 PR6 anchors ────────────────────────────────────────
     // Cases tab header duplo: `Current state` band (live, ignores
     // scope picker) + `Selected period` band (follows scope picker).

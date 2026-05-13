@@ -14,7 +14,15 @@ function renderTzLabel(tz) {
 // today's full-day window regardless of the scope picker. The
 // operator can pick `Yesterday 14h-16h` and this band keeps
 // reporting what is alive RIGHT NOW.
+//
+// Spec 049 PR8: gated on the Live toggle. When the toggle is OFF
+// the operator wants the band frozen on its last value (audit
+// screenshot, deliberate snapshot). The render call is a no-op
+// in that case — the DOM keeps whatever it last rendered.
 function renderCurrentStateBand(currentState) {
+  if (!isCasesLiveEnabled()) {
+    return;
+  }
   var cs = currentState || {};
   var setNum = function(id, val) {
     var el = document.getElementById(id);
@@ -24,6 +32,55 @@ function renderCurrentStateBand(currentState) {
   setNum('kpi-now-blocked', cs.currently_blocked);
   setNum('kpi-now-observing', cs.currently_observing);
   setNum('kpi-now-needs-review', cs.needs_review_now);
+}
+
+// Spec 049 PR8 — Live toggle state. Persisted to localStorage so
+// the operator's choice survives reloads + tab switches. Defaults
+// ON (matches the pre-PR8 implicit always-live behaviour); the
+// operator opts OUT for audit screenshots or "freeze the wall
+// while I explain something to the client" moments.
+var CASES_LIVE_STORAGE_KEY = 'iw_cases_live_toggle';
+
+function isCasesLiveEnabled() {
+  try {
+    var stored = window.localStorage && window.localStorage.getItem(CASES_LIVE_STORAGE_KEY);
+    if (stored === 'off') return false;
+    return true; // default ON, includes the 'on' case and any unknown value
+  } catch (e) {
+    return true; // localStorage unavailable (private mode etc) → default ON
+  }
+}
+
+function applyCasesLiveToggleUi(enabled) {
+  var btn = document.getElementById('cases-live-toggle');
+  if (!btn) return;
+  btn.classList.toggle('live-toggle-on', enabled);
+  btn.classList.toggle('live-toggle-off', !enabled);
+  btn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+  var label = btn.querySelector('.live-label');
+  if (label) label.textContent = enabled ? 'Live' : 'Paused';
+}
+
+function toggleCasesLive() {
+  var next = !isCasesLiveEnabled();
+  try {
+    if (window.localStorage) {
+      window.localStorage.setItem(CASES_LIVE_STORAGE_KEY, next ? 'on' : 'off');
+    }
+  } catch (e) { /* localStorage unavailable — toggle still applies for this page lifetime */ }
+  applyCasesLiveToggleUi(next);
+  // When re-enabling, render once immediately so the operator sees
+  // the catch-up jump from the frozen value to the live one.
+  if (next && window._lastOverview) {
+    renderCurrentStateBand(window._lastOverview.current_state);
+  }
+}
+
+// Sync the toggle UI with the persisted state on first load. Called
+// from the Cases tab `showView('investigate')` handler — see the
+// addEventListener wiring at the bottom of this file.
+function initCasesLiveToggle() {
+  applyCasesLiveToggleUi(isCasesLiveEnabled());
 }
 
 var DETECTOR_PRIORITY = {
@@ -598,9 +655,11 @@ async function refreshLeftLive() {
     // never browser-derived (which drifts across analysts).
     renderTzLabel(ov && ov.timezone);
 
-    // Spec 049 PR6: render the `Current state` band — live counters
-    // that IGNORE the scope picker. Operator never loses situational
-    // awareness while auditing a historical window.
+    // Spec 049 PR6 + PR8: render the `Current state` band — live
+    // counters that IGNORE the scope picker. PR8 gates this on the
+    // Live toggle (default ON); sync the toggle UI here too so a
+    // mid-session localStorage change reflects on next refresh.
+    initCasesLiveToggle();
     renderCurrentStateBand(ov && ov.current_state);
 
     // 2026-04-29 (audit Phase 2): KPIs read from `/api/overview`
@@ -714,9 +773,11 @@ async function refreshLeft(forceRefreshJourney = false) {
     // Spec 049 PR5: render operator TZ on the scope picker label.
     renderTzLabel(ov && ov.timezone);
 
-    // Spec 049 PR6: render the `Current state` band — live counters
-    // that IGNORE the scope picker. Operator never loses situational
-    // awareness while auditing a historical window.
+    // Spec 049 PR6 + PR8: render the `Current state` band — live
+    // counters that IGNORE the scope picker. PR8 gates this on the
+    // Live toggle (default ON); sync the toggle UI here too so a
+    // mid-session localStorage change reflects on next refresh.
+    initCasesLiveToggle();
     renderCurrentStateBand(ov && ov.current_state);
 
     // Spec 037 Threats UX bundle: read the three KPIs from the

@@ -1547,6 +1547,54 @@
     .cases-band-label.cases-band-period {
       margin-top: 14px;
     }
+    /* Spec 049 PR8 — Live toggle on the Current state band. The
+       label becomes flex so the toggle sits flush right. */
+    .cases-band-label.cases-band-current {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .live-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--card);
+      color: var(--muted);
+      font-size: 0.6rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      cursor: pointer;
+      font-family: inherit;
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+    .live-toggle:hover {
+      border-color: rgba(120, 229, 255, 0.4);
+    }
+    .live-toggle:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+    .live-toggle .live-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--dim);
+    }
+    .live-toggle.live-toggle-on {
+      color: var(--ok);
+      border-color: rgba(34, 197, 94, 0.4);
+    }
+    .live-toggle.live-toggle-on .live-dot {
+      background: var(--ok);
+      animation: liveTogglePulse 1.6s ease-in-out infinite;
+    }
+    @keyframes liveTogglePulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: 0.45; transform: scale(0.75); }
+    }
 
     /* Spec 049 PR5 — hour-of-day scope picker on Cases tab. Sits
        directly under the date input so the operator does not have

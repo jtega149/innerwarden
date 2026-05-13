@@ -452,6 +452,18 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_cases_band_label_styles` — `.cases-band-label` + `.cases-band-label.cases-band-period` selectors. Without them the bands stack with no visual caption.
 
+- `crates/agent/src/dashboard/mod.rs::tests::cases_tab_has_live_toggle_button` — spec 049 PR8 Live toggle present on the Current state band label. Default class `live-toggle-on` (matches pre-PR8 implicit always-live behaviour); operator opts OUT for audit screenshots.
+
+- `crates/agent/src/dashboard/mod.rs::tests::cases_band_label_uses_flex_layout_for_live_toggle` — `.cases-band-current` modifier on the band label so the toggle button sits flush right.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_live_toggle_persists_to_localstorage` — toggle state survives reloads under stable key `iw_cases_live_toggle`. `isCasesLiveEnabled` + `toggleCasesLive` helpers pinned.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_render_current_state_band_is_gated_by_live_toggle` — when toggle OFF, `renderCurrentStateBand` early-returns. Freeze contract — operator's audit screenshot stays stable.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_live_toggle_renders_catchup_on_reenable` — re-enabling jumps to latest value immediately (no stale-looking gap waiting for next SSE event).
+
+- `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_live_toggle_styles` — `.live-toggle` + `.live-toggle-on` + `.live-dot` + `@keyframes liveTogglePulse`. The pulsing dot is the operator's visual signal that the band is live.
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).
