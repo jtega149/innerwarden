@@ -1,5 +1,12 @@
 name: Code Coverage
 
+# Spec 049 PR7-CI: path-filtered + sccache. Tarpaulin runs the
+# full workspace and is the slowest job (~3-5 min wall-clock).
+# Docs-only PRs skip the tarpaulin run entirely — codecov treats
+# a missing upload on those PRs the same as a no-coverage-delta
+# event (no badge regression on main). The check still reports
+# SUCCESS so branch protection stays happy.
+
 on:
   push:
     branches: [main]
@@ -12,17 +19,45 @@ permissions:
 jobs:
   coverage:
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
+      - name: Detect changes
+        id: changes
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'rules/**'
+              - 'testdata/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Makefile'
+              - '.github/workflows/codecov.yml'
+
+      - name: Skip notice (no Rust changes)
+        if: steps.changes.outputs.rust == 'false'
+        run: echo "::notice::No Rust-relevant paths changed; skipping coverage."
+
+      - name: Setup sccache
+        if: steps.changes.outputs.rust == 'true'
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
       - name: Install Rust toolchain
+        if: steps.changes.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
       - name: Cache cargo artifacts
+        if: steps.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Cache cargo binaries
+        if: steps.changes.outputs.rust == 'true'
         id: cargo-bin-cache
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
         with:
@@ -30,12 +65,13 @@ jobs:
           key: ${{ runner.os }}-cargo-bin-tarpaulin-0.33.0
 
       - name: Install cargo-tarpaulin
-        if: steps.cargo-bin-cache.outputs.cache-hit != 'true'
+        if: steps.changes.outputs.rust == 'true' && steps.cargo-bin-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-tarpaulin --version 0.33.0 --locked
 
       # Tarpaulin failure must break the job. A silently-skipped coverage
       # run produces a badge on main that shows yesterday's number for weeks.
       - name: Run coverage
+        if: steps.changes.outputs.rust == 'true'
         run: |
           cargo tarpaulin \
             --workspace \
@@ -47,6 +83,7 @@ jobs:
             --engine llvm
 
       - name: Upload to Codecov
+        if: steps.changes.outputs.rust == 'true'
         uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

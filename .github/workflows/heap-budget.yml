@@ -20,6 +20,10 @@ name: Heap Budget
 # ~6× slower than jemalloc). `--test-threads=1` is MANDATORY — DHAT's
 # HeapStats counter is process-global and concurrent tests contaminate
 # the delta.
+#
+# Spec 049 PR7-CI: path-filtered + sccache. Docs-only PRs (spec,
+# wiki, CLAUDE.md) skip the DHAT build entirely. The check still
+# reports SUCCESS so branch protection stays happy.
 
 on:
   push:
@@ -34,15 +38,41 @@ permissions:
 jobs:
   heap-budget:
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: Detect changes
+        id: changes
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Makefile'
+              - '.github/workflows/heap-budget.yml'
+
+      - name: Skip notice (no Rust changes)
+        if: steps.changes.outputs.rust == 'false'
+        run: echo "::notice::No Rust-relevant paths changed; skipping heap-budget."
+
+      - name: Setup sccache
+        if: steps.changes.outputs.rust == 'true'
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
       - name: Install Rust toolchain
+        if: steps.changes.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
       - name: Cache cargo artifacts
+        if: steps.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Run heap-budget tests under DHAT
+        if: steps.changes.outputs.rust == 'true'
         run: make heap-budget
