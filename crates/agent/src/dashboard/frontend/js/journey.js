@@ -818,6 +818,12 @@ async function loadJourney(subjectType, subjectValue, focusIncidentId) {
       <div class="journey-actions">
         <button type="button" class="journey-btn" onclick="downloadSnapshot('json')">Export JSON</button>
         <button type="button" class="journey-btn" onclick="downloadSnapshot('md')">Export Markdown</button>
+        <!-- Spec 049 PR11 — Audit CSV export. The MSSP deliverable;
+             includes metadata header (period, filters, reproducibility
+             hash) + one row per journey entry. Reproducible: same
+             period+filters+cases → same hash, regardless of when the
+             export runs. -->
+        <button type="button" class="journey-btn" onclick="downloadSnapshot('csv')">Export Audit CSV</button>
         ${actionBtns}
       </div>
       <!-- verdict card removed: narrative "What happened" + Intelligence section cover this -->

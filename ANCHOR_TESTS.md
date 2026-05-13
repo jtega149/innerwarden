@@ -498,6 +498,22 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_recurrence_block_styles` — `.recurrence-block` + eyebrow / badge / pill / returned / profile-link selectors. Without them the block renders unstyled.
 
+- `crates/agent/src/dashboard/audit_export_csv.rs::tests::csv_quote_doubles_internal_quotes` — RFC 4180 escape. Pins the operator-readable behaviour for `reason` cells containing quoted strings (signature names, error messages). Anti-regression for a future "simplify the quote handling" that breaks CSV imports in Excel / pandas.
+
+- `crates/agent/src/dashboard/audit_export_csv.rs::tests::export_emits_one_row_per_journey_entry` — wire-format contract for the audit CSV. Header row + one data row per journey entry. Pins column order so a future "reorder columns" refactor breaks loud (operators may have downstream tooling keyed on column index).
+
+- `crates/agent/src/dashboard/audit_export_csv.rs::tests::reproducibility_hash_ignores_generated_at` — spec 049 §8.6 reproducibility contract: re-running the same export at a later time MUST produce the same hash. `generated_at` (which changes per export) is excluded from the hash.
+
+- `crates/agent/src/dashboard/audit_export_csv.rs::tests::reproducibility_hash_is_key_order_insensitive` — content-equivalent snapshots with different serde insertion order hash the same. Canonicalisation via sorted-key traversal pinned.
+
+- `crates/agent/src/dashboard/audit_export_csv.rs::tests::export_quotes_cells_with_internal_quotes` — operator's `reason` cell with internal quotes (e.g. `matched signature "DDoS-burst"`) escapes as `""` per RFC 4180.
+
+- `crates/agent/src/dashboard/mod.rs::tests::investigation_api_export_dispatches_csv_format` — `build_export_response` dispatches on `format=csv`, sets `Content-Type: text/csv`, and emits `Content-Disposition: attachment; filename="innerwarden-audit-..."`. Without dispatch the operator gets JSON for a CSV button click.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_export_csv_button_routes_to_csv_format` — journey-page "Export Audit CSV" button wires to `downloadSnapshot('csv')`. Frontend → backend → operator deliverable in one click.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_download_snapshot_handles_csv_format` — `downloadSnapshot` emits the right extension, MIME, and `innerwarden-audit-` filename prefix for `format=csv`. MSSP deliverable convention pinned.
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).

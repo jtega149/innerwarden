@@ -719,6 +719,35 @@ fn build_export_response(
             .into_response();
     }
 
+    // Spec 049 PR11 — CSV audit export. Serialize the snapshot
+    // through serde_json::Value so the CSV renderer is decoupled
+    // from `InvestigationExport`'s Rust shape; future shape
+    // changes don't ripple into the renderer.
+    if format == "csv" {
+        let value = match serde_json::to_value(&snapshot) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to serialize export snapshot for CSV",
+                )
+                    .into_response();
+            }
+        };
+        let csv = crate::dashboard::audit_export_csv::render_csv_export(&value);
+        return (
+            [
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"innerwarden-audit-{}.csv\"", date),
+                ),
+            ],
+            csv,
+        )
+            .into_response();
+    }
+
     match serde_json::to_string_pretty(&snapshot) {
         Ok(body) => (
             [(header::CONTENT_TYPE, "application/json; charset=utf-8")],

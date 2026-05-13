@@ -13,6 +13,7 @@ use types::*;
 
 mod actions;
 mod agent_api;
+mod audit_export_csv;
 mod auth;
 mod case_metrics;
 mod case_recurrence;
@@ -1428,6 +1429,71 @@ mod tests {
         assert!(
             !INDEX_HTML.contains("Unresolved Threats"),
             "Cases panel header MUST NOT revert to `Unresolved Threats`"
+        );
+    }
+
+    // ── Spec 049 PR11 anchors ───────────────────────────────────────
+    // Audit CSV export — MSSP deliverable foundation. Backend dispatch
+    // on `format=csv` produces an RFC 4180 CSV with metadata header
+    // (period, filters, reproducibility hash) and one row per journey
+    // entry. Frontend exposes "Export Audit CSV" button next to the
+    // existing JSON/Markdown buttons.
+
+    #[test]
+    fn investigation_api_export_dispatches_csv_format() {
+        // The handler MUST check `format == "csv"` and call the
+        // CSV renderer. Without dispatch, the operator's "Export
+        // Audit CSV" button just downloads JSON.
+        let src = include_str!("investigation.rs");
+        assert!(
+            src.contains("if format == \"csv\""),
+            "build_export_response must dispatch on format=csv (spec 049 PR11)"
+        );
+        assert!(
+            src.contains("audit_export_csv::render_csv_export"),
+            "CSV dispatch must invoke audit_export_csv::render_csv_export"
+        );
+        assert!(
+            src.contains("text/csv; charset=utf-8"),
+            "CSV response must set Content-Type: text/csv"
+        );
+        assert!(
+            src.contains("attachment; filename=\\\"innerwarden-audit-"),
+            "CSV response must set Content-Disposition with `innerwarden-audit-` filename prefix (MSSP deliverable convention)"
+        );
+    }
+
+    #[test]
+    fn threats_js_export_csv_button_routes_to_csv_format() {
+        // The journey-page Export Audit CSV button must call
+        // downloadSnapshot('csv'). Operator click → backend dispatch.
+        assert!(
+            JS_JOURNEY.contains("downloadSnapshot('csv')"),
+            "journey.js must wire the Export Audit CSV button to downloadSnapshot('csv') (spec 049 PR11)"
+        );
+        assert!(
+            JS_JOURNEY.contains(">Export Audit CSV<"),
+            "journey.js must label the button `Export Audit CSV` (spec 049 PR11 vocabulary)"
+        );
+    }
+
+    #[test]
+    fn threats_js_download_snapshot_handles_csv_format() {
+        // downloadSnapshot must pick the right ext/mime/filename
+        // for csv. Pin all three so a future "simplify the
+        // if-chain" refactor cannot drop one and silently break the
+        // filename pattern operators / clients rely on.
+        assert!(
+            JS_THREATS.contains("ext = 'csv'"),
+            "downloadSnapshot must emit `.csv` extension for format=csv"
+        );
+        assert!(
+            JS_THREATS.contains("mime = 'text/csv; charset=utf-8'"),
+            "downloadSnapshot must use text/csv MIME for format=csv"
+        );
+        assert!(
+            JS_THREATS.contains("filenamePrefix = 'innerwarden-audit'"),
+            "downloadSnapshot must emit `innerwarden-audit-` filename prefix for format=csv (MSSP deliverable convention)"
         );
     }
 

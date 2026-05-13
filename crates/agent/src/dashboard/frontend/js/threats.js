@@ -446,11 +446,29 @@ async function downloadSnapshot(format) {
       window_seconds: state.filters.window_seconds,
     });
     const body = await loadText('/api/export?' + qs);
-    const ext = format === 'md' ? 'md' : 'json';
+    // Spec 049 PR11: csv joins the existing json/md formats. The
+    // backend sets Content-Disposition with an `innerwarden-audit-`
+    // filename, but the operator's browser may save under the
+    // anchor's `download` attribute — keep the JS-side filename
+    // aligned for that path too.
+    var ext, mime, filenamePrefix;
+    if (format === 'md') {
+      ext = 'md';
+      mime = 'text/markdown; charset=utf-8';
+      filenamePrefix = 'innerwarden-snapshot';
+    } else if (format === 'csv') {
+      ext = 'csv';
+      mime = 'text/csv; charset=utf-8';
+      filenamePrefix = 'innerwarden-audit';
+    } else {
+      ext = 'json';
+      mime = 'application/json; charset=utf-8';
+      filenamePrefix = 'innerwarden-snapshot';
+    }
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
     downloadBlob(
-      `innerwarden-snapshot-${stamp}.${ext}`,
-      format === 'md' ? 'text/markdown; charset=utf-8' : 'application/json; charset=utf-8',
+      `${filenamePrefix}-${stamp}.${ext}`,
+      mime,
       body
     );
   } catch (e) {
