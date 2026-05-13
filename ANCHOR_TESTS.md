@@ -514,6 +514,28 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::threats_js_download_snapshot_handles_csv_format` — `downloadSnapshot` emits the right extension, MIME, and `innerwarden-audit-` filename prefix for `format=csv`. MSSP deliverable convention pinned.
 
+- `crates/agent/src/dashboard/audit_export_signing.rs::tests::load_or_generate_reuses_existing_key` — spec 049 PR12 keypair lifecycle: second call must reuse the persisted private key, not regenerate. Anti-regression for a future "always generate fresh" simplification that would invalidate every previously-shared public key fingerprint.
+
+- `crates/agent/src/dashboard/audit_export_signing.rs::tests::private_key_file_has_0600_permissions_on_unix` — operator-private key file on Unix MUST be 0600. Anti-leak guard.
+
+- `crates/agent/src/dashboard/audit_export_signing.rs::tests::malformed_key_file_is_moved_aside_and_regenerated` — wrong-length key file is renamed `.bak` and a fresh keypair is generated. Recovery without operator intervention.
+
+- `crates/agent/src/dashboard/audit_export_signing.rs::tests::sign_base64_roundtrips_through_dalek_verification` — end-to-end sanity: a signature made by our signer verifies with ed25519-dalek's verifier against the same input bytes. Anchors the "operator's claim verifies" contract.
+
+- `crates/agent/src/dashboard/audit_export_signing.rs::tests::pub_key_file_contains_base64_marker` — `.pub` file format `ed25519 <base64> innerwarden-audit-export` is the verification-recipe interface. Format change would break the operator's MSSP-client verification path.
+
+- `crates/agent/src/dashboard/audit_export_csv.rs::tests::signed_csv_emits_signature_and_fingerprint_lines` — signed CSV variant includes `# Public key fingerprint` + `# Signature (ed25519, detached, base64)` + the openssl/cosign verification recipe in the metadata header.
+
+- `crates/agent/src/dashboard/audit_export_csv.rs::tests::signed_csv_signature_verifies_with_dalek` — end-to-end: the signature in the CSV verifies against the reproducibility-hash bytes using the operator's public key. The wedge.
+
+- `crates/agent/src/dashboard/audit_export_csv.rs::tests::unsigned_csv_with_warning_includes_loud_notice` — when signing key load fails, the CSV carries `# WARNING: This export is UNSIGNED` + `# Do not forward as audit evidence` so the operator notices instead of silently shipping unverifiable evidence.
+
+- `crates/agent/src/dashboard/mod.rs::tests::audit_signing_route_registered` — `/api/audit-signing/public-key` route + handler must be wired in. Without the route, signed CSVs are unverifiable (recipient cannot fetch the key).
+
+- `crates/agent/src/dashboard/mod.rs::tests::investigation_csv_export_path_invokes_signer` — production CSV path invokes `AuditSigner::load_or_generate` + `render_csv_export_signed` (or falls back to `render_csv_export_unsigned_with_warning`). Never silently emits unsigned without warning.
+
+- `crates/agent/src/dashboard/mod.rs::tests::investigation_audit_signing_public_key_handler_defined` — `api_audit_signing_public_key` handler exists and uses the canonical `innerwarden-audit-signing.pub` filename in the Content-Disposition.
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).

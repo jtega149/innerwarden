@@ -14,6 +14,7 @@ use types::*;
 mod actions;
 mod agent_api;
 mod audit_export_csv;
+mod audit_export_signing;
 mod auth;
 mod case_metrics;
 mod case_recurrence;
@@ -615,6 +616,10 @@ pub async fn serve(
         .route("/api/threats/diagnostic", get(api_threats_diagnostic))
         .route("/api/journey", get(api_journey))
         .route("/api/export", get(api_export))
+        .route(
+            "/api/audit-signing/public-key",
+            get(api_audit_signing_public_key),
+        )
         .route("/api/report", get(api_report))
         .route("/api/report/dates", get(api_report_dates))
         .route("/api/quickwins", get(api_quickwins))
@@ -1429,6 +1434,62 @@ mod tests {
         assert!(
             !INDEX_HTML.contains("Unresolved Threats"),
             "Cases panel header MUST NOT revert to `Unresolved Threats`"
+        );
+    }
+
+    // ── Spec 049 PR12 anchors ───────────────────────────────────────
+    // Detached ed25519 signing for the audit CSV export. Every
+    // operator-facing CSV carries a signature over the
+    // reproducibility hash; key is auto-generated at first export
+    // and persisted to `<data_dir>/audit-signing.{key,pub}`.
+
+    #[test]
+    fn audit_signing_route_registered() {
+        // `/api/audit-signing/public-key` must be in the router so
+        // the operator can fetch the .pub file once and share with
+        // the audit recipient. Without the route, the signed CSV is
+        // unverifiable (recipient cannot get the key).
+        let src = include_str!("mod.rs");
+        assert!(
+            src.contains("\"/api/audit-signing/public-key\""),
+            "/api/audit-signing/public-key route must be registered (spec 049 PR12)"
+        );
+        assert!(
+            src.contains("api_audit_signing_public_key"),
+            "handler must be wired in"
+        );
+    }
+
+    #[test]
+    fn investigation_csv_export_path_invokes_signer() {
+        // The CSV format dispatch must call load_or_generate +
+        // render_csv_export_signed. Without these, exports ship
+        // unsigned and the operator's MSSP wedge collapses.
+        let src = include_str!("investigation.rs");
+        assert!(
+            src.contains("AuditSigner::load_or_generate"),
+            "CSV export must invoke AuditSigner::load_or_generate"
+        );
+        assert!(
+            src.contains("render_csv_export_signed"),
+            "CSV export must use the signed renderer"
+        );
+        assert!(
+            src.contains("render_csv_export_unsigned_with_warning"),
+            "fallback path must emit the loud unsigned warning, not silently drop the signature"
+        );
+    }
+
+    #[test]
+    fn investigation_audit_signing_public_key_handler_defined() {
+        let src = include_str!("investigation.rs");
+        assert!(
+            src.contains("pub(super) async fn api_audit_signing_public_key("),
+            "api_audit_signing_public_key handler must be defined"
+        );
+        assert!(
+            src.contains("\"attachment; filename=\\\"innerwarden-audit-signing.pub\\\"\""),
+            "public-key download must use the canonical filename"
         );
     }
 

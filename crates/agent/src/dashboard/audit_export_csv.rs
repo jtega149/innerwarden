@@ -44,7 +44,56 @@ const COLUMNS: &[&str] = &[
 /// of dependencies on the Rust struct shape — the test layer can
 /// inject hand-crafted snapshots without constructing full
 /// `InvestigationExport` instances.
+///
+/// Unsigned variant — used by the test layer + by future callers
+/// (e.g. internal automation) that don't need a signature. Production
+/// `/api/export?format=csv` always goes through
+/// [`render_csv_export_signed`] so every operator-facing export is
+/// signed by default.
+#[cfg(test)]
 pub(super) fn render_csv_export(snapshot: &Value) -> String {
+    render_csv_export_inner(snapshot, None)
+}
+
+/// Render the CSV with a `# Signature` line attached to the
+/// metadata header. Signs the `reproducibility_hash` (which already
+/// fingerprints the canonical content) rather than the full CSV
+/// bytes — keeps the verification recipe a short hash-equality
+/// check the operator's MSSP client can run with stock openssl /
+/// cosign.
+pub(super) fn render_csv_export_signed(
+    snapshot: &Value,
+    signer: &super::audit_export_signing::AuditSigner,
+) -> String {
+    render_csv_export_inner(snapshot, Some(signer))
+}
+
+/// Render the CSV with an explicit "signature unavailable" warning
+/// in the metadata header. Used when the signing key cannot be
+/// loaded or generated (filesystem permission failure etc.). The
+/// warning is loud so the operator notices instead of silently
+/// shipping unverifiable audit evidence.
+pub(super) fn render_csv_export_unsigned_with_warning(snapshot: &Value, reason: &str) -> String {
+    let mut out = render_csv_export_inner(snapshot, None);
+    let warning = format!(
+        "\n# WARNING: This export is UNSIGNED. Reason: {reason}\n\
+         # Do not forward as audit evidence until signing is restored.\n"
+    );
+    // Insert the warning right after the metadata block (before the
+    // first blank line separating header from data). Defensive
+    // fall-through: append at end if structure is unexpected.
+    if let Some(idx) = out.find("\n\n") {
+        out.insert_str(idx, &warning);
+    } else {
+        out.push_str(&warning);
+    }
+    out
+}
+
+fn render_csv_export_inner(
+    snapshot: &Value,
+    signer: Option<&super::audit_export_signing::AuditSigner>,
+) -> String {
     let mut out = String::new();
 
     // ── Metadata header ──
@@ -82,6 +131,26 @@ pub(super) fn render_csv_export(snapshot: &Value) -> String {
     out.push_str(
         "# Same period+filters+cases produce the same hash; verify via re-export to confirm content integrity.\n",
     );
+
+    // Spec 049 PR12 — ed25519 detached signature over the
+    // reproducibility hash. Signing the hash (rather than the full
+    // CSV bytes) keeps the verification recipe a short equality
+    // check the operator's MSSP client can run with stock openssl
+    // or cosign. Signature lines are LAST in the metadata block
+    // so the verifier can split on the first non-`#` line cleanly.
+    if let Some(s) = signer {
+        let sig_b64 = s.sign_base64(reproducibility_hash.as_bytes());
+        let fingerprint = s.public_key_fingerprint();
+        out.push_str(&format!("# Public key fingerprint: {fingerprint}\n"));
+        out.push_str(&format!(
+            "# Signature (ed25519, detached, base64): {sig_b64}\n"
+        ));
+        for line in super::audit_export_signing::verification_recipe_lines() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
     out.push('\n');
 
     // ── Column header row ──
@@ -491,6 +560,87 @@ mod tests {
             compute_reproducibility_hash(&snap2),
             "changing content must change the hash"
         );
+    }
+
+    // ── Signed CSV variant (spec 049 PR12) ────────────────────────
+
+    #[test]
+    fn signed_csv_emits_signature_and_fingerprint_lines() {
+        use super::super::audit_export_signing::AuditSigner;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let signer = AuditSigner::load_or_generate(dir.path()).expect("signer");
+        let snap = json!({
+            "generated_at": "2026-05-13T01:00:00Z",
+            "date": "2026-05-12",
+            "filters": {},
+            "journey": null
+        });
+        let csv = render_csv_export_signed(&snap, &signer);
+        assert!(
+            csv.contains("# Public key fingerprint: "),
+            "fingerprint line missing"
+        );
+        assert!(
+            csv.contains("# Signature (ed25519, detached, base64): "),
+            "signature line missing"
+        );
+        // Verification recipe lines must be present (anchors the
+        // operator's recovery path in the metadata header itself).
+        assert!(csv.contains("openssl pkeyutl -verify"));
+        assert!(csv.contains("cosign verify-blob"));
+    }
+
+    #[test]
+    fn signed_csv_signature_verifies_with_dalek() {
+        use super::super::audit_export_signing::AuditSigner;
+        use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+        use ed25519_dalek::Verifier;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let signer = AuditSigner::load_or_generate(dir.path()).expect("signer");
+        let snap = json!({
+            "generated_at": "2026-05-13T01:00:00Z",
+            "date": "2026-05-12",
+            "filters": {"x": 1},
+            "journey": null
+        });
+        let csv = render_csv_export_signed(&snap, &signer);
+        // Extract the signature and verify it against the hash line.
+        let sig_line = csv
+            .lines()
+            .find(|l| l.starts_with("# Signature (ed25519"))
+            .expect("signature line present");
+        let sig_b64 = sig_line.splitn(2, ": ").nth(1).expect("sig value");
+        let sig_bytes = STANDARD_NO_PAD.decode(sig_b64).expect("sig decodes");
+        let sig: ed25519_dalek::Signature = sig_bytes.as_slice().try_into().expect("sig length");
+        let hash_line = csv
+            .lines()
+            .find(|l| l.starts_with("# Reproducibility hash"))
+            .expect("hash line present");
+        let hash_value = hash_line.splitn(2, ": ").nth(1).expect("hash value");
+        signer
+            .keypair
+            .verifying_key()
+            .verify(hash_value.as_bytes(), &sig)
+            .expect("signature must verify against the reproducibility hash");
+    }
+
+    #[test]
+    fn unsigned_csv_with_warning_includes_loud_notice() {
+        let snap = json!({
+            "generated_at": "",
+            "date": "",
+            "filters": {},
+            "journey": null
+        });
+        let csv = render_csv_export_unsigned_with_warning(&snap, "Permission denied on key path");
+        assert!(
+            csv.contains("# WARNING: This export is UNSIGNED"),
+            "unsigned-export warning must be loud"
+        );
+        assert!(csv.contains("Permission denied on key path"));
+        assert!(csv.contains("Do not forward as audit evidence"));
+        // No signature line in the unsigned variant.
+        assert!(!csv.contains("# Signature (ed25519"));
     }
 
     #[test]

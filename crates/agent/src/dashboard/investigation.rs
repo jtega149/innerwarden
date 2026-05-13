@@ -621,6 +621,55 @@ fn overlay_recurrence_block(
     response
 }
 
+/// Spec 049 PR12 — `GET /api/audit-signing/public-key` returns the
+/// operator's ed25519 public key file. The MSSP shares this ONCE
+/// with each audit recipient; every subsequent signed export carries
+/// the matching key fingerprint in its metadata, so the recipient
+/// can detect rotation by re-comparing.
+///
+/// Response body: the `.pub` file content (single line:
+/// `ed25519 <base64> innerwarden-audit-export\n`).
+/// Generates the keypair on first hit so the operator can fetch the
+/// public key before running their first export.
+pub(super) async fn api_audit_signing_public_key(State(state): State<DashboardState>) -> Response {
+    let data_dir = state.data_dir.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        // Ensure the key exists by triggering the load-or-generate
+        // path. We discard the signer; only the file matters here.
+        let _ = crate::dashboard::audit_export_signing::AuditSigner::load_or_generate(&data_dir)?;
+        std::fs::read(crate::dashboard::audit_export_signing::pub_key_path(
+            &data_dir,
+        ))
+    })
+    .await;
+    match result {
+        Ok(Ok(bytes)) => (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8".to_string(),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"innerwarden-audit-signing.pub\"".to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("audit-signing public-key read failed: {e}"),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit-signing task panicked",
+        )
+            .into_response(),
+    }
+}
+
 pub(super) async fn api_export(
     State(state): State<DashboardState>,
     Query(query): Query<ExportQuery>,
@@ -734,7 +783,26 @@ fn build_export_response(
                     .into_response();
             }
         };
-        let csv = crate::dashboard::audit_export_csv::render_csv_export(&value);
+        // Spec 049 PR12 — sign with the operator's ed25519 key
+        // (auto-generated on first export at
+        // `<data_dir>/audit-signing.{key,pub}`). If key load/generation
+        // fails for any reason, fall back to UNSIGNED CSV with a
+        // warning so the operator notices instead of silently
+        // shipping unverifiable audit evidence.
+        let csv = match crate::dashboard::audit_export_signing::AuditSigner::load_or_generate(
+            &data_dir,
+        ) {
+            Ok(signer) => {
+                crate::dashboard::audit_export_csv::render_csv_export_signed(&value, &signer)
+            }
+            Err(e) => {
+                tracing::warn!("audit-export signing key load failed; emitting UNSIGNED CSV: {e}");
+                crate::dashboard::audit_export_csv::render_csv_export_unsigned_with_warning(
+                    &value,
+                    &format!("{e}"),
+                )
+            }
+        };
         return (
             [
                 (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
