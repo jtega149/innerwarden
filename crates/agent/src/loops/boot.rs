@@ -376,6 +376,64 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         }
     }));
 
+    // Spec 049 PR18 — boot-time replay of today's incidents.
+    //
+    // The KG hydration above is snapshot-based: it restores the graph
+    // captured at the time of the most recent KG snapshot. The snapshot
+    // cadence is "periodic" — at best minutes old, at worst a full day
+    // old when the operator deploys a new release before the daily
+    // snapshot has captured the day's traffic. Anything the sensor
+    // wrote to the `incidents` table BETWEEN the snapshot and the
+    // restart is in the canonical store but absent from the in-memory
+    // KG. The dashboard's Cases panel reads `nodes_of_type(Incident)`
+    // off the KG, so post-restart it shrinks even though the audit
+    // trail in SQLite is intact.
+    //
+    // Operator-reported on 2026-05-13: after two same-day agent
+    // restarts (PR15 deploy 11:08 UTC, PR16 deploy 12:11 UTC), the
+    // dashboard showed only the post-12:14 slice of the day (141
+    // Incident nodes vs 535 SQLite rows). The block of 31.14.254.81
+    // at 12:30:36 was correctly persisted but harder to find on the
+    // dashboard than it should have been because the surrounding
+    // context was missing.
+    //
+    // Fix: after KG hydration, query every incident whose `ts` is at
+    // or after the start of the current calendar day (UTC) and
+    // re-ingest into the graph. `ingest_incident` is idempotent on
+    // `incident_id` (via `upsert_node`) so rows the snapshot already
+    // covered are no-ops; rows the snapshot missed get added. The
+    // walk is bounded by `MAX_BOOT_REPLAY` so a pathological day
+    // can't pin the boot path.
+    const MAX_BOOT_REPLAY: usize = 100_000;
+    if let Some(store) = sqlite_store.as_deref() {
+        let start_of_day_utc = chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is a valid time")
+            .and_utc();
+        let start_ts = start_of_day_utc.to_rfc3339();
+        match store.incidents_since_ts(&start_ts, MAX_BOOT_REPLAY) {
+            Ok(today_incidents) => {
+                let mut g = shared_graph.write().unwrap();
+                let before = g.metrics().incident_nodes;
+                for inc in &today_incidents {
+                    g.ingest_incident(inc);
+                }
+                let after = g.metrics().incident_nodes;
+                tracing::info!(
+                    sqlite_rows = today_incidents.len(),
+                    kg_incidents_before = before,
+                    kg_incidents_after = after,
+                    "boot: replayed today's incidents into KG"
+                );
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "boot: failed to replay today's incidents — KG will reflect only the snapshot"
+            ),
+        }
+    }
+
     // Advisory cache: shared between dashboard (writes advisory denials) and
     // the incident processing loop (checks for advisory violations).
     let advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>> =

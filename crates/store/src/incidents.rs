@@ -36,6 +36,47 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Read every incident whose `ts` is at or after `start_ts`, ordered by
+    /// timestamp ascending, up to `limit`.
+    ///
+    /// Spec 049 PR18 — drives the boot-time KG replay. The agent's
+    /// in-memory `KnowledgeGraph` is rehydrated from a periodic
+    /// snapshot, which is at best minutes old and at worst a full day
+    /// old (when the operator deploys a new release before the daily
+    /// snapshot has captured the day's traffic). The replay walks the
+    /// canonical `incidents` table for the current day and re-ingests
+    /// every row into the graph so the dashboard's Cases panel stops
+    /// shrinking on every restart. Comparison with `incidents_since`:
+    /// that scans by monotonic rowid (the agent's hot-path cursor);
+    /// this one scans by `ts` so callers can ask "everything since
+    /// 00:00 UTC today" without juggling cursor state.
+    ///
+    /// `start_ts` is matched lexicographically against the `ts` column,
+    /// which is the same RFC-3339 string the writer persists — so a
+    /// caller passing `"2026-05-13T00:00:00+00:00"` gets every incident
+    /// from midnight UTC onward. Garbage in (`"not-a-ts"`) returns an
+    /// empty set without surprising the caller.
+    pub fn incidents_since_ts(&self, start_ts: &str, limit: usize) -> Result<Vec<Incident>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare_cached("SELECT data FROM incidents WHERE ts >= ?1 ORDER BY ts ASC LIMIT ?2")?;
+        let rows = stmt.query_map(params![start_ts, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let data = row?;
+            match serde_json::from_str::<Incident>(&data) {
+                Ok(incident) => results.push(incident),
+                Err(e) => {
+                    tracing::warn!(error = %e, "incidents_since_ts: skipping malformed row");
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// Read incidents with rowid > `after_id`, up to `limit`.
     pub fn incidents_since(&self, after_id: i64, limit: usize) -> Result<Vec<(i64, Incident)>> {
         let conn = self.conn()?;
@@ -206,6 +247,133 @@ mod tests {
 
         let incidents = store.incidents_since(0, 100).unwrap();
         assert_eq!(incidents.len(), 2);
+    }
+
+    fn incident_at(id: &str, ts: chrono::DateTime<Utc>) -> Incident {
+        let mut inc = sample_incident(id);
+        inc.ts = ts;
+        inc
+    }
+
+    #[test]
+    fn incidents_since_ts_returns_rows_at_or_after_start() {
+        // Spec 049 PR18 — boot replay anchor. Operator-visible promise:
+        // after agent restart, the Cases panel must show every incident
+        // the sensor produced since the start of the day. This anchor
+        // exercises the lexicographic boundary so a future refactor
+        // that changes `>=` to `>` (off-by-one) regresses immediately.
+        let store = Store::open_memory().unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 5, 13).unwrap();
+        let midnight = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+
+        // 23:59 of the prior day — must be excluded by `>= midnight`.
+        store
+            .insert_incident(&incident_at(
+                "prior-day",
+                midnight - chrono::Duration::seconds(60),
+            ))
+            .unwrap();
+        // Exact midnight — must be included (boundary case).
+        store
+            .insert_incident(&incident_at("boundary-midnight", midnight))
+            .unwrap();
+        // Mid-morning — included.
+        store
+            .insert_incident(&incident_at(
+                "morning",
+                midnight + chrono::Duration::hours(8),
+            ))
+            .unwrap();
+
+        let rows = store
+            .incidents_since_ts(&midnight.to_rfc3339(), 1_000)
+            .expect("query must succeed");
+
+        let ids: Vec<&str> = rows.iter().map(|i| i.incident_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"prior-day"),
+            "23:59 of the prior day must NOT cross into today's replay"
+        );
+        assert!(
+            ids.contains(&"boundary-midnight"),
+            "exact midnight must be included so a midnight-edge incident is never lost on restart"
+        );
+        assert!(
+            ids.contains(&"morning"),
+            "the regular hot-path case must work"
+        );
+    }
+
+    #[test]
+    fn incidents_since_ts_returns_ordered_by_ts() {
+        // Boot replay calls ingest_incident in iteration order; the
+        // graph carries `ts` as the visible field, so out-of-order
+        // replay would not corrupt the KG but it would make the
+        // ingestion log hard to read. Cheap to pin; cheap to honour.
+        let store = Store::open_memory().unwrap();
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 5, 13)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        store
+            .insert_incident(&incident_at("third", base + chrono::Duration::seconds(3)))
+            .unwrap();
+        store
+            .insert_incident(&incident_at("first", base + chrono::Duration::seconds(1)))
+            .unwrap();
+        store
+            .insert_incident(&incident_at("second", base + chrono::Duration::seconds(2)))
+            .unwrap();
+
+        let rows = store
+            .incidents_since_ts(&base.to_rfc3339(), 100)
+            .expect("query must succeed");
+        let ids: Vec<&str> = rows.iter().map(|i| i.incident_id.as_str()).collect();
+        assert_eq!(ids, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn incidents_since_ts_respects_limit() {
+        // Boot replay caps at a large number so a pathological day
+        // can't pin a runtime. The cap must be honoured.
+        let store = Store::open_memory().unwrap();
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 5, 13)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        for n in 0..10 {
+            store
+                .insert_incident(&incident_at(
+                    &format!("inc-{n}"),
+                    base + chrono::Duration::seconds(n),
+                ))
+                .unwrap();
+        }
+        let rows = store.incidents_since_ts(&base.to_rfc3339(), 4).unwrap();
+        assert_eq!(rows.len(), 4, "limit must clamp the row count");
+    }
+
+    #[test]
+    fn incidents_since_ts_returns_empty_for_malformed_timestamp() {
+        // `ts >= ?1` is a TEXT comparison — passing a bogus string
+        // must not panic and must not match every row. Lexicographic
+        // sort puts arbitrary text after numeric prefixes; the
+        // important invariant is "no crash, no surprise inflation".
+        let store = Store::open_memory().unwrap();
+        let now = chrono::Utc::now();
+        store
+            .insert_incident(&incident_at("real-row", now))
+            .unwrap();
+
+        // `not-a-ts` sorts AFTER any RFC-3339 timestamp lexicographically
+        // (digits < letters), so the result is correctly empty rather
+        // than accidentally matching the row.
+        let rows = store
+            .incidents_since_ts("not-a-ts", 100)
+            .expect("garbage input must not error");
+        assert!(rows.is_empty());
     }
 
     #[test]

@@ -578,6 +578,20 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::pr16_algorithm_gate_provider_strings_stay_in_sync_with_prod_writers` — cross-file source-grep anchor: the literal `"obvious-gate"` lives in `incident_obvious.rs`, the literal `"noise-gate"` lives in `incident_autodismiss.rs`, and the classifier in `decision_provenance.rs` branches on the same lowercase strings. Renaming any side without the other fails the build instead of silently demoting prod drill-downs to "Unknown".
 
+- `crates/store/src/incidents.rs::tests::incidents_since_ts_returns_rows_at_or_after_start` — boundary anchor for the boot-replay primitive. `incidents_since_ts(midnight)` includes the exact-midnight row and excludes the prior day. Operator-reported on 2026-05-13: after two same-day deploys the Cases panel showed 141 KG nodes vs 535 SQLite rows because there was no boot-time replay; the off-by-one `>` would silently lose the 00:00 incident on every restart.
+
+- `crates/store/src/incidents.rs::tests::incidents_since_ts_returns_ordered_by_ts` — replay walks rows in chronological order so the ingestion log is readable and downstream graph relationships (TriggeredBy edges that assume time-monotonic ingest) stay consistent.
+
+- `crates/store/src/incidents.rs::tests::incidents_since_ts_respects_limit` — the boot path caps at `MAX_BOOT_REPLAY` so a pathological day cannot pin agent startup.
+
+- `crates/store/src/incidents.rs::tests::incidents_since_ts_returns_empty_for_malformed_timestamp` — garbage `start_ts` (`"not-a-ts"`) returns empty rather than panicking or inflating; guards against config-typo failure modes during early boot.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr18_store_exposes_incidents_since_ts` — source-grep on `store/src/incidents.rs` asserting `pub fn incidents_since_ts(...)` and the `WHERE ts >= ?1 ORDER BY ts ASC` SQL exist. A rename without lockstep boot.rs update breaks here loudly.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr18_boot_path_replays_todays_incidents_into_kg` — source-grep on `loops/boot.rs` asserting the boot path calls `store.incidents_since_ts(...)`, iterates into `g.ingest_incident(inc)`, and carries `MAX_BOOT_REPLAY` as the cap. Pins the contract operator caught on 2026-05-13: KG must mirror SQLite after restart.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr18_replay_primitive_is_idempotent_on_repeat` — running the replay twice over the same data must not double-count KG nodes. Relies on `ingest_incident`'s `upsert_node` semantics on `incident_id`. Without this invariant, every boot would double the surviving overlap between snapshot and SQLite.
+
 - `crates/agent/src/dashboard/mod.rs::tests::threats_kpi_tile_label_is_blocks_not_blocked` (extended in Wave 10) - the Threats KPI tile reads "Block actions" / "today" (aggregate, decisions) and the sidebar group reads "Currently blocked attackers" (snapshot, unique IPs). Pre-Wave-10 the labels read "Blocks · Today" and "Blocked attackers" — same page, different answers, no copy disclosing the snapshot-vs-aggregate axis. Operator's hard rule (2026-05-05): every label must explicitly disclose window + scope + cardinality unit. The test name predates Wave 10 (kept for git-blame continuity); the docstring has been updated to reflect the new disambiguation pair.
 - `crates/agent/src/dashboard/mod.rs::tests::wave10_live_feed_clips_to_rolling_24h_matching_site_label` - the public live-feed builder (`build_live_feed_response`) clips `real_incidents` to `now - 24h` so the site's hardcoded "(24h)" labels (`Live.tsx:415,422,429`) match the underlying data. Source-grep anchor: pins `cutoff_24h = now - chrono::Duration::hours(24)` AND `i.ts >= cutoff_24h` filter in active code. A future "remove the cutoff for performance" PR fails CI loudly.
 

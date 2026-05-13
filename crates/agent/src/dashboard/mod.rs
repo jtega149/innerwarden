@@ -6489,4 +6489,134 @@ mod tests {
              the affordance"
         );
     }
+
+    // ── Spec 049 PR18 — boot-time KG replay of today's incidents ────
+    //
+    // Operator-reported on 2026-05-13 (audit of IP 31.14.254.81 block):
+    // after two same-day agent restarts the Cases panel showed only the
+    // post-restart slice of the day even though the SQLite incidents
+    // table held the full 535-row audit trail. The KG hydration is
+    // snapshot-based — fine for steady-state, but every release deploy
+    // creates a window between the last snapshot and the new agent
+    // process where the dashboard silently shrinks vs the canonical
+    // store.
+    //
+    // PR18 closes the gap by replaying today's `incidents` table into
+    // the KG at boot. These anchors pin:
+    //   1. The store fn the boot path depends on (`incidents_since_ts`).
+    //   2. The contract that the boot path calls that fn AND
+    //      `ingest_incident` in sequence — so a future "refactor that
+    //      removes the replay" or "drops the iteration" fails CI.
+    //   3. The idempotency promise: replaying twice does not double-count
+    //      (relies on `upsert_node` semantics inside `ingest_incident`).
+
+    #[test]
+    fn pr18_store_exposes_incidents_since_ts() {
+        // The store-side primitive is the only file that has a stable
+        // public-API answer to "give me everything since this RFC-3339
+        // string". This source-grep anchor pins the function name so a
+        // rename does not silently leave the boot path calling a stale
+        // symbol (which would compile against a re-export and still
+        // ship broken at runtime if such a re-export existed).
+        const INCIDENTS_SRC: &str = include_str!("../../../store/src/incidents.rs");
+        assert!(
+            INCIDENTS_SRC.contains("pub fn incidents_since_ts("),
+            "PR18 — store must expose `incidents_since_ts`. If you \
+             rename it, update boot.rs in the same commit and re-run \
+             this anchor."
+        );
+        assert!(
+            INCIDENTS_SRC.contains("WHERE ts >= ?1 ORDER BY ts ASC"),
+            "PR18 — the SQL must filter at-or-after the boundary and \
+             return rows in chronological order so the boot log is \
+             readable. An off-by-one `>` here would lose the midnight \
+             incident on every restart."
+        );
+    }
+
+    #[test]
+    fn pr18_boot_path_replays_todays_incidents_into_kg() {
+        // The boot path is hard to exercise from a unit test (it owns
+        // the runtime, the dashboard task, the responder, etc.). What
+        // we CAN pin is the source-level contract: boot.rs must call
+        // `incidents_since_ts` AND iterate the result into
+        // `ingest_incident`. If either drops, the gap operator caught
+        // on 2026-05-13 comes back.
+        const BOOT_SRC: &str = include_str!("../loops/boot.rs");
+        assert!(
+            BOOT_SRC.contains("store.incidents_since_ts("),
+            "PR18 — boot.rs must call store.incidents_since_ts to \
+             enumerate today's incidents from the canonical store"
+        );
+        assert!(
+            BOOT_SRC.contains("g.ingest_incident(inc)"),
+            "PR18 — the replay must re-ingest each row into the \
+             shared KG. Without the iteration the call returns \
+             rows but the operator-visible Cases panel still \
+             shrinks on restart."
+        );
+        assert!(
+            BOOT_SRC.contains("MAX_BOOT_REPLAY"),
+            "PR18 — the walk must carry the boot-replay cap so a \
+             pathological day does not pin agent startup."
+        );
+    }
+
+    #[test]
+    fn pr18_replay_primitive_is_idempotent_on_repeat() {
+        // Anchor on the actual KG primitive: ingest_incident is
+        // upsert-keyed on `incident_id`. Replaying the same set
+        // twice must not double the node count. This is the
+        // invariant that makes "replay every boot" safe even when
+        // the snapshot already covers half the rows.
+        use chrono::Utc;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+
+        let now = Utc::now();
+        let incident = Incident {
+            ts: now,
+            host: "test-host".into(),
+            incident_id: "pr18-anchor:idempotent:1".into(),
+            severity: Severity::High,
+            title: "PR18 anchor".into(),
+            summary: "".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        };
+        store.insert_incident(&incident).expect("insert");
+
+        let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let rows = store
+            .incidents_since_ts(&start.to_rfc3339(), 100)
+            .expect("query");
+        for inc in &rows {
+            graph.ingest_incident(inc);
+        }
+        let after_first = graph.metrics().incident_nodes;
+
+        // Second pass — same input. Without upsert semantics this
+        // would double the count and inflate every Cases panel after
+        // a manual ingest_decision_reset / replay-on-demand call.
+        for inc in &rows {
+            graph.ingest_incident(inc);
+        }
+        let after_second = graph.metrics().incident_nodes;
+        assert_eq!(
+            after_first, after_second,
+            "PR18 — ingest_incident must be idempotent on incident_id; \
+             without this the boot replay would double-count nodes for \
+             any row already covered by the snapshot"
+        );
+        assert_eq!(
+            after_first, 1,
+            "PR18 — one inserted incident must land as exactly one KG \
+             node, not zero (missed) and not two (double-count)"
+        );
+    }
 }
