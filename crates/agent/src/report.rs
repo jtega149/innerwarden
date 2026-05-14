@@ -355,9 +355,22 @@ fn populate_counters_from_graph(
             decision,
             confidence,
             auto_executed,
+            research_only,
             ..
         }) = graph.get_node(id)
         {
+            // 2026-05-14 — exclude research_only incidents (sensor
+            // self-traffic flagged at ingest time per spec 015). Same
+            // filter compute_overview_counts_from_sqlite applies.
+            // Pre-PR27: Report's Trend showed `Incidents 1211` raw
+            // count, the Summary showed `Incidents Today 223`
+            // filtered count — operator-visible disagreement on the
+            // same page. Filtering here lifts the Trend (and Top IPs
+            // / Incidents By Type) to the same semantic the Summary
+            // already used.
+            if *research_only {
+                continue;
+            }
             counters.total_incidents += 1;
             *counters
                 .incidents_by_type
@@ -2989,6 +3002,79 @@ mod tests {
         );
         assert_eq!(report.data_quality.incidents_without_entities, 0);
         assert!(report.operational_health.expected_files_present);
+    }
+
+    #[test]
+    fn populate_counters_from_graph_excludes_research_only_incidents() {
+        // 2026-05-14 — Report Trend showed `Incidents 1211` while
+        // Summary showed `Incidents Today 223` on the SAME page for
+        // the SAME day. Cause: this function counted every Incident
+        // node, including those flagged `research_only` (sensor
+        // self-traffic auto-tagged at ingest per spec 015). The
+        // Summary used compute_overview_counts_from_sqlite which
+        // already filtered research_only.
+        //
+        // Anchor: two incidents (one normal, one research_only),
+        // total_incidents must be 1 (the normal one).
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = Utc::now();
+        graph.add_node(Node::Incident {
+            incident_id: "real-attack:1".to_string(),
+            detector: "ssh_bruteforce".to_string(),
+            severity: "high".to_string(),
+            title: "real".to_string(),
+            summary: "real".to_string(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_node(Node::Incident {
+            incident_id: "self-traffic:1".to_string(),
+            detector: "proto_anomaly".to_string(),
+            severity: "low".to_string(),
+            title: "self".to_string(),
+            summary: "self".to_string(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: true,
+        });
+
+        let counters = counters_from_graph(&graph);
+        assert_eq!(
+            counters.total_incidents, 1,
+            "PR27 — research_only incidents must NOT inflate Trend's \
+             total_incidents. Without this filter the Trend and the \
+             Summary disagreed on the same page (1211 vs 223 in prod \
+             on 2026-05-14)."
+        );
+        // The non-research_only detector must appear in the type
+        // breakdown; the research_only one must NOT.
+        assert_eq!(
+            counters.incidents_by_type.get("ssh_bruteforce").copied(),
+            Some(1)
+        );
+        assert!(
+            !counters.incidents_by_type.contains_key("proto_anomaly"),
+            "research_only incidents must not contribute to incidents_by_type"
+        );
     }
 
     #[test]
