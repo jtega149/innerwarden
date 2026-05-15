@@ -488,6 +488,27 @@
     </div>
   </div>
 
+  <!-- 2026-05-15 PR-D: Campaign cluster modal — opens from a tag on
+       the Cases journey header ("part of campaign X — N IPs"). Lists
+       the cluster's member IPs as chips that drill down into the
+       shared Attacker dossier modal (PR-A) on click. Replaces the
+       deleted Intel `Campaigns` sub-tab (PR-B) with a per-case-aware
+       surface: the operator sees the campaign only when looking at a
+       case that's part of one, instead of having to browse an
+       aggregate listing. -->
+  <div id="campaignModal" class="enf-modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="campaignModalTitle">
+    <div class="enf-modal-overlay" onclick="closeCampaignModal()"></div>
+    <div class="enf-modal-box">
+      <div class="enf-modal-header">
+        <h3 id="campaignModalTitle">Campaign</h3>
+        <button type="button" class="enf-modal-close" onclick="closeCampaignModal()" aria-label="Close">&times;</button>
+      </div>
+      <div id="campaignModalBody" class="enf-modal-content">
+        <div style="color:var(--muted)">Loading…</div>
+      </div>
+    </div>
+  </div>
+
   <!-- 2026-05-15 PR-A: shared Attacker dossier modal — opens from
        Cases journey ("View full profile") and from Intel profile-list
        row clicks. Single drill-down surface so the dossier stays

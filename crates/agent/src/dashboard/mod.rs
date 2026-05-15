@@ -5540,6 +5540,145 @@ mod tests {
         );
     }
 
+    // ── 2026-05-15 PR-D: campaign tag on Cases journey ───────────────
+    // The deleted Intel `Campaigns` sub-tab (PR-B) is replaced by a
+    // per-case-aware tag in the Cases journey header. When the
+    // attacker IP belongs to a cluster returned by /api/campaigns,
+    // the tag reads "campaign · <id> · N IPs". Click opens a modal
+    // listing the cluster's member IPs as chips that drill down into
+    // the shared dossier modal from PR-A. Anchors below pin:
+    //   (1) markup for the campaign modal,
+    //   (2) the placeholder tag on the journey header,
+    //   (3) journey.js wires loadCampaignTagForJourney + openCampaignModal,
+    //   (4) the modal's member-IP chip onclick targets openProfileModal
+    //       (single drill-down surface — same shared modal as Intel).
+
+    #[test]
+    fn pr_d_campaign_modal_markup_and_close_paths_exist() {
+        for marker in [
+            "id=\"campaignModal\"",
+            "id=\"campaignModalTitle\"",
+            "id=\"campaignModalBody\"",
+            "onclick=\"closeCampaignModal()\"",
+        ] {
+            assert!(
+                INDEX_HTML.contains(marker),
+                "PR-D Campaign modal must contain `{marker}`"
+            );
+        }
+        let modal_start = INDEX_HTML
+            .find("id=\"campaignModal\"")
+            .expect("campaignModal present");
+        let modal_end = INDEX_HTML[modal_start..]
+            .find("</div>\n  </div>")
+            .expect("end of campaignModal block")
+            + modal_start;
+        let modal_block = &INDEX_HTML[modal_start..modal_end];
+        assert!(
+            modal_block.contains("enf-modal-overlay\" onclick=\"closeCampaignModal()\""),
+            "campaign modal overlay must call closeCampaignModal() — click-outside escape path"
+        );
+    }
+
+    #[test]
+    fn pr_d_journey_header_carries_campaign_tag_placeholder() {
+        // Anchor on the placeholder span inside the journey header
+        // template so a refactor that drops the placeholder leaves
+        // loadCampaignTagForJourney with nothing to bind to.
+        let header_start = JS_JOURNEY
+            .find("<div class=\"journey-header\">")
+            .expect("journey-header template present");
+        let header_end = JS_JOURNEY[header_start..]
+            .find("</div>")
+            .expect("end of journey-header")
+            + header_start;
+        let header_block = &JS_JOURNEY[header_start..header_end];
+        assert!(
+            header_block.contains("id=\"journeyCampaignTag\""),
+            "journey-header MUST carry the campaign-tag placeholder `#journeyCampaignTag` \
+             (PR-D 2026-05-15)"
+        );
+    }
+
+    #[test]
+    fn pr_d_journey_loads_and_hydrates_campaign_tag() {
+        // Two surfaces in journey.js:
+        //   (a) loadJourney() calls loadCampaignTagForJourney after the
+        //       successful render so the tag hydrates without blocking
+        //       the timeline paint;
+        //   (b) loadCampaignTagForJourney exists and bails for non-IP
+        //       subjects (campaigns correlate IPs only).
+        assert!(
+            JS_JOURNEY.contains("loadCampaignTagForJourney(subjectType, subjectValue)"),
+            "loadJourney MUST call loadCampaignTagForJourney(subjectType, subjectValue) \
+             after the render — operator should see the tag without re-clicking"
+        );
+        assert!(
+            JS_JOURNEY
+                .contains("async function loadCampaignTagForJourney(subjectType, subjectValue)"),
+            "journey.js MUST define loadCampaignTagForJourney(subjectType, subjectValue)"
+        );
+        let fn_start = JS_JOURNEY
+            .find("async function loadCampaignTagForJourney(subjectType, subjectValue)")
+            .expect("loadCampaignTagForJourney present");
+        let fn_end = JS_JOURNEY[fn_start..]
+            .find("\n}\n")
+            .expect("end of loadCampaignTagForJourney")
+            + fn_start;
+        let fn_body = &JS_JOURNEY[fn_start..fn_end];
+        assert!(
+            fn_body.contains("(subjectType || '').toLowerCase() !== 'ip'"),
+            "loadCampaignTagForJourney MUST bail when subject is not an IP — \
+             campaigns correlate IPs only, non-IP subjects (user/container/process) get no tag"
+        );
+        assert!(
+            fn_body.contains("_fetchCampaignsCached()"),
+            "loadCampaignTagForJourney MUST go through the cached campaigns fetcher \
+             — one /api/campaigns call per session, not per journey"
+        );
+        // Click handler must open the modal with the case's IP threaded in.
+        assert!(
+            fn_body.contains("openCampaignModal(subjectValue)"),
+            "tag onclick MUST call openCampaignModal(subjectValue) — operator clicked the \
+             tag on THIS case, modal must show clusters involving THIS ip"
+        );
+    }
+
+    #[test]
+    fn pr_d_campaign_modal_routes_member_ips_through_shared_dossier() {
+        // The whole point of folding Campaigns into Cases as a tag is
+        // that the operator stays on one drill-down surface. Clicking
+        // any member-IP chip in the campaign modal MUST open the
+        // PR-A shared dossier modal — not switch view, not re-route.
+        assert!(
+            JS_JOURNEY.contains("async function openCampaignModal(ip)"),
+            "journey.js MUST define openCampaignModal(ip)"
+        );
+        let fn_start = JS_JOURNEY
+            .find("async function openCampaignModal(ip)")
+            .expect("openCampaignModal present");
+        let fn_end = JS_JOURNEY[fn_start..]
+            .find("\n}\n")
+            .expect("end of openCampaignModal")
+            + fn_start;
+        let fn_body = &JS_JOURNEY[fn_start..fn_end];
+        assert!(
+            fn_body.contains("onclick=\"openProfileModal(\\'"),
+            "campaign modal member-IP chips MUST onclick into openProfileModal(ip) \
+             — single drill-down surface (the PR-A shared dossier)"
+        );
+        // Anti-regression: a paste error reviving the deleted Intel
+        // tab dance would break the single-surface invariant.
+        assert!(
+            !fn_body.contains("switchIntelTab"),
+            "openCampaignModal MUST NOT switch Intel sub-tabs — those are gone (PR-B/C)"
+        );
+        assert!(
+            !fn_body.contains("showView('intel')"),
+            "openCampaignModal MUST NOT navigate to Intel — the dossier is a modal now"
+        );
+    }
+
     #[test]
     fn pr_baseline_lives_on_health_tab_and_is_wired_into_load_status() {
         // PR-C: Baseline content (Hero + deviation cards + collapsed

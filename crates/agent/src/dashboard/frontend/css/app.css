@@ -324,6 +324,28 @@
     .journey-time { font-size: 0.75rem; color: var(--muted); }
     .journey-subtitle { font-size: 0.78rem; color: var(--muted); margin-bottom: 18px; }
 
+    /* 2026-05-15 PR-D: campaign-membership pill on the journey
+       header. Click opens the campaign modal listing the cluster. */
+    .journey-campaign-tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 10px;
+      border-radius: 12px;
+      background: rgba(120, 229, 255, 0.10);
+      border: 1px solid rgba(120, 229, 255, 0.32);
+      color: var(--accent);
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .journey-campaign-tag:hover {
+      background: rgba(120, 229, 255, 0.20);
+      border-color: rgba(120, 229, 255, 0.55);
+    }
+    .journey-campaign-tag-label { line-height: 1; }
+
     .journey-actions {
       display: flex; gap: 6px; margin: 0 0 12px;
     }

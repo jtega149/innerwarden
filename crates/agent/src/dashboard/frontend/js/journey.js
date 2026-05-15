@@ -879,6 +879,11 @@ async function loadJourney(subjectType, subjectValue, focusIncidentId) {
         <span class="${outcomeCls(typeof outcomeOf === 'function' ? outcomeOf({outcome: j.outcome}) : j.outcome)}">${outcomeLabel(typeof outcomeOf === 'function' ? outcomeOf({outcome: j.outcome}) : j.outcome)}</span>
         ${blockStateBadgeHtml(j.block_state)}
         <span class="journey-time">${esc(first)} → ${esc(last)}</span>
+        <!-- 2026-05-15 PR-D: campaign membership tag. Empty until
+             loadCampaignTagForJourney resolves; shown only when this
+             attacker IP belongs to one of the clusters returned by
+             /api/campaigns. Click opens the campaign modal. -->
+        <span id="journeyCampaignTag" class="journey-campaign-tag" style="display:none"></span>
       </div>
       <div class="journey-subtitle">${esc((j.subject_type || subjectType).toUpperCase())} journey · ${j.entries.length} timeline entries · click any row to expand</div>
       ${renderRecurrenceBlock(j.recurrence)}
@@ -1126,6 +1131,10 @@ async function loadJourney(subjectType, subjectValue, focusIncidentId) {
 
     // Load mini-graph for this subject
     loadJourneyGraph(subjectType, subjectValue);
+    // 2026-05-15 PR-D: hydrate the campaign-membership tag in the
+    // header. Async so a missing /api/campaigns or a non-IP subject
+    // doesn't delay the rest of the journey render.
+    loadCampaignTagForJourney(subjectType, subjectValue);
   } catch (e) {
     // Swallow AbortError quietly: a fast user toggle/IP switch raced
     // and we already kicked off the new fetch that owns the panel.
@@ -1301,6 +1310,152 @@ function renderObsVerifyScore(reason) {
   }
 
   return '';
+}
+
+// ── 2026-05-15 PR-D: campaign tag on Cases header ───────────────────
+// The deleted Intel `Campaigns` sub-tab (PR-B) is replaced by a
+// per-case-aware tag in the journey header. The tag reads "part of
+// campaign X · N IPs" when the current attacker IP belongs to a
+// cluster returned by /api/campaigns; clicking it opens a modal with
+// the cluster's member-IP list. Each member chip drills down into the
+// shared Attacker dossier modal from PR-A.
+//
+// `_campaignCache` is keyed off the page lifetime — campaigns refresh
+// every 5 minutes server-side, so a one-shot lazy fetch per session is
+// adequate. A manual refresh on the journey would re-issue the fetch
+// only if the cache is stale (>5 min).
+
+let _campaignCache = null;
+let _campaignCacheFetchedAt = 0;
+const _CAMPAIGN_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function _fetchCampaignsCached() {
+  const now = Date.now();
+  if (_campaignCache && (now - _campaignCacheFetchedAt) < _CAMPAIGN_CACHE_TTL_MS) {
+    return _campaignCache;
+  }
+  try {
+    const data = await loadJson('/api/campaigns');
+    _campaignCache = Array.isArray(data && data.campaigns) ? data.campaigns : [];
+    _campaignCacheFetchedAt = now;
+    return _campaignCache;
+  } catch (e) {
+    return _campaignCache || [];
+  }
+}
+
+function _findCampaignsContainingIp(campaigns, ip) {
+  if (!ip || !Array.isArray(campaigns)) return [];
+  return campaigns.filter(function (c) {
+    return c && Array.isArray(c.member_ips) && c.member_ips.indexOf(ip) !== -1;
+  });
+}
+
+async function loadCampaignTagForJourney(subjectType, subjectValue) {
+  // Campaigns correlate IPs only. Non-IP subjects (user / container /
+  // process) get no tag.
+  if ((subjectType || '').toLowerCase() !== 'ip' || !subjectValue) return;
+  const tag = document.getElementById('journeyCampaignTag');
+  if (!tag) return;
+  // Stash the IP on the tag so the click handler can pass it through
+  // even after the cache has refreshed and reordered.
+  tag.setAttribute('data-ip', subjectValue);
+  const all = await _fetchCampaignsCached();
+  const matches = _findCampaignsContainingIp(all, subjectValue);
+  // Re-check the tag is still bound to THIS IP (rapid case switch
+  // protection — the user may have moved on to another journey while
+  // the campaigns fetch was in flight).
+  if (tag.getAttribute('data-ip') !== subjectValue) return;
+  if (matches.length === 0) {
+    tag.style.display = 'none';
+    tag.innerHTML = '';
+    return;
+  }
+  // First match wins for the tag copy. The modal lists every campaign
+  // the IP belongs to when clicked (rare but possible).
+  const first = matches[0];
+  const count = (first.member_ips || []).length;
+  const more = matches.length > 1 ? ' (+' + (matches.length - 1) + ' more)' : '';
+  tag.style.display = '';
+  tag.innerHTML =
+    '<span class="journey-campaign-tag-label">campaign · ' + esc(first.campaign_id) +
+    ' · ' + count + ' IPs' + more + '</span>';
+  tag.onclick = function (e) {
+    e.preventDefault();
+    openCampaignModal(subjectValue);
+  };
+  tag.setAttribute('role', 'button');
+  tag.setAttribute('tabindex', '0');
+}
+
+async function openCampaignModal(ip) {
+  if (!ip) return;
+  const modal = document.getElementById('campaignModal');
+  const title = document.getElementById('campaignModalTitle');
+  const body = document.getElementById('campaignModalBody');
+  if (!modal || !body) return;
+  body.innerHTML = '<div style="color:var(--muted);padding:24px;text-align:center">Loading…</div>';
+  modal.style.display = 'flex';
+  const closeBtn = modal.querySelector('.enf-modal-close');
+  if (closeBtn) closeBtn.focus();
+  const all = await _fetchCampaignsCached();
+  const matches = _findCampaignsContainingIp(all, ip);
+  if (matches.length === 0) {
+    if (title) title.textContent = 'No campaign for ' + ip;
+    body.innerHTML = '<p style="color:var(--muted);padding:16px">' + esc(ip) + ' is not part of any detected campaign right now.</p>';
+    return;
+  }
+  if (title) title.textContent = matches.length === 1
+    ? 'Campaign · ' + matches[0].campaign_id
+    : matches.length + ' campaigns involving ' + ip;
+  let html = '';
+  for (let i = 0; i < matches.length; i++) {
+    const c = matches[i];
+    const confColor = c.confidence === 'high' ? '#e74c3c' : c.confidence === 'medium' ? '#f39c12' : '#27ae60';
+    html += '<div style="padding:14px 0;border-bottom:1px solid var(--border);">';
+    html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">';
+    html += '<span style="font-weight:700;font-size:1.05rem;">' + esc(c.campaign_id) + '</span>';
+    html += '<span style="padding:2px 8px;border-radius:4px;background:' + confColor + '20;color:' + confColor + ';font-size:0.7rem;font-weight:600;">' + esc(c.confidence || 'unknown') + '</span>';
+    html += '<span style="padding:2px 8px;border-radius:4px;background:var(--border);font-size:0.65rem;">' + esc(c.correlation_type || '') + '</span>';
+    html += '<span style="margin-left:auto;font-size:0.75rem;color:var(--dim);">' + (c.total_incidents || 0) + ' incidents · risk ' + (c.max_risk_score || 0) + '</span>';
+    html += '</div>';
+    if (c.summary) html += '<div style="font-size:0.82rem;margin-bottom:8px;">' + esc(c.summary) + '</div>';
+    html += '<div style="font-size:0.7rem;color:var(--dim);margin-bottom:4px;">Member IPs (' + (c.member_ips || []).length + ') — click any to open dossier</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:4px;">';
+    for (const memberIp of (c.member_ips || [])) {
+      const isCurrent = memberIp === ip;
+      const tint = isCurrent ? 'background:rgba(120,229,255,0.18);border:1px solid var(--accent);' : 'background:var(--border);';
+      html += '<span onclick="openProfileModal(\'' + esc(memberIp) + '\')" role="button" tabindex="0" style="padding:2px 8px;border-radius:4px;font-family:monospace;font-size:0.75rem;cursor:pointer;' + tint + '">' + esc(memberIp) + '</span>';
+    }
+    html += '</div>';
+    if (c.shared_dna_signature) {
+      html += '<div style="margin-top:6px;font-size:0.7rem;color:var(--dim);">DNA: <code>' + esc(c.shared_dna_signature) + '</code></div>';
+    }
+    if (Array.isArray(c.shared_iocs) && c.shared_iocs.length > 0) {
+      html += '<div style="margin-top:4px;font-size:0.7rem;color:var(--dim);">Shared IOCs: ' + c.shared_iocs.slice(0, 5).map(esc).join(', ') + '</div>';
+    }
+    html += '</div>';
+  }
+  body.innerHTML = html;
+}
+
+function closeCampaignModal() {
+  const modal = document.getElementById('campaignModal');
+  if (!modal) return;
+  modal.style.display = 'none';
+  const body = document.getElementById('campaignModalBody');
+  if (body) body.innerHTML = '<div style="color:var(--muted);padding:24px;text-align:center">Loading…</div>';
+}
+
+// Escape-to-close, single document-level listener (don't leak across opens).
+if (typeof window !== 'undefined' && !window._campaignModalEscBound) {
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      const modal = document.getElementById('campaignModal');
+      if (modal && modal.style.display !== 'none') closeCampaignModal();
+    }
+  });
+  window._campaignModalEscBound = true;
 }
 
 // Detector priority: higher = more important (used to pick primary group)

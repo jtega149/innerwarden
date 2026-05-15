@@ -1290,6 +1290,15 @@ Operator simplification across two PRs. PR-B (#632) deleted the Campaigns / Chai
 - `crates/agent/src/dashboard/mod.rs::tests::pr_intel_slim_only_profiles_entry_point_remains` — `loadIntel()` + `fetchAndRenderIntel(append)` survive as Intel's only entry points; Profile-row click still goes through `openProfileModal(ip)` from PR-A.
 - `crates/agent/src/dashboard/mod.rs::tests::pr_baseline_lives_on_health_tab_and_is_wired_into_load_status` — `renderBaselineHealthSection(mountSelector)` defined in status.js; `loadStatus` mounts `#baseline-health-mount` and hydrates it via the section renderer; the renderer body MUST NOT reference Intel surfaces (`intelContent`, `intelViewStatus`, `_activeFetch_intel`) — the move severs the cross-view dependency.
 
+### Campaign membership tag on Cases journey (2026-05-15 PR-D)
+
+The deleted Intel `Campaigns` sub-tab (PR-B) is replaced by a per-case-aware tag in the Cases journey header. When the case's attacker IP belongs to a cluster returned by `/api/campaigns`, the tag reads `campaign · <id> · N IPs`; clicking it opens a campaign modal listing the cluster's member IPs as chips. Each chip drills down into the shared Attacker dossier modal from PR-A — single drill-down surface, regardless of where the operator started (Cases case, Intel profile row, or campaign-modal chip). The campaigns fetch is session-cached (5min TTL) so one `/api/campaigns` request covers every journey opened in the session.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr_d_campaign_modal_markup_and_close_paths_exist` — `#campaignModal` + title + body in `index.html`; close paths wired on X button + overlay click-outside.
+- `crates/agent/src/dashboard/mod.rs::tests::pr_d_journey_header_carries_campaign_tag_placeholder` — `#journeyCampaignTag` placeholder span sits inside the `.journey-header` template so `loadCampaignTagForJourney` has a stable mount.
+- `crates/agent/src/dashboard/mod.rs::tests::pr_d_journey_loads_and_hydrates_campaign_tag` — `loadJourney` calls `loadCampaignTagForJourney(subjectType, subjectValue)` after the timeline renders; the function bails for non-IP subjects (campaigns correlate IPs only); routes through the cached `_fetchCampaignsCached()` helper; tag onclick opens `openCampaignModal(subjectValue)` with the case's IP threaded in.
+- `crates/agent/src/dashboard/mod.rs::tests::pr_d_campaign_modal_routes_member_ips_through_shared_dossier` — `openCampaignModal(ip)` body emits member-IP chips that onclick into `openProfileModal(ip)` (single drill-down surface, PR-A); does NOT switch sub-tabs or navigate to Intel (anti-regression: the deleted tab-dance must stay buried).
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
