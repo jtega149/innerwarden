@@ -68,11 +68,20 @@ function syncFiltersFromUi() {
     }
   }
   state.filters.date = rawDate;
-  state.filters.compare_date = document.getElementById('flt-compare-date').value || '';
-  state.filters.severity_min = document.getElementById('flt-severity').value || '';
-  state.filters.detector = (document.getElementById('flt-detector').value || '').trim();
-  state.filters.window_seconds = document.getElementById('flt-window').value || '';
-  state.filters.status = document.getElementById('flt-status').value || '';
+  // 2026-05-15 slim-down: compare-date, severity, detector, window and
+  // status inputs were removed from the Cases sidebar. Guard each read
+  // so syncFiltersFromUi does not throw on null.value — the state
+  // fields are kept in `state.filters` for URL-deep-link replay.
+  var cmpEl = document.getElementById('flt-compare-date');
+  state.filters.compare_date = cmpEl ? (cmpEl.value || '') : '';
+  var sevEl = document.getElementById('flt-severity');
+  state.filters.severity_min = sevEl ? (sevEl.value || '') : '';
+  var detEl = document.getElementById('flt-detector');
+  state.filters.detector = detEl ? ((detEl.value || '').trim()) : '';
+  var winEl = document.getElementById('flt-window');
+  state.filters.window_seconds = winEl ? (winEl.value || '') : '';
+  var statEl = document.getElementById('flt-status');
+  state.filters.status = statEl ? (statEl.value || '') : '';
   // Spec 049 PR5: hour-of-day picker. Validate at the UI boundary so
   // a malformed value (e.g. typed "99") never reaches the backend.
   // Same contract as `parse_hour_filter` in `data_api.rs`: both must
