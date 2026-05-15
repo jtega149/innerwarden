@@ -10,11 +10,21 @@ async function loadStatus() {
       loadJson('/api/collectors').catch(() => ({ collectors: [] }))
     ]);
     status.textContent = 'Updated ' + new Date().toLocaleTimeString();
-    content.innerHTML = renderStatus(s, col.collectors || []);
+    content.innerHTML = renderStatus(s, col.collectors || [])
+      // 2026-05-15: Enforcement section migrated here from the removed
+      // Responses tab. Mount point gets populated lazily by
+      // renderEnforcementHealthSection (defined in responses.js).
+      + '<div id="enforcement-health-mount"></div>';
     loadDeepSecurity();
     // Spec 024: populate the Metrics Drift section after the table
     // skeleton lands in the DOM.
     loadMetricsDrift();
+    // 2026-05-15: enforcement stats + orphan diagnostics now live on
+    // Health, not on a dedicated Responses tab. Lazy-mount under the
+    // existing content so the rest of the Health page stays unchanged.
+    if (typeof renderEnforcementHealthSection === 'function') {
+      renderEnforcementHealthSection('enforcement-health-mount');
+    }
   } catch(e) {
     status.textContent = 'error';
     content.innerHTML = '<div class="empty" style="padding:40px;color:var(--danger)">Failed: ' + esc(String(e.message)) + '</div>';

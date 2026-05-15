@@ -24,9 +24,12 @@ function toggleLeftPanel() {
 }
 
 // ── D10 - View switcher ──────────────────────────────────────────────────
-// Audit 4.6: `responses` is now a top-level nav button, so it no
-// longer needs to live in the More dropdown's secondary list. The
-// dropdown only carries review surfaces (no operator-action surfaces).
+// 2026-05-15: the standalone `responses` tab was removed. Per-attacker
+// enforcement detail now renders on the journey panel (Enforcement
+// block); the cross-attacker audit view is a modal opened from the
+// Cases sidebar; lifetime stats and orphan diagnostics moved to the
+// Health tab. The `/api/responses` endpoint stays (consumed by the
+// modal, Health tab, and Home strip).
 const _secondaryTabs = ['sensors','report','honeypot','compliance','monthly','graph'];
 const _secondaryLabels = { sensors:'Sensors', report:'Report', honeypot:'Honeypot', compliance:'Compliance', monthly:'Monthly', graph:'Graph' };
 
@@ -36,8 +39,8 @@ function toggleMoreMenu() {
 }
 
 function showView(name) {
-  const views = { home: 'viewHome', sensors: 'viewSensors', investigate: 'viewInvestigate', report: 'viewReport', status: 'viewStatus', honeypot: 'viewHoneypot', compliance: 'viewCompliance', intel: 'viewIntel', monthly: 'viewMonthly', responses: 'viewResponses', fleet: 'viewFleet', graph: 'viewGraph' };
-  const btns  = { home: 'navHome', sensors: 'navSensors', investigate: 'navInvestigate', report: 'navReport', status: 'navStatus', honeypot: 'navHoneypot', compliance: 'navCompliance', intel: 'navIntel', monthly: 'navMonthly', responses: 'navResponses', fleet: 'navFleet', graph: 'navGraph' };
+  const views = { home: 'viewHome', sensors: 'viewSensors', investigate: 'viewInvestigate', report: 'viewReport', status: 'viewStatus', honeypot: 'viewHoneypot', compliance: 'viewCompliance', intel: 'viewIntel', monthly: 'viewMonthly', fleet: 'viewFleet', graph: 'viewGraph' };
+  const btns  = { home: 'navHome', sensors: 'navSensors', investigate: 'navInvestigate', report: 'navReport', status: 'navStatus', honeypot: 'navHoneypot', compliance: 'navCompliance', intel: 'navIntel', monthly: 'navMonthly', fleet: 'navFleet', graph: 'navGraph' };
   // Update URL hash (use friendly name for threats)
   var hashName = name === 'investigate' ? 'threats' : name;
   if (location.hash !== '#' + hashName) {
@@ -101,7 +104,6 @@ function showView(name) {
   if (name === 'compliance') loadCompliance();
   if (name === 'intel') loadIntel();
   if (name === 'monthly') loadMonthly();
-  if (name === 'responses') loadResponses();
   if (name === 'fleet') loadFleet();
   // Graph tab was removed and stats moved to Health; the old loadGraph()
   // module is no longer bundled so we stop dispatching here too.

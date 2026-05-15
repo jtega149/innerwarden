@@ -41,6 +41,92 @@ function renderCasesSidebarBand(overview) {
 // route both names through the same function.
 function renderCurrentStateBand(overview) { renderCasesSidebarBand(overview); }
 
+// ── 2026-05-15: Enforcement audit modal ─────────────────────────────
+// Cross-attacker view of every active block on every backend. Replaces
+// the standalone Responses tab. Per-attacker enforcement detail lives
+// inline on the journey panel (renderEnforcementBlock in journey.js);
+// this modal is the OPERATOR's bird-eye view when they need to audit
+// the whole kernel state at once.
+
+function updateEnforcementAuditCount(responsesPayload) {
+  var countEl = document.getElementById('enforcementAuditCount');
+  if (!countEl) return;
+  var active = (responsesPayload && responsesPayload.gauges && responsesPayload.gauges.active != null)
+    ? responsesPayload.gauges.active
+    : (responsesPayload && Array.isArray(responsesPayload.active) ? responsesPayload.active.length : 0);
+  countEl.textContent = active;
+  countEl.title = active === 1 ? '1 enforcement entry active right now' : (active + ' enforcement entries active right now');
+}
+
+function openEnforcementModal() {
+  var modal = document.getElementById('enforcementModal');
+  var content = document.getElementById('enforcementModalContent');
+  if (!modal || !content) return;
+  modal.style.display = 'flex';
+  content.innerHTML = '<div style="color:var(--muted)">Loading…</div>';
+  loadJson('/api/responses').then(function(r) {
+    renderEnforcementModal(r);
+  }).catch(function(e) {
+    content.innerHTML = '<div style="color:var(--danger)">Failed to load: ' + esc(e.message || String(e)) + '</div>';
+  });
+}
+
+function closeEnforcementModal() {
+  var modal = document.getElementById('enforcementModal');
+  if (modal) modal.style.display = 'none';
+}
+
+function renderEnforcementModal(r) {
+  var content = document.getElementById('enforcementModalContent');
+  if (!content) return;
+  var active = (r && Array.isArray(r.active)) ? r.active : [];
+  var gauges = (r && r.gauges) || {};
+
+  var header = '<div style="margin-bottom:10px;color:var(--muted);font-size:0.74rem;letter-spacing:0.04em;text-transform:uppercase">'
+    + (gauges.active || active.length) + ' active'
+    + ' · ' + (gauges.orphaned || 0) + ' orphaned'
+    + ' · ' + (gauges.in_retry || 0) + ' in retry'
+    + ' · ' + (gauges.pending || 0) + ' pending'
+    + '</div>';
+
+  if (active.length === 0) {
+    content.innerHTML = header + '<div style="color:var(--dim);padding:20px 0;text-align:center">No active blocks. All have expired or been reverted.</div>';
+    return;
+  }
+
+  var rows = active.map(function(a) {
+    var stateKind = (a.state && a.state.kind) || 'active';
+    var stateBadge = '<span class="enf-state enf-state-' + esc(stateKind === 'revert_pending' ? 'pending' : (stateKind === 'revert_failed' ? 'failed' : 'active')) + '">' + esc(stateKind.replace('_', ' ')) + '</span>';
+    var ttlSecs = a.ttl_secs || 0;
+    var ttlH = Math.floor(ttlSecs / 3600);
+    var ttlLabel = ttlH > 0 ? (ttlH + 'h') : Math.max(0, Math.floor(ttlSecs / 60)) + 'm';
+    var remSecs = a.remaining_secs || 0;
+    var remMins = Math.floor(remSecs / 60);
+    var remHrs = Math.floor(remMins / 60);
+    var remaining = remHrs > 0 ? (remHrs + 'h ' + (remMins % 60) + 'm') : (remMins + 'm');
+    return '<tr>'
+      + '<td class="enf-modal-target">' + esc(a.target || '') + '</td>'
+      + '<td><span class="enf-backend">' + esc(a.backend || '') + '</span></td>'
+      + '<td>' + stateBadge + '</td>'
+      + '<td>' + esc(a.type || 'block_ip') + '</td>'
+      + '<td>' + esc(ttlLabel) + '</td>'
+      + '<td>' + esc(remaining) + '</td>'
+      + '<td style="color:var(--dim);font-size:0.7rem">' + esc((a.incident_id || '').substring(0, 60)) + '</td>'
+      + '</tr>';
+  }).join('');
+
+  content.innerHTML = header
+    + '<table class="enf-modal-table">'
+    + '<thead><tr><th>Target</th><th>Backend</th><th>State</th><th>Type</th><th>TTL</th><th>Remaining</th><th>Incident</th></tr></thead>'
+    + '<tbody>' + rows + '</tbody>'
+    + '</table>';
+}
+
+// Esc key closes the modal.
+document.addEventListener('keydown', function(ev) {
+  if (ev.key === 'Escape') closeEnforcementModal();
+});
+
 var DETECTOR_PRIORITY = {
   reverse_shell: 100, fileless_exec: 95, container_escape: 90,
   rootkit: 85, data_exfil_cmd: 80, sudo_abuse: 75,
@@ -752,19 +838,24 @@ async function refreshLeftLive() {
       group_by: state.pivot,
     });
 
-    const [ov, entityData] = await Promise.all([
+    const [ov, entityData, responsesPayload] = await Promise.all([
       loadJson('/api/overview' + (overviewQs ? '?' + overviewQs : '')),
       state.pivot === 'ip'
         ? loadJson('/api/entities?' + entityQs).then((r) => ({
             items: (r.attackers || []).map((a) => ({ ...a, value: a.ip, group_by: 'ip' })),
           }))
         : loadJson('/api/pivots?' + entityQs),
+      // 2026-05-15: keep the "View all enforcement (N)" link in sync
+      // with the kernel ground-truth on every refresh.
+      loadJson('/api/responses').catch(function() { return {}; }),
     ]);
 
     const items = entityData.items || [];
 
     window._lastOverview = ov;
     window._lastEntityItems = items;
+    window._lastResponsesPayload = responsesPayload;
+    updateEnforcementAuditCount(responsesPayload);
 
     // Spec 049 PR5: render operator TZ on the scope picker label so
     // the operator never has to guess what timezone "yesterday at
@@ -839,7 +930,7 @@ async function refreshLeft(forceRefreshJourney = false) {
       window_seconds: state.filters.window_seconds,
     });
 
-    const [ov, entityData, clusterData, statusData] = await Promise.all([
+    const [ov, entityData, clusterData, statusData, responsesPayload] = await Promise.all([
       loadJson('/api/overview' + (overviewQs ? '?' + overviewQs : '')),
       state.pivot === 'ip'
         ? loadJson('/api/entities?' + entityQs).then((r) => ({
@@ -852,11 +943,15 @@ async function refreshLeft(forceRefreshJourney = false) {
         : loadJson('/api/pivots?' + entityQs),
       loadJson('/api/clusters?' + clusterQs),
       loadJson('/api/status').catch(() => ({ mode: 'guard' })),
+      // 2026-05-15: keep the enforcement-audit count fresh on manual refresh.
+      loadJson('/api/responses').catch(function() { return {}; }),
     ]);
 
     // Store agent mode globally so outcomeOf() can adapt.
     // guard = AI blocks autonomously, watch/read_only = AI detects only.
     window._agentMode = statusData.mode || 'guard';
+    window._lastResponsesPayload = responsesPayload;
+    updateEnforcementAuditCount(responsesPayload);
 
     // Phase 12 (QA fix #1): persistent header pill must reflect
     // runtime SystemHealth, not just the static GUARD/WATCH mode.

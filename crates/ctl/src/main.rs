@@ -1244,6 +1244,31 @@ enum GetCommand {
         action: Option<String>,
     },
 
+    /// Show response (enforcement) audit log: active blocks + recent reverts.
+    ///
+    /// Reads the agent's `responses.json` on disk (the same source that drove
+    /// the dashboard's Responses tab before it was removed in 2026-05-15). For
+    /// the live dashboard view, open Cases → "View all enforcement". For
+    /// per-attacker enforcement, click the attacker on Cases.
+    ///
+    /// Examples:
+    ///   innerwarden get responses
+    ///   innerwarden get responses --history --since-days 7
+    ///   innerwarden get responses --ip 1.2.3.4
+    Responses {
+        /// Include the recent revert history (off by default — active blocks only)
+        #[arg(long)]
+        history: bool,
+
+        /// When --history is set, how many days back to include (default: 7)
+        #[arg(long, default_value = "7")]
+        since_days: u64,
+
+        /// Filter both active list and history to one target IP
+        #[arg(long)]
+        ip: Option<String>,
+    },
+
     /// Print the daily security report in the terminal.
     ///
     /// Examples:
@@ -2231,6 +2256,17 @@ fn main() -> Result<()> {
                 &cli,
                 *days,
                 action.as_deref(),
+                &cli.data_dir.clone(),
+            ),
+            GetCommand::Responses {
+                history,
+                since_days,
+                ref ip,
+            } => commands::response::cmd_responses(
+                &cli,
+                *history,
+                *since_days,
+                ip.as_deref(),
                 &cli.data_dir.clone(),
             ),
             GetCommand::Report { ref date } => {

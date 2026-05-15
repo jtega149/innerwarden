@@ -1,11 +1,396 @@
 use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::{Duration, Utc};
 
 use crate::{
     append_admin_action, current_operator, looks_like_ip, resolve_data_dir, write_manual_decision,
     AdminActionEntry, Cli,
 };
+
+/// `innerwarden get responses [--history --since-days N] [--ip X]`
+///
+/// Reads `<data_dir>/responses.json` (written by the agent's
+/// `response_lifecycle` module). Replaces the standalone dashboard
+/// Responses tab that was removed in the 2026-05-15 slim-down. Per-
+/// attacker enforcement and the cross-attacker audit view live in
+/// the dashboard (journey panel + "View all enforcement" modal); this
+/// CLI is for headless / scripted / audit-export flows.
+pub fn cmd_responses(
+    cli: &Cli,
+    history: bool,
+    since_days: u64,
+    ip: Option<&str>,
+    data_dir: &Path,
+) -> Result<()> {
+    let dir = resolve_data_dir(cli, data_dir);
+    let path: PathBuf = dir.join("responses.json");
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+
+    print!("{}", format_active_table(&json, ip));
+    if history {
+        print!(
+            "{}",
+            format_history_table(&json, since_days, ip, Utc::now())
+        );
+    }
+
+    // Silence unused-warning shims — the same module hosts manual
+    // block helpers used by `action block`.
+    let _ = (
+        append_admin_action,
+        current_operator,
+        looks_like_ip,
+        write_manual_decision,
+    );
+    let _: Option<AdminActionEntry> = None;
+
+    Ok(())
+}
+
+/// Pure formatter for the "Active enforcement" table. Pulled out of
+/// `cmd_responses` so its filter+sort logic is unit-testable without
+/// stdout capture or filesystem fixtures.
+pub(crate) fn format_active_table(json: &serde_json::Value, ip: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let mut active_rows: Vec<&serde_json::Value> = json
+        .get("active")
+        .and_then(|v| v.as_array())
+        .map(|v| v.iter())
+        .into_iter()
+        .flatten()
+        .filter(|a| match ip {
+            Some(needle) => a.get("target").and_then(|t| t.as_str()) == Some(needle),
+            None => true,
+        })
+        .collect();
+    active_rows.sort_by(|a, b| {
+        let ra = a
+            .get("remaining_secs")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let rb = b
+            .get("remaining_secs")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        ra.cmp(&rb)
+    });
+
+    let _ = writeln!(out, "Active enforcement ({}):", active_rows.len());
+    if active_rows.is_empty() {
+        let _ = writeln!(out, "  (none)");
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "  {:<20} {:<10} {:<14} {:<10} {:<10} INCIDENT",
+        "TARGET", "BACKEND", "STATE", "TTL", "REMAINING"
+    );
+    for a in &active_rows {
+        let target = a.get("target").and_then(|v| v.as_str()).unwrap_or("-");
+        let backend = a.get("backend").and_then(|v| v.as_str()).unwrap_or("-");
+        let state = a
+            .get("state")
+            .and_then(|s| s.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("active");
+        let ttl_secs = a.get("ttl_secs").and_then(|v| v.as_i64()).unwrap_or(0);
+        let rem_secs = a
+            .get("remaining_secs")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let incident = a.get("incident_id").and_then(|v| v.as_str()).unwrap_or("");
+        let _ = writeln!(
+            out,
+            "  {:<20} {:<10} {:<14} {:<10} {:<10} {}",
+            target,
+            backend,
+            state,
+            format!("{}h", ttl_secs / 3600),
+            format!("{}m", rem_secs / 60),
+            incident
+        );
+    }
+    out
+}
+
+/// Pure formatter for the "Recent reverts" table. Takes `now` as an
+/// argument so tests can pin the date window deterministically.
+pub(crate) fn format_history_table(
+    json: &serde_json::Value,
+    since_days: u64,
+    ip: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let cutoff = now - Duration::days(since_days as i64);
+    let mut rows: Vec<&serde_json::Value> = json
+        .get("history")
+        .and_then(|v| v.as_array())
+        .map(|v| v.iter())
+        .into_iter()
+        .flatten()
+        .filter(|h| match ip {
+            Some(needle) => h.get("target").and_then(|t| t.as_str()) == Some(needle),
+            None => true,
+        })
+        .filter(|h| {
+            h.get("reverted_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false)
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let ra = a.get("reverted_at").and_then(|v| v.as_str()).unwrap_or("");
+        let rb = b.get("reverted_at").and_then(|v| v.as_str()).unwrap_or("");
+        rb.cmp(ra)
+    });
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Recent reverts (last {} day{}): {} entries",
+        since_days,
+        if since_days == 1 { "" } else { "s" },
+        rows.len()
+    );
+    if rows.is_empty() {
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "  {:<20} {:<10} {:<18} REVERTED_AT",
+        "TARGET", "BACKEND", "REASON"
+    );
+    for h in &rows {
+        let target = h.get("target").and_then(|v| v.as_str()).unwrap_or("-");
+        let backend = h.get("backend").and_then(|v| v.as_str()).unwrap_or("-");
+        let reason = h.get("reason").and_then(|v| v.as_str()).unwrap_or("-");
+        let when = h.get("reverted_at").and_then(|v| v.as_str()).unwrap_or("-");
+        let reason_short = if reason.len() > 17 {
+            format!("{}…", &reason[..17])
+        } else {
+            reason.to_string()
+        };
+        let _ = writeln!(
+            out,
+            "  {:<20} {:<10} {:<18} {}",
+            target, backend, reason_short, when
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod responses_format_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    fn fixture() -> serde_json::Value {
+        json!({
+            "active": [
+                {
+                    "target": "1.2.3.4",
+                    "backend": "ufw",
+                    "state": { "kind": "active" },
+                    "ttl_secs": 168 * 3600,
+                    "remaining_secs": 100 * 3600,
+                    "incident_id": "repeat-offender:1.2.3.4:1",
+                    "type": "block_ip"
+                },
+                {
+                    "target": "1.2.3.4",
+                    "backend": "xdp",
+                    "state": { "kind": "active" },
+                    "ttl_secs": 168 * 3600,
+                    "remaining_secs": 100 * 3600,
+                    "incident_id": "repeat-offender:1.2.3.4:1",
+                    "type": "block_ip"
+                },
+                {
+                    "target": "9.9.9.9",
+                    "backend": "ufw",
+                    "state": { "kind": "active" },
+                    "ttl_secs": 24 * 3600,
+                    "remaining_secs": 6 * 3600,
+                    "incident_id": "proto-anomaly:9.9.9.9:7",
+                    "type": "block_ip"
+                }
+            ],
+            "history": [
+                {
+                    "target": "1.2.3.4",
+                    "backend": "ufw",
+                    "reason": "expired",
+                    "reverted_at": "2026-05-15T10:00:00Z"
+                },
+                {
+                    "target": "8.8.8.8",
+                    "backend": "xdp",
+                    "reason": "manual",
+                    "reverted_at": "2026-05-15T11:00:00Z"
+                },
+                {
+                    "target": "7.7.7.7",
+                    "backend": "ufw",
+                    "reason": "expired",
+                    "reverted_at": "2026-05-01T09:00:00Z"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn active_table_lists_all_entries_when_no_filter() {
+        let out = format_active_table(&fixture(), None);
+        assert!(out.contains("Active enforcement (3):"));
+        assert!(out.contains("1.2.3.4"));
+        assert!(out.contains("ufw"));
+        assert!(out.contains("xdp"));
+        assert!(out.contains("9.9.9.9"));
+        assert!(out.contains("TARGET"));
+        assert!(out.contains("INCIDENT"));
+    }
+
+    #[test]
+    fn active_table_filters_by_ip() {
+        let out = format_active_table(&fixture(), Some("1.2.3.4"));
+        assert!(out.contains("Active enforcement (2):"));
+        assert!(out.contains("1.2.3.4"));
+        // 9.9.9.9 must be filtered out
+        assert!(!out.contains("9.9.9.9"));
+    }
+
+    #[test]
+    fn active_table_renders_empty_state() {
+        let json = json!({"active": []});
+        let out = format_active_table(&json, None);
+        assert!(out.contains("Active enforcement (0):"));
+        assert!(out.contains("(none)"));
+    }
+
+    #[test]
+    fn active_table_filter_with_no_match_is_empty() {
+        let out = format_active_table(&fixture(), Some("99.99.99.99"));
+        assert!(out.contains("Active enforcement (0):"));
+        assert!(out.contains("(none)"));
+    }
+
+    #[test]
+    fn active_table_sorts_by_remaining_ascending() {
+        // 9.9.9.9 has 6h remaining, 1.2.3.4 entries have 100h. The
+        // 9.9.9.9 row must appear BEFORE the 1.2.3.4 rows so the
+        // closest-to-expiry block is at the top.
+        let out = format_active_table(&fixture(), None);
+        let nine = out.find("9.9.9.9").expect("9.9.9.9 row present");
+        let one = out.find("1.2.3.4").expect("1.2.3.4 row present");
+        assert!(
+            nine < one,
+            "expected 9.9.9.9 (6h remaining) before 1.2.3.4 (100h remaining)"
+        );
+    }
+
+    #[test]
+    fn history_table_includes_entries_inside_window() {
+        // now = 2026-05-15T12:00 UTC, since_days = 7 → cutoff =
+        // 2026-05-08T12:00. The 05-15 entries are inside; the 05-01
+        // entry is outside.
+        let now = Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
+        let out = format_history_table(&fixture(), 7, None, now);
+        assert!(out.contains("Recent reverts (last 7 days): 2 entries"));
+        assert!(out.contains("1.2.3.4"));
+        assert!(out.contains("8.8.8.8"));
+        // 7.7.7.7 is two weeks old — outside the 7-day window.
+        assert!(!out.contains("7.7.7.7"));
+    }
+
+    #[test]
+    fn history_table_singular_day_label() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
+        let out = format_history_table(&fixture(), 1, None, now);
+        assert!(
+            out.contains("last 1 day):"),
+            "singular `day)` (no `s`) when since_days == 1; got: {out}"
+        );
+        assert!(
+            !out.contains("last 1 days)"),
+            "must not pluralise when since_days == 1; got: {out}"
+        );
+    }
+
+    #[test]
+    fn history_table_filters_by_ip() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
+        let out = format_history_table(&fixture(), 30, Some("1.2.3.4"), now);
+        assert!(out.contains("Recent reverts (last 30 days): 1 entries"));
+        assert!(out.contains("1.2.3.4"));
+        assert!(!out.contains("8.8.8.8"));
+        assert!(!out.contains("7.7.7.7"));
+    }
+
+    #[test]
+    fn history_table_renders_empty_state_when_window_empty() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
+        // 0 days back from 'now' — nothing should match.
+        let out = format_history_table(&fixture(), 0, None, now);
+        assert!(out.contains("Recent reverts (last 0 days): 0 entries"));
+        // No table header when empty.
+        assert!(!out.contains("REVERTED_AT"));
+    }
+
+    #[test]
+    fn history_table_truncates_long_reason_with_ellipsis() {
+        let json = json!({
+            "history": [{
+                "target": "1.2.3.4",
+                "backend": "ufw",
+                "reason": "orphaned: this is a very long error message that exceeds eighteen chars",
+                "reverted_at": "2026-05-15T10:00:00Z"
+            }]
+        });
+        let now = Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
+        let out = format_history_table(&json, 1, None, now);
+        assert!(
+            out.contains("…"),
+            "long reason must be truncated with ellipsis"
+        );
+    }
+
+    #[test]
+    fn history_table_descending_by_reverted_at() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
+        let out = format_history_table(&fixture(), 30, None, now);
+        // 8.8.8.8 reverted at 11:00, 1.2.3.4 reverted at 10:00, 7.7.7.7
+        // would be outside but 30d includes all three. Most recent
+        // first → 8.8.8.8 before 1.2.3.4 in the output.
+        let eight = out.find("8.8.8.8").expect("8.8.8.8 row present");
+        let one = out.find("1.2.3.4").expect("1.2.3.4 row present");
+        assert!(
+            eight < one,
+            "expected 8.8.8.8 (11:00) before 1.2.3.4 (10:00) — descending sort"
+        );
+    }
+
+    #[test]
+    fn empty_payload_renders_clean_zeros() {
+        let json = json!({});
+        let out_active = format_active_table(&json, None);
+        assert!(out_active.contains("Active enforcement (0):"));
+        let now = Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
+        let out_history = format_history_table(&json, 7, None, now);
+        assert!(out_history.contains("Recent reverts (last 7 days): 0 entries"));
+    }
+}
 
 fn configured_block_backend(agent_config: &Path) -> String {
     std::fs::read_to_string(agent_config)

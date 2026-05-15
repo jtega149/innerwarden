@@ -1,11 +1,23 @@
-// ── Responses tab ────────────────────────────────────────────────
-async function loadResponses() {
-  const status = document.getElementById('responsesViewStatus');
-  const content = document.getElementById('responsesContent');
-  if (status) status.textContent = 'Loading…';
+// ── Enforcement health section (2026-05-15) ─────────────────────
+// Replaces the standalone Responses tab. Renders into the Health tab:
+//   - lifetime totals (counters, monotonic since boot)
+//   - gauges (current state)
+//   - orphan diagnostic panel (when orphans > 0)
+// Used by status.js::loadStatus to mount under the existing Health tab.
+//
+// The per-attacker enforcement view + cross-attacker audit modal live
+// in journey.js (renderEnforcementBlock) and threats.js
+// (openEnforcementModal) respectively — both consume /api/responses too.
+
+async function renderEnforcementHealthSection(mountSelector) {
+  var mount = typeof mountSelector === 'string'
+    ? document.getElementById(mountSelector)
+    : mountSelector;
+  if (!mount) return;
+  mount.innerHTML = '<div style="color:var(--muted);font-size:0.78rem">Loading enforcement stats…</div>';
   try {
     const r = await loadJson('/api/responses');
-    let html = '';
+    let html = '<h3 class="status-section-title" style="margin-top:18px;">Enforcement</h3>';
 
     // PR #425 Wave 4d: gauges (now) vs counters (lifetime) explicit.
     // Pre-Wave-4d the dashboard banner read totals.orphaned (counter,
@@ -72,114 +84,26 @@ async function loadResponses() {
       </div>`;
     }
 
-    // Backwards-compat shim for the rest of the function.
-    const orphaned = gOrphans;
-    const failed = gInRetry;
-
-    // Active responses table
-    if (r.active?.length > 0) {
-      html += `<h3 style="margin:12px 0 8px;">Active Responses</h3>
-        <table style="width:100%;border-collapse:collapse;font-size:0.8rem;">
-        <thead><tr style="border-bottom:2px solid var(--border);text-align:left;">
-          <th style="padding:6px;">Target</th><th style="padding:6px;">Backend</th>
-          <th style="padding:6px;">State</th>
-          <th style="padding:6px;">Type</th><th style="padding:6px;">TTL</th>
-          <th style="padding:6px;">Remaining</th><th style="padding:6px;">Incident</th>
-        </tr></thead><tbody>`;
-      r.active.forEach(a => {
-        const mins = Math.floor((a.remaining_secs||0)/60);
-        const hrs = Math.floor(mins/60);
-        const remaining = hrs > 0 ? `${hrs}h ${mins%60}m` : `${mins}m`;
-        const ttlH = Math.floor((a.ttl_secs||0)/3600);
-        const backendColor = {xdp:'#e74c3c',iptables:'#f39c12',nftables:'#f39c12',ufw:'#3498db',cloudflare:'#f39c12',container:'#9b59b6',nginx:'#27ae60',sudo:'#e67e22'}[a.backend]||'var(--dim)';
-        const backendTip = {xdp:'Kernel-level firewall (fastest)',iptables:'Linux packet filter',nftables:'Modern Linux firewall',ufw:'Ubuntu firewall',cloudflare:'Cloudflare edge rules',container:'Container runtime isolation',nginx:'Web server access control',sudo:'Privilege management'}[a.backend]||'';
-
-        // State badge: Active (green), RevertPending (blue), RevertFailed (red)
-        const stateKind = a.state?.kind || 'active';
-        let stateBadge = '';
-        let rowStyle = '';
-        if (stateKind === 'active') {
-          stateBadge = `<span style="padding:2px 6px;border-radius:3px;background:#27ae6020;color:#27ae60;font-size:0.7rem;">active</span>`;
-        } else if (stateKind === 'revert_pending') {
-          const trigger = a.state?.trigger || '';
-          stateBadge = `<span title="Revert command dispatched (${trigger}), awaiting result" style="padding:2px 6px;border-radius:3px;background:#3498db20;color:#3498db;font-size:0.7rem;">pending · ${trigger}</span>`;
-          rowStyle = 'background:#3498db08;';
-        } else if (stateKind === 'revert_failed') {
-          const attempts = a.state?.attempts || 0;
-          const errShort = (a.state?.last_error || '').substring(0, 80);
-          stateBadge = `<span title="${errShort.replace(/"/g,'&quot;')}" style="padding:2px 6px;border-radius:3px;background:#e74c3c20;color:#e74c3c;font-size:0.7rem;font-weight:600;cursor:help">retry ${attempts}/3</span>`;
-          rowStyle = 'background:#e74c3c0c;';
-        }
-
-        html += `<tr style="border-bottom:1px solid var(--border);${rowStyle}">
-          <td style="padding:6px;font-family:monospace;font-weight:600;">${esc(a.target)}</td>
-          <td style="padding:6px;"><span title="${esc(backendTip)}" style="padding:2px 6px;border-radius:3px;background:${backendColor}20;color:${backendColor};font-size:0.7rem;cursor:help">${esc(a.backend)}</span></td>
-          <td style="padding:6px;">${stateBadge}</td>
-          <td style="padding:6px;">${esc(a.type)}</td>
-          <td style="padding:6px;">${ttlH}h</td>
-          <td style="padding:6px;font-weight:600;color:${mins < 10 ? '#e74c3c' : 'var(--text)'};">${remaining}</td>
-          <td style="padding:6px;font-size:0.7rem;color:var(--dim);">${esc((a.incident_id||'').substring(0,40))}</td>
-        </tr>`;
-      });
-      html += '</tbody></table>';
-    } else {
-      html += '<p style="color:var(--dim);margin:20px 0;">No active responses. All blocks have expired or been reverted.</p>';
-    }
-
-    // History
-    if (r.history?.length > 0) {
-      html += `<h3 style="margin:20px 0 8px;">Recent History (${r.history.length})</h3>
-        <table style="width:100%;border-collapse:collapse;font-size:0.75rem;">
-        <thead><tr style="border-bottom:2px solid var(--border);text-align:left;">
-          <th style="padding:4px 6px;">Target</th><th style="padding:4px 6px;">Backend</th>
-          <th style="padding:4px 6px;">Reason</th><th style="padding:4px 6px;">Reverted At</th>
-        </tr></thead><tbody>`;
-      r.history.forEach(h => {
-        // Color-code reason: expired/manual green-blue (normal), already_absent
-        // teal (success-but-gone), orphaned red (state drift admitted).
-        let reasonColor = 'var(--dim)';
-        let reasonLabel = h.reason || '';
-        let reasonTitle = '';
-        if (reasonLabel === 'expired') {
-          reasonColor = '#27ae60';
-        } else if (reasonLabel === 'manual') {
-          reasonColor = '#3498db';
-        } else if (reasonLabel === 'already_absent') {
-          reasonColor = '#1abc9c';
-          reasonTitle = 'Rule was already removed before we got to it — treated as success';
-        } else if (reasonLabel.startsWith && reasonLabel.startsWith('orphaned')) {
-          reasonColor = '#e74c3c';
-          reasonTitle = reasonLabel; // full stderr is in the reason string
-          reasonLabel = 'orphaned';
-        }
-        html += `<tr style="border-bottom:1px solid var(--border);">
-          <td style="padding:4px 6px;font-family:monospace;">${esc(h.target)}</td>
-          <td style="padding:4px 6px;">${esc(h.backend)}</td>
-          <td style="padding:4px 6px;"><span title="${esc(reasonTitle)}" style="color:${reasonColor};${reasonTitle?'cursor:help;':''}">${esc(reasonLabel)}</span></td>
-          <td style="padding:4px 6px;color:var(--dim);">${new Date(h.reverted_at).toLocaleString()}</td>
-        </tr>`;
-      });
-      html += '</tbody></table>';
-    }
-
     // 2026-05-03 (PR #419 Wave 2): if orphans exist, append a
     // collapsible "Diagnose orphans" panel that lazy-loads the
-    // /api/responses/orphans endpoint. Read-only; Wave 3 will add
-    // remediation buttons behind 2FA.
-    if (orphaned > 0) {
+    // /api/responses/orphans endpoint with clear / mark-already-gone
+    // actions behind 2FA.
+    if (gOrphans > 0) {
       html += renderOrphanDiagnosticPanel();
+    } else {
+      html += '<p style="color:var(--dim);margin:10px 0 0;font-size:0.78rem">No orphaned responses. All revert flows are reconciled with the kernel.</p>';
     }
 
-    content.innerHTML = html;
-    if (status) {
-      const parts = [`${r.active_count||0} active`];
-      if (failed > 0) parts.push(`${failed} retrying`);
-      if (orphaned > 0) parts.push(`${orphaned} orphaned`);
-      status.textContent = parts.join(' · ');
-    }
+    // 2026-05-15: footnote pointing the operator at the where-each-piece-went map.
+    html += '<p style="color:var(--dim);font-size:0.7rem;margin-top:14px;">'
+      + 'Per-attacker enforcement detail lives on the journey panel (open any attacker on Cases). '
+      + 'Cross-attacker audit: "View all enforcement" link on the Cases sidebar. '
+      + 'Historical reverts: <code>innerwarden responses history</code>.'
+      + '</p>';
+
+    mount.innerHTML = html;
   } catch(e) {
-    content.innerHTML = `<p style="color:#e74c3c">Failed to load responses: ${e.message}</p>`;
-    if (status) status.textContent = 'Error';
+    mount.innerHTML = '<p style="color:#e74c3c">Failed to load enforcement stats: ' + esc(e.message || String(e)) + '</p>';
   }
 }
 

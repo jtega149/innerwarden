@@ -4848,64 +4848,181 @@ mod tests {
     }
 
     #[test]
-    fn nav_promotes_responses_to_top_level() {
-        // Audit 4.6: Responses moved out of the More dropdown into a
-        // top-level button between Threats and Health. The dropdown
-        // must no longer carry navResponses; the top-level row must.
-        let html = INDEX_HTML;
-        let main_nav_start = html
-            .find("class=\"main-nav\"")
-            .expect("main-nav block must exist");
-        let nav_more_start = html[main_nav_start..]
-            .find("class=\"nav-more-menu\"")
-            .map(|p| main_nav_start + p)
-            .expect("nav-more-menu block must exist");
-        let main_row = &html[main_nav_start..nav_more_start];
-        let more_block_end = html[nav_more_start..]
-            .find("</div>")
-            .map(|p| nav_more_start + p)
-            .expect("more menu close tag");
-        let more_block = &html[nav_more_start..more_block_end];
+    fn pr_responses_removal_journey_carries_enforcement_block() {
+        // 2026-05-15: per-attacker enforcement detail moved INLINE into
+        // the journey panel. When the journey loads for an IP subject
+        // and that IP has active blocks, the panel renders an
+        // "ENFORCEMENT · enforced right now" block at the top with one
+        // row per backend (ufw + xdp + etc) showing state + TTL +
+        // remaining. Anchored at the JS bundle boundary.
+        assert!(
+            JS_JOURNEY.contains("function renderEnforcementBlock"),
+            "journey.js must define renderEnforcementBlock (slim-down: per-attacker enforcement on the journey panel)"
+        );
+        assert!(
+            JS_JOURNEY
+                .contains("renderEnforcementBlock(subjectType, subjectValue, responsesPayload)"),
+            "loadJourney must call renderEnforcementBlock with the loaded /api/responses payload"
+        );
+        assert!(
+            JS_JOURNEY.contains("loadJson('/api/responses'"),
+            "loadJourney must fetch /api/responses so the enforcement block has data to filter"
+        );
+        // The IP-only guard ensures we don't render the block for user/detector pivots.
+        assert!(
+            JS_JOURNEY.contains("(subjectType || '').toLowerCase() !== 'ip'"),
+            "renderEnforcementBlock must guard for IP subjects only — user/detector pivots have no per-IP enforcement"
+        );
+        // CSS for the block must ship so it's not unstyled text.
+        assert!(APP_CSS.contains(".enf-block"));
+        assert!(APP_CSS.contains(".enf-state-active"));
+    }
 
+    #[test]
+    fn pr_responses_removal_cases_sidebar_carries_enforcement_modal() {
+        // 2026-05-15: cross-attacker audit view moved to a MODAL opened
+        // from the Cases sidebar. Anchor pins the markup, the trigger,
+        // the open/close functions, the source endpoint, and the count
+        // sync hook.
         assert!(
-            main_row.contains("id=\"navResponses\""),
-            "navResponses must live in the top-level main-nav row (audit 4.6)"
+            INDEX_HTML.contains("id=\"enforcementAuditLink\""),
+            "Cases sidebar must carry the 'View all enforcement' link"
         );
         assert!(
-            !more_block.contains("id=\"navResponses\""),
-            "navResponses must NOT remain in the More dropdown (audit 4.6)"
+            INDEX_HTML.contains("id=\"enforcementAuditCount\""),
+            "The link must include a count badge — kernel ground-truth at a glance"
         );
-        // The other secondary tabs must still be inside the dropdown
-        // — the refactor only promotes Responses, not the rest.
-        for id in [
-            "navSensors",
-            "navReport",
-            "navHoneypot",
-            "navCompliance",
-            "navMonthly",
-        ] {
-            assert!(
-                more_block.contains(id),
-                "{id} must remain in the More dropdown — only Responses was promoted"
-            );
-        }
-        // nav.js drops `responses` from the secondaryTabs list so the
-        // showView dispatcher does not still treat it as a More item.
-        // Other `'responses'` mentions (the views/btns id maps,
-        // loadResponses dispatch) must stay — only the secondary-tab
-        // membership is wrong after the promotion.
+        assert!(
+            INDEX_HTML.contains("id=\"enforcementModal\""),
+            "Modal markup must exist in index.html"
+        );
+        assert!(
+            INDEX_HTML.contains("openEnforcementModal()"),
+            "Sidebar link must wire to openEnforcementModal()"
+        );
+        // JS bindings.
+        assert!(
+            JS_THREATS.contains("function openEnforcementModal"),
+            "threats.js must define openEnforcementModal"
+        );
+        assert!(
+            JS_THREATS.contains("function closeEnforcementModal"),
+            "threats.js must define closeEnforcementModal (Esc + overlay click)"
+        );
+        assert!(
+            JS_THREATS.contains("function renderEnforcementModal"),
+            "threats.js must define renderEnforcementModal — the table rendering helper"
+        );
+        assert!(
+            JS_THREATS.contains("function updateEnforcementAuditCount"),
+            "threats.js must define updateEnforcementAuditCount so the link badge stays fresh"
+        );
+        assert!(
+            JS_THREATS.contains("updateEnforcementAuditCount(responsesPayload)"),
+            "refreshLeft must invoke updateEnforcementAuditCount on every overview refresh"
+        );
+        // Modal renders against /api/responses — same source as the
+        // journey block + Health tab. Single source of truth.
+        assert!(
+            JS_THREATS.contains("loadJson('/api/responses')"),
+            "openEnforcementModal must read /api/responses (same source the Home strip + journey block consume)"
+        );
+        // CSS for the modal must ship.
+        assert!(APP_CSS.contains(".enf-modal"));
+        assert!(APP_CSS.contains(".enf-audit-link"));
+    }
+
+    #[test]
+    fn pr_responses_removal_health_carries_enforcement_section() {
+        // 2026-05-15: lifetime stats + orphan diagnostics moved to the
+        // Health tab. The mount point lives inside status.js's content
+        // render; the renderEnforcementHealthSection helper (defined in
+        // responses.js) populates it lazily.
+        assert!(
+            JS_STATUS.contains("enforcement-health-mount"),
+            "status.js must mount the enforcement-health-mount node in the Health tab"
+        );
+        assert!(
+            JS_STATUS.contains("renderEnforcementHealthSection"),
+            "status.js must invoke renderEnforcementHealthSection (defined in responses.js)"
+        );
+        assert!(
+            JS_RESPONSES.contains("async function renderEnforcementHealthSection"),
+            "responses.js must export renderEnforcementHealthSection — the section renderer"
+        );
+        // The standalone `loadResponses` function MUST be gone.
+        assert!(
+            !JS_RESPONSES.contains("async function loadResponses("),
+            "responses.js must NOT define loadResponses() — that targeted the removed tab"
+        );
+    }
+
+    #[test]
+    fn pr_responses_removal_ctl_carries_history_subcommand() {
+        // 2026-05-15: recent-revert history moved from the dashboard to
+        // the CLI. Auditors pull it on demand via `innerwarden get
+        // responses --history --since-days N --ip X`.
+        const CTL_MAIN: &str = include_str!("../../../ctl/src/main.rs");
+        const CTL_RESPONSE: &str = include_str!("../../../ctl/src/commands/response.rs");
+        assert!(
+            CTL_MAIN.contains("Responses {"),
+            "ctl GetCommand must declare the Responses variant"
+        );
+        assert!(
+            CTL_MAIN.contains("commands::response::cmd_responses"),
+            "ctl Get dispatcher must wire Responses → commands::response::cmd_responses"
+        );
+        assert!(
+            CTL_RESPONSE.contains("pub fn cmd_responses"),
+            "ctl commands::response must implement cmd_responses (`innerwarden get responses`)"
+        );
+        // Flags pinned so a future refactor cannot silently drop one.
+        assert!(CTL_MAIN.contains("history: bool"));
+        assert!(CTL_MAIN.contains("since_days: u64"));
+        assert!(CTL_MAIN.contains("ip: Option<String>"));
+    }
+
+    #[test]
+    fn nav_drops_responses_tab_after_slim_down() {
+        // 2026-05-15: the standalone Responses tab was removed from
+        // the dashboard. Per-attacker enforcement detail moved to the
+        // journey panel (Enforcement block); cross-attacker audit
+        // became a modal on the Cases sidebar; lifetime stats +
+        // orphan diagnostics moved to the Health tab; recent-revert
+        // history moved to the CLI (`innerwarden get responses
+        // --history`). Anchor pins the no-residue contract.
+        let html = INDEX_HTML;
+        assert!(
+            !html.contains("id=\"navResponses\""),
+            "navResponses button must be gone from the navbar (2026-05-15 slim-down)"
+        );
+        assert!(
+            !html.contains("id=\"viewResponses\""),
+            "viewResponses div must be gone from the body (2026-05-15 slim-down)"
+        );
+        assert!(
+            !html.contains("id=\"responsesContent\""),
+            "responsesContent mount must be gone (slim-down: Health hosts the section)"
+        );
+        // nav.js views/btns maps + dispatcher cleanup.
         let nav = JS_NAV;
-        let secondary_start = nav
-            .find("_secondaryTabs = [")
-            .expect("_secondaryTabs declaration");
-        let secondary_end = nav[secondary_start..]
-            .find("];")
-            .map(|p| secondary_start + p)
-            .expect("_secondaryTabs end");
-        let secondary_block = &nav[secondary_start..secondary_end];
         assert!(
-            !secondary_block.contains("'responses'"),
-            "nav.js _secondaryTabs must drop 'responses' after the promotion (audit 4.6)"
+            !nav.contains("'responses'"),
+            "nav.js MUST NOT reference 'responses' — tab was removed (2026-05-15 slim-down)"
+        );
+        assert!(
+            !nav.contains("loadResponses("),
+            "nav.js MUST NOT dispatch loadResponses() — tab was removed"
+        );
+        // The Cases sidebar carries the cross-attacker audit modal trigger.
+        assert!(
+            html.contains("id=\"enforcementAuditLink\""),
+            "Cases sidebar must carry the 'View all enforcement' modal link (slim-down replacement for the tab)"
+        );
+        // The Health tab mounts the enforcement section.
+        assert!(
+            html.contains("id=\"enforcement-health-mount\"") || JS_STATUS.contains("enforcement-health-mount"),
+            "Health tab must carry the enforcement-health-mount node (slim-down: lifetime stats + orphan diagnostics moved here)"
         );
     }
 

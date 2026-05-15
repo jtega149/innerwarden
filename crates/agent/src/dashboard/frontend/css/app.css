@@ -1462,6 +1462,70 @@
       background: rgba(120, 229, 255, 0.04);
       border-left: 3px solid var(--accent);
     }
+
+    /* 2026-05-15: Enforcement block — shows what's enforced right now
+       for the subject of the open journey. Sits between recurrence
+       block and journey-actions; read-only display in Phase 1. */
+    .enf-block {
+      margin: 10px 0;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: rgba(34, 197, 94, 0.05);
+      border-left: 3px solid #22c55e;
+    }
+    .enf-title {
+      font-size: 0.62rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .enf-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 0;
+      font-size: 0.78rem;
+      border-top: 1px dashed rgba(255, 255, 255, 0.06);
+    }
+    .enf-row:first-of-type { border-top: none; }
+    .enf-backend {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 700;
+      color: var(--accent);
+      min-width: 56px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-size: 0.7rem;
+    }
+    .enf-state {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.68rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--muted);
+    }
+    .enf-state-active { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
+    .enf-state-pending { background: rgba(52, 152, 219, 0.15); color: #3498db; }
+    .enf-state-failed { background: rgba(231, 76, 60, 0.18); color: #e74c3c; font-weight: 700; }
+    .enf-type {
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+    }
+    .enf-ttl, .enf-remaining {
+      color: var(--muted);
+      font-size: 0.72rem;
+    }
+    .enf-incident {
+      color: var(--dim);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.68rem;
+    }
     .recurrence-block .recurrence-header {
       display: flex;
       align-items: center;
@@ -2470,3 +2534,97 @@
       font-size: 0.78rem;
     }
 
+
+    /* 2026-05-15: Enforcement audit link + modal. Replaces the
+       standalone Responses tab — link sits in the Cases sidebar,
+       modal lists every active block on every backend. */
+    .enf-audit-link {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      width: 100%;
+      padding: 8px 10px;
+      margin: 4px 0 8px;
+      background: transparent;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 0.74rem;
+      letter-spacing: 0.03em;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+    .enf-audit-link:hover {
+      color: var(--text);
+      border-color: var(--accent);
+      background: rgba(120, 229, 255, 0.05);
+    }
+    .enf-audit-link .enf-audit-count {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 700;
+      color: var(--accent);
+      font-size: 0.78rem;
+    }
+
+    .enf-modal {
+      position: fixed; inset: 0; z-index: 200;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .enf-modal-overlay {
+      position: absolute; inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+    }
+    .enf-modal-box {
+      position: relative;
+      background: var(--bg1); border: 1px solid var(--line);
+      border-radius: 12px;
+      width: min(900px, calc(100vw - 32px));
+      max-height: calc(100vh - 60px);
+      display: flex; flex-direction: column;
+      box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+    }
+    .enf-modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .enf-modal-header h3 {
+      margin: 0;
+      font-size: 0.9rem;
+      color: var(--text);
+    }
+    .enf-modal-close {
+      background: transparent; border: none;
+      color: var(--muted); font-size: 1.4rem;
+      cursor: pointer; padding: 0 6px;
+    }
+    .enf-modal-close:hover { color: var(--text); }
+    .enf-modal-content {
+      padding: 14px 18px;
+      overflow-y: auto;
+      font-size: 0.85rem;
+    }
+    .enf-modal-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.78rem;
+    }
+    .enf-modal-table th {
+      text-align: left;
+      padding: 6px 8px;
+      border-bottom: 2px solid var(--line);
+      color: var(--muted);
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 0.66rem;
+    }
+    .enf-modal-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--line);
+    }
+    .enf-modal-target {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 600;
+      color: var(--text);
+    }

@@ -1,3 +1,54 @@
+// ── Enforcement block (2026-05-15) ─────────────────────────────────────
+// Renders a compact "what is enforced for this subject RIGHT NOW" panel
+// at the top of the journey detail. Replaces the cross-attacker
+// Responses tab for the 95% case: operator clicks an attacker and wants
+// to confirm "is this IP really blocked? on which backend? when does it
+// expire?". Read-only in this PR; manual revert ships in a follow-up
+// when the backend POST /api/responses/:id/revert endpoint lands.
+function renderEnforcementBlock(subjectType, subjectValue, responsesPayload) {
+  if ((subjectType || '').toLowerCase() !== 'ip' || !subjectValue) return '';
+  if (!responsesPayload || !Array.isArray(responsesPayload.active)) return '';
+  var matches = responsesPayload.active.filter(function(a) {
+    return a && a.target === subjectValue;
+  });
+  if (matches.length === 0) return '';
+
+  var rows = matches.map(function(a) {
+    var stateKind = (a.state && a.state.kind) || 'active';
+    var stateBadge;
+    if (stateKind === 'active') {
+      stateBadge = '<span class="enf-state enf-state-active">active</span>';
+    } else if (stateKind === 'revert_pending') {
+      stateBadge = '<span class="enf-state enf-state-pending">revert pending</span>';
+    } else if (stateKind === 'revert_failed') {
+      stateBadge = '<span class="enf-state enf-state-failed">revert failed</span>';
+    } else {
+      stateBadge = '<span class="enf-state">' + esc(stateKind) + '</span>';
+    }
+    var ttlSecs = a.ttl_secs || 0;
+    var ttlH = Math.floor(ttlSecs / 3600);
+    var ttlLabel = ttlH > 0 ? (ttlH + 'h') : Math.max(0, Math.floor(ttlSecs / 60)) + 'm';
+    var remSecs = a.remaining_secs || 0;
+    var remMins = Math.floor(remSecs / 60);
+    var remHrs = Math.floor(remMins / 60);
+    var remaining = remHrs > 0 ? (remHrs + 'h ' + (remMins % 60) + 'm') : (remMins + 'm');
+    var incident = a.incident_id ? ' · <span class="enf-incident">' + esc(a.incident_id) + '</span>' : '';
+    return '<div class="enf-row">'
+      + '<span class="enf-backend">' + esc(a.backend || '—') + '</span>'
+      + stateBadge
+      + '<span class="enf-type">' + esc(a.type || 'block_ip') + '</span>'
+      + '<span class="enf-ttl">TTL ' + esc(ttlLabel) + '</span>'
+      + '<span class="enf-remaining">' + esc(remaining) + ' remaining</span>'
+      + incident
+      + '</div>';
+  }).join('');
+
+  return '<div class="enf-block">'
+    + '<div class="enf-title">ENFORCEMENT · enforced right now</div>'
+    + rows
+    + '</div>';
+}
+
 // ── Kind badge ─────────────────────────────────────────────────────────
 function kindBadge(entry) {
   const d = entry.data || {};
@@ -744,11 +795,17 @@ async function loadJourney(subjectType, subjectValue, focusIncidentId) {
           window_seconds: state.filters.window_seconds,
         })
       : '';
-    const [j, compare] = await Promise.all([
+    const [j, compare, responsesPayload] = await Promise.all([
       loadJson('/api/journey?' + baseQs, { signal: journeySignal }),
       shouldCompare ? loadJson('/api/journey?' + compareQs, { signal: journeySignal }) : Promise.resolve(null),
+      // 2026-05-15: pull active enforcement for the Enforcement block.
+      // Endpoint returns ALL active entries; we filter client-side to
+      // the rows whose `target` matches this subject's IP. Tiny payload
+      // (~35 rows on a busy host) — no separate per-IP filter needed.
+      loadJson('/api/responses', { signal: journeySignal }).catch(function() { return {}; }),
     ]);
     window._currentJourneyOutcome = j.outcome || 'unknown';
+    window._lastResponsesPayload = responsesPayload;
     const first = j.first_seen ? fmtDateTime(j.first_seen) : '-';
     const last  = j.last_seen  ? fmtDateTime(j.last_seen)  : '-';
     const summary = j.summary || {};
@@ -815,6 +872,7 @@ async function loadJourney(subjectType, subjectValue, focusIncidentId) {
       </div>
       <div class="journey-subtitle">${esc((j.subject_type || subjectType).toUpperCase())} journey · ${j.entries.length} timeline entries · click any row to expand</div>
       ${renderRecurrenceBlock(j.recurrence)}
+      ${renderEnforcementBlock(subjectType, subjectValue, responsesPayload)}
       <div class="journey-actions">
         <button type="button" class="journey-btn" onclick="downloadSnapshot('json')">Export JSON</button>
         <button type="button" class="journey-btn" onclick="downloadSnapshot('md')">Export Markdown</button>
