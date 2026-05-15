@@ -1452,13 +1452,17 @@ mod tests {
             .expect("loadHome present");
         let end = JS_HOME[start..].find("\n}\n").expect("end of loadHome") + start;
         let body = &JS_HOME[start..end];
-        // The five things that must be called inside loadHome today.
+        // The six things that must be called inside loadHome today.
+        // `renderHomeSensorsSummary` was added 2026-05-15 when the
+        // Sensors HUD cards / gauge / radar / Event Types tile moved
+        // to Home — see the Sensors slim-down anchors below.
         for fn_call in [
             "updateHomeHero(",
             "renderReviewBanner(",
             "renderActivityStrip(",
             "renderOnboardingTip(",
             "loadBriefing(",
+            "renderHomeSensorsSummary(",
         ] {
             assert!(
                 body.contains(fn_call),
@@ -1466,6 +1470,194 @@ mod tests {
                  missing call leaves the section blank on page load"
             );
         }
+    }
+
+    // ── 2026-05-15 Sensors slim-down anchors ─────────────────────────
+    // The Sensors page lost five elements per operator request:
+    // (1) the "incidents being handled by AI" banner above the HUD
+    // (`#topAction` + `loadTopAction`), (2) the 4-tile HUD stat bar
+    // (`#sensorCards` — Events Today / Incidents / Sources Active /
+    // Detectors Firing), (3) the Unresolved Cases gauge (`#threatGauge`
+    // + `#threatLabel`), (4) the Detector Activity radar
+    // (`#detectorChart`), and (5) the Event Types tile (`#sensorKinds`).
+    // All five moved to Home below the AI Intelligence Briefing under
+    // the new container `#homeSensorsSummary`, rendered by
+    // `renderHomeSensorsSummary` in home.js using the same `/api/sensors`
+    // payload `loadHome` already fetches. Operator's exact instruction
+    // was "no dead code", so these anchors pin (a) the removed markup
+    // and function MUST stay gone, (b) the new Home markers MUST be
+    // present, (c) the chart helpers stay parameterised so a future
+    // refactor doesn't quietly re-hardcode the old DOM ids, and (d) the
+    // Sensors page still renders its kept surface (per-collector rows
+    // + Event Timeline).
+
+    #[test]
+    fn pr_sensors_slim_removed_dom_ids_are_gone_from_index_html() {
+        // Sentinel against accidental restoration. Every ID below was
+        // deleted from `viewSensors` on 2026-05-15. The matching
+        // `home*` ids on Home are asserted by the positive-presence
+        // test below — together the two anchors enforce the move.
+        for orphan in [
+            "id=\"topAction\"",
+            "id=\"sensorCards\"",
+            "id=\"threatGauge\"",
+            "id=\"threatLabel\"",
+            "id=\"detectorChart\"",
+            "id=\"sensorKinds\"",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(orphan),
+                "2026-05-15 Sensors slim: {orphan} was removed from viewSensors; \
+                 re-adding it brings back the HUD element the operator asked to drop"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_sensors_slim_home_summary_section_is_present_below_briefing() {
+        // The migrated HUD lives in a new home-section container and
+        // MUST appear AFTER the AI Intelligence Briefing section.
+        // Operator's exact instruction was "mover para a home do
+        // dashboard abaixo de AI Intelligence Briefing".
+        for marker in [
+            "id=\"homeSensorsSummary\"",
+            "id=\"homeSensorCards\"",
+            "id=\"homeThreatGauge\"",
+            "id=\"homeThreatLabel\"",
+            "id=\"homeDetectorChart\"",
+            "id=\"homeSensorKinds\"",
+            ">Sensors Summary<",
+        ] {
+            assert!(
+                INDEX_HTML.contains(marker),
+                "Home must contain `{marker}` — Sensors HUD migrated 2026-05-15"
+            );
+        }
+        // Positional anchor: the briefingSection must come BEFORE
+        // homeSensorsSummary in the source so the operator reads the
+        // narrative summary first and the metric tiles second.
+        let briefing_pos = INDEX_HTML
+            .find("id=\"briefingSection\"")
+            .expect("briefingSection still present");
+        let summary_pos = INDEX_HTML
+            .find("id=\"homeSensorsSummary\"")
+            .expect("homeSensorsSummary present");
+        assert!(
+            briefing_pos < summary_pos,
+            "Sensors Summary section MUST render below AI Intelligence Briefing \
+             (operator instruction 2026-05-15)"
+        );
+    }
+
+    #[test]
+    fn pr_sensors_slim_load_top_action_is_gone_from_sensors_js_and_nav_js() {
+        // The "14 incidents being handled by AI" banner renderer was
+        // deleted. Both the function and its only call site MUST stay
+        // gone — anything coming back is dead code (the HTML target
+        // `#topAction` was removed in the same PR).
+        assert!(
+            !JS_SENSORS.contains("async function loadTopAction"),
+            "2026-05-15 Sensors slim: `loadTopAction` was removed from sensors.js \
+             — its HTML target `#topAction` is gone, so reviving it leaks dead code"
+        );
+        assert!(
+            !JS_SENSORS.contains("function loadTopAction"),
+            "2026-05-15 Sensors slim: no `function loadTopAction` of any signature \
+             should resurface"
+        );
+        assert!(
+            !JS_NAV.contains("loadTopAction("),
+            "2026-05-15 Sensors slim: nav.js MUST NOT call `loadTopAction()` — \
+             the function was deleted along with the banner DOM"
+        );
+        // Sensors view loader MUST still be wired so the per-collector
+        // rows + Event Timeline render on navigation.
+        assert!(
+            JS_NAV.contains("if (name === 'sensors') loadSensors();"),
+            "nav.js MUST still call loadSensors() when the Sensors view opens"
+        );
+    }
+
+    #[test]
+    fn pr_sensors_slim_chart_helpers_are_parameterised_for_home_mounts() {
+        // `drawThreatGauge` and `drawDetectorChart` were
+        // canvas-id-hardcoded pre-slim. Anchoring the new signatures
+        // catches a future refactor that quietly drops the parameter
+        // (and breaks the Home mount silently because the home ids
+        // would not match the hardcoded `threatGauge` / `detectorChart`
+        // lookups).
+        assert!(
+            JS_SENSORS.contains("function drawThreatGauge(canvasId, labelId)"),
+            "drawThreatGauge MUST accept (canvasId, labelId) so Home can mount it"
+        );
+        assert!(
+            JS_SENSORS.contains("function drawDetectorChart(canvasId, detectors)"),
+            "drawDetectorChart MUST accept (canvasId, detectors) so Home can mount it"
+        );
+        // The hardcoded lookups MUST stay gone.
+        assert!(
+            !JS_SENSORS.contains("document.getElementById('threatGauge')"),
+            "drawThreatGauge MUST NOT hardcode `threatGauge` — that DOM id was removed"
+        );
+        assert!(
+            !JS_SENSORS.contains("document.getElementById('detectorChart')"),
+            "drawDetectorChart MUST NOT hardcode `detectorChart` — that DOM id was removed"
+        );
+    }
+
+    #[test]
+    fn pr_sensors_slim_home_renderer_mounts_to_home_dom_ids() {
+        // `renderHomeSensorsSummary` is the single function responsible
+        // for filling the migrated tiles on Home. It MUST target the
+        // home-specific DOM ids — anchoring catches a paste error that
+        // sends the renderer back to the old Sensors ids (silently
+        // leaving the Home section blank).
+        let start = JS_HOME
+            .find("function renderHomeSensorsSummary(")
+            .expect("renderHomeSensorsSummary present in home.js");
+        let end = JS_HOME[start..]
+            .find("\n}\n")
+            .expect("end of renderHomeSensorsSummary")
+            + start;
+        let body = &JS_HOME[start..end];
+        for marker in [
+            "getElementById('homeSensorCards')",
+            "drawThreatGauge('homeThreatGauge', 'homeThreatLabel')",
+            "drawDetectorChart('homeDetectorChart', sensors.detectors || [])",
+            "getElementById('homeSensorKinds')",
+        ] {
+            assert!(
+                body.contains(marker),
+                "renderHomeSensorsSummary MUST contain `{marker}` so the migrated \
+                 HUD mounts under the Home DOM ids (2026-05-15 Sensors slim)"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_sensors_slim_sensors_view_still_renders_collector_rows_and_timeline() {
+        // The slim drops the HUD-style surface but the collector-health
+        // surface (per-source rows) and the Event Timeline are the
+        // diagnostic value of the Sensors page — those MUST stay.
+        assert!(
+            INDEX_HTML.contains("id=\"sensorSources\""),
+            "Sensors view MUST keep the per-collector rows container"
+        );
+        assert!(
+            INDEX_HTML.contains("id=\"sensorChart\""),
+            "Sensors view MUST keep the Event Timeline canvas"
+        );
+        // And `loadSensors` MUST still render those — anchor the
+        // surviving render calls so a future refactor doesn't strip
+        // them while cleaning up alongside the HUD removal.
+        assert!(
+            JS_SENSORS.contains("getElementById('sensorSources')"),
+            "loadSensors MUST still render into the per-collector container"
+        );
+        assert!(
+            JS_SENSORS.contains("drawTimelineChart(data.event_timeline"),
+            "loadSensors MUST still draw the Event Timeline"
+        );
     }
 
     // ── Spec 049 PR3 anchors ────────────────────────────────────────

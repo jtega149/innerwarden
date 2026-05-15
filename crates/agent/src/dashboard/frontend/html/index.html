@@ -206,6 +206,33 @@
       </div>
     </div>
 
+    <!-- 6. SENSORS SUMMARY (migrated 2026-05-15 from the Sensors page).
+         Operator requested the HUD stat cards / Unresolved Cases gauge
+         / Detector Activity radar / Event Types tile to live below the
+         AI Intelligence Briefing. The same `/api/sensors` payload
+         feeds both surfaces; renderHomeSensorsSummary in home.js
+         mounts here. Sensors view keeps the per-collector breakdown +
+         Event Timeline (the diagnostic surface). -->
+    <div class="home-section" id="homeSensorsSummary">
+      <div class="home-section-title">Sensors Summary</div>
+      <div class="hud-stats" id="homeSensorCards"></div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px; margin-top:14px;">
+        <div class="hud-panel" style="display:flex;flex-direction:column;align-items:center;">
+          <h3 class="hud-panel-title">Unresolved Cases</h3>
+          <div style="position:relative;height:160px;width:100%;"><canvas id="homeThreatGauge"></canvas></div>
+          <div id="homeThreatLabel" style="font-family:'JetBrains Mono',monospace;font-size:0.8rem;color:#8b9db8;margin-top:4px;"></div>
+        </div>
+        <div class="hud-panel">
+          <h3 class="hud-panel-title">Detector Activity</h3>
+          <div style="position:relative;height:200px;"><canvas id="homeDetectorChart"></canvas></div>
+        </div>
+        <div class="hud-panel">
+          <h3 class="hud-panel-title">Event Types</h3>
+          <div id="homeSensorKinds" style="font-size:0.8rem;"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- 2026-05-15: removed Host Posture, System Health line + Show
          details toggle, and the Technical Details panel (which held
          pending-buckets, collector-strip and mode/heartbeat metadata).
@@ -213,29 +240,22 @@
          data they surfaced is reachable from Sensors / Health / Cases. -->
   </div>
 
-  <!-- ── Sensors view ── -->
+  <!-- ── Sensors view ── 2026-05-15 slim ──
+       The HUD stat cards (Events Today / Incidents / Sources Active /
+       Detectors Firing), the "incidents being handled by AI" banner,
+       the Unresolved Cases gauge, the Detector Activity radar, and
+       the Event Types tile were moved to Home (below AI Intelligence
+       Briefing — see #homeSensorsSummary). Sensors is now the
+       collector-health diagnostic view: per-stream rows + the Event
+       Timeline. Operator's exact request: "remover essas coisas com
+       setas em vermelho da pagina sensors e nao deixar codigo morto,
+       e mover para a home do dashboard abaixo de AI Intelligence
+       Briefing". -->
   <div class="report-view sensor-hud" id="viewSensors" style="display:flex;">
-    <div id="topAction" style="display:none;margin-bottom:14px;padding:16px 20px;border-radius:14px;border:1px solid rgba(244,63,94,0.3);background:rgba(244,63,94,0.06);"></div>
-    <div class="hud-stats" id="sensorCards"></div>
     <div style="display:flex; flex-wrap:wrap; gap:6px; flex-direction:column;" id="sensorSources"></div>
     <div class="hud-panel">
       <h3 class="hud-panel-title">Event Timeline</h3>
       <div style="position:relative;height:240px;"><canvas id="sensorChart"></canvas></div>
-    </div>
-    <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px;">
-      <div class="hud-panel" style="display:flex;flex-direction:column;align-items:center;">
-        <h3 class="hud-panel-title">Unresolved Cases</h3>
-        <div style="position:relative;height:160px;width:100%;"><canvas id="threatGauge"></canvas></div>
-        <div id="threatLabel" style="font-family:'JetBrains Mono',monospace;font-size:0.8rem;color:#8b9db8;margin-top:4px;"></div>
-      </div>
-      <div class="hud-panel">
-        <h3 class="hud-panel-title">Detector Activity</h3>
-        <div style="position:relative;height:200px;"><canvas id="detectorChart"></canvas></div>
-      </div>
-      <div class="hud-panel">
-        <h3 class="hud-panel-title">Event Types</h3>
-        <div id="sensorKinds" style="font-size:0.8rem;"></div>
-      </div>
     </div>
   </div>
 

@@ -65,7 +65,65 @@ async function loadHome() {
     // contradictory state on one screen.
     syncModeBadgeFromHealth(overview, actionCfg);
     loadBriefing();
+    // 2026-05-15 Sensors slim: the HUD stat cards, Unresolved Cases
+    // gauge, Detector Activity radar and Event Types tile moved from
+    // the Sensors page to Home (below the AI Briefing). Same payload
+    // already fetched in the Promise.all above.
+    renderHomeSensorsSummary(sensors);
   } catch(e) { console.warn('loadHome error:', e); }
+}
+
+// ── Sensors summary on Home (migrated from the Sensors page) ─────────
+// Renders the 4 HUD KPIs + Unresolved Cases gauge + Detector Activity
+// radar + Event Types tile under the AI Briefing. Uses the same
+// `/api/sensors` payload loadHome already fetched. Defensive about
+// missing DOM nodes so partial-page mounts don't throw.
+function renderHomeSensorsSummary(sensors) {
+  if (!sensors) return;
+  // 4 KPIs: Events Today / Incidents / Sources Active / Detectors
+  // Firing. Same shape as the old Sensors HUD cards.
+  var cards = document.getElementById('homeSensorCards');
+  if (cards) {
+    var totalEvents = sensors.total_events || 0;
+    var totalIncidents = sensors.total_incidents || 0;
+    var sourcesCount = (sensors.sources || []).length;
+    var detectorsCount = (sensors.detectors || []).length;
+    var unresolved = (typeof getUnresolved === 'function') ? getUnresolved().unresolved : 0;
+    var incClass = unresolved > 0 ? 'danger' : 'safe';
+    var incSuffix = totalIncidents > 0 && unresolved === 0
+      ? '<div style="font-size:0.6rem;opacity:0.6;margin-top:2px">all handled</div>'
+      : '';
+    var html = '';
+    html += '<div class="hud-card"><div class="hud-val">' + totalEvents.toLocaleString() + '</div><div class="hud-label">Events Today</div></div>';
+    html += '<div class="hud-card"><div class="hud-val ' + incClass + '">' + totalIncidents + '</div>' + incSuffix + '<div class="hud-label">Incidents</div></div>';
+    html += '<div class="hud-card"><div class="hud-val safe">' + sourcesCount + '</div><div class="hud-label">Sources Active</div></div>';
+    html += '<div class="hud-card"><div class="hud-val">' + detectorsCount + '</div><div class="hud-label">Detectors Firing</div></div>';
+    cards.innerHTML = html;
+  }
+  // Unresolved Cases gauge + Detector Activity radar — both
+  // parameterised in sensors.js so Home can mount them under its own
+  // canvas ids.
+  if (typeof drawThreatGauge === 'function') {
+    drawThreatGauge('homeThreatGauge', 'homeThreatLabel');
+  }
+  if (typeof drawDetectorChart === 'function') {
+    drawDetectorChart('homeDetectorChart', sensors.detectors || []);
+  }
+  // Event Types tile — top 10 kinds with % of total events.
+  var kindsEl = document.getElementById('homeSensorKinds');
+  if (kindsEl) {
+    var khtml = '';
+    var totalForPct = sensors.total_events || 0;
+    var topKinds = (sensors.top_kinds || []).slice(0, 10);
+    for (var i = 0; i < topKinds.length; i++) {
+      var k = topKinds[i];
+      var pct = totalForPct > 0 ? ((k.count / totalForPct) * 100).toFixed(1) : '0';
+      khtml += '<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
+        '<span style="color:var(--fg);">' + k.name + '</span>' +
+        '<span style="color:var(--muted);">' + k.count.toLocaleString() + ' (' + pct + '%)</span></div>';
+    }
+    kindsEl.innerHTML = khtml || '<span style="color:var(--muted);">No events yet</span>';
+  }
 }
 
 

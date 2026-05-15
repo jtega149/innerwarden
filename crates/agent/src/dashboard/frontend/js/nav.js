@@ -97,7 +97,11 @@ function showView(name) {
   }
 
   if (name === 'home') loadHome();
-  if (name === 'sensors') { loadSensors(); loadTopAction(); }
+  // 2026-05-15: Sensors HUD slim — `loadTopAction` was deleted along
+  // with the "incidents being handled by AI" banner. Home owns that
+  // editorial via the hero + activity strip; Sensors is now the
+  // collector-health view, no top-banner.
+  if (name === 'sensors') loadSensors();
   if (name === 'report') loadReport();
   if (name === 'status') loadStatus();
   if (name === 'honeypot') loadHoneypot();

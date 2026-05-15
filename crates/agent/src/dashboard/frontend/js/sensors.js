@@ -119,19 +119,12 @@ function healthBadge(status) {
 async function loadSensors() {
   try {
     const data = await loadJson('/api/sensors');
-    const cards = document.getElementById('sensorCards');
-    if (!cards) return;
-
-    // HUD stat cards
-    let html = '';
-    html += '<div class="hud-card"><div class="hud-val">' + (data.total_events||0).toLocaleString() + '</div><div class="hud-label">Events Today</div></div>';
-    var unresolved = getUnresolved().unresolved;
-    var incClass = unresolved > 0 ? 'danger' : 'safe';
-    var incSuffix = data.total_incidents > 0 && unresolved === 0 ? '<div style="font-size:0.6rem;opacity:0.6;margin-top:2px">all handled</div>' : '';
-    html += '<div class="hud-card"><div class="hud-val ' + incClass + '">' + (data.total_incidents||0) + '</div>' + incSuffix + '<div class="hud-label">Incidents</div></div>';
-    html += '<div class="hud-card"><div class="hud-val safe">' + (data.sources||[]).length + '</div><div class="hud-label">Sources Active</div></div>';
-    html += '<div class="hud-card"><div class="hud-val">' + (data.detectors||[]).length + '</div><div class="hud-label">Detectors Firing</div></div>';
-    cards.innerHTML = html;
+    // 2026-05-15 Sensors slim: the HUD stat cards, Unresolved-Cases
+    // gauge, Detector Activity radar and Event Types tile moved to
+    // Home (rendered by renderHomeSensorsSummary). Sensors keeps the
+    // collector-health surface — telemetry/alarm/snapshot rows + the
+    // Event Timeline — because that's the diagnostic view, not the
+    // at-a-glance view.
 
     // Per-source rows — split into active vs available
     const srcEl = document.getElementById('sensorSources');
@@ -257,100 +250,19 @@ async function loadSensors() {
       srcEl.innerHTML = shtml;
     }
 
-    // Charts
+    // Event Timeline still lives on the Sensors page — paired with
+    // the per-collector breakdown above. The HUD stat cards, gauge,
+    // radar and Event Types tile moved to Home (renderHomeSensorsSummary).
     drawTimelineChart(data.event_timeline || {}, data.sources || []);
-    drawThreatGauge(data.total_incidents || 0, data.total_events || 0);
-
-    // Top kinds list
-    const kindsEl = document.getElementById('sensorKinds');
-    if (kindsEl) {
-      let khtml = '';
-      for (const k of (data.top_kinds || []).slice(0, 10)) {
-        const pct = data.total_events > 0 ? ((k.count / data.total_events) * 100).toFixed(1) : '0';
-        khtml += '<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
-          '<span style="color:var(--fg);">' + k.name + '</span>' +
-          '<span style="color:var(--muted);">' + k.count.toLocaleString() + ' (' + pct + '%)</span></div>';
-      }
-      kindsEl.innerHTML = khtml || '<span style="color:var(--muted);">No events yet</span>';
-    }
-
-    // Detector activity chart
-    drawDetectorChart(data.detectors || []);
   } catch(e) { console.error('loadSensors', e); }
 }
 
-// ── Top Action Widget: surface the most urgent decision ───────────
-async function loadTopAction() {
-  try {
-    const ctx = await loadJson('/api/agent/security-context');
-    const el = document.getElementById('topAction');
-    if (!el) return;
-
-    const level = ctx.threat_level || 'low';
-    const hc = ctx.high_or_critical_today || 0;
-    const threats = ctx.top_threats || [];
-    const blocks = ctx.recent_blocks_today || 0;
-
-    if (level === 'low' && hc === 0) {
-      // All clear — show subtle green bar
-      el.style.display = 'block';
-      el.style.borderColor = 'rgba(58,194,126,0.3)';
-      el.style.background = 'rgba(58,194,126,0.04)';
-      el.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between">' +
-        '<div style="display:flex;align-items:center;gap:10px">' +
-        '<span style="font-size:1.3rem">&#9989;</span>' +
-        '<div><div style="font-size:0.85rem;font-weight:700;color:var(--ok)">All Clear</div>' +
-        '<div style="font-size:0.7rem;color:var(--muted)">' + blocks + ' IPs blocked today. No unresolved high-severity incidents.</div></div></div>' +
-        '<button onclick="this.closest(\'[id]\').style.display=\'none\'" style="' +
-        'padding:4px 8px;border-radius:6px;border:1px solid var(--line);' +
-        'background:transparent;color:var(--muted);font-size:0.75rem;' +
-        'cursor:pointer;line-height:1" title="Dismiss">\u2715</button></div>';
-      return;
-    }
-
-    // There are incidents the AI is handling. With Guard ON, present
-    // as informational (blue), not alarming (red). The AI is autonomous.
-    const topThreat = threats.length > 0 ? threats[0] : null;
-    const isGuard = (window._agentMode || 'guard') === 'guard';
-    const color = isGuard ? '#78e5ff' : (level === 'critical' ? '#f43f5e' : '#fb923c');
-
-    el.style.display = 'block';
-    el.style.borderColor = isGuard ? 'rgba(120,229,255,0.3)' : 'rgba(244,63,94,0.3)';
-    el.style.background = isGuard ? 'rgba(120,229,255,0.04)' : 'linear-gradient(135deg, rgba(244,63,94,0.06), transparent)';
-
-    const statusLabel = isGuard
-      ? hc + ' incident' + (hc > 1 ? 's' : '') + ' being handled by AI'
-      : hc + ' unresolved ' + (level === 'critical' ? 'CRITICAL' : 'high-severity') + ' incident' + (hc > 1 ? 's' : '');
-
-    let actionHtml = '<div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">' +
-      '<div style="display:flex;align-items:center;gap:10px">' +
-      '<span style="font-size:1.3rem">' + (isGuard ? '&#128737;' : (level === 'critical' ? '&#128680;' : '&#9888;&#65039;')) + '</span>' +
-      '<div>' +
-      '<div style="font-size:0.85rem;font-weight:700;color:' + color + '">' + statusLabel + '</div>' +
-      '<div style="font-size:0.7rem;color:var(--muted)">';
-
-    if (topThreat) {
-      actionHtml += 'Top threat: <strong style="color:var(--text)">' + esc(topThreat) + '</strong>';
-      if (threats.length > 1) actionHtml += ' + ' + (threats.length - 1) + ' more';
-    }
-    actionHtml += '</div></div></div>';
-
-    // Action button + dismiss
-    actionHtml += '<div style="display:flex;align-items:center;gap:8px">' +
-      '<button onclick="showView(\'investigate\')" style="' +
-      'padding:8px 18px;border-radius:10px;border:1px solid ' + color + ';' +
-      'background:transparent;color:' + color + ';font-size:0.75rem;font-weight:700;' +
-      'cursor:pointer;white-space:nowrap;transition:background 0.2s' +
-      '" onmouseover="this.style.background=\'' + color + '20\'" onmouseout="this.style.background=\'transparent\'">' +
-      'Investigate &#8594;</button>' +
-      '<button onclick="this.closest(\'[id]\').style.display=\'none\'" style="' +
-      'padding:4px 8px;border-radius:6px;border:1px solid var(--line);' +
-      'background:transparent;color:var(--muted);font-size:0.75rem;' +
-      'cursor:pointer;line-height:1" title="Dismiss">\u2715</button></div></div>';
-
-    el.innerHTML = actionHtml;
-  } catch(e) { console.warn('loadTopAction:', e); }
-}
+// 2026-05-15: `loadTopAction` (the "14 incidents being handled by AI"
+// banner above the Sensors HUD) was removed alongside the HUD stat
+// cards / Unresolved Cases gauge / Detector Activity radar / Event
+// Types tile. The data moved to Home in compact form via
+// `renderHomeSensorsSummary`; the banner's editorial content is now
+// covered by Home's hero + activity strip.
 
 // Chart.js global config - match site design system
 let timelineChart = null;
@@ -458,10 +370,13 @@ function drawTimelineChart(timeline, sources) {
 }
 
 // ── 2. THREAT GAUGE - Doughnut speedometer ──
-function drawThreatGauge(incidents, events) {
-  const canvas = document.getElementById('threatGauge');
+// 2026-05-15: parameterised so Home can mount the gauge under its own
+// DOM ids (`homeThreatGauge` / `homeThreatLabel`). The Sensors page no
+// longer renders the gauge — see renderHomeSensorsSummary in home.js.
+function drawThreatGauge(canvasId, labelId) {
+  const canvas = document.getElementById(canvasId);
   if (!canvas || !CJ) return;
-  const label = document.getElementById('threatLabel');
+  const label = labelId ? document.getElementById(labelId) : null;
 
   // Scale based on UNRESOLVED threats only — blocked threats = success, not danger.
   const ur = getUnresolved().unresolved;
@@ -544,8 +459,11 @@ function drawThreatGauge(incidents, events) {
 }
 
 // ── 3. POLAR AREA - Detector activity (radial, colorful) ──
-function drawDetectorChart(detectors) {
-  const canvas = document.getElementById('detectorChart');
+// 2026-05-15: parameterised so Home can render the radar under its own
+// canvas id (`homeDetectorChart`). The Sensors page no longer renders
+// it — see renderHomeSensorsSummary in home.js.
+function drawDetectorChart(canvasId, detectors) {
+  const canvas = document.getElementById(canvasId);
   if (!canvas || !CJ || detectors.length === 0) return;
 
   const top = detectors.slice(0, 8);

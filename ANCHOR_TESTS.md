@@ -1260,6 +1260,17 @@ Fix: tighten the check. Match `crontab -e` (edit) and `crontab -r` (remove) expl
 - `crates/sensor/src/detectors/crontab_persistence.rs::tests::crontab_remove_flag_still_triggers_persistence_alert` — `crontab -r` (remove) MUST still fire — anti-regression for "tightening dropped a real signal".
 - `crates/sensor/src/detectors/crontab_persistence.rs::tests::crontab_list_other_user_flag_does_not_trigger_persistence_alert` — `crontab -u alice -l` (list someone else's crontab) is also read-only.
 
+### Sensors slim-down — HUD migrated to Home (2026-05-15)
+
+Operator request: "remover essas coisas com setas em vermelho da pagina sensors e nao deixar codigo morto, e cobrir de testes como sempre, e mover para a home do dashboard abaixo de AI Intelligence Briefing". The Sensors page lost the AI-handling banner, the 4 KPI tiles, the Unresolved Cases gauge, the Detector Activity radar, and the Event Types tile — all migrated under a new `#homeSensorsSummary` section below the AI Briefing on Home. These anchors pin the move so a future refactor cannot accidentally (a) bring the removed DOM ids / `loadTopAction` back, (b) drop the new Home markers, (c) re-hardcode the chart canvas ids, or (d) strip the kept Sensors surface (per-collector rows + Event Timeline).
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr_sensors_slim_removed_dom_ids_are_gone_from_index_html` — `#topAction`, `#sensorCards`, `#threatGauge`, `#threatLabel`, `#detectorChart`, `#sensorKinds` stay deleted from `viewSensors`.
+- `crates/agent/src/dashboard/mod.rs::tests::pr_sensors_slim_home_summary_section_is_present_below_briefing` — Home has `#homeSensorsSummary` + the 5 child ids and the "Sensors Summary" title, and `#briefingSection` appears before `#homeSensorsSummary` in the source (operator instruction: below the briefing).
+- `crates/agent/src/dashboard/mod.rs::tests::pr_sensors_slim_load_top_action_is_gone_from_sensors_js_and_nav_js` — `loadTopAction` removed from sensors.js; nav.js no longer calls it; `loadSensors()` still wired up.
+- `crates/agent/src/dashboard/mod.rs::tests::pr_sensors_slim_chart_helpers_are_parameterised_for_home_mounts` — `drawThreatGauge(canvasId, labelId)` and `drawDetectorChart(canvasId, detectors)` accept canvas ids as parameters; no hardcoded `threatGauge` / `detectorChart` `getElementById` lookups survive.
+- `crates/agent/src/dashboard/mod.rs::tests::pr_sensors_slim_home_renderer_mounts_to_home_dom_ids` — `renderHomeSensorsSummary` body mounts to `homeSensorCards` / `homeThreatGauge` / `homeThreatLabel` / `homeDetectorChart` / `homeSensorKinds` (catches a paste error that targets the old Sensors ids).
+- `crates/agent/src/dashboard/mod.rs::tests::pr_sensors_slim_sensors_view_still_renders_collector_rows_and_timeline` — Sensors view keeps `#sensorSources` + `#sensorChart` in markup AND `loadSensors` still renders into both.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
