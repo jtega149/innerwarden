@@ -5389,17 +5389,17 @@ mod tests {
         // `showProfileDetail` / `switchIntelTab('profiles')` dance
         // fails CI before the operator hits the bug again.
         //
-        // Entries:
+        // Entries currently wired (post-PR-B):
         //   - Cases journey "View full profile" link (via openIntelProfile alias)
         //   - Intel profile-list table row click
-        //   - Campaign member-IP chip click (intel.js campaigns sub-tab)
+        //
+        // The Campaign member-IP chip entry was deleted in PR-B when
+        // the Campaigns sub-tab was removed. It will return in PR-D as
+        // a tag on the Cases header that opens the same modal; a new
+        // anchor will be added in that PR for the new surface.
         assert!(
             JS_INTEL.contains("onclick=\"openProfileModal(\\'"),
             "Intel profile-list rows MUST onclick into openProfileModal(ip)"
-        );
-        assert!(
-            JS_INTEL.contains("openProfileModal('${esc(ip)}')"),
-            "Campaign member-IP chips MUST onclick into openProfileModal(ip)"
         );
         // `showProfileDetail` was the pre-PR-A in-page renderer + entry.
         // It is replaced by `renderProfileDossierHtml` (chrome-free
@@ -5419,6 +5419,114 @@ mod tests {
         assert!(
             JS_INTEL.contains("function renderProfileDossierHtml(p)"),
             "intel.js must define `renderProfileDossierHtml(p)` — the chrome-free body builder"
+        );
+    }
+
+    // ── 2026-05-15 PR-B: Intel slim — Campaigns/Chains/MITRE deleted ─
+    // Intel page trimmed to Profiles + Baseline sub-tabs. Operator:
+    // - Campaigns → will become a tag in the Cases header (PR-D);
+    //               aggregate listing is overkill for the daily flow.
+    // - Chains → already on the Cases journey per-incident; aggregate
+    //            timeline was rarely opened.
+    // - MITRE → coverage heatmap already on the Monthly threat report.
+    // Baseline stays for now; moves to Health in PR-C.
+
+    #[test]
+    fn pr_intel_slim_deleted_sub_tab_buttons_are_gone_from_index_html() {
+        for orphan in [
+            "id=\"intelTabCampaigns\"",
+            "id=\"intelTabChains\"",
+            "id=\"intelTabMitre\"",
+            "switchIntelTab('campaigns')",
+            "switchIntelTab('chains')",
+            "switchIntelTab('mitre')",
+            ">Campaigns</button>",
+            ">Chains</button>",
+            ">MITRE</button>",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(orphan),
+                "2026-05-15 PR-B Intel slim: `{orphan}` was deleted; the Campaigns / \
+                 Chains / MITRE sub-tab surfaces must stay gone"
+            );
+        }
+        // Profiles + Baseline buttons MUST still be present (Baseline
+        // moves to Health in PR-C; until then the tab toggle stays).
+        assert!(
+            INDEX_HTML.contains("id=\"intelTabProfiles\""),
+            "Profiles sub-tab button MUST stay — it's the only remaining Intel surface"
+        );
+        assert!(
+            INDEX_HTML.contains("id=\"intelTabBaseline\""),
+            "Baseline sub-tab button stays until PR-C moves it to Health"
+        );
+    }
+
+    #[test]
+    fn pr_intel_slim_deleted_sub_tab_loaders_are_gone_from_intel_js() {
+        for orphan in [
+            "async function loadCampaigns",
+            "async function loadChains",
+            "async function loadMitreCoverage",
+            "function loadCampaigns",
+            "function loadChains",
+            "function loadMitreCoverage",
+            "loadCampaigns(",
+            "loadChains(",
+            "loadMitreCoverage(",
+        ] {
+            assert!(
+                !JS_INTEL.contains(orphan),
+                "2026-05-15 PR-B Intel slim: `{orphan}` was deleted; the legacy \
+                 sub-tab loaders + call sites must stay gone (no dead code)"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_intel_slim_switch_tab_dispatcher_lists_only_remaining_tabs() {
+        // The dispatcher walks the `tabs` array to update button styles
+        // and routes each name to a loader. Both surfaces must reflect
+        // the deletion — anchor catches a paste error that re-introduces
+        // 'campaigns' / 'chains' / 'mitre' to the array or the dispatch
+        // switch (which would then NPE on click because the loaders are
+        // gone).
+        let start = JS_INTEL
+            .find("function switchIntelTab(tab)")
+            .expect("switchIntelTab present");
+        let end = JS_INTEL[start..]
+            .find("\n}\n")
+            .expect("end of switchIntelTab")
+            + start;
+        let body = &JS_INTEL[start..end];
+        for ghost in [
+            "'Campaigns'",
+            "'Chains'",
+            "'Mitre'",
+            "'campaigns'",
+            "'chains'",
+            "'mitre'",
+        ] {
+            assert!(
+                !body.contains(ghost),
+                "switchIntelTab MUST NOT reference `{ghost}` — that sub-tab was \
+                 deleted in PR-B; reviving the name in the dispatcher would NPE \
+                 at click time because the loader is gone too"
+            );
+        }
+        // The remaining-tab vocabulary must be present.
+        assert!(
+            body.contains("['Profiles', 'Baseline']"),
+            "switchIntelTab `tabs` array MUST list ['Profiles', 'Baseline'] — the \
+             only remaining sub-tabs"
+        );
+        assert!(
+            body.contains("if (tab === 'baseline') loadBaseline();"),
+            "switchIntelTab MUST dispatch 'baseline' → loadBaseline()"
+        );
+        assert!(
+            body.contains("else loadIntel();"),
+            "switchIntelTab default branch MUST fall through to loadIntel() (Profiles)"
         );
     }
 
