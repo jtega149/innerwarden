@@ -446,10 +446,20 @@ function renderRecurrenceBlock(rec) {
         '↻ ' + esc(String(returnsRaw)) + ' return(s) after unblock <small>(approx.)</small>' +
       '</span>'
     : '<span class="recurrence-pill">No returns after unblock</span>';
-  var profileHref = rec.profile_link
+  // 2026-05-15: open the specific attacker profile, not the generic
+  // Intel tab. profile_link is `/api/attacker-profiles/<ip>`; pull
+  // the IP off the tail. The helper openIntelProfile centralises the
+  // showView('intel') + setTimeout + showProfileDetail dance.
+  var profileIp = '';
+  if (rec.profile_link) {
+    var parts = String(rec.profile_link).split('/');
+    profileIp = parts[parts.length - 1] || '';
+  }
+  var profileHref = profileIp
     ? '<a href="#intel" class="recurrence-profile-link" ' +
-        'onclick="event.preventDefault();showView(\'intel\')">' +
-        'View full profile →</a>'
+        'onclick="event.preventDefault();openIntelProfile(\'' +
+        esc(profileIp) +
+        '\')">View full profile →</a>'
     : '';
   // Snake-case wire string for CSS hooks (per-pattern styling can
   // land in a future PR; PR10 keeps chrome neutral). Sanitize defensively.

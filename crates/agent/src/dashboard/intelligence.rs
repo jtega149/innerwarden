@@ -47,6 +47,25 @@ pub(super) async fn api_attacker_profiles(
     }
 
     let total = filtered.len();
+    // 2026-05-15: bucket counts so the Intel page KPI tiles can show the
+    // TRUE high/medium/low counts instead of filtering the visible 100-row
+    // slice (operator-reported: "High Risk: 100" was the same as the
+    // visible-row count, not the real bucket size).
+    let high_risk = filtered
+        .iter()
+        .filter(|p| p.get("risk_score").and_then(|v| v.as_i64()).unwrap_or(0) >= 70)
+        .count();
+    let medium_risk = filtered
+        .iter()
+        .filter(|p| {
+            let r = p.get("risk_score").and_then(|v| v.as_i64()).unwrap_or(0);
+            (40..70).contains(&r)
+        })
+        .count();
+    let low_risk = filtered
+        .iter()
+        .filter(|p| p.get("risk_score").and_then(|v| v.as_i64()).unwrap_or(0) < 40)
+        .count();
     let page: Vec<serde_json::Value> = filtered.into_iter().skip(offset).take(limit).collect();
 
     Json(serde_json::json!({
@@ -54,6 +73,13 @@ pub(super) async fn api_attacker_profiles(
         "offset": offset,
         "limit": limit,
         "profiles": page,
+        // Canonical bucket counts (computed over the full filtered set,
+        // not the visible page) so the Intel page KPI tiles are honest.
+        "totals_by_risk": {
+            "high": high_risk,    // >= 70
+            "medium": medium_risk, // 40..70
+            "low": low_risk,       // < 40
+        }
     }))
 }
 

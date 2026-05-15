@@ -3,66 +3,159 @@
 // removed alongside the playbook engine. Future declarative
 // orchestration belongs to Spec 042 active defense.
 
+// 2026-05-15: page size + active risk filter persisted across calls.
+// Operator-reported: KPI "High Risk: 100" was the same as the visible
+// row count, not the real bucket size; "Total: 4141" had no way to
+// reach the other 4041; sorted-desc table gave no visual cue for
+// where the risk cliff was.
+const INTEL_PAGE_SIZE = 100;
+let _intelOffset = 0;
+let _intelRiskFilter = 0; // 0 = all, 70 = high, 40 = medium+, ...
+let _intelLoadedProfiles = []; // accumulator for "Load more"
+
 async function loadIntel() {
+  _intelOffset = 0;
+  _intelLoadedProfiles = [];
+  await fetchAndRenderIntel(/* append= */ false);
+}
+
+async function fetchAndRenderIntel(append) {
   const status = document.getElementById('intelViewStatus');
   const content = document.getElementById('intelContent');
-  if (status) status.textContent = 'Loading…';
+  if (status) status.textContent = append ? 'Loading more…' : 'Loading…';
   const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
     const sort = document.getElementById('intelSort')?.value || 'risk_score';
-    const minRisk = document.getElementById('intelMinRisk')?.value || '0';
-    const data = await loadJson(`/api/attacker-profiles?sort=${sort}&min_risk=${minRisk}&limit=100`, { signal });
+    const url = '/api/attacker-profiles?sort=' + encodeURIComponent(sort)
+      + '&min_risk=' + _intelRiskFilter
+      + '&limit=' + INTEL_PAGE_SIZE
+      + '&offset=' + _intelOffset;
+    const data = await loadJson(url, { signal });
     if (!data || !data.profiles) { content.innerHTML = '<p style="color:var(--dim)">No attacker profiles yet.</p>'; return; }
 
-    let html = `<div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px;">
-      <div class="kpi-card"><div class="kpi-value">${data.total || 0}</div><div class="kpi-label">Total Profiles</div></div>
-      <div class="kpi-card"><div class="kpi-value">${data.profiles.filter(p=>p.risk_score>=70).length}</div><div class="kpi-label">High Risk (≥70)</div></div>
-      <div class="kpi-card"><div class="kpi-value">${new Set(data.profiles.map(p=>p.dna?.pattern_class).filter(Boolean)).size}</div><div class="kpi-label">Pattern Types</div></div>
-      <div class="kpi-card"><div class="kpi-value">${new Set(data.profiles.map(p=>p.geo?.country_code).filter(Boolean)).size}</div><div class="kpi-label">Countries</div></div>
-    </div>`;
+    if (append) {
+      _intelLoadedProfiles = _intelLoadedProfiles.concat(data.profiles);
+    } else {
+      _intelLoadedProfiles = data.profiles.slice();
+    }
 
-    html += `<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
-      <thead><tr style="border-bottom:2px solid var(--border);text-align:left;">
-        <th style="padding:6px;">Risk</th><th style="padding:6px;">IP</th><th style="padding:6px;">Country</th>
-        <th style="padding:6px;">Incidents</th><th style="padding:6px;">Blocks</th><th style="padding:6px;">Detectors</th>
-        <th style="padding:6px;">Pattern</th><th style="padding:6px;">DNA</th><th style="padding:6px;">Last Seen</th>
-      </tr></thead><tbody>`;
+    const buckets = data.totals_by_risk || {};
+    const totalAll = data.total || 0;
+    const totalHigh = buckets.high || 0;
+    const totalMedium = buckets.medium || 0;
+    // The visible profiles set respects the current risk filter; the
+    // bucket counts in the response are scoped to that filter (the
+    // backend computes them over `filtered`). So when filter=0
+    // buckets reflect the whole DB; when filter=70, "high" == total
+    // visible and others are 0. That's the right honesty contract.
 
-    for (const p of data.profiles) {
+    // KPI tiles — clicking sets the risk filter. Current filter is
+    // highlighted so the operator knows which bucket they're seeing.
+    const tile = function(label, value, filterValue, active) {
+      const cursor = filterValue == null ? '' : 'cursor:pointer;';
+      const ring = active ? 'box-shadow:inset 0 0 0 1px var(--accent);' : '';
+      const onclick = filterValue == null ? ''
+        : ` onclick="setIntelRiskFilter(${filterValue})"`;
+      return '<div class="kpi-card" style="' + cursor + ring + '"' + onclick + '>'
+        + '<div class="kpi-value">' + value + '</div>'
+        + '<div class="kpi-label">' + label + '</div>'
+        + '</div>';
+    };
+    let html = '<div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:12px;">'
+      + tile('Total Profiles', totalAll, 0, _intelRiskFilter === 0)
+      + tile('High Risk (≥70)', totalHigh, 70, _intelRiskFilter === 70)
+      + tile('Medium (40–69)', totalMedium, 40, _intelRiskFilter === 40)
+      + tile('Countries', new Set(_intelLoadedProfiles.map(p=>p.geo?.country_code).filter(Boolean)).size, null, false)
+      + '</div>';
+
+    // Filter row — IP search + sort + clear-filter (when active).
+    html += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:0.78rem;">'
+      + '<input id="intelIpSearch" type="search" placeholder="search IP…" oninput="filterIntelByIp(this.value)" autocomplete="off" spellcheck="false" style="padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);min-width:200px;" />'
+      + (_intelRiskFilter > 0
+          ? '<span style="color:var(--accent);">Filter: risk ≥ ' + _intelRiskFilter + '</span><button type="button" onclick="setIntelRiskFilter(0)" style="padding:3px 8px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;">× clear</button>'
+          : '')
+      + '</div>';
+
+    html += '<table id="intelTable" style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+      + '<thead><tr style="border-bottom:2px solid var(--border);text-align:left;">'
+      + '<th style="padding:6px;">Risk</th><th style="padding:6px;">IP</th><th style="padding:6px;">Country</th>'
+      + '<th style="padding:6px;">Incidents</th><th style="padding:6px;">Blocks</th><th style="padding:6px;">Detectors</th>'
+      + '<th style="padding:6px;">Pattern</th><th style="padding:6px;">Last Seen</th>'
+      + '</tr></thead><tbody>';
+
+    for (const p of _intelLoadedProfiles) {
       const riskColor = p.risk_score >= 70 ? '#e74c3c' : p.risk_score >= 40 ? '#f39c12' : '#27ae60';
-      const riskBar = `<div style="display:flex;align-items:center;gap:6px;">
-        <div style="width:40px;height:8px;background:var(--border);border-radius:4px;overflow:hidden;">
-          <div style="width:${p.risk_score}%;height:100%;background:${riskColor};"></div>
-        </div><span style="color:${riskColor};font-weight:600;">${p.risk_score}</span></div>`;
+      const riskBar = '<div style="display:flex;align-items:center;gap:6px;">'
+        + '<div style="width:40px;height:8px;background:var(--border);border-radius:4px;overflow:hidden;">'
+        + '<div style="width:' + p.risk_score + '%;height:100%;background:' + riskColor + ';"></div></div>'
+        + '<span style="color:' + riskColor + ';font-weight:600;">' + p.risk_score + '</span></div>';
       const country = p.geo?.country_code || '??';
       const detectors = (p.detectors_triggered || []).slice(0, 3).join(', ');
       const patternRaw = p.dna?.pattern_class || 'unknown';
-      const dnaShort = (p.dna?.hash || '').slice(0, 10);
       const lastSeen = p.last_seen ? new Date(p.last_seen).toLocaleDateString() : '\u2014';
       const patternLabels = { regular_scanner:'Regular Scanner', targeted:'Targeted Attack', opportunistic:'Opportunistic', unknown:'Unknown' };
       const pattern = patternLabels[patternRaw] || patternRaw.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
       const patternBadge = pattern === 'Regular Scanner' ? lucideIcon('refresh-ccw') : pattern === 'Targeted Attack' ? lucideIcon('target') : pattern === 'Opportunistic' ? lucideIcon('crosshair') : lucideIcon('alert-circle');
-
-      html += `<tr style="border-bottom:1px solid var(--border);cursor:pointer;" onclick="showProfileDetail('${esc(p.ip)}')">
-        <td style="padding:6px;">${riskBar}</td>
-        <td style="padding:6px;font-family:monospace;">${esc(p.ip)}</td>
-        <td style="padding:6px;">${country}</td>
-        <td style="padding:6px;">${p.total_incidents}</td>
-        <td style="padding:6px;">${p.total_blocks}</td>
-        <td style="padding:6px;font-size:0.75rem;">${detectors}</td>
-        <td style="padding:6px;">${patternBadge} ${pattern}</td>
-        <td style="padding:6px;font-family:monospace;font-size:0.7rem;color:var(--dim);">${dnaShort}</td>
-        <td style="padding:6px;font-size:0.75rem;">${lastSeen}</td>
-      </tr>`;
+      // 2026-05-15 slim-down: dropped the DNA-hash column from the
+      // table. The full DNA fingerprint is still on the per-profile
+      // detail page; on the list, an 10-char monospace string was
+      // chrome noise that pushed Last Seen into ellipsis territory
+      // on common screen widths.
+      // 2026-05-15: tint rows \u226570 so the operator can spot the cliff
+      // even when the visible page mixes risk bands.
+      const rowTint = p.risk_score >= 70 ? 'background:rgba(231,76,60,0.05);' : '';
+      html += '<tr style="border-bottom:1px solid var(--border);cursor:pointer;' + rowTint + '" data-ip="' + esc(p.ip) + '" onclick="showProfileDetail(\'' + esc(p.ip) + '\')">'
+        + '<td style="padding:6px;">' + riskBar + '</td>'
+        + '<td style="padding:6px;font-family:monospace;">' + esc(p.ip) + '</td>'
+        + '<td style="padding:6px;">' + country + '</td>'
+        + '<td style="padding:6px;">' + p.total_incidents + '</td>'
+        + '<td style="padding:6px;">' + p.total_blocks + '</td>'
+        + '<td style="padding:6px;font-size:0.75rem;">' + detectors + '</td>'
+        + '<td style="padding:6px;">' + patternBadge + ' ' + pattern + '</td>'
+        + '<td style="padding:6px;font-size:0.75rem;">' + lastSeen + '</td>'
+        + '</tr>';
     }
     html += '</tbody></table>';
+
+    // "Showing X of Y" + Load more button. Honest about pagination \u2014
+    // operator no longer has to wonder where the other 4000+ profiles
+    // went.
+    const shown = _intelLoadedProfiles.length;
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;font-size:0.78rem;color:var(--muted);">';
+    html += '<span>Showing ' + shown + ' of ' + totalAll + ' profiles' + (_intelRiskFilter > 0 ? ' (filter: risk \u2265 ' + _intelRiskFilter + ')' : '') + '</span>';
+    if (shown < totalAll) {
+      html += '<button type="button" onclick="loadMoreIntelProfiles()" style="padding:5px 14px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;font-weight:600;">Load more (' + Math.min(INTEL_PAGE_SIZE, totalAll - shown) + ' more)</button>';
+    }
+    html += '</div>';
+
     content.innerHTML = html;
-    if (status) status.textContent = `${data.total} profiles`;
+    if (status) status.textContent = shown + ' of ' + totalAll + ' profiles';
   } catch(e) {
     if (e && (e.name === 'AbortError' || e.code === 20)) return;
-    content.innerHTML = `<p style="color:#e74c3c;">Failed to load: ${e.message}</p>`;
+    content.innerHTML = '<p style="color:#e74c3c;">Failed to load: ' + esc(e.message) + '</p>';
     if (status) status.textContent = 'Error';
   }
+}
+
+// 2026-05-15: click handlers \u2014 keep them at module scope so the
+// `onclick=` attributes in the rendered HTML can reach them.
+function setIntelRiskFilter(risk) {
+  _intelRiskFilter = risk;
+  loadIntel();
+}
+
+function loadMoreIntelProfiles() {
+  _intelOffset += INTEL_PAGE_SIZE;
+  fetchAndRenderIntel(/* append= */ true);
+}
+
+function filterIntelByIp(query) {
+  const q = (query || '').trim().toLowerCase();
+  const rows = document.querySelectorAll('#intelTable tbody tr');
+  rows.forEach(function(r) {
+    const ip = (r.getAttribute('data-ip') || '').toLowerCase();
+    r.style.display = (!q || ip.indexOf(q) !== -1) ? '' : 'none';
+  });
 }
 
 async function showProfileDetail(ip) {
@@ -158,6 +251,25 @@ async function showProfileDetail(ip) {
   } catch(e) {
     content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p><button type="button" onclick="loadIntel()">← Back</button>`;
   }
+}
+
+// 2026-05-15: deep-link helper. Other surfaces (Cases journey
+// recurrence block, Threats live-feed cards, future Telegram links)
+// can call `openIntelProfile(ip)` to land directly on the IP's
+// profile detail instead of the generic profile list. Switches to
+// the Intel tab → forces the Profiles sub-tab → loads the detail
+// once the tab has mounted.
+function openIntelProfile(ip) {
+  if (!ip) return;
+  showView('intel');
+  setTimeout(function () {
+    if (typeof switchIntelTab === 'function') {
+      switchIntelTab('profiles');
+    }
+    if (typeof showProfileDetail === 'function') {
+      showProfileDetail(ip);
+    }
+  }, 120);
 }
 
 let currentIntelTab = 'profiles';

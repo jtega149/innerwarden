@@ -5060,6 +5060,97 @@ mod tests {
     }
 
     #[test]
+    fn pr_intel_recurrence_link_deeplinks_to_ip_profile() {
+        // 2026-05-15: the recurrence block's "View full profile →" link
+        // pre-fix called `showView('intel')` only, landing the operator
+        // on the generic profiles list instead of the specific IP's
+        // detail page. The helper `openIntelProfile(ip)` switches view,
+        // forces the Profiles sub-tab, and then loads the detail —
+        // matching the pattern the campaign-member-IP click already used.
+        assert!(
+            JS_INTEL.contains("function openIntelProfile("),
+            "intel.js must define openIntelProfile(ip) — the deep-link helper"
+        );
+        assert!(
+            JS_INTEL.contains("showProfileDetail(ip)"),
+            "openIntelProfile must end at showProfileDetail to render the IP's detail page"
+        );
+        // Journey recurrence block must thread the IP into the link.
+        assert!(
+            JS_JOURNEY.contains("openIntelProfile("),
+            "journey.js recurrence block must call openIntelProfile(ip) instead of plain showView('intel')"
+        );
+        // Anti-regression: do NOT revert to the generic-tab nav.
+        assert!(
+            !JS_JOURNEY.contains("recurrence-profile-link\" onclick=\"event.preventDefault();showView(\\'intel\\')\""),
+            "recurrence-profile-link must not regress to plain showView('intel')"
+        );
+    }
+
+    #[test]
+    fn pr_intel_kpi_counts_use_canonical_buckets_not_visible_slice() {
+        // 2026-05-15: pre-fix the "High Risk (≥70)" KPI tile counted
+        // profiles within the visible 100-row slice — when all 100
+        // visible rows happened to be high-risk (because the list is
+        // sorted by risk desc), the tile showed 100 regardless of the
+        // true high-risk total. Operator-reported confusion: "100
+        // total high-risk? out of 4141?".
+        //
+        // Backend now returns `totals_by_risk: { high, medium, low }`
+        // computed over the FULL filtered set. Frontend reads those
+        // canonical numbers.
+        const INTEL_RS: &str = include_str!("intelligence.rs");
+        assert!(
+            INTEL_RS.contains("\"totals_by_risk\""),
+            "intelligence.rs must emit totals_by_risk in /api/attacker-profiles response"
+        );
+        for bucket in ["\"high\":", "\"medium\":", "\"low\":"] {
+            assert!(
+                INTEL_RS.contains(bucket),
+                "totals_by_risk must include the `{bucket}` bucket"
+            );
+        }
+        // Frontend must read from `data.totals_by_risk`, not from a
+        // visible-slice filter.
+        assert!(
+            JS_INTEL.contains("data.totals_by_risk"),
+            "intel.js must read KPI counts from data.totals_by_risk (the canonical buckets), \
+             not from data.profiles.filter(...) which only sees the visible page slice"
+        );
+    }
+
+    #[test]
+    fn pr_intel_paginates_with_load_more_and_ip_search() {
+        // 2026-05-15: the Intel page used to show 100 rows from a DB
+        // with 4000+ profiles and had no way to reach the rest. The
+        // operator could see the KPI tile said "Total Profiles: 4141"
+        // and could not access the other 4041. Add: explicit "Showing
+        // X of Y", a Load more button, and an IP search input.
+        assert!(
+            JS_INTEL.contains("function loadMoreIntelProfiles("),
+            "intel.js must define loadMoreIntelProfiles for pagination"
+        );
+        assert!(
+            JS_INTEL.contains("function setIntelRiskFilter("),
+            "intel.js must define setIntelRiskFilter so KPI tile clicks filter the list"
+        );
+        assert!(
+            JS_INTEL.contains("function filterIntelByIp("),
+            "intel.js must define filterIntelByIp so the search input filters the visible rows client-side"
+        );
+        assert!(
+            JS_INTEL.contains("Showing ' + shown + ' of ' + totalAll"),
+            "intel.js must surface 'Showing X of Y' so the operator never wonders where the rest of the 4000+ profiles went"
+        );
+        // Risk filter row tint must exist so ≥70 rows are visually distinct
+        // even when the visible page mixes bands.
+        assert!(
+            JS_INTEL.contains("rgba(231,76,60,0.05)"),
+            "intel.js must tint ≥70 risk rows so the operator can spot the high-risk cliff at a glance"
+        );
+    }
+
+    #[test]
     fn nav_drops_responses_tab_after_slim_down() {
         // 2026-05-15: the standalone Responses tab was removed from
         // the dashboard. Per-attacker enforcement detail moved to the
