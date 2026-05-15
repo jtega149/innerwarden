@@ -104,7 +104,7 @@ async function fetchAndRenderIntel(append) {
       // 2026-05-15: tint rows \u226570 so the operator can spot the cliff
       // even when the visible page mixes risk bands.
       const rowTint = p.risk_score >= 70 ? 'background:rgba(231,76,60,0.05);' : '';
-      html += '<tr style="border-bottom:1px solid var(--border);cursor:pointer;' + rowTint + '" data-ip="' + esc(p.ip) + '" onclick="showProfileDetail(\'' + esc(p.ip) + '\')">'
+      html += '<tr style="border-bottom:1px solid var(--border);cursor:pointer;' + rowTint + '" data-ip="' + esc(p.ip) + '" onclick="openProfileModal(\'' + esc(p.ip) + '\')">'
         + '<td style="padding:6px;">' + riskBar + '</td>'
         + '<td style="padding:6px;font-family:monospace;">' + esc(p.ip) + '</td>'
         + '<td style="padding:6px;">' + country + '</td>'
@@ -158,16 +158,19 @@ function filterIntelByIp(query) {
   });
 }
 
-async function showProfileDetail(ip) {
-  const content = document.getElementById('intelContent');
-  try {
-    const p = await loadJson(`/api/attacker-profiles/${encodeURIComponent(ip)}`);
-    if (!p || p.error) { content.innerHTML = `<p style="color:#e74c3c">${p?.error || 'Not found'}</p>`; return; }
-
-    const riskColor = p.risk_score >= 70 ? '#e74c3c' : p.risk_score >= 40 ? '#f39c12' : '#27ae60';
-    let html = `<button type="button" onclick="loadIntel()" style="margin-bottom:12px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">← Back</button>`;
-
-    html += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">`;
+// 2026-05-15 PR-A: dossier body builder. Returns the HTML for an
+// attacker dossier given the `/api/attacker-profiles/<ip>` payload.
+// Header chrome (back button / close button) is the caller's
+// responsibility — `openProfileModal` (the shared drill-down used by
+// Cases journey + Intel profile rows) supplies its own X-close in the
+// modal header, so this body is chrome-free.
+function renderProfileDossierHtml(p) {
+  if (!p || p.error) {
+    return `<p style="color:#e74c3c">${p?.error || 'Not found'}</p>`;
+  }
+  const riskColor = p.risk_score >= 70 ? '#e74c3c' : p.risk_score >= 40 ? '#f39c12' : '#27ae60';
+  let html = '';
+  html += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">`;
 
     // Left: Identity + Timeline
     html += `<div class="kpi-card" style="padding:16px;">
@@ -247,29 +250,72 @@ async function showProfileDetail(ip) {
       </div>`;
     }
 
-    content.innerHTML = html;
-  } catch(e) {
-    content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p><button type="button" onclick="loadIntel()">← Back</button>`;
+  return html;
+}
+
+// 2026-05-15 PR-A: shared dossier modal. The drill-down for an
+// attacker IP is one DOM surface, opened from both Cases journey
+// ("View full profile") and Intel profile-row clicks. Previously
+// `openIntelProfile` did `showView('intel') → setTimeout(120ms) →
+// switchIntelTab('profiles') → showProfileDetail` — that 120ms
+// race lost when the Intel tab fetch out-ran the timer, leaving the
+// operator on the generic profile list instead of the requested IP.
+// The modal sidesteps that entirely: no tab switch, no race window.
+async function openProfileModal(ip) {
+  if (!ip) return;
+  const modal = document.getElementById('profileModal');
+  const title = document.getElementById('profileModalTitle');
+  const body = document.getElementById('profileModalBody');
+  if (!modal || !body) return;
+  // Show the modal immediately with a loading state — operator gets
+  // visual feedback the click registered even if the API is slow.
+  if (title) title.textContent = 'Attacker dossier · ' + ip;
+  body.innerHTML = '<div style="color:var(--muted);padding:24px;text-align:center">Loading…</div>';
+  modal.style.display = 'flex';
+  // Focus the close button for keyboard users; Escape closes (wired
+  // by the document-level keydown handler below).
+  const closeBtn = modal.querySelector('.enf-modal-close');
+  if (closeBtn) closeBtn.focus();
+  try {
+    const p = await loadJson(`/api/attacker-profiles/${encodeURIComponent(ip)}`);
+    // Re-check the modal is still open + still targeting THIS IP
+    // (rapid-click protection — a second openProfileModal call would
+    // have already overwritten the title with the new IP).
+    if (modal.style.display === 'none') return;
+    if (title && title.textContent !== 'Attacker dossier · ' + ip) return;
+    body.innerHTML = renderProfileDossierHtml(p);
+  } catch (e) {
+    body.innerHTML = `<p style="color:#e74c3c;padding:16px">Failed to load: ${esc(e.message)}</p>`;
   }
 }
 
-// 2026-05-15: deep-link helper. Other surfaces (Cases journey
-// recurrence block, Threats live-feed cards, future Telegram links)
-// can call `openIntelProfile(ip)` to land directly on the IP's
-// profile detail instead of the generic profile list. Switches to
-// the Intel tab → forces the Profiles sub-tab → loads the detail
-// once the tab has mounted.
+function closeProfileModal() {
+  const modal = document.getElementById('profileModal');
+  if (!modal) return;
+  modal.style.display = 'none';
+  // Clear body so a follow-up open call starts from the loading
+  // skeleton, not stale content from the previous IP.
+  const body = document.getElementById('profileModalBody');
+  if (body) body.innerHTML = '<div style="color:var(--muted);padding:24px;text-align:center">Loading…</div>';
+}
+
+// Escape-to-close. Single document-level listener so we never leak
+// multiple handlers across re-opens.
+if (typeof window !== 'undefined' && !window._profileModalEscBound) {
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      const modal = document.getElementById('profileModal');
+      if (modal && modal.style.display !== 'none') closeProfileModal();
+    }
+  });
+  window._profileModalEscBound = true;
+}
+
+// 2026-05-15 PR-A: `openIntelProfile` kept as a thin alias for
+// backward compatibility with any cached call sites. New code MUST
+// call `openProfileModal(ip)` directly.
 function openIntelProfile(ip) {
-  if (!ip) return;
-  showView('intel');
-  setTimeout(function () {
-    if (typeof switchIntelTab === 'function') {
-      switchIntelTab('profiles');
-    }
-    if (typeof showProfileDetail === 'function') {
-      showProfileDetail(ip);
-    }
-  }, 120);
+  openProfileModal(ip);
 }
 
 let currentIntelTab = 'profiles';
@@ -351,7 +397,7 @@ async function loadCampaigns() {
           <div>
             <div style="font-size:0.75rem;color:var(--dim);margin-bottom:4px;">Member IPs (${c.member_ips.length})</div>
             <div style="display:flex;flex-wrap:wrap;gap:4px;">
-              ${c.member_ips.map(ip=>`<span onclick="switchIntelTab('profiles');setTimeout(()=>showProfileDetail('${esc(ip)}'),100)" style="padding:2px 8px;border-radius:4px;background:var(--border);font-family:monospace;font-size:0.75rem;cursor:pointer;">${esc(ip)}</span>`).join('')}
+              ${c.member_ips.map(ip=>`<span onclick="openProfileModal('${esc(ip)}')" style="padding:2px 8px;border-radius:4px;background:var(--border);font-family:monospace;font-size:0.75rem;cursor:pointer;">${esc(ip)}</span>`).join('')}
             </div>
             ${c.countries.length ? `<div style="font-size:0.7rem;color:var(--dim);margin-top:4px;">Countries: ${c.countries.join(', ')}</div>` : ''}
           </div>

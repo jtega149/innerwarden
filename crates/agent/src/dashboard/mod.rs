@@ -5277,29 +5277,148 @@ mod tests {
 
     #[test]
     fn pr_intel_recurrence_link_deeplinks_to_ip_profile() {
-        // 2026-05-15: the recurrence block's "View full profile →" link
-        // pre-fix called `showView('intel')` only, landing the operator
-        // on the generic profiles list instead of the specific IP's
-        // detail page. The helper `openIntelProfile(ip)` switches view,
-        // forces the Profiles sub-tab, and then loads the detail —
-        // matching the pattern the campaign-member-IP click already used.
+        // 2026-05-15 (PR-A): "View full profile →" lands on the
+        // specific IP, never on a generic list. The pre-PR628 bug
+        // (`showView('intel')` only) was fixed in PR628 with an
+        // `openIntelProfile` helper that did a tab dance with a 120ms
+        // setTimeout — that race lost when the Intel tab fetch out-ran
+        // the timer, leaving the operator on the generic profile list.
+        // PR-A replaces the dance with a shared modal opened by
+        // `openProfileModal(ip)`: no tab switch, no race window.
+        //
+        // Contract pinned by this anchor (operator: "sem chance de
+        // nao abrir"):
+        //   (1) The shared modal exists in markup.
+        //   (2) `openProfileModal(ip)` is defined in intel.js and
+        //       fetches the per-IP endpoint using the passed `ip`.
+        //   (3) `openIntelProfile(ip)` (kept as backward-compat alias)
+        //       routes to `openProfileModal(ip)`.
+        //   (4) The journey "View full profile" link calls the
+        //       deep-link entry with the case's attacker IP threaded in.
+        //   (5) Anti-regression: no DOM handler is allowed to call
+        //       plain `showView('intel')` from the recurrence link
+        //       (that's what surfaced the generic list bug originally).
         assert!(
-            JS_INTEL.contains("function openIntelProfile("),
-            "intel.js must define openIntelProfile(ip) — the deep-link helper"
+            JS_INTEL.contains("async function openProfileModal(ip)"),
+            "intel.js must define `openProfileModal(ip)` — the shared modal entry"
         );
         assert!(
-            JS_INTEL.contains("showProfileDetail(ip)"),
-            "openIntelProfile must end at showProfileDetail to render the IP's detail page"
+            JS_INTEL.contains("`/api/attacker-profiles/${encodeURIComponent(ip)}`"),
+            "openProfileModal must fetch the per-IP endpoint with the passed `ip` \
+             (operator: \"abrir o ip certo\" — never the generic list)"
         );
-        // Journey recurrence block must thread the IP into the link.
+        // openIntelProfile kept as backward-compat alias.
+        assert!(
+            JS_INTEL.contains("function openIntelProfile(ip)"),
+            "intel.js must keep `openIntelProfile(ip)` as a backward-compat alias"
+        );
+        let alias_start = JS_INTEL
+            .find("function openIntelProfile(ip)")
+            .expect("alias present");
+        let alias_end = JS_INTEL[alias_start..].find("\n}\n").expect("end of alias") + alias_start;
+        let alias_body = &JS_INTEL[alias_start..alias_end];
+        assert!(
+            alias_body.contains("openProfileModal(ip)"),
+            "openIntelProfile must route to openProfileModal(ip) — single drill-down surface"
+        );
+        // Anti-regression: the pre-PR628 / pre-PR-A failure modes.
+        assert!(
+            !alias_body.contains("setTimeout"),
+            "openIntelProfile MUST NOT setTimeout — the 120ms race window was the \
+             PR628 bug that resurfaced as \"View full profile lands on generic page\""
+        );
+        assert!(
+            !alias_body.contains("switchIntelTab"),
+            "openIntelProfile MUST NOT switch sub-tabs — the modal renders independently"
+        );
+        // Journey link still threads the IP.
         assert!(
             JS_JOURNEY.contains("openIntelProfile("),
-            "journey.js recurrence block must call openIntelProfile(ip) instead of plain showView('intel')"
+            "journey.js \"View full profile\" link MUST call openIntelProfile(ip) \
+             (or openProfileModal(ip) directly) with the case's attacker IP"
         );
-        // Anti-regression: do NOT revert to the generic-tab nav.
         assert!(
             !JS_JOURNEY.contains("recurrence-profile-link\" onclick=\"event.preventDefault();showView(\\'intel\\')\""),
             "recurrence-profile-link must not regress to plain showView('intel')"
+        );
+    }
+
+    #[test]
+    fn pr_profile_modal_dom_and_close_paths_exist() {
+        // 2026-05-15 PR-A: the shared dossier modal has a fixed DOM
+        // shape that openProfileModal targets. Anchor catches a paste
+        // error that renames any of the four required ids — without
+        // them the modal silently fails to mount and the operator
+        // sees a blank screen on click.
+        for marker in [
+            "id=\"profileModal\"",
+            "id=\"profileModalTitle\"",
+            "id=\"profileModalBody\"",
+            "onclick=\"closeProfileModal()\"",
+        ] {
+            assert!(
+                INDEX_HTML.contains(marker),
+                "Attacker dossier modal must contain `{marker}` — the shared drill-down \
+                 surface for Cases + Intel (2026-05-15 PR-A)"
+            );
+        }
+        // Close path: the modal MUST be closeable by the X button AND
+        // by the overlay (click-outside). Anchor the overlay handler
+        // so a future refactor doesn't quietly leave a trap-modal that
+        // only closes via the X.
+        let modal_start = INDEX_HTML
+            .find("id=\"profileModal\"")
+            .expect("profileModal present");
+        let modal_end = INDEX_HTML[modal_start..]
+            .find("</div>\n  </div>")
+            .expect("end of modal block")
+            + modal_start;
+        let modal_block = &INDEX_HTML[modal_start..modal_end];
+        assert!(
+            modal_block.contains("enf-modal-overlay\" onclick=\"closeProfileModal()\""),
+            "profile modal overlay must call closeProfileModal() on click — operator \
+             escape path beyond the X button"
+        );
+    }
+
+    #[test]
+    fn pr_profile_modal_open_routes_through_shared_entry() {
+        // Every operator-facing entry into the dossier MUST go through
+        // openProfileModal(ip). Anchor lists the entries and pins the
+        // call sites so a paste error that revives the old
+        // `showProfileDetail` / `switchIntelTab('profiles')` dance
+        // fails CI before the operator hits the bug again.
+        //
+        // Entries:
+        //   - Cases journey "View full profile" link (via openIntelProfile alias)
+        //   - Intel profile-list table row click
+        //   - Campaign member-IP chip click (intel.js campaigns sub-tab)
+        assert!(
+            JS_INTEL.contains("onclick=\"openProfileModal(\\'"),
+            "Intel profile-list rows MUST onclick into openProfileModal(ip)"
+        );
+        assert!(
+            JS_INTEL.contains("openProfileModal('${esc(ip)}')"),
+            "Campaign member-IP chips MUST onclick into openProfileModal(ip)"
+        );
+        // `showProfileDetail` was the pre-PR-A in-page renderer + entry.
+        // It is replaced by `renderProfileDossierHtml` (chrome-free
+        // body builder) + `openProfileModal` (modal entry). The legacy
+        // function MUST stay deleted — its survival would tempt a
+        // future refactor to wire something into it and re-introduce
+        // a parallel drill-down code path.
+        assert!(
+            !JS_INTEL.contains("function showProfileDetail"),
+            "showProfileDetail MUST stay deleted (replaced by renderProfileDossierHtml \
+             + openProfileModal in 2026-05-15 PR-A)"
+        );
+        assert!(
+            !JS_INTEL.contains("showProfileDetail("),
+            "no call site MUST invoke the deleted showProfileDetail"
+        );
+        assert!(
+            JS_INTEL.contains("function renderProfileDossierHtml(p)"),
+            "intel.js must define `renderProfileDossierHtml(p)` — the chrome-free body builder"
         );
     }
 

@@ -489,6 +489,28 @@
     </div>
   </div>
 
+  <!-- 2026-05-15 PR-A: shared Attacker dossier modal — opens from
+       Cases journey ("View full profile") and from Intel profile-list
+       row clicks. Single drill-down surface so the dossier stays
+       consistent regardless of entry point. `openProfileModal(ip)`
+       in intel.js fetches `/api/attacker-profiles/<ip>` and renders
+       into `#profileModalBody`. Anchor tests in dashboard/mod.rs pin
+       that both entry points always land on the specific IP — the
+       operator-reported "View full profile lands on the generic
+       page" regression cannot recur silently. -->
+  <div id="profileModal" class="enf-modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="profileModalTitle">
+    <div class="enf-modal-overlay" onclick="closeProfileModal()"></div>
+    <div class="enf-modal-box">
+      <div class="enf-modal-header">
+        <h3 id="profileModalTitle">Attacker dossier</h3>
+        <button type="button" class="enf-modal-close" onclick="closeProfileModal()" aria-label="Close">&times;</button>
+      </div>
+      <div id="profileModalBody" class="enf-modal-content">
+        <div style="color:var(--muted)">Loading…</div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script src="/js/api.js"></script>

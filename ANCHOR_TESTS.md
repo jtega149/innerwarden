@@ -1271,6 +1271,16 @@ Operator response to PR #629 (which had compromised by keeping a slim Sensors pa
 - `crates/agent/src/dashboard/mod.rs::tests::pr_sensors_fold_chart_and_rows_helpers_are_parameterised` — `drawTimelineChart(canvasId, timeline, sources)` and `renderSensorSourceRows(srcElId, data)` accept their target DOM id as a parameter; no hardcoded `sensorChart`/`sensorSources` `getElementById` lookups survive; `drawThreatGauge` and `drawDetectorChart` stay deleted.
 - `crates/agent/src/dashboard/mod.rs::tests::pr_sensors_fold_home_renderer_mounts_to_home_panel_ids` — `renderHomeSensorsPanel` body calls `renderSensorSourceRows('homeSensorSources', sensors)` and `drawTimelineChart('homeSensorChart', sensors.event_timeline || {}, sensors.sources || [])`.
 
+### Shared attacker dossier modal — single drill-down surface (2026-05-15 PR-A)
+
+Operator reported on 2026-05-15: clicking "View full profile →" on a Cases journey lands on the generic Intel profile list, not the specific IP — "sem chance de nao abrir". PR #628 had introduced an `openIntelProfile(ip)` helper that did `showView('intel') → setTimeout(120ms) → switchIntelTab('profiles') → showProfileDetail(ip)`. That 120ms race lost when the Intel tab fetch out-ran the timer, so the deep-link silently dropped the IP and the operator landed on the generic page.
+
+This PR (a) introduces a shared `#profileModal` overlay rendered by `openProfileModal(ip)` in intel.js, (b) rewires every operator-facing entry into the dossier (Cases journey "View full profile" link, Intel profile-list row clicks, Campaign member-IP chips) to go through the modal, (c) keeps `openIntelProfile(ip)` as a thin backward-compat alias that forwards to `openProfileModal(ip)`, and (d) replaces the in-page `showProfileDetail` with a chrome-free body builder `renderProfileDossierHtml(p)` that the modal mounts into its body. The 120ms setTimeout race is gone — no tab switch, no async sequence between user click and dossier render.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr_intel_recurrence_link_deeplinks_to_ip_profile` — `openProfileModal(ip)` exists; it fetches `/api/attacker-profiles/${encodeURIComponent(ip)}` using the passed `ip` (operator: "abrir o ip certo"); `openIntelProfile(ip)` is kept as alias routing through `openProfileModal(ip)`; alias body MUST NOT setTimeout or switchIntelTab (the original PR628 race); journey.js still wires the deep-link with the case's attacker IP threaded in.
+- `crates/agent/src/dashboard/mod.rs::tests::pr_profile_modal_dom_and_close_paths_exist` — required DOM ids (`profileModal`, `profileModalTitle`, `profileModalBody`) present in index.html; close paths wired on BOTH the X button and the overlay click-outside (no trap-modal).
+- `crates/agent/src/dashboard/mod.rs::tests::pr_profile_modal_open_routes_through_shared_entry` — every operator entry into the dossier (Intel profile-list rows, Campaign member-IP chips) calls `openProfileModal(ip)`; the legacy `showProfileDetail` function is deleted and no remaining call site references it; the new `renderProfileDossierHtml(p)` body builder is defined.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
