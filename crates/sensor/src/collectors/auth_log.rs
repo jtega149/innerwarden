@@ -164,6 +164,49 @@ pub fn parse_sshd_message(msg: &str, host: &str, source: &str) -> Option<Event> 
             vec!["auth", "ssh"],
             vec![EntityRef::ip(ip), EntityRef::user(user)],
         ))
+    } else if msg.starts_with("Connection closed by invalid user") {
+        // OpenSSH 9.x+ (Ubuntu 24.04, Debian 13, modern distros): instead of
+        // logging `Failed password for invalid user X from IP` on every
+        // attempt, sshd now logs a single `Connection closed by invalid
+        // user X IP port Y [preauth]` line when the client disconnects.
+        // The old regex never matched this, so `ssh_bruteforce` was blind
+        // to brute-force attempts on any modern Ubuntu install — confirmed
+        // by an operator-side stress test on test001 (Ubuntu 24.04 with
+        // OpenSSH 9.6) on 2026-05-16 where 15 failed logins from the
+        // operator's Mac produced zero ssh.login_failed events.
+        //
+        // Format: "Connection closed by invalid user <user> <ip> port <p> [preauth]"
+        let user = word_after(msg, "Connection closed by invalid user")?;
+        let ip = word_after(msg, &format!("invalid user {user}"))?;
+        Some(make_event(
+            &meta,
+            "ssh.login_failed",
+            Severity::Info,
+            format!("Failed login - invalid user {user} from {ip} (preauth disconnect)"),
+            serde_json::json!({ "ip": ip, "user": user, "reason": "invalid_user_preauth" }),
+            vec!["auth", "ssh"],
+            vec![EntityRef::ip(ip), EntityRef::user(user)],
+        ))
+    } else if msg.starts_with("Connection closed by authenticating user") {
+        // Companion to the above for valid usernames where the password
+        // attempt was rejected and the client disconnected before sshd
+        // emitted its own `Failed password` line. Same OpenSSH 9.x+
+        // change; reason marked separately so the
+        // credential_stuffing/wrong_password split downstream remains
+        // intact.
+        //
+        // Format: "Connection closed by authenticating user <user> <ip> port <p> [preauth]"
+        let user = word_after(msg, "Connection closed by authenticating user")?;
+        let ip = word_after(msg, &format!("authenticating user {user}"))?;
+        Some(make_event(
+            &meta,
+            "ssh.login_failed",
+            Severity::Info,
+            format!("Failed login for {user} from {ip} (preauth disconnect)"),
+            serde_json::json!({ "ip": ip, "user": user, "reason": "wrong_password_preauth" }),
+            vec!["auth", "ssh"],
+            vec![EntityRef::ip(ip), EntityRef::user(user)],
+        ))
     } else if msg.starts_with("Accepted password for") || msg.starts_with("Accepted publickey for")
     {
         let method = if msg.starts_with("Accepted password") {
@@ -256,6 +299,35 @@ mod tests {
         assert_eq!(ev.kind, "ssh.login_failed");
         assert_eq!(ev.details["user"], "admin");
         assert_eq!(ev.details["ip"], "5.6.7.8");
+    }
+
+    #[test]
+    fn parse_openssh9_connection_closed_invalid_user() {
+        // Real line captured on test001 (Ubuntu 24.04, OpenSSH 9.6) during
+        // a 15-failure stress test on 2026-05-16. The pre-OpenSSH-9 regex
+        // would never have matched, so ssh_bruteforce stayed blind.
+        let line = "2026-05-16T15:28:54.265332+00:00 test001 sshd[39701]: Connection closed by invalid user jenkins 192.168.0.162 port 64537 [preauth]";
+        let ev = parse_sshd_line(line, "test001").unwrap();
+        assert_eq!(ev.kind, "ssh.login_failed");
+        assert_eq!(ev.details["user"], "jenkins");
+        assert_eq!(ev.details["ip"], "192.168.0.162");
+        assert_eq!(ev.details["reason"], "invalid_user_preauth");
+    }
+
+    #[test]
+    fn parse_openssh9_connection_closed_authenticating_user() {
+        // Valid-username variant — sshd uses "authenticating user" when the
+        // username exists locally but the password / publickey attempt
+        // failed and the client disconnected before sshd emitted its own
+        // "Failed password" line. Both branches need to fire
+        // ssh.login_failed so credential_stuffing still catches a username
+        // spray on modern OpenSSH.
+        let line = "2026-05-16T15:28:54.415553+00:00 test001 sshd[39699]: Connection closed by authenticating user www-data 192.168.0.162 port 64535 [preauth]";
+        let ev = parse_sshd_line(line, "test001").unwrap();
+        assert_eq!(ev.kind, "ssh.login_failed");
+        assert_eq!(ev.details["user"], "www-data");
+        assert_eq!(ev.details["ip"], "192.168.0.162");
+        assert_eq!(ev.details["reason"], "wrong_password_preauth");
     }
 
     #[test]
