@@ -189,7 +189,27 @@ fn build_sensors_payload(
                 .unwrap_or(0)
         }
     };
-    let sources: Vec<(String, usize)> = if graph.total_events_ingested > 0 {
+    // Spec 050-hotfix follow-up to #659: per-collector "TELEMETRY STREAMS"
+    // tiles in the Sensors HUD historically rendered `graph.source_counts`
+    // (process-lifetime accumulator restored from the KG snapshot). On
+    // 2026-05-17 the operator screenshot showed EBPF=23M while the chart
+    // below (canonical via #659) and the Home tile (canonical via PR30)
+    // both painted ~270k for the same date — same divergence pattern PR30
+    // and #659 closed for adjacent surfaces.
+    //
+    // Precedence: canonical timeline (sum-by-source for the date) →
+    // KG `source_counts` (snapshot-restored, lifetime) → telemetry snapshot.
+    let sources: Vec<(String, usize)> = if let Some(canonical) = event_timeline_canonical.as_ref() {
+        let mut acc: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for inner in canonical.values() {
+            for (src, &cnt) in inner.iter() {
+                *acc.entry(src.clone()).or_insert(0) += cnt as usize;
+            }
+        }
+        let mut s: Vec<(String, usize)> = acc.into_iter().collect();
+        s.sort_by(|a, b| b.1.cmp(&a.1));
+        s
+    } else if graph.total_events_ingested > 0 {
         let mut s: Vec<(String, usize)> = graph
             .source_counts
             .iter()
@@ -1125,6 +1145,86 @@ mod tests {
         );
         let today_bucket = timeline["22:00"].as_object().unwrap();
         assert_eq!(today_bucket["auth_log"].as_u64(), Some(7));
+    }
+
+    // Spec 050-hotfix follow-up to #659: per-collector telemetry tiles
+    // ("TELEMETRY STREAMS" rows in the Sensors HUD) must read from the
+    // same canonical SQLite source the chart now uses. Pre-fix the tiles
+    // rendered `graph.source_counts` — a process-lifetime accumulator
+    // that survives across restarts via the KG snapshot. Operator
+    // screenshot on 2026-05-17 showed EBPF=23,060,722 (lifetime sum)
+    // next to a chart spanning today's date only — operator-visible
+    // contradiction.
+    //
+    // Asserts: when `event_timeline_canonical` is Some, the `sources`
+    // field sum agrees with the canonical totals (not the poisoned KG
+    // counter).
+    #[test]
+    fn build_sensors_payload_sources_prefer_canonical_over_kg_lifetime_counter() {
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Poison the KG with an inflated lifetime counter for `ebpf`
+        // — what production looked like before this fix (23 M lifetime
+        // for "today's" tile).
+        {
+            let mut g = kg.write().unwrap();
+            let ebpf_arc = crate::knowledge_graph::intern::intern("ebpf");
+            g.source_counts.insert(ebpf_arc, 23_000_000);
+            g.total_events_ingested = 23_000_000;
+        }
+
+        // Canonical timeline: today's truth from SQLite.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut canonical: std::collections::BTreeMap<
+            String,
+            std::collections::HashMap<String, u64>,
+        > = std::collections::BTreeMap::new();
+        canonical
+            .entry(format!("{today}T09:13"))
+            .or_default()
+            .insert("ebpf".to_string(), 30_000);
+        canonical
+            .entry(format!("{today}T14:34"))
+            .or_default()
+            .insert("ebpf".to_string(), 20_000);
+        canonical
+            .entry(format!("{today}T14:35"))
+            .or_default()
+            .insert("auditd".to_string(), 5_000);
+
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, Some(canonical));
+        let sources = payload["sources"]
+            .as_array()
+            .expect("sources must be an array");
+
+        // Find ebpf in the sources list. JSON shape: {"name": str, "count": u64}.
+        let ebpf_entry = sources
+            .iter()
+            .find(|v| v["name"].as_str() == Some("ebpf"))
+            .expect("ebpf source must appear");
+        let ebpf_count = ebpf_entry["count"]
+            .as_u64()
+            .expect("ebpf count must be u64");
+        assert_eq!(
+            ebpf_count, 50_000,
+            "ebpf tile must sum canonical buckets (30k + 20k = 50k), \
+             NOT the 23 M KG lifetime poison. Got {ebpf_count}"
+        );
+
+        let auditd_entry = sources
+            .iter()
+            .find(|v| v["name"].as_str() == Some("auditd"))
+            .expect("auditd source must appear");
+        let auditd_count = auditd_entry["count"]
+            .as_u64()
+            .expect("auditd count must be u64");
+        assert_eq!(
+            auditd_count, 5_000,
+            "auditd tile must sum to canonical bucket value, got {auditd_count}"
+        );
     }
 
     // Spec 050-hotfix (issue #656) anchor: when the caller threads a
