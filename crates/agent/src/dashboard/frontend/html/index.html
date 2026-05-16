@@ -88,7 +88,8 @@
                cases de pra ver se teve alguma secao de honeypot do ip
                e o que ele digitiou". -->
           <button type="button" class="nav-more-item" id="navCompliance" onclick="showView('compliance')">Compliance</button>
-          <button type="button" class="nav-more-item" id="navMonthly" onclick="showView('monthly')">Monthly</button>
+<!-- 2026-05-16 PR-G: `navMonthly` deleted. The month threat report
+               renders inside Briefings via the Day/Month period switcher. -->
         </div>
       </div>
     </div>
@@ -311,15 +312,32 @@
     </main>
   </div>
 
-  <!-- ── Report view ── -->
+  <!-- ── Briefings view ── 2026-05-16 PR-G ──
+       Period-aware retrospective. The day report (existing
+       `/api/report?date=…`) and the month threat report (existing
+       `/api/threat-report?month=…`) live behind a single period
+       switcher (Day / Month). The previously-separate Monthly view +
+       `#navMonthly` More-menu button were deleted; both periods now
+       render into `#reportContent`. Internal route slug `report`
+       survives so existing deep links to #report keep working. -->
   <div class="report-view" id="viewReport" style="display:none">
     <div class="report-toolbar">
-      <label class="report-label">Date</label>
-      <button type="button" class="report-nav-btn" id="reportPrev" onclick="navigateReport(-1)" title="Previous day">←</button>
-      <select id="reportDateSelect" onchange="loadReport()"><option value="">latest</option></select>
-      <button type="button" class="report-nav-btn" id="reportNext" onclick="navigateReport(1)" title="Next day">→</button>
-      <button type="button" class="report-refresh-btn" onclick="loadReport()">↻ Refresh</button>
-      <button type="button" class="report-export-btn" onclick="exportReport()" title="Export as Markdown">↓ Export</button>
+      <div id="reportPeriodSwitch" class="report-period-switch" role="group" aria-label="Report period">
+        <button type="button" class="report-period-btn report-period-active" id="reportPeriodDay" onclick="switchReportPeriod('day')">Day</button>
+        <button type="button" class="report-period-btn" id="reportPeriodMonth" onclick="switchReportPeriod('month')">Month</button>
+      </div>
+      <div id="reportDayControls" class="report-period-controls">
+        <label class="report-label">Date</label>
+        <button type="button" class="report-nav-btn" id="reportPrev" onclick="navigateReport(-1)" title="Previous day">←</button>
+        <select id="reportDateSelect" onchange="loadReport()"><option value="">latest</option></select>
+        <button type="button" class="report-nav-btn" id="reportNext" onclick="navigateReport(1)" title="Next day">→</button>
+        <button type="button" class="report-export-btn" onclick="exportReport()" title="Export as Markdown">↓ Export</button>
+      </div>
+      <div id="reportMonthControls" class="report-period-controls" style="display:none">
+        <label class="report-label">Month</label>
+        <select id="monthlyPicker" onchange="loadMonthly()"></select>
+      </div>
+      <button type="button" class="report-refresh-btn" onclick="refreshReportForActivePeriod()">↻ Refresh</button>
       <span id="reportStatus" class="report-status"></span>
     </div>
     <div id="reportContent" class="report-content">
@@ -427,17 +445,12 @@
     </div>
   </div>
 
-  <!-- ── Monthly view ── -->
-  <div class="report-view" id="viewMonthly" style="display:none">
-    <div class="report-toolbar">
-      <button type="button" class="report-refresh-btn" onclick="loadMonthly()">↻ Refresh</button>
-      <select id="monthlyPicker" onchange="loadMonthly()" style="margin-left:8px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);"></select>
-      <span id="monthlyViewStatus" class="report-status"></span>
-    </div>
-    <div id="monthlyContent" class="report-content" style="padding:16px;">
-      <p style="color:var(--dim);">Select a month to view the threat report...</p>
-    </div>
-  </div>
+  <!-- 2026-05-16 PR-G: standalone Monthly view deleted. The month
+       threat report (`/api/threat-report?month=…`) now renders into
+       the unified Briefings view via the Day/Month period switcher.
+       The Monthly picker (`#monthlyPicker`) was moved into the
+       Briefings toolbar; monthly.js writes its output into the same
+       `#reportContent` mount as the day report. -->
 
   <!-- 2026-05-15: removed the standalone Responses view. Per-attacker
        enforcement → journey panel (Enforcement block). Cross-attacker

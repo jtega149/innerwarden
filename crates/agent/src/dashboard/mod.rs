@@ -1718,6 +1718,142 @@ mod tests {
         );
     }
 
+    // ── 2026-05-16 PR-G: unified Briefings (Day / Month) ─────────────
+    // Operator simplification: the standalone Monthly tab was merged
+    // into the Briefings view via a Day / Month period switcher. Same
+    // `#reportContent` mount, same `#reportStatus`. The deleted
+    // surfaces (`#viewMonthly`, `#monthlyContent`, `#monthlyViewStatus`,
+    // `#navMonthly`, `showView('monthly')`) MUST stay gone; the new
+    // surfaces (`#reportPeriodSwitch`, `#reportPeriodDay`,
+    // `#reportPeriodMonth`, `switchReportPeriod`) MUST be wired.
+
+    #[test]
+    fn pr_g_monthly_tab_surfaces_are_gone() {
+        for orphan in [
+            "id=\"viewMonthly\"",
+            "id=\"monthlyContent\"",
+            "id=\"monthlyViewStatus\"",
+            "id=\"navMonthly\"",
+            "showView('monthly')",
+            ">Monthly</button>",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(orphan),
+                "PR-G: `{orphan}` was deleted; the standalone Monthly tab UI must stay \
+                 gone — Day/Month period switcher lives inside the Briefings view"
+            );
+        }
+        // nav.js routes no `'monthly'` view name and does not call
+        // `loadMonthly` from the dispatcher.
+        assert!(
+            !JS_NAV.contains("'monthly'"),
+            "PR-G: nav.js MUST NOT reference the 'monthly' route"
+        );
+        assert!(
+            !JS_NAV.contains("name === 'monthly'"),
+            "PR-G: nav.js MUST NOT route the 'monthly' view name"
+        );
+    }
+
+    #[test]
+    fn pr_g_briefings_view_has_period_switcher_and_unified_mount() {
+        for marker in [
+            "id=\"reportPeriodSwitch\"",
+            "id=\"reportPeriodDay\"",
+            "id=\"reportPeriodMonth\"",
+            "id=\"reportDayControls\"",
+            "id=\"reportMonthControls\"",
+            // Picker moved into the Briefings toolbar.
+            "id=\"monthlyPicker\"",
+            // Both periods render into the same `#reportContent`.
+            "id=\"reportContent\"",
+            // Period buttons wire onclick into switchReportPeriod.
+            "onclick=\"switchReportPeriod('day')\"",
+            "onclick=\"switchReportPeriod('month')\"",
+        ] {
+            assert!(
+                INDEX_HTML.contains(marker),
+                "PR-G: Briefings view MUST contain `{marker}`"
+            );
+        }
+        // The internal route slug stays `report` — spec 049 contract.
+        assert!(
+            INDEX_HTML.contains("id=\"viewReport\""),
+            "PR-G: `viewReport` div MUST stay (route slug unchanged)"
+        );
+    }
+
+    #[test]
+    fn pr_g_reports_js_owns_period_switch_and_dispatch() {
+        // reports.js carries the period state + the three helpers nav.js
+        // and the toolbar need:
+        //   - switchReportPeriod(period): toggles toolbar visibility and
+        //     kicks off the matching loader.
+        //   - loadReportForActivePeriod(): nav.js entry point that
+        //     dispatches based on current period.
+        //   - refreshReportForActivePeriod(): refresh-button entry.
+        for fn_sig in [
+            "function switchReportPeriod(period)",
+            "function loadReportForActivePeriod()",
+            "function refreshReportForActivePeriod()",
+            "let _reportPeriod",
+        ] {
+            assert!(
+                JS_REPORTS.contains(fn_sig),
+                "PR-G: reports.js MUST define `{fn_sig}`"
+            );
+        }
+        // The switch dispatches to loadReport for day, loadMonthly for month.
+        let switch_start = JS_REPORTS
+            .find("function switchReportPeriod(period)")
+            .expect("switchReportPeriod present");
+        let switch_end = JS_REPORTS[switch_start..]
+            .find("\n}\n")
+            .expect("end of switchReportPeriod")
+            + switch_start;
+        let switch_body = &JS_REPORTS[switch_start..switch_end];
+        assert!(
+            switch_body.contains("loadReport()"),
+            "switchReportPeriod MUST kick loadReport() for the Day period"
+        );
+        assert!(
+            switch_body.contains("loadMonthly()"),
+            "switchReportPeriod MUST kick loadMonthly() for the Month period"
+        );
+        // nav.js routes to the period-aware entrypoint, not directly
+        // to loadReport (which would skip the month case when the
+        // active period is month).
+        assert!(
+            JS_NAV.contains("loadReportForActivePeriod()"),
+            "PR-G: nav.js MUST dispatch the `report` view name to \
+             loadReportForActivePeriod(), not loadReport() directly"
+        );
+    }
+
+    #[test]
+    fn pr_g_monthly_js_writes_into_shared_report_mount() {
+        // monthly.js was rewired to target the shared `#reportContent` +
+        // `#reportStatus` instead of the deleted `#monthlyContent` /
+        // `#monthlyViewStatus`. Anchor catches a refactor that points
+        // it back at the dead ids.
+        assert!(
+            JS_MONTHLY.contains("getElementById('reportStatus')"),
+            "PR-G: monthly.js MUST write status into the shared #reportStatus"
+        );
+        assert!(
+            JS_MONTHLY.contains("getElementById('reportContent')"),
+            "PR-G: monthly.js MUST render into the shared #reportContent"
+        );
+        assert!(
+            !JS_MONTHLY.contains("getElementById('monthlyContent')"),
+            "PR-G: the deleted #monthlyContent mount must stay unreferenced"
+        );
+        assert!(
+            !JS_MONTHLY.contains("getElementById('monthlyViewStatus')"),
+            "PR-G: the deleted #monthlyViewStatus must stay unreferenced"
+        );
+    }
+
     #[test]
     fn rename_keeps_internal_route_slugs_unchanged() {
         // The rename is purely operator-facing. Internal route slugs

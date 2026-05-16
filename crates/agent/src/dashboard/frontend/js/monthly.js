@@ -1,9 +1,14 @@
-// ── Monthly Report tab ────────────────────────────────────────────
+// ── Monthly Report (Month tab inside Briefings) ──────────────────────
+// 2026-05-16 PR-G: the standalone Monthly view was merged into the
+// Briefings view (Day / Month period switcher). The picker
+// (`#monthlyPicker`) was moved into the Briefings toolbar; the
+// renderer now writes into the shared `#reportContent` + `#reportStatus`
+// surface instead of the deleted `#monthlyContent` / `#monthlyViewStatus`.
 let monthlyMonthsLoaded = false;
 
 async function loadMonthly() {
-  const status = document.getElementById('monthlyViewStatus');
-  const content = document.getElementById('monthlyContent');
+  const status = document.getElementById('reportStatus');
+  const content = document.getElementById('reportContent');
   const picker = document.getElementById('monthlyPicker');
 
   // Load available months on first visit

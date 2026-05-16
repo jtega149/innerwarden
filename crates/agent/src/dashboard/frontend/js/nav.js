@@ -33,8 +33,10 @@ function toggleLeftPanel() {
 // 2026-05-16 PR-F: Honeypot route dropped from the More menu — per-IP
 // honeypot session detail (creds + commands + IOCs) lives in the
 // shared Attacker Dossier modal (PR-A).
-const _secondaryTabs = ['sensors','report','compliance','monthly','graph'];
-const _secondaryLabels = { sensors:'Sensors', report:'Report', compliance:'Compliance', monthly:'Monthly', graph:'Graph' };
+// 2026-05-16 PR-G: `monthly` dropped from the More menu — Briefings
+// carries the Day/Month period switcher.
+const _secondaryTabs = ['sensors','report','compliance','graph'];
+const _secondaryLabels = { sensors:'Sensors', report:'Report', compliance:'Compliance', graph:'Graph' };
 
 function toggleMoreMenu() {
   const m = document.getElementById('moreMenu');
@@ -42,11 +44,13 @@ function toggleMoreMenu() {
 }
 
 function showView(name) {
-  // 2026-05-16 PR-F: `honeypot` route dropped — per-IP honeypot intel
-  // lives in the shared Attacker Dossier modal (PR-A), aggregate
-  // cross-IP intel lives in the Monthly threat report.
-  const views = { home: 'viewHome', sensors: 'viewSensors', investigate: 'viewInvestigate', report: 'viewReport', status: 'viewStatus', compliance: 'viewCompliance', intel: 'viewIntel', monthly: 'viewMonthly', fleet: 'viewFleet', graph: 'viewGraph' };
-  const btns  = { home: 'navHome', sensors: 'navSensors', investigate: 'navInvestigate', report: 'navReport', status: 'navStatus', compliance: 'navCompliance', intel: 'navIntel', monthly: 'navMonthly', fleet: 'navFleet', graph: 'navGraph' };
+  // 2026-05-16 PR-F: Honeypot route dropped — per-IP honeypot intel
+  // lives in the shared Attacker Dossier modal (PR-A).
+  // 2026-05-16 PR-G: `monthly` route dropped — Briefings carries the
+  // Day/Month period switcher; the month threat report renders inside
+  // the same `viewReport` mount via `loadMonthly`.
+  const views = { home: 'viewHome', sensors: 'viewSensors', investigate: 'viewInvestigate', report: 'viewReport', status: 'viewStatus', compliance: 'viewCompliance', intel: 'viewIntel', fleet: 'viewFleet', graph: 'viewGraph' };
+  const btns  = { home: 'navHome', sensors: 'navSensors', investigate: 'navInvestigate', report: 'navReport', status: 'navStatus', compliance: 'navCompliance', intel: 'navIntel', fleet: 'navFleet', graph: 'navGraph' };
   // Update URL hash (use friendly name for threats)
   var hashName = name === 'investigate' ? 'threats' : name;
   if (location.hash !== '#' + hashName) {
@@ -107,13 +111,17 @@ function showView(name) {
   // entrypoint were deleted. The per-collector breakdown + Event
   // Timeline render on Home itself via `renderHomeSensorsPanel`, so
   // the dispatcher has no `sensors` arm anymore.
-  if (name === 'report') loadReport();
+  // 2026-05-16 PR-G: `report` view is now period-aware (Day/Month
+  // switcher). `loadReportForActivePeriod()` dispatches to the
+  // matching loader (loadReport for Day, loadMonthly for Month).
+  if (name === 'report') loadReportForActivePeriod();
   if (name === 'status') loadStatus();
   // 2026-05-16 PR-F: `honeypot` route deleted. Per-IP honeypot detail
   // is on the Attacker Dossier modal (PR-A).
   if (name === 'compliance') loadCompliance();
   if (name === 'intel') loadIntel();
-  if (name === 'monthly') loadMonthly();
+  // 2026-05-16 PR-G: `monthly` route deleted. The month threat report
+  // is now a sub-period of the Briefings view.
   if (name === 'fleet') loadFleet();
   // Graph tab was removed and stats moved to Health; the old loadGraph()
   // module is no longer bundled so we stop dispatching here too.

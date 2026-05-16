@@ -845,6 +845,36 @@
       display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     }
     .report-label { font-size: 0.72rem; color: var(--muted); }
+    /* 2026-05-16 PR-G: Day/Month period switcher inside the Briefings
+       toolbar. Replaces the deleted standalone Monthly tab. */
+    .report-period-switch {
+      display: inline-flex;
+      gap: 4px;
+      padding: 3px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    .report-period-btn {
+      padding: 4px 14px;
+      border-radius: 7px;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }
+    .report-period-btn:hover { color: var(--text); }
+    .report-period-active {
+      background: var(--accent);
+      color: #0a0f1a;
+    }
+    .report-period-active:hover { color: #0a0f1a; }
+    .report-period-controls {
+      display: inline-flex; align-items: center; gap: 8px;
+    }
     .report-toolbar select {
       background: var(--card); border: 1px solid var(--line); color: var(--fg);
       border-radius: 8px; padding: 5px 10px; font-size: 0.75rem; cursor: pointer;

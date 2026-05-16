@@ -1,4 +1,45 @@
 // ── D10 - Report tab ────────────────────────────────────────────────────
+// 2026-05-16 PR-G: The Briefings view carries a Day / Month period
+// switcher. The standalone Monthly view was deleted; both periods
+// render into the same `#reportContent` mount.
+let _reportPeriod = 'day';
+
+function switchReportPeriod(period) {
+  _reportPeriod = (period === 'month') ? 'month' : 'day';
+  const dayBtn = document.getElementById('reportPeriodDay');
+  const monthBtn = document.getElementById('reportPeriodMonth');
+  const dayCtrls = document.getElementById('reportDayControls');
+  const monthCtrls = document.getElementById('reportMonthControls');
+  if (dayBtn) dayBtn.classList.toggle('report-period-active', _reportPeriod === 'day');
+  if (monthBtn) monthBtn.classList.toggle('report-period-active', _reportPeriod === 'month');
+  if (dayCtrls) dayCtrls.style.display = _reportPeriod === 'day' ? '' : 'none';
+  if (monthCtrls) monthCtrls.style.display = _reportPeriod === 'month' ? '' : 'none';
+  // Kick off the render for the newly-selected period. Each loader
+  // owns its own fetch + content mount.
+  if (_reportPeriod === 'day') {
+    loadReport();
+  } else if (typeof loadMonthly === 'function') {
+    loadMonthly();
+  }
+}
+
+// nav.js calls this when the operator opens the Briefings view. It
+// dispatches to the loader matching the currently-active period —
+// nav.js doesn't need to know about Day vs Month.
+function loadReportForActivePeriod() {
+  if (_reportPeriod === 'month' && typeof loadMonthly === 'function') {
+    loadMonthly();
+  } else {
+    loadReport();
+  }
+}
+
+// Refresh button hits the loader for whichever period is currently
+// displayed.
+function refreshReportForActivePeriod() {
+  loadReportForActivePeriod();
+}
+
 async function loadReportDates() {
   try {
     const dates = await loadJson('/api/report/dates');
