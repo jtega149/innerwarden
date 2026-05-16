@@ -398,6 +398,75 @@
       color: var(--accent);
     }
 
+    /* 2026-05-16 PR-H: shared pagination bar — Intel profile list +
+       Decision Audit Records both render this exact layout: status
+       label on the left, per-page size selector in the middle, page
+       buttons on the right. Single CSS surface so the look stays
+       consistent across the dashboard. */
+    .pagination-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+      padding: 8px 4px;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .pagination-status { color: var(--muted); }
+    .pagination-pagesize {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+    }
+    .pagination-pagesize select {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      cursor: pointer;
+    }
+    .pagination-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+    }
+    .pagination-btn {
+      min-width: 32px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .pagination-btn:hover:not(:disabled) {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    .pagination-btn-active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #0a0f1a;
+    }
+    .pagination-btn-active:hover { color: #0a0f1a; }
+    .pagination-btn-disabled,
+    .pagination-btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+    .pagination-ellipsis {
+      padding: 0 4px;
+      color: var(--muted);
+    }
+
     .journey-actions {
       display: flex; gap: 6px; margin: 0 0 12px;
     }

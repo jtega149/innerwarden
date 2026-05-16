@@ -247,7 +247,7 @@ function renderReport(r) {
     // `incidents: ✗ 0B` while Summary said `Incidents Today: 223`.
     const isSqliteOnly = (f.file === 'events' || f.file === 'incidents') && !f.exists;
     const existsCell = isSqliteOnly
-      ? '<span class="health-ok" title="stored in innerwarden.db (spec 016)">SQLite</span>'
+      ? '<span class="health-ok" title="stored in innerwarden.db">SQLite</span>'
       : (f.exists ? '<span class="health-ok">' + lucideIcon('check',{size:12}) + '</span>' : '<span class="health-fail">' + lucideIcon('x',{size:12}) + '</span>');
     const valid = isSqliteOnly
       ? '<span class="health-ok">' + lucideIcon('check',{size:12}) + '</span>'

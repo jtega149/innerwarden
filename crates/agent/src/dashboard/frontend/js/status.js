@@ -457,12 +457,15 @@ function renderStatus(s, collectors) {
       '</div></div>';
   }
 
-  // ── Section 6: Metrics Drift (spec 024) ──────────────────────────────
+  // ── Section 6: Metrics Drift ─────────────────────────────────────
+  // 2026-05-16 PR-H: dropped the "spec 024" tag from the visible
+  // subtitle (operator-facing copy must not leak internal spec
+  // numbers — they're noise to the end user).
   // The populated content is injected asynchronously by loadMetricsDrift().
   html += '<div class="report-section" id="metrics-drift-section">' +
     '<div class="report-section-title">' +
       'Metrics Drift <span style="font-size:0.72rem;color:var(--muted);font-weight:normal">' +
-        '· spec 024 · scraping /metrics</span>' +
+        '· scraping /metrics</span>' +
     '</div>' +
     '<div id="metrics-drift-body"><div class="muted">Loading…</div></div>' +
     '</div>';

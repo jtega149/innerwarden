@@ -232,28 +232,51 @@ async function loadCompliance() {
 // ── Decision audit trail (paginated viewer) ─────────────────────────
 //
 // State + functions are intentionally module-scoped (window) rather
-// than enclosed so the "Load more" button's onclick can reach them
+// than enclosed so the pagination buttons' onclick can reach them
 // without inline closures (the rest of the dashboard uses the same
-// pattern). Cursor-based pagination keeps the viewer correct when
-// new decisions arrive between page loads.
-window._auditTrailState = { rows: [], beforeId: null, hasMore: true, action: '' };
+// pattern).
+//
+// 2026-05-16 PR-H: switched from the legacy `load-more (older)`
+// cursor-accumulator to page-number navigation + page-size selector
+// (10/50/100, default 10). The backend remains cursor-based
+// (`before_id` advances through older rows), but the frontend
+// remembers the cursors it has seen so Previous / specific-page jumps
+// work. `cursorStack[i]` is the `before_id` to pass to the API to
+// fetch page `i` (cursorStack[0] = null = newest page).
+window._auditTrailState = {
+  rows: [],
+  pageSize: 10,
+  page: 0,
+  cursorStack: [null], // cursorStack[i] => before_id for page i
+  hasMore: true,
+  action: '',
+};
+const AUDIT_PAGE_SIZES = [10, 50, 100];
 
 async function loadAuditTrail() {
   const el = document.getElementById('comp-audit-trail');
   if (!el) return;
   // Reset on every refresh of the parent compliance view.
-  window._auditTrailState = { rows: [], beforeId: null, hasMore: true, action: '' };
+  window._auditTrailState = {
+    rows: [],
+    pageSize: window._auditTrailState?.pageSize || 10,
+    page: 0,
+    cursorStack: [null],
+    hasMore: true,
+    action: '',
+  };
   el.innerHTML = '<div class="muted">Loading audit trail...</div>';
-  await fetchAuditTrailPage(true);
+  await fetchAuditTrailPage();
 }
 
-async function fetchAuditTrailPage(replace) {
+async function fetchAuditTrailPage() {
   const el = document.getElementById('comp-audit-trail');
   if (!el) return;
   const st = window._auditTrailState;
   const qs = new URLSearchParams();
-  qs.set('limit', '50');
-  if (st.beforeId) qs.set('before_id', String(st.beforeId));
+  qs.set('limit', String(st.pageSize));
+  const beforeId = st.cursorStack[st.page] || null;
+  if (beforeId) qs.set('before_id', String(beforeId));
   if (st.action) qs.set('action', st.action);
   let data;
   try {
@@ -267,14 +290,36 @@ async function fetchAuditTrailPage(replace) {
     return;
   }
   const incoming = data.items || [];
-  if (replace) {
-    st.rows = incoming;
-  } else {
-    st.rows = st.rows.concat(incoming);
+  st.rows = incoming;
+  // Cache the cursor to reach the next page if we haven't already.
+  // `next_before_id` is the id of the last row in this page; passing
+  // it to the API returns rows older than that.
+  if (st.cursorStack.length === st.page + 1 && data.next_before_id != null) {
+    st.cursorStack.push(data.next_before_id);
   }
-  st.beforeId = data.next_before_id || null;
-  st.hasMore = incoming.length >= 50 && st.beforeId != null;
+  st.hasMore = incoming.length >= st.pageSize && data.next_before_id != null;
   renderAuditTrail();
+}
+
+function setAuditPage(page) {
+  if (typeof page !== 'number' || page < 0) return;
+  const st = window._auditTrailState;
+  // Only allow jumping to a page we have a cursor for (we walk forward
+  // through cursors one-at-a-time as the operator pages Next).
+  if (page >= st.cursorStack.length) return;
+  st.page = page;
+  fetchAuditTrailPage();
+}
+
+function setAuditPageSize(size) {
+  const parsed = parseInt(size, 10);
+  if (!AUDIT_PAGE_SIZES.includes(parsed)) return;
+  const st = window._auditTrailState;
+  st.pageSize = parsed;
+  // Changing size invalidates the cursor stack — recompute from page 0.
+  st.page = 0;
+  st.cursorStack = [null];
+  fetchAuditTrailPage();
 }
 
 function renderAuditTrail() {
@@ -356,22 +401,82 @@ function renderAuditTrail() {
       '</tr>';
   }
   html += '</tbody></table></div>';
-  if (st.hasMore) {
-    html += '<div style="margin-top:10px;text-align:center">' +
-      '<button type="button" onclick="fetchAuditTrailPage(false)" ' +
-      'style="background:transparent;border:1px solid var(--border);color:var(--accent);padding:5px 14px;border-radius:4px;font-size:0.75rem;cursor:pointer">' +
-      'Load 50 more (older)</button>' +
-      '</div>';
-  }
+  // 2026-05-16 PR-H: real pagination bar (page nums + size selector)
+  // replacing the legacy `load-more (older)` button. Operator:
+  // "ninguem se acha nesse tipo de paginacao load more, coloca uma
+  // paginacao decente".
+  html += renderAuditPaginationBar();
   el.innerHTML = html;
   // Restore selected action in dropdown after re-render.
   const sel = document.getElementById('audit-action-filter');
   if (sel) sel.value = st.action || '';
 }
 
+function renderAuditPaginationBar() {
+  const st = window._auditTrailState;
+  const shown = st.rows.length;
+  if (shown === 0) return '';
+  const sizeOptions = AUDIT_PAGE_SIZES.map(function (s) {
+    return '<option value="' + s + '"' + (s === st.pageSize ? ' selected' : '') + '>' + s + '</option>';
+  }).join('');
+  // The audit-trail backend is cursor-based, so we don't know the
+  // total row count up-front. The bar shows the page-window we're
+  // walking — "Page X" with Previous + Next + page-size selector.
+  // Specific-page jumps are gated by the cursorStack (you can jump
+  // to any page you've already paged through).
+  const knownPages = st.cursorStack.length; // number of cursors we know
+  const lastKnown = Math.max(0, knownPages - 1);
+  // hasMore is honest about whether a further page exists beyond
+  // the last cursor we've cached.
+  const canNext = st.page < knownPages - 1 || st.hasMore;
+  const prevCls = st.page === 0 ? 'pagination-btn pagination-btn-disabled' : 'pagination-btn';
+  const nextCls = canNext ? 'pagination-btn' : 'pagination-btn pagination-btn-disabled';
+  let bar = '<div class="pagination-bar">';
+  bar += '<span class="pagination-status">Page ' + (st.page + 1) + ' · showing ' + shown + ' record' + (shown === 1 ? '' : 's') + '</span>';
+  bar += '<label class="pagination-pagesize">Per page: ' +
+    '<select onchange="setAuditPageSize(this.value)">' + sizeOptions + '</select></label>';
+  bar += '<div class="pagination-nav" role="navigation" aria-label="Pagination">';
+  bar += '<button type="button" class="' + prevCls + '"' +
+    (st.page === 0 ? ' disabled' : '') +
+    ' onclick="setAuditPage(' + Math.max(0, st.page - 1) + ')" aria-label="Previous page">‹</button>';
+  // Show the first known page + current ±1 + last known page as
+  // numbered buttons. Mirrors paginationButtons() in intel.js but
+  // capped at knownPages so we don't promise pages we can't reach.
+  const pageNumbers = new Set();
+  pageNumbers.add(0);
+  pageNumbers.add(lastKnown);
+  for (let i = -1; i <= 1; i++) {
+    const p = st.page + i;
+    if (p >= 0 && p <= lastKnown) pageNumbers.add(p);
+  }
+  const ordered = Array.from(pageNumbers).sort(function (a, b) { return a - b; });
+  let prev = -1;
+  for (const p of ordered) {
+    if (prev !== -1 && p - prev > 1) {
+      bar += '<span class="pagination-ellipsis">…</span>';
+    }
+    const cls = p === st.page ? 'pagination-btn pagination-btn-active' : 'pagination-btn';
+    bar += '<button type="button" class="' + cls + '" onclick="setAuditPage(' + p + ')">' + (p + 1) + '</button>';
+    prev = p;
+  }
+  bar += '<button type="button" class="' + nextCls + '"' +
+    (canNext ? '' : ' disabled') +
+    ' onclick="setAuditPage(' + Math.min(lastKnown + (st.hasMore ? 1 : 0), st.page + 1) + ')" aria-label="Next page">›</button>';
+  bar += '</div></div>';
+  return bar;
+}
+
 function onAuditActionChange(value) {
-  window._auditTrailState = { rows: [], beforeId: null, hasMore: true, action: value || '' };
-  fetchAuditTrailPage(true);
+  const prevSize = window._auditTrailState?.pageSize || 10;
+  window._auditTrailState = {
+    rows: [],
+    pageSize: prevSize,
+    page: 0,
+    cursorStack: [null],
+    hasMore: true,
+    action: value || '',
+  };
+  fetchAuditTrailPage();
 }
 
 // ── Operator override / label workflow (audit-only v1) ──────────────

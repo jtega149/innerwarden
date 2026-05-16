@@ -3,51 +3,45 @@
 // removed alongside the playbook engine. Future declarative
 // orchestration belongs to Spec 042 active defense.
 
-// 2026-05-15: page size + active risk filter persisted across calls.
-// Operator-reported: KPI "High Risk: 100" was the same as the visible
-// row count, not the real bucket size; "Total: 4141" had no way to
-// reach the other 4041; sorted-desc table gave no visual cue for
-// where the risk cliff was.
-const INTEL_PAGE_SIZE = 100;
-let _intelOffset = 0;
+// 2026-05-16 PR-H: real pagination. Operator: "ninguem se acha nesse
+// tipo de paginacao load more, coloca uma paginacao decente, e deixa
+// o cara escolher quantas linhas ele quer, mas comeca por 10, ai 50
+// e 100 talvez". Replaces the PR-E "Load more" accumulator with
+// proper page numbers + per-page size selector. The accumulator made
+// it impossible to jump to a specific page or to know which slice of
+// the 4000+ profiles you were actually looking at.
+//
+// Allowed page sizes (10 / 50 / 100) are tight to keep the table from
+// overwhelming the operator while still giving room for power users.
+const INTEL_PAGE_SIZES = [10, 50, 100];
+let _intelPageSize = 10;
+let _intelPage = 0; // 0-indexed
 let _intelRiskFilter = 0; // 0 = all, 70 = high, 40 = medium+, ...
-let _intelLoadedProfiles = []; // accumulator for "Load more"
 
 async function loadIntel() {
-  _intelOffset = 0;
-  _intelLoadedProfiles = [];
-  await fetchAndRenderIntel(/* append= */ false);
+  _intelPage = 0;
+  await fetchAndRenderIntel();
 }
 
-async function fetchAndRenderIntel(append) {
+async function fetchAndRenderIntel() {
   const status = document.getElementById('intelViewStatus');
   const content = document.getElementById('intelContent');
-  if (status) status.textContent = append ? 'Loading more…' : 'Loading…';
+  if (status) status.textContent = 'Loading…';
   const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
-    // 2026-05-16 PR-E: Intel UX slim — operator: "tinha que deixar
-    // isso mais simples e organizado". Removed the 4 KPI tiles
-    // (Total Profiles / High Risk / Medium / Countries — none of
-    // them were actionable; "Total: 4141" was noise, "Countries"
-    // was trivia), the Sort dropdown (default risk_score desc is
-    // what every operator actually wants), and the Min Risk input
-    // (replaced by 3 explicit chips with active state). The result
-    // is one search box + three chips above the risk-sorted table.
-    // No 300 filtros e tralha.
     const url = '/api/attacker-profiles?sort=risk_score'
       + '&min_risk=' + _intelRiskFilter
-      + '&limit=' + INTEL_PAGE_SIZE
-      + '&offset=' + _intelOffset;
+      + '&limit=' + _intelPageSize
+      + '&offset=' + (_intelPage * _intelPageSize);
     const data = await loadJson(url, { signal });
     if (!data || !data.profiles) { content.innerHTML = '<p style="color:var(--dim)">No attacker profiles yet.</p>'; return; }
 
-    if (append) {
-      _intelLoadedProfiles = _intelLoadedProfiles.concat(data.profiles);
-    } else {
-      _intelLoadedProfiles = data.profiles.slice();
-    }
-
+    const profiles = data.profiles;
     const totalAll = data.total || 0;
+    const totalPages = Math.max(1, Math.ceil(totalAll / _intelPageSize));
+    // Clamp current page if the backend total shrank between renders
+    // (filter change, new data). Avoids "page 27" showing empty.
+    if (_intelPage >= totalPages) _intelPage = Math.max(0, totalPages - 1);
 
     // Filter row — IP search (left) + 3 risk chips (right). One
     // line, no clutter. The active chip carries the accent ring so
@@ -73,7 +67,7 @@ async function fetchAndRenderIntel(append) {
       + '<th style="padding:6px;">Pattern</th><th style="padding:6px;">Last Seen</th>'
       + '</tr></thead><tbody>';
 
-    for (const p of _intelLoadedProfiles) {
+    for (const p of profiles) {
       const riskColor = p.risk_score >= 70 ? '#e74c3c' : p.risk_score >= 40 ? '#f39c12' : '#27ae60';
       const riskBar = '<div style="display:flex;align-items:center;gap:6px;">'
         + '<div style="width:40px;height:8px;background:var(--border);border-radius:4px;overflow:hidden;">'
@@ -107,19 +101,20 @@ async function fetchAndRenderIntel(append) {
     }
     html += '</tbody></table>';
 
-    // "Showing X of Y" + Load more button. Honest about pagination \u2014
-    // operator no longer has to wonder where the other 4000+ profiles
-    // went.
-    const shown = _intelLoadedProfiles.length;
-    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;font-size:0.78rem;color:var(--muted);">';
-    html += '<span>Showing ' + shown + ' of ' + totalAll + ' profiles' + (_intelRiskFilter > 0 ? ' (filter: risk \u2265 ' + _intelRiskFilter + ')' : '') + '</span>';
-    if (shown < totalAll) {
-      html += '<button type="button" onclick="loadMoreIntelProfiles()" style="padding:5px 14px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;font-weight:600;">Load more (' + Math.min(INTEL_PAGE_SIZE, totalAll - shown) + ' more)</button>';
-    }
-    html += '</div>';
+    // Pagination bar: page-size selector + "Showing X-Y of Z" + page
+    // number buttons. Replaces the legacy "Load more" accumulator
+    // (PR-H 2026-05-16 \u2014 operator asked for proper pagination).
+    html += renderIntelPaginationBar(profiles.length, totalAll, totalPages);
 
     content.innerHTML = html;
-    if (status) status.textContent = shown + ' of ' + totalAll + ' profiles';
+    const shown = profiles.length;
+    const startIdx = (_intelPage * _intelPageSize) + 1;
+    const endIdx = (_intelPage * _intelPageSize) + shown;
+    if (status) {
+      status.textContent = totalAll === 0
+        ? '0 profiles'
+        : startIdx + '\u2013' + endIdx + ' of ' + totalAll + ' profiles';
+    }
   } catch(e) {
     if (e && (e.name === 'AbortError' || e.code === 20)) return;
     content.innerHTML = '<p style="color:#e74c3c;">Failed to load: ' + esc(e.message) + '</p>';
@@ -129,14 +124,26 @@ async function fetchAndRenderIntel(append) {
 
 // 2026-05-15: click handlers \u2014 keep them at module scope so the
 // `onclick=` attributes in the rendered HTML can reach them.
+// 2026-05-16 PR-H: switched from offset-accumulator to page-number
+// pagination. setIntelPage / setIntelPageSize replace loadMore.
 function setIntelRiskFilter(risk) {
   _intelRiskFilter = risk;
-  loadIntel();
+  _intelPage = 0;
+  fetchAndRenderIntel();
 }
 
-function loadMoreIntelProfiles() {
-  _intelOffset += INTEL_PAGE_SIZE;
-  fetchAndRenderIntel(/* append= */ true);
+function setIntelPage(page) {
+  if (typeof page !== 'number' || page < 0) return;
+  _intelPage = page;
+  fetchAndRenderIntel();
+}
+
+function setIntelPageSize(size) {
+  const parsed = parseInt(size, 10);
+  if (!INTEL_PAGE_SIZES.includes(parsed)) return;
+  _intelPageSize = parsed;
+  _intelPage = 0; // resetting size restarts at the first page
+  fetchAndRenderIntel();
 }
 
 function filterIntelByIp(query) {
@@ -146,6 +153,71 @@ function filterIntelByIp(query) {
     const ip = (r.getAttribute('data-ip') || '').toLowerCase();
     r.style.display = (!q || ip.indexOf(q) !== -1) ? '' : 'none';
   });
+}
+
+// 2026-05-16 PR-H: pagination bar. Renders the standard
+// `[Per page] \u00b7 Showing X\u2013Y of Z \u00b7 [\u2039 Prev] [1 2 ... N] [Next \u203a]`
+// pattern below the table. Helper is shared by the audit-trail
+// pagination through the same `paginationBar` shape (see
+// `compliance.js::_auditTrailPaginationBar`).
+function renderIntelPaginationBar(shown, totalAll, totalPages) {
+  if (totalAll === 0) {
+    return '<div class="pagination-bar"><span class="pagination-status">' +
+      'No profiles match the current filter.</span></div>';
+  }
+  const startIdx = (_intelPage * _intelPageSize) + 1;
+  const endIdx = (_intelPage * _intelPageSize) + shown;
+  const sizeOptions = INTEL_PAGE_SIZES.map(function (s) {
+    return '<option value="' + s + '"' + (s === _intelPageSize ? ' selected' : '') + '>' + s + '</option>';
+  }).join('');
+  let bar = '<div class="pagination-bar">';
+  bar += '<span class="pagination-status">Showing ' + startIdx + '\u2013' + endIdx + ' of ' + totalAll +
+    (_intelRiskFilter > 0 ? ' (filter: risk \u2265 ' + _intelRiskFilter + ')' : '') + '</span>';
+  bar += '<label class="pagination-pagesize">Per page: ' +
+    '<select onchange="setIntelPageSize(this.value)">' + sizeOptions + '</select></label>';
+  bar += '<div class="pagination-nav" role="navigation" aria-label="Pagination">';
+  bar += paginationButtons(_intelPage, totalPages, 'setIntelPage');
+  bar += '</div></div>';
+  return bar;
+}
+
+// 2026-05-16 PR-H: shared pagination button-row builder. Emits
+// `[\u2039] [1] [2] \u2026 [N] [\u203a]` with the current page highlighted and an
+// ellipsis when there are more than ~9 pages. Exposed at module
+// scope so the audit-trail renderer can reuse it. `onclickFn` is the
+// name of the page-setter function (`setIntelPage` / `setAuditPage`)
+// \u2014 passing the name as a string instead of binding lets the bar
+// survive innerHTML re-renders.
+function paginationButtons(currentPage, totalPages, onclickFn) {
+  if (totalPages <= 1) return '';
+  let html = '';
+  const prevCls = currentPage === 0 ? 'pagination-btn pagination-btn-disabled' : 'pagination-btn';
+  const nextCls = currentPage >= totalPages - 1 ? 'pagination-btn pagination-btn-disabled' : 'pagination-btn';
+  const prevDisabled = currentPage === 0 ? 'disabled' : '';
+  const nextDisabled = currentPage >= totalPages - 1 ? 'disabled' : '';
+  html += '<button type="button" class="' + prevCls + '" ' + prevDisabled +
+    ' onclick="' + onclickFn + '(' + Math.max(0, currentPage - 1) + ')" aria-label="Previous page">\u2039</button>';
+  // Page-number window: always show 1, current-1, current, current+1, last.
+  const pages = new Set();
+  pages.add(0);
+  pages.add(totalPages - 1);
+  for (let i = -1; i <= 1; i++) {
+    const p = currentPage + i;
+    if (p >= 0 && p < totalPages) pages.add(p);
+  }
+  const ordered = Array.from(pages).sort(function (a, b) { return a - b; });
+  let prev = -1;
+  for (const p of ordered) {
+    if (prev !== -1 && p - prev > 1) {
+      html += '<span class="pagination-ellipsis">\u2026</span>';
+    }
+    const cls = p === currentPage ? 'pagination-btn pagination-btn-active' : 'pagination-btn';
+    html += '<button type="button" class="' + cls + '" onclick="' + onclickFn + '(' + p + ')">' + (p + 1) + '</button>';
+    prev = p;
+  }
+  html += '<button type="button" class="' + nextCls + '" ' + nextDisabled +
+    ' onclick="' + onclickFn + '(' + Math.min(totalPages - 1, currentPage + 1) + ')" aria-label="Next page">\u203a</button>';
+  return html;
 }
 
 // 2026-05-15 PR-A: dossier body builder. Returns the HTML for an

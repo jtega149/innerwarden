@@ -5652,17 +5652,23 @@ mod tests {
     #[test]
     fn pr_intel_slim_only_profiles_entry_point_remains() {
         // Post-PR-C: the only entry into the Intel view is `loadIntel()`,
-        // and the only render path is `fetchAndRenderIntel(append)` →
-        // the profile list. Profile-row click opens the shared dossier
+        // and the only render path is `fetchAndRenderIntel` → the
+        // profile list. Profile-row click opens the shared dossier
         // modal from PR-A. Anchor pins the surface so a regression that
         // re-introduces sub-tab machinery fails CI.
+        //
+        // 2026-05-16 PR-H: `fetchAndRenderIntel` no longer takes the
+        // `append` parameter — the accumulator that motivated it was
+        // deleted alongside the legacy "Load more" pagination.
+        // Renderer is now per-page (each fetch loads one page's worth
+        // of profiles, no concatenation).
         assert!(
             JS_INTEL.contains("async function loadIntel()"),
             "loadIntel() MUST stay — it's the Intel view's single entry"
         );
         assert!(
-            JS_INTEL.contains("async function fetchAndRenderIntel(append)"),
-            "fetchAndRenderIntel(append) MUST stay — it's the Profiles list renderer"
+            JS_INTEL.contains("async function fetchAndRenderIntel("),
+            "fetchAndRenderIntel(...) MUST stay — it's the Profiles list renderer"
         );
         // The Profiles-row click MUST keep targeting the modal.
         assert!(
@@ -6016,27 +6022,147 @@ mod tests {
         // operator could see the KPI tile said "Total Profiles: 4141"
         // and could not access the other 4041. Add: explicit "Showing
         // X of Y", a Load more button, and an IP search input.
-        assert!(
-            JS_INTEL.contains("function loadMoreIntelProfiles("),
-            "intel.js must define loadMoreIntelProfiles for pagination"
-        );
+        //
+        // 2026-05-16 PR-H: replaced the "Load more" accumulator with
+        // page-number pagination + per-page size selector. The
+        // setIntelRiskFilter / filterIntelByIp / row-tint contracts
+        // survived; loadMoreIntelProfiles is gone (replaced by
+        // setIntelPage / setIntelPageSize — anchored separately).
         assert!(
             JS_INTEL.contains("function setIntelRiskFilter("),
-            "intel.js must define setIntelRiskFilter so KPI tile clicks filter the list"
+            "intel.js must define setIntelRiskFilter so the risk chips filter the list"
         );
         assert!(
             JS_INTEL.contains("function filterIntelByIp("),
             "intel.js must define filterIntelByIp so the search input filters the visible rows client-side"
-        );
-        assert!(
-            JS_INTEL.contains("Showing ' + shown + ' of ' + totalAll"),
-            "intel.js must surface 'Showing X of Y' so the operator never wonders where the rest of the 4000+ profiles went"
         );
         // Risk filter row tint must exist so ≥70 rows are visually distinct
         // even when the visible page mixes bands.
         assert!(
             JS_INTEL.contains("rgba(231,76,60,0.05)"),
             "intel.js must tint ≥70 risk rows so the operator can spot the high-risk cliff at a glance"
+        );
+    }
+
+    // ── 2026-05-16 PR-H: real pagination + spec cleanup ──────────────
+    // Operator-reported pain points:
+    //   1. "ninguem se acha nesse tipo de paginacao load more, coloca
+    //       uma paginacao decente, e deixa o cara escolher quantas
+    //       linhas ele quer, mas comeca por 10, ai 50 e 100 talvez"
+    //   2. "checca todo dashboard por favor pra ver se tem spec,
+    //       usuario final nao sabe o que e spec"
+    // PR-H rewrites Intel + Decision Audit Records pagination to use
+    // page numbers + per-page size selector (10/50/100, default 10),
+    // and strips the two visible "spec NNN" leaks from the Health /
+    // Briefings tabs.
+
+    #[test]
+    fn pr_h_intel_uses_page_numbers_not_load_more() {
+        // Intel pagination state + helpers MUST mirror the new shape.
+        assert!(
+            JS_INTEL.contains("const INTEL_PAGE_SIZES = [10, 50, 100]"),
+            "INTEL_PAGE_SIZES MUST list the operator-approved page sizes (10/50/100)"
+        );
+        assert!(
+            JS_INTEL.contains("let _intelPageSize = 10"),
+            "default Intel page size MUST start at 10 — operator: \"comeca por 10\""
+        );
+        for sig in [
+            "function setIntelPage(page)",
+            "function setIntelPageSize(size)",
+            "function renderIntelPaginationBar(",
+            "function paginationButtons(",
+        ] {
+            assert!(
+                JS_INTEL.contains(sig),
+                "intel.js must define `{sig}` for the new pagination"
+            );
+        }
+        // Legacy accumulator must stay gone.
+        for orphan in [
+            "function loadMoreIntelProfiles",
+            "const INTEL_PAGE_SIZE = 100",
+            "let _intelOffset",
+            "let _intelLoadedProfiles",
+            "_intelLoadedProfiles.concat",
+        ] {
+            assert!(
+                !JS_INTEL.contains(orphan),
+                "PR-H: legacy `{orphan}` from the Load-more accumulator MUST stay deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_h_audit_trail_uses_page_numbers_not_load_more() {
+        // Decision Audit Records pagination on Compliance MUST mirror
+        // the Intel shape: same 10/50/100 sizes, default 10,
+        // setAuditPage / setAuditPageSize, no "Load 50 more" button.
+        assert!(
+            JS_COMPLIANCE.contains("const AUDIT_PAGE_SIZES = [10, 50, 100]"),
+            "AUDIT_PAGE_SIZES MUST list the operator-approved page sizes (10/50/100)"
+        );
+        assert!(
+            JS_COMPLIANCE.contains("pageSize: 10"),
+            "Audit trail default page size MUST be 10 — operator: \"comeca por 10\""
+        );
+        for sig in [
+            "function setAuditPage(page)",
+            "function setAuditPageSize(size)",
+            "function renderAuditPaginationBar()",
+        ] {
+            assert!(
+                JS_COMPLIANCE.contains(sig),
+                "compliance.js must define `{sig}` for the new audit pagination"
+            );
+        }
+        // Legacy "Load N more (older)" button stays gone.
+        assert!(
+            !JS_COMPLIANCE.contains("Load 50 more"),
+            "PR-H: the legacy `Load 50 more (older)` button MUST stay deleted"
+        );
+        assert!(
+            !JS_COMPLIANCE.contains("fetchAuditTrailPage(false)"),
+            "PR-H: the false-arg (append) call site of fetchAuditTrailPage MUST stay gone"
+        );
+    }
+
+    #[test]
+    fn pr_h_pagination_css_is_shared_across_intel_and_audit() {
+        // The same `.pagination-bar` / `.pagination-btn` styles back
+        // both surfaces. Anchor catches a future fork that styles them
+        // separately and drifts.
+        for selector in [
+            ".pagination-bar",
+            ".pagination-status",
+            ".pagination-pagesize",
+            ".pagination-nav",
+            ".pagination-btn",
+            ".pagination-btn-active",
+            ".pagination-btn-disabled",
+            ".pagination-ellipsis",
+        ] {
+            assert!(
+                APP_CSS.contains(selector),
+                "PR-H: `{selector}` MUST be defined in app.css — shared style across Intel + Audit"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_h_no_spec_leaks_in_operator_facing_strings() {
+        // Operator: "usuario final nao sabe o que e spec". The two
+        // visible-chrome `spec NNN` mentions on Health (Metrics Drift
+        // subtitle) and Briefings (SQLite tooltip) MUST stay gone.
+        assert!(
+            !JS_STATUS.contains("· spec 024 ·"),
+            "PR-H: the visible `spec 024` chrome on Metrics Drift was operator-flagged \
+             noise — must stay deleted"
+        );
+        assert!(
+            !JS_REPORTS.contains("(spec 016)"),
+            "PR-H: the visible `(spec 016)` tooltip on SQLite Operational Health was \
+             operator-flagged noise — must stay deleted"
         );
     }
 
