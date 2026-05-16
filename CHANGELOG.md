@@ -9,7 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Operator-facing polish caught during the v0.13.4-rc.1 lab install on `test001` (2026-05-16). Three small PRs landed against `main` after v0.13.4 was tagged; collected here for the next stable promote.
+## [0.13.5] - 2026-05-16
+
+Operator-facing polish release. Eight PRs against `main` after v0.13.4 was tagged, all motivated by the v0.13.4-rc.1 lab install on `test001` and the operator-reported Telegram FPs during an `apt upgrade` on Oracle prod. Verified end-to-end on Oracle prod (ARM64 aarch64, kernel 6.8.0-1052-oracle, post-reboot) and `test001` (Ubuntu 24.04 x86_64, kernel 6.8.0-117-generic) before tagging.
 
 ### Added
 
