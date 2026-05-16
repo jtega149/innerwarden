@@ -1,11 +1,19 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
 use crate::{abuseipdb, ai, decisions, ioc, skills, telegram};
+
+/// Spec 050-hotfix: emit at most one "silent drop" incident per IP
+/// per this window. Long enough that a recurring attacker doesn't
+/// flood the live feed (one TCP reconnect every second from a botnet
+/// would otherwise produce 3600 incidents/h per IP); short enough
+/// that the same attacker returning a day later still surfaces.
+const SILENT_DROP_INCIDENT_COOLDOWN: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, Copy)]
 struct AlwaysOnSessionOutcome {
@@ -35,6 +43,103 @@ fn elapsed_secs_for_report(started_at: std::time::Instant) -> u64 {
         1
     } else {
         0
+    }
+}
+
+/// Spec 050-hotfix gate: returns `true` when a silent-drop incident
+/// for `ip` should be emitted now, and updates the cooldown table so
+/// the next call within `SILENT_DROP_INCIDENT_COOLDOWN` returns
+/// `false`. Pure on the cooldown map — no I/O — so it's safe to test.
+///
+/// Operator-reported on 2026-05-16: a known-attacker IP that hit
+/// the honeypot earlier (sessions on May 10 + May 15) was silently
+/// dropped at the in-memory `filter_blocklist` gate every time it
+/// came back. Result: zero visibility on the live feed for a
+/// recurring attacker. The cooldown emits one tile-sized incident
+/// per hour per IP so the feed shows "this attacker tried again"
+/// without spamming when a botnet retries every second.
+pub(crate) fn silent_drop_due(
+    ip: &str,
+    cooldown_map: &mut HashMap<String, std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    match cooldown_map.get(ip) {
+        Some(&last) if now.duration_since(last) < SILENT_DROP_INCIDENT_COOLDOWN => false,
+        _ => {
+            cooldown_map.insert(ip.to_string(), now);
+            // Bound the map so a pathological flood of distinct
+            // attacker IPs cannot grow it unbounded. 4096 is
+            // generous — at 1 entry/second we still cover ~70 min
+            // before evicting (matches the cooldown horizon).
+            if cooldown_map.len() > 4096 {
+                let cutoff = now - SILENT_DROP_INCIDENT_COOLDOWN;
+                cooldown_map.retain(|_, t| *t > cutoff);
+            }
+            true
+        }
+    }
+}
+
+/// Spec 050-hotfix: write a Low-severity "silent drop" incident to
+/// the store so the live feed sees recurring attackers. Called from
+/// the always-on honeypot Filter 1 path after `silent_drop_due`
+/// returns `true`.
+///
+/// Severity: `Low`. The IP is already blocked (that's why we're in
+/// Filter 1); the new info is operator-visible reconnect activity,
+/// not a fresh threat that needs response. The live feed groups by
+/// IP so each repeat-attacker row's `incidents` counter ticks up
+/// as more silent drops are recorded (subject to the per-IP cooldown).
+async fn write_silent_drop_incident(
+    ip: &str,
+    host: &str,
+    sqlite_store: Option<&Arc<innerwarden_store::Store>>,
+) {
+    let Some(store) = sqlite_store else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    let incident = innerwarden_core::incident::Incident {
+        ts: now,
+        host: host.to_string(),
+        incident_id: format!(
+            "honeypot:silent_drop:{ip}:{}",
+            now.format("%Y-%m-%dT%H:%MZ")
+        ),
+        severity: innerwarden_core::event::Severity::Low,
+        title: format!("Recurring attacker dropped at honeypot edge: {ip}"),
+        summary: format!(
+            "IP {ip} is already on the always-on honeypot filter blocklist \
+             from a prior interaction. Connection silently dropped (no \
+             session evidence collected). Rate-limited to one incident \
+             per hour per IP."
+        ),
+        evidence: serde_json::json!([{
+            "kind": "honeypot_silent_drop",
+            "ip": ip,
+            "reason": "filter_blocklist_hit",
+        }]),
+        recommended_checks: vec![
+            "Inspect prior sessions from this IP in /var/lib/innerwarden/honeypot/".to_string(),
+            "If this is operator legitimate traffic, allowlist via [ips]".to_string(),
+        ],
+        tags: vec!["honeypot".to_string(), "recurring_attacker".to_string()],
+        entities: vec![innerwarden_core::entities::EntityRef::ip(ip)],
+    };
+    let store = store.clone();
+    let result = tokio::task::spawn_blocking(move || store.insert_incident(&incident)).await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => warn!(
+            ip,
+            error = %e,
+            "honeypot silent-drop incident write failed"
+        ),
+        Err(e) => warn!(
+            ip,
+            error = %e,
+            "honeypot silent-drop incident task join failed"
+        ),
     }
 }
 
@@ -531,6 +636,18 @@ pub(crate) async fn run_always_on_honeypot(
     };
     info!(port, bind_addr, "always-on honeypot listener started");
 
+    // Spec 050-hotfix: per-IP cooldown for silent-drop incidents.
+    // Owned by the listener task so no cross-task locking is needed
+    // (single-threaded by virtue of running inside this `loop`).
+    let mut silent_drop_cooldown: HashMap<String, std::time::Instant> = HashMap::new();
+
+    // Resolve the host id once for incident records below. Same
+    // pattern as `always_on_abuseipdb_block` so live-feed grouping
+    // matches operator expectations.
+    let silent_drop_host = std::env::var("HOSTNAME")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+        .unwrap_or_else(|_| "unknown".to_string());
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -544,11 +661,28 @@ pub(crate) async fn run_always_on_honeypot(
 
                 let ip = peer.ip().to_string();
 
-                // Filter 1: already in filter blocklist - drop silently.
+                // Filter 1: already in filter blocklist - drop the TCP
+                // connection. Pre-fix this path was completely silent
+                // (debug! only). Operator-reported on 2026-05-16: a
+                // recurring attacker that landed on the blocklist from
+                // earlier sessions stopped showing up on the live feed
+                // even though it kept reconnecting. Now we emit a
+                // rate-limited Low-severity incident (one per IP per
+                // hour) so the feed still surfaces the reconnect
+                // pattern without flooding under sustained probes.
                 {
                     let bl = filter_blocklist.lock().unwrap_or_else(|e| e.into_inner());
                     if bl.contains(&ip) {
                         debug!(ip, "always-on honeypot: IP in blocklist - dropping silently");
+                        drop(bl);
+                        if silent_drop_due(&ip, &mut silent_drop_cooldown, std::time::Instant::now()) {
+                            let ip_c = ip.clone();
+                            let host_c = silent_drop_host.clone();
+                            let store_c = sqlite_store.clone();
+                            tokio::spawn(async move {
+                                write_silent_drop_incident(&ip_c, &host_c, store_c.as_ref()).await;
+                            });
+                        }
                         continue;
                     }
                 }
@@ -777,6 +911,72 @@ async fn always_on_abuseipdb_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── spec 050-hotfix: silent-drop visibility tests ──────────────────
+
+    #[test]
+    fn silent_drop_due_emits_on_first_hit() {
+        let mut cd: HashMap<String, std::time::Instant> = HashMap::new();
+        let now = std::time::Instant::now();
+        assert!(silent_drop_due("203.0.113.7", &mut cd, now));
+        // Cooldown table now records this IP.
+        assert!(cd.contains_key("203.0.113.7"));
+    }
+
+    #[test]
+    fn silent_drop_due_suppresses_inside_cooldown() {
+        let mut cd: HashMap<String, std::time::Instant> = HashMap::new();
+        let base = std::time::Instant::now();
+        assert!(silent_drop_due("203.0.113.7", &mut cd, base));
+        // 30 minutes later — still inside the 60-minute cooldown.
+        let inside = base + Duration::from_secs(30 * 60);
+        assert!(!silent_drop_due("203.0.113.7", &mut cd, inside));
+    }
+
+    #[test]
+    fn silent_drop_due_emits_again_after_cooldown_expires() {
+        let mut cd: HashMap<String, std::time::Instant> = HashMap::new();
+        let base = std::time::Instant::now();
+        assert!(silent_drop_due("203.0.113.7", &mut cd, base));
+        let past_cooldown = base + SILENT_DROP_INCIDENT_COOLDOWN + Duration::from_secs(1);
+        assert!(silent_drop_due("203.0.113.7", &mut cd, past_cooldown));
+    }
+
+    #[test]
+    fn silent_drop_due_tracks_distinct_ips_independently() {
+        let mut cd: HashMap<String, std::time::Instant> = HashMap::new();
+        let now = std::time::Instant::now();
+        assert!(silent_drop_due("203.0.113.7", &mut cd, now));
+        // Same instant but a different IP — must emit (cooldown is per-IP).
+        assert!(silent_drop_due("198.51.100.42", &mut cd, now));
+    }
+
+    #[test]
+    fn silent_drop_due_evicts_stale_entries_under_pressure() {
+        // Synthetic flood: 4097 distinct IPs spaced 1 second apart.
+        // The map is bounded at 4096; after the bound trips, the
+        // cleanup retains only entries inside the cooldown window.
+        let mut cd: HashMap<String, std::time::Instant> = HashMap::new();
+        let base = std::time::Instant::now();
+        for i in 0..4097u32 {
+            let ip = format!("10.0.{}.{}", i / 256, i % 256);
+            let ts = base + Duration::from_secs(i as u64);
+            assert!(silent_drop_due(&ip, &mut cd, ts));
+        }
+        // After the eviction sweep, the map must have shrunk — the
+        // very-oldest entries (>cooldown old) get dropped.
+        assert!(
+            cd.len() <= 4097,
+            "map size {} should not blow past the soft bound",
+            cd.len()
+        );
+        // The most-recent IP (i=4096) must still be tracked.
+        let last = format!("10.0.{}.{}", 4096 / 256, 4096 % 256);
+        assert!(
+            cd.contains_key(&last),
+            "most recent IP {last} should still be in cooldown map"
+        );
+    }
 
     #[test]
     fn no_autoblock_without_interaction() {
