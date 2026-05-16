@@ -603,7 +603,6 @@ pub async fn serve(
         .route("/js/reports.js", get(serve_js_reports))
         .route("/js/status.js", get(serve_js_status))
         .route("/js/compliance.js", get(serve_js_compliance))
-        .route("/js/honeypot.js", get(serve_js_honeypot))
         .route("/js/intel.js", get(serve_js_intel))
         .route("/js/monthly.js", get(serve_js_monthly))
         .route("/js/responses.js", get(serve_js_responses))
@@ -1036,7 +1035,6 @@ js_handler!(serve_js_sensors, JS_SENSORS);
 js_handler!(serve_js_reports, JS_REPORTS);
 js_handler!(serve_js_status, JS_STATUS);
 js_handler!(serve_js_compliance, JS_COMPLIANCE);
-js_handler!(serve_js_honeypot, JS_HONEYPOT);
 js_handler!(serve_js_intel, JS_INTEL);
 js_handler!(serve_js_monthly, JS_MONTHLY);
 js_handler!(serve_js_responses, JS_RESPONSES);
@@ -1066,7 +1064,6 @@ const JS_SENSORS: &str = include_str!("frontend/js/sensors.js");
 const JS_REPORTS: &str = include_str!("frontend/js/reports.js");
 const JS_STATUS: &str = include_str!("frontend/js/status.js");
 const JS_COMPLIANCE: &str = include_str!("frontend/js/compliance.js");
-const JS_HONEYPOT: &str = include_str!("frontend/js/honeypot.js");
 const JS_INTEL: &str = include_str!("frontend/js/intel.js");
 const JS_MONTHLY: &str = include_str!("frontend/js/monthly.js");
 const JS_RESPONSES: &str = include_str!("frontend/js/responses.js");
@@ -2784,7 +2781,6 @@ mod tests {
             ("reports.js", JS_REPORTS),
             ("status.js", JS_STATUS),
             ("compliance.js", JS_COMPLIANCE),
-            ("honeypot.js", JS_HONEYPOT),
             ("intel.js", JS_INTEL),
             ("monthly.js", JS_MONTHLY),
             ("responses.js", JS_RESPONSES),
@@ -2912,7 +2908,6 @@ mod tests {
             ("status.js", JS_STATUS, true),
             ("intel.js", JS_INTEL, true),
             ("monthly.js", JS_MONTHLY, true),
-            ("honeypot.js", JS_HONEYPOT, true),
             ("compliance.js", JS_COMPLIANCE, true),
             ("responses.js", JS_RESPONSES, true),
             ("journey.js", JS_JOURNEY, true),
@@ -5984,85 +5979,79 @@ mod tests {
         );
     }
 
-    #[test]
-    fn honeypot_js_separates_engaged_from_listener_only_sessions() {
-        // Audit 2.9: honeypot tab USED to display 178 sessions all
-        // with 0 commands / 0 auth attempts and read like "honeypot
-        // is busy" when actually the attackers walked away. Anchor
-        // pins the engagement banner copy + the filter toggle so a
-        // refactor cannot quietly drop the honesty surface.
-        assert!(JS_HONEYPOT.contains("function _honeypotIsEngaged"));
-        assert!(JS_HONEYPOT.contains("toggleHoneypotEngagedFilter"));
-        assert!(
-            JS_HONEYPOT.contains("Honeypot engagement:"),
-            "engagement banner copy missing — operator can't tell engaged vs listener-only (audit 2.9)"
-        );
-        // The explanatory copy is the load-bearing part — a future
-        // copy edit must keep the engaged/unengaged definition
-        // visible to the non-technical operator.
-        assert!(JS_HONEYPOT.contains("Engaged = attacker typed"));
-        assert!(JS_HONEYPOT.contains("Unengaged ="));
-    }
+    // ── 2026-05-16 PR-F: Honeypot tab removed ────────────────────────
+    // The 3 honeypot_js_* anchors (Audit 2.9 + Spec 046 #13 + #14)
+    // were deleted alongside the Honeypot tab. They pinned the
+    // engaged/listener-only honesty surface, pagination, and the
+    // three-branch empty state — all UI for a tab that no longer
+    // exists. Per-IP honeypot intel (credentials attempted + commands
+    // typed + IOCs) survives in the shared Attacker Dossier modal
+    // (PR-A); aggregate cross-IP intel lives on the Monthly threat
+    // report. Operator: "por mim tudo bem desde que em cases de pra
+    // ver se teve alguma secao de honeypot do ip e o que ele digitiou".
 
-    /// Spec 046 anchor #13 — Inv. 6 (frontend pinned). The
-    /// pagination controls (Prev / Next + page-size + 'has_more'
-    /// consumption) MUST stay in the bundle so a future refactor
-    /// cannot silently revert to "fetch all 244+ sessions".
     #[test]
-    fn honeypot_js_renders_pagination_controls() {
-        assert!(
-            JS_HONEYPOT.contains("function honeypotPrevPage"),
-            "Prev page handler missing — pagination broken"
-        );
-        assert!(
-            JS_HONEYPOT.contains("function honeypotNextPage"),
-            "Next page handler missing — pagination broken"
-        );
-        assert!(
-            JS_HONEYPOT.contains("_honeypotPaginationBar"),
-            "pagination render helper missing"
-        );
-        // The query string the frontend sends MUST carry the three
-        // backend-honored params; a refactor that drops one breaks
-        // the contract with `paginate_honeypot_sessions`.
-        for key in ["page", "size", "engaged_only"] {
+    fn pr_f_honeypot_tab_is_gone_from_dashboard() {
+        for orphan in [
+            "id=\"navHoneypot\"",
+            "id=\"viewHoneypot\"",
+            "id=\"honeypotContent\"",
+            "id=\"honeypotViewStatus\"",
+            "showView('honeypot')",
+            ">Honeypot</button>",
+            "/js/honeypot.js",
+        ] {
             assert!(
-                JS_HONEYPOT.contains(key),
-                "pagination param '{key}' missing from frontend query"
+                !INDEX_HTML.contains(orphan),
+                "PR-F: `{orphan}` was deleted; the Honeypot tab UI must stay gone — \
+                 per-IP detail lives in the shared Attacker Dossier modal (PR-A)"
             );
         }
-        // Default state MUST be engaged-only (Spec 046 Inv. 7).
-        // Anchor against accidental `_honeypotShowEngagedOnly = false`.
+        // nav.js must not route the deleted view.
         assert!(
-            JS_HONEYPOT.contains("_honeypotShowEngagedOnly = true"),
-            "engaged-only default flipped — Spec 046 Inv. 7 regressed"
+            !JS_NAV.contains("'honeypot'"),
+            "PR-F: nav.js MUST NOT reference the 'honeypot' route"
+        );
+        assert!(
+            !JS_NAV.contains("loadHoneypot("),
+            "PR-F: nav.js MUST NOT call loadHoneypot — the loader was deleted with the file"
         );
     }
 
-    /// Spec 046 anchor #14 — Inv. 8 (three empty states). A
-    /// refactor that collapses the three empty-state branches into
-    /// one generic "no sessions" wall reverts the operator-visible
-    /// honesty surface.
     #[test]
-    fn honeypot_js_handles_three_empty_states() {
+    fn pr_f_dossier_modal_still_surfaces_honeypot_intel_per_ip() {
+        // The contract that justifies dropping the Honeypot tab:
+        // when an IP touched the honeypot, the operator sees the
+        // session detail (credentials attempted + commands executed
+        // + IOCs) on the shared Attacker Dossier modal. Anchor pins
+        // the dossier renderer keeps the Honeypot Intel section.
+        // Operator's exact requirement: "em cases de pra ver se teve
+        // alguma secao de honeypot do ip e o que ele digitiou".
+        let start = JS_INTEL
+            .find("function renderProfileDossierHtml(p)")
+            .expect("renderProfileDossierHtml present");
+        let end = JS_INTEL[start..]
+            .find("\n}\n")
+            .expect("end of renderProfileDossierHtml")
+            + start;
+        let body = &JS_INTEL[start..end];
         assert!(
-            JS_HONEYPOT.contains("function _honeypotEmptyState"),
-            "empty-state helper missing — three-branch contract regressed"
+            body.contains("if (p.honeypot_sessions > 0)"),
+            "dossier MUST gate the Honeypot Intel section on honeypot_sessions > 0"
         );
-        // Case (a) — listener has no data at all.
         assert!(
-            JS_HONEYPOT.contains("Honeypot listener active — no probes yet"),
-            "case (a) copy missing"
+            body.contains("Honeypot Intel"),
+            "dossier MUST render the `Honeypot Intel` section header for honeypot-touched IPs"
         );
-        // Case (b) — data exists, zero engaged.
         assert!(
-            JS_HONEYPOT.contains("no shell engagements yet"),
-            "case (b) copy missing"
+            body.contains("Credentials Attempted"),
+            "dossier MUST surface the credentials_attempted list — operator wants \
+             to see what they typed"
         );
-        // Case (c) — current page empty under filter.
         assert!(
-            JS_HONEYPOT.contains("is empty under the current filter"),
-            "case (c) copy missing"
+            body.contains("Commands Executed"),
+            "dossier MUST surface the commands_executed list — operator wants to \
+             see what they typed"
         );
     }
 
@@ -6363,7 +6352,6 @@ mod tests {
             ("reports.js", JS_REPORTS),
             ("status.js", JS_STATUS),
             ("compliance.js", JS_COMPLIANCE),
-            ("honeypot.js", JS_HONEYPOT),
             ("intel.js", JS_INTEL),
             ("monthly.js", JS_MONTHLY),
             ("responses.js", JS_RESPONSES),
@@ -6783,7 +6771,6 @@ mod tests {
         check!(serve_js_reports(), "reports.js");
         check!(serve_js_status(), "status.js");
         check!(serve_js_compliance(), "compliance.js");
-        check!(serve_js_honeypot(), "honeypot.js");
         check!(serve_js_intel(), "intel.js");
         check!(serve_js_monthly(), "monthly.js");
         check!(serve_js_responses(), "responses.js");

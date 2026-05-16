@@ -81,7 +81,12 @@
                view delete. The per-collector breakdown + Event Timeline
                live on Home under `#homeSensorsPanel`. -->
           <button type="button" class="nav-more-item" id="navReport" onclick="showView('report')">Briefings</button>
-          <button type="button" class="nav-more-item" id="navHoneypot" onclick="showView('honeypot')">Honeypot</button>
+<!-- 2026-05-16 PR-F: Honeypot nav item removed. Per-IP honeypot
+               sessions (credentials attempted + commands typed + IOCs)
+               are already surfaced in the shared Attacker Dossier modal
+               (PR-A) when an IP touched the honeypot — operator: "em
+               cases de pra ver se teve alguma secao de honeypot do ip
+               e o que ele digitiou". -->
           <button type="button" class="nav-more-item" id="navCompliance" onclick="showView('compliance')">Compliance</button>
           <button type="button" class="nav-more-item" id="navMonthly" onclick="showView('monthly')">Monthly</button>
         </div>
@@ -333,16 +338,14 @@
     </div>
   </div>
 
-  <!-- ── Honeypot view ── -->
-  <div class="report-view" id="viewHoneypot" style="display:none">
-    <div class="report-toolbar">
-      <button type="button" class="report-refresh-btn" onclick="loadHoneypot()">↻ Refresh</button>
-      <span id="honeypotViewStatus" class="report-status"></span>
-    </div>
-    <div id="honeypotContent" class="report-content">
-      <div class="empty" style="padding:40px;text-align:center">Loading…</div>
-    </div>
-  </div>
+  <!-- 2026-05-16 PR-F: standalone Honeypot view deleted. Per-IP
+       honeypot session detail (credentials attempted + commands typed
+       + IOCs) is already surfaced in the shared Attacker Dossier modal
+       (PR-A) when the IP touched the honeypot. The aggregate cross-IP
+       intelligence (top credentials, common malware URLs, weekly
+       trends) is part of the Monthly threat report. Operator
+       confirmed: "por mim tudo bem desde que em cases de pra ver se
+       teve alguma secao de honeypot do ip e o que ele digitiou". -->
 
   <!-- ── Compliance view ── -->
   <div class="report-view" id="viewCompliance" style="display:none">
@@ -540,7 +543,6 @@
 <script src="/js/reports.js"></script>
 <script src="/js/status.js"></script>
 <script src="/js/compliance.js"></script>
-<script src="/js/honeypot.js"></script>
 <script src="/js/intel.js"></script>
 <script src="/js/monthly.js"></script>
 <script src="/js/responses.js"></script>

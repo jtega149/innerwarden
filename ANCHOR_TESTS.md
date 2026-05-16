@@ -1314,6 +1314,13 @@ Operator-reported on 2026-05-16: every "AI Explanation" click on Cases returned 
 - `crates/agent/src/dashboard/data_api.rs::tests::pr_e_build_explain_context_sqlite_returns_none_when_no_matching_incidents` — SQLite scan returns `None` when no incident's `entities` array contains the subject IP (no fabricated context for unknown IPs).
 - `crates/agent/src/dashboard/data_api.rs::tests::pr_e_build_explain_context_sqlite_builds_from_matching_incidents` — bug-replay anchor: with an IP that has incident rows in SQLite but is no longer in the KG, the fallback surfaces incident title + summary + the source-label "sqlite-only context" so the LLM knows it's working with SQLite-only data.
 
+### Honeypot tab dropped — per-IP detail lives on the Dossier modal (2026-05-16 PR-F)
+
+Operator: "honeypot vc tinha dito que dava pra remover porque dava pra ver em outro lugar, por mim tudo bem desde que em cases de pra ver se teve alguma secao de honeypot do ip e o que ele digitiou". The standalone Honeypot dashboard tab is deleted alongside `frontend/js/honeypot.js`, the More-menu button, the view div, and the `/js/honeypot.js` route. Per-IP honeypot session detail (credentials attempted + commands executed + IOCs) is already surfaced in the shared Attacker Dossier modal (PR-A) when an IP touched the honeypot. Aggregate cross-IP intelligence (top credentials, common malware URLs, weekly trends) lives on the Monthly threat report. The `/api/honeypot/sessions` backend endpoint + `paginate_honeypot_sessions` helper stay (no dashboard consumer remains, but the API surface is preserved for CLI / future integrations).
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr_f_honeypot_tab_is_gone_from_dashboard` — `#navHoneypot`, `#viewHoneypot`, `#honeypotContent`, `#honeypotViewStatus`, every `showView('honeypot')` DOM handler, the visible `>Honeypot</button>` label, and the `/js/honeypot.js` script tag stay deleted from index.html; nav.js routes no `'honeypot'` view name and does not call `loadHoneypot`.
+- `crates/agent/src/dashboard/mod.rs::tests::pr_f_dossier_modal_still_surfaces_honeypot_intel_per_ip` — `renderProfileDossierHtml` keeps the gated `if (p.honeypot_sessions > 0)` block + the `Honeypot Intel` section header + `Credentials Attempted` and `Commands Executed` lists, so the operator's "ver se teve alguma secao de honeypot do ip e o que ele digitiou" requirement is satisfied via the dossier modal.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

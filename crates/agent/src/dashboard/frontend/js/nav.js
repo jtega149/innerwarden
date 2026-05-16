@@ -30,8 +30,11 @@ function toggleLeftPanel() {
 // Cases sidebar; lifetime stats and orphan diagnostics moved to the
 // Health tab. The `/api/responses` endpoint stays (consumed by the
 // modal, Health tab, and Home strip).
-const _secondaryTabs = ['sensors','report','honeypot','compliance','monthly','graph'];
-const _secondaryLabels = { sensors:'Sensors', report:'Report', honeypot:'Honeypot', compliance:'Compliance', monthly:'Monthly', graph:'Graph' };
+// 2026-05-16 PR-F: Honeypot route dropped from the More menu — per-IP
+// honeypot session detail (creds + commands + IOCs) lives in the
+// shared Attacker Dossier modal (PR-A).
+const _secondaryTabs = ['sensors','report','compliance','monthly','graph'];
+const _secondaryLabels = { sensors:'Sensors', report:'Report', compliance:'Compliance', monthly:'Monthly', graph:'Graph' };
 
 function toggleMoreMenu() {
   const m = document.getElementById('moreMenu');
@@ -39,8 +42,11 @@ function toggleMoreMenu() {
 }
 
 function showView(name) {
-  const views = { home: 'viewHome', sensors: 'viewSensors', investigate: 'viewInvestigate', report: 'viewReport', status: 'viewStatus', honeypot: 'viewHoneypot', compliance: 'viewCompliance', intel: 'viewIntel', monthly: 'viewMonthly', fleet: 'viewFleet', graph: 'viewGraph' };
-  const btns  = { home: 'navHome', sensors: 'navSensors', investigate: 'navInvestigate', report: 'navReport', status: 'navStatus', honeypot: 'navHoneypot', compliance: 'navCompliance', intel: 'navIntel', monthly: 'navMonthly', fleet: 'navFleet', graph: 'navGraph' };
+  // 2026-05-16 PR-F: `honeypot` route dropped — per-IP honeypot intel
+  // lives in the shared Attacker Dossier modal (PR-A), aggregate
+  // cross-IP intel lives in the Monthly threat report.
+  const views = { home: 'viewHome', sensors: 'viewSensors', investigate: 'viewInvestigate', report: 'viewReport', status: 'viewStatus', compliance: 'viewCompliance', intel: 'viewIntel', monthly: 'viewMonthly', fleet: 'viewFleet', graph: 'viewGraph' };
+  const btns  = { home: 'navHome', sensors: 'navSensors', investigate: 'navInvestigate', report: 'navReport', status: 'navStatus', compliance: 'navCompliance', intel: 'navIntel', monthly: 'navMonthly', fleet: 'navFleet', graph: 'navGraph' };
   // Update URL hash (use friendly name for threats)
   var hashName = name === 'investigate' ? 'threats' : name;
   if (location.hash !== '#' + hashName) {
@@ -103,7 +109,8 @@ function showView(name) {
   // the dispatcher has no `sensors` arm anymore.
   if (name === 'report') loadReport();
   if (name === 'status') loadStatus();
-  if (name === 'honeypot') loadHoneypot();
+  // 2026-05-16 PR-F: `honeypot` route deleted. Per-IP honeypot detail
+  // is on the Attacker Dossier modal (PR-A).
   if (name === 'compliance') loadCompliance();
   if (name === 'intel') loadIntel();
   if (name === 'monthly') loadMonthly();
