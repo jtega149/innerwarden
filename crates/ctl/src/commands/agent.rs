@@ -1,26 +1,142 @@
 use std::io::Write;
+use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::{AgentCommand, Cli};
 
 /// Resolve the dashboard URL from agent config or default.
+///
+/// Default scheme is HTTPS: the agent's `--dashboard` flag enables a
+/// self-signed TLS cert at startup ("dashboard HTTPS started" in the log),
+/// so probing http:// returns "Connection refused" and the setup wizard
+/// prints the misleading "Dashboard not reachable".
+///
+/// Parsing rules:
+///   1. Top-level `dashboard_bind = "..."` wins.
+///   2. Inside `[dashboard]` (or `[dashboard.*]` subsections), an exact
+///      `bind = "..."` wins.
+///   3. Everything else is ignored. Crucially: a `bind_addr` inside
+///      `[honeypot]` must NOT be picked up — the old `starts_with("bind")`
+///      check captured that and produced URLs like `http://127.0.0.1` with
+///      no port.
+///   4. Fully-qualified `http://` or `https://` URLs are honored as-is.
+///   5. If the bound address has no `:port` suffix, default to `:8787`.
+///   6. `bind` set to a wildcard (`0.0.0.0` / `[::]`) is rewritten to
+///      `127.0.0.1` so the CLI talks to itself, not whatever's listening on
+///      the public interface.
 pub(crate) fn resolve_dashboard_url(cli: &Cli) -> String {
-    // Try to read from agent.toml [dashboard] bind
-    if let Ok(content) = std::fs::read_to_string(&cli.agent_config) {
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("dashboard_bind") || trimmed.starts_with("bind") {
-                if let Some(val) = trimmed.split('=').nth(1) {
-                    let addr = val.trim().trim_matches('"');
-                    if !addr.is_empty() {
-                        return format!("http://{addr}");
-                    }
-                }
-            }
+    const DEFAULT: &str = "https://127.0.0.1:8787";
+
+    let Ok(content) = std::fs::read_to_string(&cli.agent_config) else {
+        return DEFAULT.to_string();
+    };
+
+    let mut current_section = String::new();
+    let mut dashboard_bind: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            current_section = rest.trim().to_string();
+            continue;
+        }
+
+        let Some(eq) = trimmed.find('=') else {
+            continue;
+        };
+        let key = trimmed[..eq].trim();
+        let raw_value = trimmed[eq + 1..].trim();
+        // Strip inline comments and surrounding quotes.
+        let value_no_comment = raw_value.split('#').next().unwrap_or("").trim();
+        let value = value_no_comment.trim_matches('"').trim_matches('\'');
+
+        if value.is_empty() {
+            continue;
+        }
+
+        // Rule 1: top-level dashboard_bind.
+        if key == "dashboard_bind" && current_section.is_empty() {
+            dashboard_bind = Some(value.to_string());
+            break;
+        }
+
+        // Rule 2: bind inside [dashboard] (or [dashboard.something]).
+        if key == "bind"
+            && (current_section == "dashboard" || current_section.starts_with("dashboard."))
+        {
+            dashboard_bind = Some(value.to_string());
+            break;
         }
     }
-    "http://127.0.0.1:8787".to_string()
+
+    let Some(mut addr) = dashboard_bind else {
+        return DEFAULT.to_string();
+    };
+
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        return addr;
+    }
+
+    // Rewrite wildcards: the CLI calls localhost, not the public bind.
+    if let Some(rest) = addr.strip_prefix("0.0.0.0") {
+        addr = format!("127.0.0.1{rest}");
+    } else if let Some(rest) = addr.strip_prefix("[::]") {
+        addr = format!("127.0.0.1{rest}");
+    } else if addr == "*" {
+        addr = "127.0.0.1:8787".to_string();
+    }
+
+    // If no :port suffix, add the default.
+    let has_port = if addr.starts_with('[') {
+        // IPv6 literal: [::1]:8787 — port follows the closing bracket.
+        addr.split_once(']')
+            .is_some_and(|(_, rest)| rest.starts_with(':'))
+    } else {
+        addr.contains(':')
+    };
+    if !has_port {
+        addr = format!("{addr}:8787");
+    }
+
+    format!("https://{addr}")
+}
+
+pub(crate) fn dashboard_api_agent(url: &str) -> ureq::Agent {
+    let mut builder = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(5)));
+    if is_loopback_dashboard_url(url) {
+        // The local dashboard uses a self-signed certificate. Keep the relaxed
+        // TLS policy scoped to loopback URLs only.
+        builder = builder.tls_config(
+            ureq::tls::TlsConfig::builder()
+                .disable_verification(true)
+                .build(),
+        );
+    }
+    let config = builder.build();
+    config.into()
+}
+
+fn is_loopback_dashboard_url(url: &str) -> bool {
+    let authority = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("");
+
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']').map(|(host, _)| host).unwrap_or(rest)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 pub(crate) fn parse_selection_indices(input: &str, max: usize) -> Option<Vec<usize>> {
@@ -432,7 +548,7 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
                 });
 
                 let url = format!("{dashboard_url}/api/agent-guard/connect");
-                match ureq::post(url).send_json(&payload) {
+                match dashboard_api_agent(&url).post(&url).send_json(&payload) {
                     Ok(resp) => {
                         let body: serde_json::Value =
                             resp.into_body().read_json().unwrap_or_default();
@@ -488,7 +604,7 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
             let payload = serde_json::json!({ "agent_id": id });
             let url = format!("{dashboard_url}/api/agent-guard/disconnect");
 
-            match ureq::post(url).send_json(&payload) {
+            match dashboard_api_agent(&url).post(&url).send_json(&payload) {
                 Ok(_) => {
                     println!("  \x1b[32m✓\x1b[0m Agent {id} disconnected");
                 }
@@ -510,9 +626,10 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;
     use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     fn test_cli(temp: &TempDir) -> Cli {
@@ -544,8 +661,25 @@ mod tests {
     ) -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test should bind local server");
         let addr = listener.local_addr().expect("test should read local addr");
+        listener
+            .set_nonblocking(true)
+            .expect("test should make listener nonblocking");
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("test should accept request");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(err)
+                        if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        panic!("test server timed out waiting for dashboard request");
+                    }
+                    Err(err) => panic!("test should accept request: {err}"),
+                }
+            };
             let mut buf = [0_u8; 4096];
             let n = stream.read(&mut buf).expect("test should read request");
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -564,14 +698,22 @@ mod tests {
 
     #[test]
     fn resolve_dashboard_url_defaults_when_config_is_missing() {
+        // Default scheme is HTTPS — the agent starts a self-signed TLS
+        // listener whenever --dashboard is passed (the install.sh systemd
+        // unit always passes it). Probing http:// returned a misleading
+        // "Connection refused" during setup and made the wizard print
+        // "Dashboard not reachable" even when the dashboard was up.
         let temp = TempDir::new().expect("test should create temp dir");
         let cli = test_cli(&temp);
         let url = resolve_dashboard_url(&cli);
-        assert_eq!(url, "http://127.0.0.1:8787");
+        assert_eq!(url, "https://127.0.0.1:8787");
     }
 
     #[test]
-    fn resolve_dashboard_url_reads_bind_from_config() {
+    fn resolve_dashboard_url_reads_bind_from_dashboard_section() {
+        // bind inside [dashboard] is honoured; 0.0.0.0 is rewritten to
+        // 127.0.0.1 because the CLI talks to localhost, not whatever's
+        // listening on the public bind.
         let temp = TempDir::new().expect("test should create temp dir");
         let cli = test_cli(&temp);
         std::fs::write(
@@ -582,24 +724,78 @@ bind = "0.0.0.0:9999"
         )
         .expect("test should write agent config");
         let url = resolve_dashboard_url(&cli);
-        assert_eq!(url, "http://0.0.0.0:9999");
+        assert_eq!(url, "https://127.0.0.1:9999");
     }
 
     #[test]
-    fn resolve_dashboard_url_reads_dashboard_bind_and_ignores_empty_values() {
+    fn resolve_dashboard_url_reads_top_level_dashboard_bind_and_ignores_empty_values() {
+        // dashboard_bind only wins at the top level (rule 1). An empty
+        // value inside [dashboard] is skipped and the next entry is used.
         let temp = TempDir::new().expect("test should create temp dir");
         let cli = test_cli(&temp);
         std::fs::write(
             &cli.agent_config,
-            r#"[dashboard]
+            r#"dashboard_bind = "127.0.0.1:8788"
+
+[dashboard]
 bind = ""
-dashboard_bind = "127.0.0.1:8788"
 "#,
         )
         .expect("test should write agent config");
 
         let url = resolve_dashboard_url(&cli);
-        assert_eq!(url, "http://127.0.0.1:8788");
+        assert_eq!(url, "https://127.0.0.1:8788");
+    }
+
+    #[test]
+    fn resolve_dashboard_url_ignores_honeypot_bind_addr() {
+        // Regression for the v0.13.4-rc.1 bug where `bind_addr` inside
+        // [honeypot] was picked up as the dashboard address because the
+        // parser used `starts_with("bind")`. That produced URLs like
+        // `http://127.0.0.1` (no port) and broke the reachability probe.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        std::fs::write(
+            &cli.agent_config,
+            r#"[honeypot]
+mode = "demo"
+bind_addr = "127.0.0.1"
+port = 2222
+"#,
+        )
+        .expect("test should write agent config");
+        let url = resolve_dashboard_url(&cli);
+        assert_eq!(url, "https://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn resolve_dashboard_url_appends_default_port_when_missing() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        std::fs::write(
+            &cli.agent_config,
+            r#"[dashboard]
+bind = "127.0.0.1"
+"#,
+        )
+        .expect("test should write agent config");
+        let url = resolve_dashboard_url(&cli);
+        assert_eq!(url, "https://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn resolve_dashboard_url_ipv6_wildcard_rewrites_to_loopback() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        std::fs::write(
+            &cli.agent_config,
+            r#"[dashboard]
+bind = "[::]:8787"
+"#,
+        )
+        .expect("test should write agent config");
+        let url = resolve_dashboard_url(&cli);
+        assert_eq!(url, "https://127.0.0.1:8787");
     }
 
     #[test]
@@ -700,7 +896,7 @@ dashboard_bind = "127.0.0.1:8788"
         std::fs::write(
             &cli.agent_config,
             r#"[dashboard]
-dashboard_bind = "127.0.0.1:1"
+bind = "http://127.0.0.1:1"
 "#,
         )
         .expect("test should write agent config");
@@ -727,7 +923,7 @@ dashboard_bind = "127.0.0.1:1"
         let (addr, handle) = start_one_shot_json_server(r#"{"agent_id":"ag-test"}"#);
         std::fs::write(
             &cli.agent_config,
-            format!("[dashboard]\ndashboard_bind = \"{addr}\"\n"),
+            format!("[dashboard]\nbind = \"http://{addr}\"\n"),
         )
         .expect("test should write agent config");
 
@@ -753,7 +949,7 @@ dashboard_bind = "127.0.0.1:1"
         std::fs::write(
             &cli.agent_config,
             r#"[dashboard]
-dashboard_bind = "127.0.0.1:1"
+bind = "http://127.0.0.1:1"
 "#,
         )
         .expect("test should write agent config");
@@ -774,7 +970,7 @@ dashboard_bind = "127.0.0.1:1"
         let (addr, handle) = start_one_shot_json_server(r#"{}"#);
         std::fs::write(
             &cli.agent_config,
-            format!("[dashboard]\ndashboard_bind = \"{addr}\"\n"),
+            format!("[dashboard]\nbind = \"http://{addr}\"\n"),
         )
         .expect("test should write agent config");
 

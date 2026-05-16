@@ -6,21 +6,17 @@ use std::process::Command;
 
 const INFO_BOX_OFFSET: usize = 4;
 
-/// Compact double-sword logo with brand text between blades.
+/// Retro-game ASCII wordmark. ASCII-only (no unicode/box-drawing) so it
+/// renders identically in journald, SSH-tunnelled terminals, and curl|bash
+/// pipes. Matches the banner in `install.sh::print_install_banner`.
 const LOGO_WIDE: &[&str] = &[
-    "      .-.                       .-.",
-    "     {{@}}                     {{@}}",
-    "      8@8                       8@8",
-    "      888      INNER WARDEN     888",
-    "      8@8                       8@8",
-    "     _    )8(    _             _    )8(    _",
-    "      (@)__/8@8\\__(@)           (@)__/8@8\\__(@)",
-    "     ~-=):(=-~                 ~-=):(=-~",
-    "      |.|                       |.|",
-    "      |.|                       |.|",
-    "      |.|                       |.|",
-    "      \\ /                       \\ /",
-    "     ^                         ^",
+    "================================================================================",
+    " ___ _   _ _   _ _____ ____   __        ___    ____  ____  _____ _   _ ",
+    "|_ _| \\ | | \\ | | ____|  _ \\  \\ \\      / / \\  |  _ \\|  _ \\| ____| \\ | |",
+    " | ||  \\| |  \\| |  _| | |_) |  \\ \\ /\\ / / _ \\ | |_) | | | |  _| |  \\| |",
+    " | || |\\  | |\\  | |___|  _ <    \\ V  V / ___ \\|  _ <| |_| | |___| |\\  |",
+    "|___|_| \\_|_| \\_|_____|_| \\_\\    \\_/\\_/_/   \\_\\_| \\_\\____/|_____|_| \\_|",
+    "================================================================================",
 ];
 
 fn parse_env_size(key: &str) -> Option<usize> {

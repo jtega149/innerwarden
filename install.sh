@@ -47,7 +47,11 @@ for arg in "$@"; do
   esac
 done
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# BASH_SOURCE[0] is unset when the script is piped through `curl | bash` —
+# `set -u` then aborts before we even print the banner. Fall back to $0
+# (which is the empty string under bash -c but at least won't crash) and
+# default to PWD when that also yields nothing useful.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 
 # Detect OS + arch + distro
 OS_TYPE="$(uname -s)"   # Linux | Darwin
@@ -187,8 +191,12 @@ term_rows() {
 print_centered_line() {
   local cols="$1"
   local line="$2"
-  local width
-  width="$(printf '%s' "${line}" | wc -m | tr -d ' ')"
+  local width visible
+  # Strip ANSI escape sequences before measuring so coloured lines still
+  # centre correctly. Without this, an 8-char "\033[1;32m...\033[0m" wrap
+  # adds 12 phantom columns and the wordmark drifts left.
+  visible="$(printf '%s' "${line}" | sed -E 's/\x1b\[[0-9;]*m//g')"
+  width="$(printf '%s' "${visible}" | wc -m | tr -d ' ')"
   local pad=0
   if (( cols > width )); then
     pad=$(( (cols - width) / 2 ))
@@ -204,26 +212,27 @@ print_install_banner() {
   local platform_line
   local os_lower
   os_lower="$(printf '%s' "${OS_TYPE}" | tr '[:upper:]' '[:lower:]')"
-  platform_line="$(printf "%s %s | kernel %s%s" "${os_lower}" "${ARCH}" "${KERNEL}" "${DISTRO:+ | ${DISTRO}}")"
+  platform_line="$(printf "%s %s  |  kernel %s%s" "${os_lower}" "${ARCH}" "${KERNEL}" "${DISTRO:+  |  ${DISTRO}}")"
 
+  # ANSI green for retro-terminal feel; gated on isatty to keep CI logs clean.
+  local g='' d=''
+  if [[ -t 1 ]]; then
+    g=$'\033[1;32m'
+    d=$'\033[0m'
+  fi
+
+  # Retro-game wordmark — ASCII-only (no unicode/box-drawing) so it renders
+  # the same on every terminal, including journald and curl|bash pipes.
   local banner_lines=(
-"      .-.                       .-."
-"     {{@}}                     {{@}}"
-"      8@8                       8@8"
-"      888      INNER WARDEN     888"
-"      8@8                       8@8"
-"     _    )8(    _             _    )8(    _"
-"      (@)__/8@8\\__(@)           (@)__/8@8\\__(@)"
-"     ~-=):(=-~                 ~-=):(=-~"
-"      |.|                       |.|"
-"      |.|                       |.|"
-"      |.|                       |.|"
-"      \\ /                       \\ /"
-"     ^                         ^"
+"${g}================================================================================${d}"
+"${g} ___ _   _ _   _ _____ ____   __        ___    ____  ____  _____ _   _ ${d}"
+"${g}|_ _| \\ | | \\ | | ____|  _ \\  \\ \\      / / \\  |  _ \\|  _ \\| ____| \\ | |${d}"
+"${g} | ||  \\| |  \\| |  _| | |_) |  \\ \\ /\\ / / _ \\ | |_) | | | |  _| |  \\| |${d}"
+"${g} | || |\\  | |\\  | |___|  _ <    \\ V  V / ___ \\|  _ <| |_| | |___| |\\  |${d}"
+"${g}|___|_| \\_|_| \\_|_____|_| \\_\\    \\_/\\_/_/   \\_\\_| \\_\\____/|_____|_| \\_|${d}"
+"${g}================================================================================${d}"
 ""
-"+-----------------------------------------+"
-"|  Your server's immune system installer  |"
-"+-----------------------------------------+"
+"your server's immune system  ::  installer"
 "${platform_line}"
   )
 
@@ -550,7 +559,8 @@ download_asset() {
 
 if [[ "${BUILD_FROM_SOURCE}" == "1" ]]; then
   # ── Build from source (development / unsupported arch) ──────────────────
-  ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # Same curl|bash safety fallback as SCRIPT_DIR above (BASH_SOURCE[0] unset).
+  ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
   if ! command -v cargo >/dev/null 2>&1; then
     log "cargo not found. Installing rustup (user install)..."
     curl -sSf https://sh.rustup.rs | sh -s -- -y

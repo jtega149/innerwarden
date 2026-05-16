@@ -41,6 +41,10 @@ use innerwarden_core::audit::{append_admin_action, current_operator, AdminAction
 #[derive(Parser)]
 #[command(
     name = "innerwarden",
+    // `--version` / `-V` print the workspace version. Operators kept hitting
+    // `innerwarden --version` and getting "unexpected argument" — clap only
+    // wires the flag when `version = ...` is set on the parent command.
+    version = env!("CARGO_PKG_VERSION"),
     about = "InnerWarden. self-defending security for Linux and macOS.",
     long_about = "8 commands to protect your server:\n\n\
                   \x20 get       Query status, incidents, decisions, reports\n\

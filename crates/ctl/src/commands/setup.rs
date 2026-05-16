@@ -960,7 +960,8 @@ fn collect_setup_runtime_status(_cli: &Cli, _is_macos: bool) -> SetupRuntimeStat
 fn collect_setup_runtime_status(cli: &Cli, is_macos: bool) -> SetupRuntimeStatus {
     let dashboard_url = resolve_dashboard_url(cli);
     let dashboard_status_url = format!("{dashboard_url}/api/status");
-    let dashboard_reachable = ureq::get(&dashboard_status_url)
+    let dashboard_reachable = crate::commands::agent::dashboard_api_agent(&dashboard_status_url)
+        .get(&dashboard_status_url)
         .config()
         .timeout_global(Some(std::time::Duration::from_secs(2)))
         .build()
