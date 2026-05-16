@@ -144,6 +144,14 @@ fn read_proc_cmdline(pid: u32, filename: &str) -> Vec<String> {
 }
 
 /// Convert a kernel execve event to an Inner Warden Event.
+///
+/// Reads `/proc/{ppid}/comm` so the 050-PR0 context-aware allowlist
+/// (`detectors::exec_context::classify`) stays I/O-free on the hot
+/// path — the classifier reads `parent_comm` from `event.details`
+/// rather than re-resolving it for every detector that needs it. The
+/// lookup is best-effort: a missing file (parent exited, namespaced
+/// `/proc`) yields an empty `parent_comm`, which the classifier maps
+/// to the safe `AttackerInferred` default.
 #[allow(clippy::too_many_arguments)]
 fn execve_to_event(
     pid: u32,
@@ -164,11 +172,14 @@ fn execve_to_event(
         .map(|s| serde_json::Value::String(s.clone()))
         .collect();
 
+    let parent_comm = crate::detectors::exec_context::proc_comm(ppid).unwrap_or_default();
+
     let mut details = serde_json::json!({
         "pid": pid,
         "uid": uid,
         "ppid": ppid,
         "comm": comm,
+        "parent_comm": parent_comm,
         "command": command,
         "argv": argv_json,
         "argc": argc,

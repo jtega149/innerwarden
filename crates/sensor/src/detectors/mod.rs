@@ -5,6 +5,7 @@ pub mod container_escape;
 pub mod credential_stuffing;
 pub mod crypto_miner;
 pub mod distributed_ssh;
+pub mod exec_context;
 pub mod suspicious_login;
 
 /// IPs that should be treated as external even though they're technically private.

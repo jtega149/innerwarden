@@ -832,6 +832,55 @@ impl DynamicAllowlist {
         false
     }
 
+    /// Spec 050-PR0 context-aware allowlist gate. Returns `true` when
+    /// a `shell.command_exec` (or `process.exec`) event should be
+    /// silenced for discovery-style detectors.
+    ///
+    /// Three layered gates; **any** match silences:
+    ///
+    /// 1. Legacy comm allowlist (`DISCOVERY_ALLOWED`) — monitoring
+    ///    tools, build systems, boot scripts. Kept as-is to preserve
+    ///    pre-050 behaviour; these comms historically had blanket
+    ///    silence and we cannot regress that without a shadow window.
+    /// 2. Operator-extensible `[detectors.discovery_anomaly]` TOML
+    ///    list — wired through `is_process_allowed`. Lets the operator
+    ///    add their own service-account comms without recompile.
+    /// 3. Execution context (`exec_context::classify`) — the new
+    ///    half. Catches the 2026-05-16 Caldera gap: an operator
+    ///    running `whoami` under `bash` with uid 1000 classifies as
+    ///    `OpInteractive` and is silenced; sandcat running the same
+    ///    `whoami` with parent `sandcat` classifies as
+    ///    `AttackerInferred` and falls through.
+    ///
+    /// Operator quote (2026-05-16): "se o user normal faz, o allow
+    /// list deveria pegar o user normal não o caldeira."
+    pub fn is_benign_discovery(&self, event: &innerwarden_core::event::Event) -> bool {
+        if event.kind != "shell.command_exec" && event.kind != "process.exec" {
+            return false;
+        }
+        let comm = event
+            .details
+            .get("comm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if comm.is_empty() {
+            return false;
+        }
+
+        // Gate 1: legacy DISCOVERY_ALLOWED comm list.
+        if comm_in_allowlist(comm, DISCOVERY_ALLOWED) {
+            return true;
+        }
+
+        // Gate 2: operator-extensible per-detector TOML list.
+        if self.is_process_allowed(comm, Some("discovery_anomaly")) {
+            return true;
+        }
+
+        // Gate 3: 050-PR0 context-aware classifier.
+        crate::detectors::exec_context::classify(event).is_benign()
+    }
+
     /// Check if an IP is dynamically allowlisted.
     pub fn is_ip_allowed(&self, ip: &str) -> bool {
         if self.ips.contains(ip) {
@@ -1436,5 +1485,164 @@ ignored = 0, 9, 67
             &al,
             None
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Spec 050-PR0: is_benign_discovery — 3-gate context-aware allowlist
+    // -----------------------------------------------------------------
+
+    fn discovery_event(comm: &str, parent_comm: &str, uid: u64) -> innerwarden_core::event::Event {
+        innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            source: "ebpf".to_string(),
+            kind: "shell.command_exec".to_string(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: format!("Shell command executed: {comm}"),
+            details: serde_json::json!({
+                "pid": 1234,
+                "uid": uid,
+                "ppid": 999,
+                "comm": comm,
+                "parent_comm": parent_comm,
+                "command": comm,
+                "argv": [comm],
+                "argc": 1,
+            }),
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn is_benign_discovery_silences_operator_in_interactive_shell() {
+        // Canonical 2026-05-16 operator-flagged case: a logged-in
+        // operator running `whoami` from their ssh shell must be
+        // silenced. parent_comm="bash" + uid>999 → OpInteractive.
+        let al = DynamicAllowlist::load(Path::new("/nonexistent"));
+        let ev = discovery_event("whoami", "bash", 1000);
+        assert!(al.is_benign_discovery(&ev));
+    }
+
+    #[test]
+    fn is_benign_discovery_surfaces_caldera_sandcat_recon() {
+        // Counterpart to the test above: sandcat (no interactive
+        // shell parent) running the same `whoami` must fall through
+        // to AttackerInferred and be surfaced. This is the gap the
+        // pre-050 blanket allowlist could not close.
+        let al = DynamicAllowlist::load(Path::new("/nonexistent"));
+        let ev = discovery_event("whoami", "sandcat", 1000);
+        assert!(!al.is_benign_discovery(&ev));
+    }
+
+    #[test]
+    fn is_benign_discovery_gate1_legacy_comm_allowlist_silences_innerwarden() {
+        // Gate 1: comm is in DISCOVERY_ALLOWED. Catches monitoring
+        // tools that don't fit the 5 context buckets (innerwarden,
+        // osqueryd, aide, telegraf, prometheus). Preserves pre-050
+        // behaviour for these.
+        let al = DynamicAllowlist::load(Path::new("/nonexistent"));
+        let ev = discovery_event("innerwarden-sensor", "systemd", 998);
+        assert!(al.is_benign_discovery(&ev));
+    }
+
+    #[test]
+    fn is_benign_discovery_gate2_operator_toml_extension() {
+        // Gate 2: operator-extensible per-detector list. Operators
+        // who run their own service-account comm add it to
+        // `[detectors.discovery_anomaly]` and the same benign
+        // treatment applies — without recompile.
+        //
+        // Comm choice: `myservicecheck` deliberately avoids any
+        // prefix match in `DISCOVERY_ALLOWED` (which catches `node`,
+        // `aide`, `logcheck`, etc. via starts_with). Parent
+        // `systemd` keeps gate 3 firmly in `AttackerInferred`, so
+        // the only path to a benign verdict is gate 2.
+        let dir = std::env::temp_dir().join("iw_test_benign_discovery_gate2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.discovery_anomaly]
+"myservicecheck" = "Operator monitoring agent"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+
+        let ev = discovery_event("myservicecheck", "systemd", 998);
+        assert!(al.is_benign_discovery(&ev));
+
+        // Without the TOML entry, the same event would NOT be
+        // silenced — proves the test is exercising gate 2.
+        let al_empty = DynamicAllowlist::load(Path::new("/nonexistent"));
+        assert!(!al_empty.is_benign_discovery(&ev));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn is_benign_discovery_gate3_package_manager_parent() {
+        // Gate 3: context classifier. dpkg/apt postinst scripts run
+        // discovery commands legitimately. The 2026-05-16 FP wave
+        // (kernel_module, sudo_abuse, etc.) had `dpkg` as parent.
+        let al = DynamicAllowlist::load(Path::new("/nonexistent"));
+        let ev = discovery_event("uname", "dpkg", 0);
+        assert!(al.is_benign_discovery(&ev));
+    }
+
+    #[test]
+    fn is_benign_discovery_gate3_automation_parent() {
+        // Gate 3 cont.: ansible / salt / puppet runs.
+        let al = DynamicAllowlist::load(Path::new("/nonexistent"));
+        let ev = discovery_event("ss", "ansible-playboo", 0);
+        assert!(al.is_benign_discovery(&ev));
+    }
+
+    #[test]
+    fn is_benign_discovery_ignores_non_exec_events() {
+        // The gate is only meaningful for exec events; everything
+        // else returns false. Prevents stray network/file events
+        // from accidentally invoking discovery suppression.
+        let al = DynamicAllowlist::load(Path::new("/nonexistent"));
+        let mut ev = discovery_event("whoami", "bash", 1000);
+        ev.kind = "network.outbound_connect".to_string();
+        assert!(!al.is_benign_discovery(&ev));
+    }
+
+    #[test]
+    fn is_benign_discovery_handles_missing_comm() {
+        // Auditd-only events lack `comm`. The gate should not panic
+        // and should return false (falls through to detector logic).
+        let al = DynamicAllowlist::load(Path::new("/nonexistent"));
+        let ev = innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "test".into(),
+            source: "auditd".into(),
+            kind: "shell.command_exec".into(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: "auditd EXECVE".into(),
+            details: serde_json::json!({
+                "audit_id": "42",
+                "command": "whoami",
+                "argv": ["whoami"],
+            }),
+            tags: vec![],
+            entities: vec![],
+        };
+        assert!(!al.is_benign_discovery(&ev));
+    }
+
+    #[test]
+    fn is_benign_discovery_accepts_process_exec_kind() {
+        // Some detectors emit `process.exec` instead of
+        // `shell.command_exec`; the gate must accept both so the
+        // semantics are uniform across the pipeline.
+        let al = DynamicAllowlist::load(Path::new("/nonexistent"));
+        let mut ev = discovery_event("whoami", "bash", 1000);
+        ev.kind = "process.exec".to_string();
+        assert!(al.is_benign_discovery(&ev));
     }
 }

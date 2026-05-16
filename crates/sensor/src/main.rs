@@ -381,6 +381,10 @@ async fn main() -> Result<()> {
     // Initialize host self-awareness (own IPs, listening ports).
     detectors::init_host_inventory();
 
+    // Spec 050-PR0: anchor the sensor-start instant so the
+    // exec_context classifier can detect the 60 s boot window.
+    detectors::exec_context::init_sensor_start();
+
     // Load blocked IPs from agent feedback file.
     let blocked_ips = load_blocked_ips(data_dir);
     if !blocked_ips.is_empty() {
@@ -1828,15 +1832,29 @@ fn process_event(
         }
     }
 
-    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
-    // + systemd_persistence + mitre_hunt from PR #647). The detector body
-    // does not thread `dynamic_allowlist` through, so we extract the
-    // incident here and consult `[detectors.discovery_burst]` before writing.
-    let discovery_burst_incident = detectors
-        .discovery_burst
-        .as_mut()
-        .and_then(|d| d.process(&ev));
+    // Spec 050-PR0 context-aware pre-emit gate. Skip the detector
+    // entirely when the event's execution context proves benign
+    // (operator interactive shell, package-manager postinst,
+    // automation, boot/MOTD) or the comm is on the legacy
+    // `DISCOVERY_ALLOWED` / `[detectors.discovery_anomaly]` list. This
+    // is the operator-flagged 2026-05-16 fix: a sandcat agent running
+    // the same `whoami`/`ps` as a real operator no longer hides behind
+    // the blanket allowlist — the context check distinguishes the two.
+    let discovery_burst_incident = if detectors.dynamic_allowlist.is_benign_discovery(&ev) {
+        None
+    } else {
+        detectors
+            .discovery_burst
+            .as_mut()
+            .and_then(|d| d.process(&ev))
+    };
     if let Some(incident) = discovery_burst_incident {
+        // Post-emit allowlist gate retained for the
+        // `[detectors.discovery_burst]` TOML section (mirrors
+        // kernel_module_load + sudo_abuse + systemd_persistence +
+        // mitre_hunt from PR #647). The pre-emit gate above handles
+        // the *event* level; this handles the *incident* level for
+        // operators allowlisting specific outcomes.
         if !detectors
             .dynamic_allowlist
             .suppress_incident_for_detector(&incident, "discovery_burst")
