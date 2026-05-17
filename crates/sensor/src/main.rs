@@ -151,6 +151,12 @@ struct DetectorSet {
     c2_web_tunnel: Option<detectors::c2_web_tunnel::C2WebTunnelDetector>,
     c2_protocol_tunneling: Option<detectors::c2_protocol_tunneling::C2ProtocolTunnelingDetector>,
     c2_non_standard_port: Option<detectors::c2_non_standard_port::C2NonStandardPortDetector>,
+    // spec 050-PR4 — Privilege Escalation + Lateral Movement
+    setuid_exploit_pattern: Option<detectors::setuid_exploit_pattern::SetuidExploitPatternDetector>,
+    capabilities_abuse: Option<detectors::capabilities_abuse::CapabilitiesAbuseDetector>,
+    lateral_egress_ssh: Option<detectors::lateral_egress_ssh::LateralEgressSshDetector>,
+    lateral_egress_scp_rsync:
+        Option<detectors::lateral_egress_scp_rsync::LateralEgressScpRsyncDetector>,
 }
 
 #[derive(Default)]
@@ -789,6 +795,25 @@ async fn main() -> Result<()> {
         c2_non_standard_port: Some({
             info!("c2_non_standard_port detector enabled (T1571 listeners outside well-known set)");
             detectors::c2_non_standard_port::C2NonStandardPortDetector::new(&cfg.agent.host_id)
+        }),
+        // spec 050-PR4 — Privilege Escalation + Lateral Movement
+        setuid_exploit_pattern: Some({
+            info!("setuid_exploit_pattern detector enabled (T1548.001 non-baseline SUID exec)");
+            detectors::setuid_exploit_pattern::SetuidExploitPatternDetector::new(&cfg.agent.host_id)
+        }),
+        capabilities_abuse: Some({
+            info!("capabilities_abuse detector enabled (T1548.005 dangerous caps + exploit argv)");
+            detectors::capabilities_abuse::CapabilitiesAbuseDetector::new(&cfg.agent.host_id)
+        }),
+        lateral_egress_ssh: Some({
+            info!("lateral_egress_ssh detector enabled (T1021.004 ssh from non-operator tree)");
+            detectors::lateral_egress_ssh::LateralEgressSshDetector::new(&cfg.agent.host_id)
+        }),
+        lateral_egress_scp_rsync: Some({
+            info!("lateral_egress_scp_rsync detector enabled (T1048.001 staged exfil)");
+            detectors::lateral_egress_scp_rsync::LateralEgressScpRsyncDetector::new(
+                &cfg.agent.host_id,
+            )
         }),
     };
 
@@ -2179,6 +2204,59 @@ fn process_event(
         if !detectors
             .dynamic_allowlist
             .suppress_incident_for_detector(&incident, "c2_non_standard_port")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // spec 050-PR4 — Privilege Escalation + Lateral Movement
+    let setuid_exploit_pattern_incident = detectors
+        .setuid_exploit_pattern
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = setuid_exploit_pattern_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "setuid_exploit_pattern")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let capabilities_abuse_incident = detectors
+        .capabilities_abuse
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = capabilities_abuse_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "capabilities_abuse")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let lateral_egress_ssh_incident = detectors
+        .lateral_egress_ssh
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = lateral_egress_ssh_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "lateral_egress_ssh")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let lateral_egress_scp_rsync_incident = detectors
+        .lateral_egress_scp_rsync
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = lateral_egress_scp_rsync_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "lateral_egress_scp_rsync")
         {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }

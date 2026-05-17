@@ -262,6 +262,12 @@ pub mod c2_non_standard_port;
 pub mod c2_protocol_tunneling;
 pub mod c2_web_tunnel;
 
+// spec 050-PR4 — Privilege Escalation + Lateral Movement
+pub mod capabilities_abuse;
+pub mod lateral_egress_scp_rsync;
+pub mod lateral_egress_ssh;
+pub mod setuid_exploit_pattern;
+
 #[cfg(test)]
 mod tests {
     use super::*;
