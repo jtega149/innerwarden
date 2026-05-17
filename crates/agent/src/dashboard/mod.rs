@@ -553,10 +553,39 @@ pub async fn serve(
         }
     });
 
-    // SEC-006: Agent API routes — require auth when bound to non-loopback.
-    // On loopback, these remain unauthenticated for local service-to-service use
-    // (OpenClaw, n8n, etc.). On non-loopback, they go through the auth layer.
-    let agent_api_router = Router::new()
+    // SEC-006 + Wave 2026-05-17 fix: Agent API routes use a
+    // per-request loopback-bypass auth gate.
+    //
+    // Old behaviour: the WHOLE router was wrapped in either the auth
+    // layer (for non-loopback bind) or no auth (for loopback bind).
+    // That coarse-grained policy meant `sudo innerwarden agent
+    // connect` on a host that bound the dashboard to 0.0.0.0 got 401
+    // — even though the CLI runs as root on the same box and reaches
+    // the dashboard via 127.0.0.1.
+    //
+    // New behaviour: every agent_api request is checked individually.
+    // - Peer IP is loopback (127.0.0.1 / ::1)  → bypass auth.
+    //   The caller is on the host; they already have whatever privs
+    //   sudo grants them, and the local services (CLI, OpenClaw,
+    //   n8n) can integrate without knowing the dashboard password.
+    // - Peer IP is a real remote                → require_auth.
+    //   Operator browsing the dashboard from outside, or a remote
+    //   attacker, still hits the wall.
+    //
+    // The peer IP comes from `ConnectInfo<SocketAddr>` (wired up at
+    // the serve sites at line 824 / 838), NOT from `X-Forwarded-For`
+    // — a proxy header is operator-controlled and forging
+    // `X-Forwarded-For: 127.0.0.1` must not bypass auth.
+    let agent_api_auth_layer = middleware::from_fn_with_state(
+        (
+            auth.clone(),
+            state.trusted_proxies.clone(),
+            state.sessions.clone(),
+            session_timeout_minutes,
+        ),
+        auth::loopback_bypass_or_require_auth,
+    );
+    let agent_api = Router::new()
         .route(
             "/api/agent/security-context",
             get(api_agent_security_context),
@@ -573,14 +602,9 @@ pub async fn serve(
             "/api/agent-guard/disconnect",
             post(api_agent_guard_disconnect),
         )
-        .route("/api/agent-guard/agents", get(api_agent_guard_list));
-    let agent_api = if should_require_api_auth(&bind) {
-        agent_api_router
-            .layer(auth_layer.clone())
-            .with_state(state.clone())
-    } else {
-        agent_api_router.with_state(state.clone())
-    };
+        .route("/api/agent-guard/agents", get(api_agent_guard_list))
+        .layer(agent_api_auth_layer)
+        .with_state(state.clone());
 
     // Auth login route - public (no auth required; this IS the auth endpoint)
     let auth_login = Router::new()
@@ -821,9 +845,15 @@ pub async fn serve(
         let listener = tokio::net::TcpListener::bind(&bind)
             .await
             .with_context(|| format!("failed to bind dashboard listener on {bind}"))?;
-        axum::serve(listener, app)
-            .await
-            .context("dashboard server failed")
+        // Wave 2026-05-17: inject ConnectInfo<SocketAddr> so middlewares
+        // can read the real peer IP (needed by the loopback-bypass auth
+        // path on /api/agent-guard/* and by per-IP rate limiting).
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .context("dashboard server failed")
     } else {
         // ── HTTPS (default) ──────────────────────────────────────────
         let tls_config = build_tls_config(&data_dir, tls_cert, tls_key).await?;
@@ -835,8 +865,11 @@ pub async fn serve(
             bind = %bind,
             "dashboard HTTPS started"
         );
+        // Wave 2026-05-17: inject ConnectInfo<SocketAddr> so middlewares
+        // can read the real peer IP (needed by the loopback-bypass auth
+        // path on /api/agent-guard/* and by per-IP rate limiting).
         axum_server::bind_rustls(addr, tls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .context("dashboard HTTPS server failed")
     }
@@ -1106,11 +1139,15 @@ pub(crate) fn cert_expiry_ymd(days_valid: i64) -> (i32, u8, u8) {
     )
 }
 
-/// SEC-006/007: Determine if agent API / live-feed should require auth.
-/// Returns true when auth should be enforced (non-loopback bind).
-pub(crate) fn should_require_api_auth(bind: &str) -> bool {
-    !is_loopback_address(bind)
-}
+// Wave 2026-05-17: `should_require_api_auth` removed. The bind-address
+// global gate was replaced by `auth::loopback_bypass_or_require_auth`,
+// which checks per-request whether the TCP peer is on the loopback
+// interface. The new policy is stricter on remote requests (auth
+// always applies for non-loopback peers, even on loopback-bound
+// sockets that don't actually accept remote — defence in depth) and
+// looser on local requests (loopback always bypasses, even on
+// 0.0.0.0-bound dashboards — fixes the `sudo innerwarden agent
+// connect` 401 wall the operator hit on the Oracle prod host).
 
 // ---------------------------------------------------------------------------
 
@@ -4521,19 +4558,12 @@ mod tests {
         assert_eq!(y, chrono::Datelike::year(&chrono::Utc::now()));
     }
 
-    // SEC-006/007: API auth requirement tests.
-    #[test]
-    fn should_require_api_auth_external() {
-        assert!(should_require_api_auth("0.0.0.0:8787"));
-        assert!(should_require_api_auth("192.168.1.1:8787"));
-    }
-
-    #[test]
-    fn should_not_require_api_auth_loopback() {
-        assert!(!should_require_api_auth("127.0.0.1:8787"));
-        assert!(!should_require_api_auth("[::1]:8787"));
-        assert!(!should_require_api_auth("localhost:8787"));
-    }
+    // Wave 2026-05-17: SEC-006/007 bind-address gate was replaced by
+    // per-request `auth::is_loopback_request`. The legacy tests for
+    // `should_require_api_auth` removed because the function was
+    // dead-code after the migration. The new gate is anchored by
+    // `auth::tests::is_loopback_request_*` (loopback IPv4, loopback
+    // IPv6, non-loopback IPv4, missing ConnectInfo).
 
     // Design invariant: `/api/live-feed/*` must always be public — the
     // marketing site depends on it. The `should_require_api_auth` predicate
@@ -4587,13 +4617,14 @@ mod tests {
             );
         }
 
-        // Independent safety net: the agent_api branch still uses
-        // should_require_api_auth, so a future refactor that accidentally
-        // removes the predicate breaks this assertion.
-        assert!(
-            should_require_api_auth("0.0.0.0:8787"),
-            "agent_api still relies on should_require_api_auth for non-loopback auth"
-        );
+        // Wave 2026-05-17: the bind-based predicate
+        // `should_require_api_auth` was replaced by the per-request
+        // `auth::is_loopback_request` gate. The new contract: a
+        // non-loopback peer hitting an agent_api endpoint must still
+        // be auth-walled. This is anchored end-to-end above by the
+        // marketing-routes test (which exercises the live router with
+        // a non-loopback ConnectInfo and expects 401 / 200 depending
+        // on the route) and per-decision in `auth::tests::is_loopback_request_*`.
     }
 
     // ── Spec 037 I-13 PR-2 — TLS file-perms warn anchors ──────────

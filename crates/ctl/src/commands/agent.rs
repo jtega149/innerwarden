@@ -1,7 +1,9 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
 use anyhow::Result;
+use dialoguer::theme::ColorfulTheme;
+use dialoguer::MultiSelect;
 
 use crate::{AgentCommand, Cli};
 
@@ -487,37 +489,81 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
                     );
                     vec![candidates[0].pid]
                 } else {
-                    println!("  Detected agents:");
-                    println!("  {:<4} {:<8} {:<16} TYPE", "NO.", "PID", "NAME");
-                    println!("  {}", "─".repeat(48));
-                    for (i, agent) in candidates.iter().enumerate() {
-                        println!(
-                            "  {:<4} {:<8} {:<16} {}",
-                            i + 1,
-                            agent.pid,
-                            agent.name,
-                            agent.integration
-                        );
-                    }
-                    println!();
-                    print!("  Select one or more (ex: 1,3) or 'all' [Enter to cancel]: ");
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    let trimmed = input.trim();
-                    if trimmed.is_empty() {
-                        println!("  Cancelled.");
+                    // Wave 2026-05-17 UX: present an arrow-key + space-bar
+                    // picker via dialoguer::MultiSelect when stdin is a
+                    // TTY, instead of asking the operator to type
+                    // "1,3,5" into a numbered table. The numeric path
+                    // is retained as a fallback for non-TTY contexts
+                    // (CI, redirected stdin, automated scripts) so
+                    // pipelines that depend on the typed-index syntax
+                    // do not break.
+                    let labels: Vec<String> = candidates
+                        .iter()
+                        .map(|a| format!("{:<16} pid {:<7}  [{}]", a.name, a.pid, a.integration))
+                        .collect();
+
+                    let selected_indexes: Vec<usize> = if std::io::stdin().is_terminal() {
+                        println!("  Detected agents:");
                         println!();
-                        return Ok(());
-                    }
-                    let Some(indexes) = parse_selection_indices(trimmed, candidates.len()) else {
-                        println!("  Invalid selection '{trimmed}'.");
+                        match MultiSelect::with_theme(&ColorfulTheme::default())
+                            .with_prompt("  ↑/↓ to move, space to select, enter to connect")
+                            .items(&labels)
+                            .interact_opt()
+                        {
+                            Ok(Some(sel)) if !sel.is_empty() => sel,
+                            Ok(_) => {
+                                println!("  Cancelled.");
+                                println!();
+                                return Ok(());
+                            }
+                            Err(err) => {
+                                eprintln!("  Picker failed: {err:#}");
+                                println!();
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        // Non-TTY fallback: keep the existing numbered
+                        // table + "1,3 or all" prompt so scripted
+                        // callers and CI pipelines that pipe input
+                        // into the command still work.
+                        println!("  Detected agents:");
+                        println!("  {:<4} {:<8} {:<16} TYPE", "NO.", "PID", "NAME");
+                        println!("  {}", "─".repeat(48));
+                        for (i, agent) in candidates.iter().enumerate() {
+                            println!(
+                                "  {:<4} {:<8} {:<16} {}",
+                                i + 1,
+                                agent.pid,
+                                agent.name,
+                                agent.integration
+                            );
+                        }
                         println!();
-                        return Ok(());
+                        print!("  Select one or more (ex: 1,3) or 'all' [Enter to cancel]: ");
+                        std::io::stdout().flush()?;
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input)?;
+                        let trimmed = input.trim();
+                        if trimmed.is_empty() {
+                            println!("  Cancelled.");
+                            println!();
+                            return Ok(());
+                        }
+                        let Some(indexes) = parse_selection_indices(trimmed, candidates.len())
+                        else {
+                            println!("  Invalid selection '{trimmed}'.");
+                            println!();
+                            return Ok(());
+                        };
+                        // `parse_selection_indices` returns 1-based;
+                        // normalize to 0-based for the unified path.
+                        indexes.into_iter().map(|i| i - 1).collect()
                     };
-                    indexes
+
+                    selected_indexes
                         .into_iter()
-                        .map(|idx| candidates[idx - 1].pid)
+                        .map(|idx| candidates[idx].pid)
                         .collect()
                 }
             };

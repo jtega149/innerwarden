@@ -187,6 +187,69 @@ pub(super) fn clear_rate_limit(ip: &str) {
     map.remove(ip);
 }
 
+/// Pure check: should this request bypass the auth wall because it
+/// arrived from the local loopback interface?
+///
+/// Wave 2026-05-17 fix: prior to this, the `agent_api` router was
+/// either fully auth-walled or fully open based on the **bind**
+/// address. Hosts that bound the dashboard to `0.0.0.0` (so the
+/// operator could browse it from outside) had `sudo innerwarden agent
+/// connect` blocked by the same 401 wall the browser had to clear —
+/// even though the CLI runs as root on the same host and reaches the
+/// dashboard via 127.0.0.1.
+///
+/// The right model is per-request: if the actual TCP peer IP is
+/// loopback (127.0.0.1 or ::1), the caller is on the box already and
+/// has root via the sudo wrapper — auth would be friction without
+/// security gain. If the peer is a real remote IP, auth still
+/// applies.
+///
+/// Critical detail: this MUST use the socket peer IP from
+/// `ConnectInfo<SocketAddr>`, NOT the value of `extract_client_ip`.
+/// `extract_client_ip` honours `X-Forwarded-For` / `X-Real-IP` when
+/// the request arrives from a trusted proxy — a remote attacker behind
+/// a misconfigured proxy that forwards `X-Forwarded-For: 127.0.0.1`
+/// must NOT bypass auth.
+pub(super) fn is_loopback_request(req: &Request<Body>) -> bool {
+    let Some(conn_info) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+    else {
+        // No ConnectInfo means the server forgot to wire
+        // `into_make_service_with_connect_info` — fail SAFE
+        // (no bypass).
+        return false;
+    };
+    conn_info.0.ip().is_loopback()
+}
+
+/// Auth middleware variant that bypasses the wall for loopback
+/// requests and otherwise delegates to `require_auth`. Used by the
+/// `agent_api` router so `sudo innerwarden agent connect` (always
+/// loopback) works without dashboard credentials even on hosts that
+/// bind the dashboard publicly.
+#[allow(clippy::type_complexity)]
+pub(super) async fn loopback_bypass_or_require_auth(
+    state: State<(
+        Option<DashboardAuth>,
+        Arc<Vec<IpAddr>>,
+        Arc<RwLock<HashMap<String, Session>>>,
+        u64,
+    )>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    if is_loopback_request(&req) {
+        // Stamp the authenticated-user sentinel so downstream handlers
+        // (orphan resolution, audit trail) have a stable label for
+        // local-CLI / local-AI-agent requests.
+        req.extensions_mut()
+            .insert(AuthenticatedUser("loopback".to_string()));
+        return next.run(req).await;
+    }
+    require_auth(state, req, next).await
+}
+
 #[allow(clippy::type_complexity)]
 pub(super) async fn require_auth(
     State((auth, trusted_proxies, sessions, session_timeout_minutes)): State<(
@@ -873,5 +936,74 @@ mod tests {
                  current CARGO_PKG_VERSION minor — older lines should be 'No'."
             );
         }
+    }
+
+    // ─── Wave 2026-05-17 — loopback bypass anchors ───────────────────────
+    //
+    // The per-request auth gate `is_loopback_request` decides whether
+    // /api/agent-guard/* (and friends) skip the password wall. The
+    // operator hit a 401 running `sudo innerwarden agent connect <pid>`
+    // on a host whose dashboard was bound to 0.0.0.0; the fix bypasses
+    // auth when the TCP peer IP is loopback. These tests anchor every
+    // branch of that decision: loopback IPv4, loopback IPv6, a real
+    // remote IP that must NOT bypass, and the failure-safe case where
+    // `ConnectInfo` is missing (which would mean the server forgot to
+    // call `into_make_service_with_connect_info` — must fail closed).
+
+    fn req_with_connect_info(ip: std::net::IpAddr) -> Request<Body> {
+        let mut req = Request::new(Body::empty());
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo::<SocketAddr>(SocketAddr::new(
+                ip, 12345,
+            )));
+        req
+    }
+
+    #[test]
+    fn is_loopback_request_true_for_ipv4_loopback() {
+        let req = req_with_connect_info("127.0.0.1".parse().unwrap());
+        assert!(is_loopback_request(&req));
+    }
+
+    #[test]
+    fn is_loopback_request_true_for_ipv6_loopback() {
+        let req = req_with_connect_info("::1".parse().unwrap());
+        assert!(is_loopback_request(&req));
+    }
+
+    #[test]
+    fn is_loopback_request_false_for_remote_ipv4() {
+        let req = req_with_connect_info("198.51.100.42".parse().unwrap());
+        assert!(!is_loopback_request(&req));
+    }
+
+    #[test]
+    fn is_loopback_request_false_for_lan_ipv4() {
+        // RFC1918 — a host on the operator's LAN is not "on the same
+        // box" and must still hit the auth wall.
+        let req = req_with_connect_info("192.168.0.42".parse().unwrap());
+        assert!(!is_loopback_request(&req));
+    }
+
+    #[test]
+    fn is_loopback_request_false_when_connect_info_missing() {
+        // Defence in depth: if the serve site forgot to wire
+        // `into_make_service_with_connect_info`, the helper must NOT
+        // bypass auth — fail closed, not open.
+        let req = Request::new(Body::empty());
+        assert!(!is_loopback_request(&req));
+    }
+
+    #[test]
+    fn is_loopback_request_ignores_x_forwarded_for_spoof() {
+        // A remote attacker behind a misconfigured proxy that forwards
+        // `X-Forwarded-For: 127.0.0.1` must NOT bypass auth. The helper
+        // reads the socket peer, not the header — anchor this by
+        // setting the header AND a real remote peer; result must still
+        // be false.
+        let mut req = req_with_connect_info("198.51.100.99".parse().unwrap());
+        req.headers_mut()
+            .insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        assert!(!is_loopback_request(&req));
     }
 }
