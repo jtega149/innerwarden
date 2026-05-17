@@ -277,6 +277,10 @@ pub mod startup_script_persistence;
 // spec 050-PR6 — Impact
 pub mod data_destruction_pattern;
 
+// Post-spec 050 / 2026-05-17 wave — gap closers
+pub mod symlink_hijack;
+pub mod system_user_interactive;
+
 #[cfg(test)]
 mod tests {
     use super::*;

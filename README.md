@@ -49,7 +49,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 It lives where the action is. Not a tool watching from outside, not an alert in someone else's dashboard. Inner Warden runs inside the server, sees what every program does, and decides what to do — all without leaving the box. One binary, one SQLite database, no SIEM bundle, no external IDS, no cloud control plane. Two Rust daemons and a CLI.
 
-40 eBPF kernel hooks. 49 detectors. 22 collectors. 47 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. Monthly threat reports. Mesh collaborative defense. **Unified SQLite store** for every artifact (incidents, decisions, KV cache, graph snapshots, attacker profiles). **Intelligent notifications**: incidents group into a single Telegram message per IP instead of one-per-event. **Circuit breaker**: per-hour cap on autonomous block decisions protects against runaway enforcement (pause / log-only / dry-run modes). **Continuous trust scoring**: graduated enforcement plus daily self-check. **Regression safety net**: `make scenario-qa` gates every PR against drift for 7 canonical attack scenarios.
+44 eBPF kernel programs. 73 detectors. 29 collectors. 67 cross-layer correlation rules. 75+ MITRE ATT&CK techniques covered across all 14 Linux tactics. 1275 anchored unit tests on every change. 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. Monthly threat reports. Mesh collaborative defense. **Unified SQLite store** for every artifact (incidents, decisions, KV cache, graph snapshots, attacker profiles). **Intelligent notifications**: incidents group into a single Telegram message per IP instead of one-per-event. **Circuit breaker**: per-hour cap on autonomous block decisions protects against runaway enforcement (pause / log-only / dry-run modes). **Continuous trust scoring**: graduated enforcement plus daily self-check. **Regression safety net**: `make scenario-qa` gates every PR against drift for 7 canonical attack scenarios.
 
 <h3 align="center">
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
@@ -86,14 +86,14 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 ┌─────────────────────────────────────────────┼──────────────────────┐
 │                           KERNEL (Ring 0)   │                      │
 │                                                                    │
-│  ┌───────────── ─┐  ┌───────────┐  ┌─────────┐  ┌───────────────┐  │
-│  │23 tracepoints │  │ 5 kprobes │  │  3 LSM  │  │      XDP      │  │
-│  │ execve,       │  │ creds,    │  │ exec    │  │  wire-speed   │  │
-│  │ connect,      │  │ MSR, ACPI │  │ file    │  │  IP blocking  │  │
-│  │ openat,       │  │ timestomp │  │ bpf     │  │  10M+ pps     │  │
-│  │ mount, clone, │  │ truncate  │  │ + kill  │  │  allowlist +  │  │
-│  │ ptrace, ...   │  │           │  │ chain   │  │  blocklist    │  │
-│  └──────┬─────── ┘  └─────┬─────┘  └───┬─────┘  └──────┬────────┘  │
+│  ┌───────────── ─┐  ┌────────────┐  ┌─────────┐  ┌───────────────┐ │
+│  │23 tracepoints │  │ 10 kprobes │  │  3 LSM  │  │      XDP      │ │
+│  │ execve,       │  │ creds,     │  │ exec    │  │  wire-speed   │ │
+│  │ connect,      │  │ MSR, ACPI  │  │ file    │  │  IP blocking  │ │
+│  │ openat,       │  │ timestomp  │  │ bpf     │  │  10M+ pps     │ │
+│  │ mount, clone, │  │ truncate   │  │ + kill  │  │  allowlist +  │ │
+│  │ ptrace, ...   │  │ + 7 raw_tp │  │ chain   │  │  blocklist    │ │
+│  └──────┬─────── ┘  └─────┬──────┘  └───┬─────┘  └──────┬────────┘ │
 │         └─ ───────┬───────┘            │               │           │
 │                  ▼                     │               │           │
 │           ┌─────────────┐              │               │           │
@@ -108,7 +108,7 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │                                                                   │
 │  ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────────────────────┐    │
 │  │auth.log │ │journald │ │ Docker │ │    eBPF collector      │◄─┘ |
-│  │nginx    │ │syslog   │ │ cgroup │ │    (40 hooks)          │    |
+│  │nginx    │ │syslog   │ │ cgroup │ │    (44 hooks)          │    |
 │  └────┬────┘ └────┬────┘ └──┬──── ┘ └───────────┬────────────┘    │
 │       │           │         │                   │                 │
 │  ┌────┴────┐ ┌────┴─────┐ ┌─┴──────────────┐    │                 │
@@ -119,7 +119,7 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │       └───────────┴───────────────┴─────────────┘                 │
 │                          │                                        │
 │                    ┌─────▼──────┐                                 │
-│                    │49 detectors│ + 8 YARA + 8 Sigma              │
+│                    │73 detectors│ + 8 YARA + 8 Sigma              │
 │                    │ stateful   │                                 │
 │                    └─────┬──────┘                                 │
 │                          │                                        │
@@ -140,7 +140,7 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │   └────────────────────────┬──────────────────────────────────┘   │
 │                            ▼                                      │
 │     ┌──────────────────────────────────────────────┐              │
-│     │  47 Cross-Layer Correlation Rules            │              │
+│     │  67 Cross-Layer Correlation Rules            │              │
 │     │  + Kill Chain Tracker (7 stages per entity)  │              │
 │     │  + Threat DNA behavioral fingerprinting      │              │
 │     └────────────────────┬─────────────────────────┘              │
@@ -208,9 +208,9 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 
 ## What it does
 
-1. **Watches**: 20+ collectors across all layers — eBPF syscall tracing (40 kernel hooks including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, CloudTrail
-2. **Detects**: 49 stateful detectors + 8 YARA malware rules + 8 Sigma log rules identify brute-force, credential stuffing, port scans, C2 callbacks, privilege escalation, container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID), timestomping, log tampering, discovery bursts, and more. **65 MITRE ATT&CK techniques covered** across 14 tactics.
-3. **Correlates**: 47 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
+1. **Watches**: 29 collectors across all layers — eBPF syscall tracing (44 kernel hooks including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, CloudTrail
+2. **Detects**: 73 stateful detectors + 8 YARA malware rules + 8 Sigma log rules identify brute-force, credential stuffing, port scans, C2 callbacks (including tunnels via ngrok/cloudflared/bore, non-standard ports, and DNS/ICMP/SSH-forward protocol tunneling), privilege escalation (non-baseline SUID exec, dangerous-capability abuse), container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID, plus scp/rsync staged-egress), timestomping, log tampering, discovery bursts (nmap, wordlist scanners, argv-driven anomaly), collection patterns (clipboard, screen capture, password-protected archives), persistence (PAM module tampering, RC scripts, systemd units, cron, SSH keys), defense evasion (auditd disable, SELinux/AppArmor disable), data destruction (rm -rf user data, disk wipe, mkfs/luksFormat on running volumes), symlink/hardlink hijack of sensitive files, service-account interactive shells (foothold signal), and more. **75+ MITRE ATT&CK techniques covered** across 14 tactics.
+3. **Correlates**: 67 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP, Discovery → Privesc → Lateral Movement chains, full kill chain Initial Access → Foothold → Persistence → Defense Evasion → Impact. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
 4. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
 5. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
 6. **Responds automatically**: 20 built-in playbooks covering every detector — ransomware, reverse shell, data exfil, malware, privilege escalation, kernel module load, process injection, persistence (SSH key, crontab, systemd), container escape, crypto miner, DNS tunnelling, lateral movement, web shell, discovery burst, and more. Response sequences: kill process, block IP, suspend sudo, quarantine file, isolate network, capture forensics, pcap, notify, escalate
@@ -279,7 +279,7 @@ The default `[honeypot] interaction = "llm_shell"` ships a tiered SSH listener t
 
 ## What it detects
 
-49 stateful detectors + 8 YARA rules + 8 Sigma rules covering the full attack lifecycle. Highlights:
+73 stateful detectors + 8 YARA rules + 8 Sigma rules covering the full attack lifecycle. **75+ unique MITRE ATT&CK techniques across all 14 Linux tactics.** Highlights:
 
 | Detector | Threat | MITRE |
 |----------|--------|-------|
@@ -309,8 +309,18 @@ The default `[honeypot] interaction = "llm_shell"` ships a tiered SSH listener t
 | `integrity_alert` | Changes to /etc/passwd, /etc/shadow, sudoers, SSH keys | T1098 |
 | `packet_flood` | DDoS / volumetric attack detection | - |
 | `user_agent_scanner` | Known scanner signatures (Nikto, sqlmap, Nuclei, 20+) | T1595.002 |
+| `nmap_scan` / `wordlist_scan` / `discovery_anomaly` | Network/dir/host enumeration with context-aware silencing of operator activity | T1046 / T1595.001 / T1595.003 / T1018 |
+| `clipboard_read` / `screen_capture` / `archive_pwd_protected` / `automated_file_collection` | Collection-stage attacker tools (xclip/xsel, scrot/maim, zip -P, mass tar/find) | T1115 / T1113 / T1560.001 / T1119 |
+| `c2_web_tunnel` / `c2_protocol_tunneling` / `c2_non_standard_port` | ngrok/cloudflared/bore tunnels, DNS/ICMP/SSH-forward tunneling, listeners outside well-known ports | T1090.003 / T1572 / T1071.004 / T1571 |
+| `setuid_exploit_pattern` / `capabilities_abuse` | Non-baseline SUID exec by non-root, dangerous Linux-capability + exploitation argv pairing | T1548.001 / T1068 / T1548.005 |
+| `lateral_egress_ssh` / `lateral_egress_scp_rsync` | Outbound `ssh` from non-operator-shell tree, scp/rsync staging user-data dirs to remote | T1021.004 / T1029 / T1048.001 |
+| `pam_module_change` / `startup_script_persistence` | PAM config/module tampering, RC script persistence (/etc/rc.local, /etc/init.d/, /etc/cron.d/) | T1556.003 / T1037.004 |
+| `auditd_disable` / `selinux_apparmor_disable` | Stopping audit subsystem, disabling SELinux/AppArmor MAC | T1562.001 |
+| `data_destruction_pattern` | rm -rf user data, disk wipe via dd, shred burst, mkfs on running volume, cryptsetup luksFormat | T1485 / T1561.001 / T1486 |
+| **`symlink_hijack`** | Symlink/hardlink naming /etc/shadow, /etc/sudoers, /etc/pam.d/*, ~/.ssh/authorized_keys | T1555 / T1574.005 |
+| **`system_user_interactive`** | Service accounts (www-data, nobody, postgres, …) running interactive shells with tty or sshd parent | T1059 / T1078.003 |
 
-Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection`, `user_creation`, `crontab_persistence`, `systemd_persistence`, `process_injection`, `outbound_anomaly`, `data_exfil_ebpf` (sensitive file read → outbound connect by PID), `yara_scan` (8 built-in rules: XMRig, webshells, Cobalt Strike, Metasploit, rootkits), `sigma_rule` (8 built-in rules: cron modification, /tmp execution, shadow access, docker.sock), `cgroup_abuse` (CPU/memory resource abuse), `io_uring_anomaly`, `container_drift`, `host_drift`, `sensitive_write`.
+Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection`, `user_creation`, `crontab_persistence`, `systemd_persistence`, `process_injection`, `outbound_anomaly`, `data_exfil_ebpf` (sensitive file read → outbound connect by PID), `keylogger_bash_trap` (shell startup file tampering + trap-DEBUG patterns), `yara_scan` (8 built-in rules: XMRig, webshells, Cobalt Strike, Metasploit, rootkits), `sigma_rule` (8 built-in rules: cron modification, /tmp execution, shadow access, docker.sock), `cgroup_abuse` (CPU/memory resource abuse), `io_uring_anomaly`, `container_drift`, `host_drift`, `sensitive_write`.
 
 `execution_guard` parses commands structurally using tree-sitter-bash. It catches `curl | sh` pipelines, `/tmp` execution, reverse shell patterns, and staged download-chmod-execute sequences.
 
@@ -322,17 +332,17 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 
 ## How it works
 
-**Sensor**: deterministic signal collection. No AI, no HTTP. 22 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 40 kernel hooks, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration.
+**Sensor**: deterministic signal collection. No AI, no HTTP. 29 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 44 kernel hooks, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **1275 anchored unit tests gate every change** before it can merge.
 
-**eBPF**: 40 kernel hooks running inside Linux (5.8+, CO-RE/BTF portable):
+**eBPF**: 44 kernel programs running inside Linux (5.8+, CO-RE/BTF portable):
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
-- **3 kprobes**: `commit_creds` (privilege escalation), `native_write_msr` (firmware MSR tampering), `acpi_evaluate_object` (ACPI rootkit detection)
+- **10 kprobes**: `commit_creds` (privilege escalation), `native_write_msr` (firmware MSR tampering), `acpi_evaluate_object` (ACPI rootkit detection), `do_truncate` (log tampering), plus 6 timing-based rootkit kprobes (Trace of the Times: iterate_dir, filldir64, tcp4_seq_show, proc_pid_readdir kprobe/kretprobe pairs)
 - **3 LSM hooks**: `bprm_check_security` (exec blocking + kill chain with 8 attack patterns), `file_open` (sensitive path write protection), `bpf` (eBPF weaponisation / VoidLink defence)
-- **4 kprobe/kretprobe pairs** (Trace of the Times): iterate_dir, filldir64, tcp4_seq_show, proc_pid_readdir — timing-based rootkit detection
+- **7 raw tracepoints** on `sys_enter`: tail-call dispatcher routing every syscall through a single attach point to N specialised handlers via ProgramArray
 - **XDP program**: wire-speed IP blocking at the network driver (10M+ pps drop rate)
 - **Phase 2 firmware hooks**: MSR write guard (LSTAR/SMRR), I/O port access (SPI controller probing), ACPI method execution monitoring
 
-> **Looking for the eBPF source code?** All 40 kernel programs live in a single file: [`crates/sensor-ebpf/src/main.rs`](crates/sensor-ebpf/src/main.rs).
+> **Looking for the eBPF source code?** All 44 kernel programs live in a single file: [`crates/sensor-ebpf/src/main.rs`](crates/sensor-ebpf/src/main.rs).
 
 **Kernel-level noise filters** keep overhead near zero: COMM_ALLOWLIST (137 trusted processes like sshd, systemd, docker), CGROUP_ALLOWLIST, PID_RATE_LIMIT, and PID_CHAIN. Tail call dispatcher routes events through a single attach point to N handlers via ProgramArray. Ring buffer with epoll wakeup delivers events in microseconds.
 

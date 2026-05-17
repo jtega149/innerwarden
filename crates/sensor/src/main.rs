@@ -167,6 +167,10 @@ struct DetectorSet {
     // spec 050-PR6 — Impact
     data_destruction_pattern:
         Option<detectors::data_destruction_pattern::DataDestructionPatternDetector>,
+    // 2026-05-17 wave — gap closers
+    symlink_hijack: Option<detectors::symlink_hijack::SymlinkHijackDetector>,
+    system_user_interactive:
+        Option<detectors::system_user_interactive::SystemUserInteractiveDetector>,
 }
 
 #[derive(Default)]
@@ -852,6 +856,19 @@ async fn main() -> Result<()> {
                 "data_destruction_pattern detector enabled (T1485/T1561.001/T1486 wipe & destruction)"
             );
             detectors::data_destruction_pattern::DataDestructionPatternDetector::new(
+                &cfg.agent.host_id,
+            )
+        }),
+        // 2026-05-17 wave — gap closers
+        symlink_hijack: Some({
+            info!("symlink_hijack detector enabled (T1555 / T1574.005 sensitive-path links)");
+            detectors::symlink_hijack::SymlinkHijackDetector::new(&cfg.agent.host_id)
+        }),
+        system_user_interactive: Some({
+            info!(
+                "system_user_interactive detector enabled (T1059 / T1078.003 service-account shell)"
+            );
+            detectors::system_user_interactive::SystemUserInteractiveDetector::new(
                 &cfg.agent.host_id,
             )
         }),
@@ -2364,6 +2381,33 @@ fn process_event(
         if !detectors
             .dynamic_allowlist
             .suppress_incident_for_detector(&incident, "data_destruction_pattern")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // 2026-05-17 wave — gap closers
+    let symlink_hijack_incident = detectors
+        .symlink_hijack
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = symlink_hijack_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "symlink_hijack")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let system_user_interactive_incident = detectors
+        .system_user_interactive
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = system_user_interactive_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "system_user_interactive")
         {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
