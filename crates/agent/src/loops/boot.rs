@@ -614,6 +614,26 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             ),
             None => dashboard::TwoFactorSettings::default(),
         };
+
+        // 2026-05-18 fix: write the discovery hint file BEFORE
+        // spawning the dashboard task, so any AI agent process on the
+        // box (OpenClaw, Codex CLI, n8n, etc.) can read it the moment
+        // the dashboard is reachable. Fail-soft: a write error here
+        // (read-only volume, exotic FS) must not abort agent boot —
+        // the dashboard still works, we just lose the discovery
+        // affordance for peer agents.
+        match crate::agent_discovery::write_discovery(
+            &cli.data_dir,
+            &cli.dashboard_bind,
+            !cli.insecure_no_tls,
+            env!("CARGO_PKG_VERSION"),
+        ) {
+            Ok(path) => info!(path = %path.display(), "agent discovery file written"),
+            Err(e) => {
+                warn!(error = %e, "failed to write agent discovery file (peer agents may not auto-discover us)")
+            }
+        }
+
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,

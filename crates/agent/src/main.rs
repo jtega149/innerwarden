@@ -60,6 +60,7 @@ pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 mod abuseipdb;
 mod abuseipdb_report_budget;
 mod agent_context;
+mod agent_discovery;
 mod ai;
 mod allowlist;
 mod attacker_intel;
