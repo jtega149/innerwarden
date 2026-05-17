@@ -2,11 +2,10 @@
 name = "innerwarden-dna"
 version.workspace = true
 edition.workspace = true
-license = "BUSL-1.1"
+license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Behavioral threat fingerprinting — identifies attackers by behavior, not IP"
-publish = false
 
 [dependencies]
 anyhow = "1"

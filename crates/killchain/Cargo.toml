@@ -2,11 +2,10 @@
 name = "innerwarden-killchain"
 version.workspace = true
 edition.workspace = true
-license = "BUSL-1.1"
+license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Kill chain detection engine — detects attack patterns from eBPF events via bitmask tracking"
-publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

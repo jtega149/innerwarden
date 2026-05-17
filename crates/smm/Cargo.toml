@@ -2,7 +2,7 @@
 name = "innerwarden-smm"
 version.workspace = true
 edition.workspace = true
-license = "BUSL-1.1"
+license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Ring -2 firmware security — SMM monitoring, MSR guards, SPI flash integrity, UEFI/TPM attestation"
