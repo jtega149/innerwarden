@@ -72,12 +72,23 @@ impl NmapScanDetector {
             return None;
         }
 
-        let comm = event
+        // eBPF execve tracepoint fires BEFORE the process renames to the
+        // new binary, so `comm` still holds the LAUNCHER's name (`sudo`,
+        // `bash`, an attacker's disguised binary). The binary actually
+        // being executed lives in `argv[0]` or the `command` string.
+        // Smoke test 2026-05-17 confirmed: `sudo nmap` produced events
+        // with `comm="sudo"` / `argv=["/usr/bin/nmap",...]` — checking
+        // comm never matches the scanner list. Match against argv[0]
+        // basename instead. discovery_burst already follows this pattern;
+        // PR1's first detector revision did not.
+        let argv0 = event
             .details
-            .get("comm")
+            .get("argv")
+            .and_then(|v| v.get(0))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !is_scanner_comm(comm) {
+        let argv0_base = argv0.split('/').next_back().unwrap_or(argv0);
+        if !is_scanner_comm(argv0_base) {
             return None;
         }
 
@@ -86,16 +97,19 @@ impl NmapScanDetector {
             .get("parent_comm")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if is_automation_parent(parent_comm) {
+        // `comm` is the launcher (sudo / bash / attacker binary). Treat
+        // it as an extra layer of parent-context — `is_automation_parent`
+        // for either parent_comm OR launcher comm silences ansible-driven
+        // scans run via sudo. Pre-fix this branch only saw parent_comm.
+        let comm = event
+            .details
+            .get("comm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if is_automation_parent(parent_comm) || is_automation_parent(comm) {
             return None;
         }
 
-        let argv0 = event
-            .details
-            .get("argv")
-            .and_then(|v| v.get(0))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
         if is_security_tool_path(argv0) {
             return None;
         }
@@ -116,7 +130,11 @@ impl NmapScanDetector {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        let key = format!("{}:{}", uid, comm_base(comm));
+        // Cooldown keyed on (uid, scanner-binary-name) so the same user
+        // re-running nmap minutes later doesn't trigger a duplicate
+        // alert. Use argv0_base because that's the scanner identity;
+        // `comm` is the launcher and varies across invocations.
+        let key = format!("{}:{}", uid, argv0_base);
         let now = event.ts;
         if let Some(&last) = self.last_fired.get(&key) {
             if now - last < self.cooldown {
@@ -134,19 +152,20 @@ impl NmapScanDetector {
             host: self.host.clone(),
             incident_id: format!(
                 "nmap_scan:{}:{}",
-                comm_base(comm),
+                argv0_base,
                 now.format("%Y-%m-%dT%H:%M:%SZ")
             ),
             severity: Severity::High,
-            title: format!("Network scanner ran on host: {}", comm_base(comm)),
+            title: format!("Network scanner ran on host: {}", argv0_base),
             summary: format!(
-                "Process `{comm}` (pid={pid}, uid={uid}) — `{command}`. Network \
-                 scanners on production hosts are an active reconnaissance \
-                 signal."
+                "Scanner `{argv0_base}` (launched by `{comm}`, pid={pid}, uid={uid}) — `{command}`. \
+                 Network scanners on production hosts are an active reconnaissance signal."
             ),
             evidence: serde_json::json!([{
                 "kind": "nmap_scan",
-                "comm": comm,
+                "scanner": argv0_base,
+                "argv0": argv0,
+                "launcher_comm": comm,
                 "parent_comm": parent_comm,
                 "uid": uid,
                 "pid": pid,
@@ -222,6 +241,45 @@ mod tests {
         let incident = det.process(&ev).expect("should fire");
         assert_eq!(incident.severity, Severity::High);
         assert!(incident.incident_id.starts_with("nmap_scan:nmap"));
+    }
+
+    /// Smoke test 2026-05-17 on Oracle prod revealed the eBPF execve
+    /// tracepoint emits events while the calling process is still
+    /// **pre-rename** — `comm` holds the launcher (`sudo`, `bash`),
+    /// `argv[0]` holds the binary actually being exec'd. Pre-fix the
+    /// detector matched `comm` and never saw `nmap`. This anchor pins
+    /// the corrected behaviour: argv[0] basename is the scanner identity.
+    #[test]
+    fn fires_when_comm_is_launcher_and_argv_holds_nmap_path() {
+        let mut det = NmapScanDetector::new("test");
+        let ev = Event {
+            ts: Utc::now(),
+            host: "test".into(),
+            source: "ebpf".into(),
+            kind: "shell.command_exec".into(),
+            severity: Severity::Info,
+            summary: "Shell command executed: /usr/bin/nmap".into(),
+            details: serde_json::json!({
+                "pid": 4242,
+                "uid": 0,
+                "ppid": 4241,
+                "comm": "sudo",            // launcher, NOT the binary
+                "parent_comm": "sudo",
+                "command": "/usr/bin/nmap",
+                "argv": ["/usr/bin/nmap"], // <- the scanner is here
+                "argc": 1,
+            }),
+            tags: vec![],
+            entities: vec![],
+        };
+        let incident = det
+            .process(&ev)
+            .expect("should fire on argv[0]=/usr/bin/nmap even with comm=sudo");
+        assert_eq!(incident.severity, Severity::High);
+        assert!(incident.incident_id.starts_with("nmap_scan:nmap"));
+        let ev0 = &incident.evidence[0];
+        assert_eq!(ev0["scanner"], "nmap");
+        assert_eq!(ev0["launcher_comm"], "sudo");
     }
 
     #[test]
