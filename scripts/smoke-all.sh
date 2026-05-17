@@ -26,7 +26,7 @@ SANDBOX="/tmp/iw_smoke_sandbox"
 LOOP_BACKING="/var/tmp/iw_smoke_loop.img"
 TEST_USER="iw_smoke_test"
 TEST_HOME="/home/${TEST_USER}"
-INCIDENTS_GLOB="/var/lib/innerwarden/incidents-*.jsonl"
+INCIDENTS_DB="/var/lib/innerwarden/innerwarden.db"
 WAIT_PER_DETECTOR=10  # seconds to wait for an incident after triggering
 LOG="/tmp/iw_smoke_log_$(date +%s).log"
 
@@ -43,32 +43,42 @@ mark_pass(){ RESULTS["$1"]=PASS; PASS=$((PASS+1)); say "PASS $1"; }
 mark_fail(){ RESULTS["$1"]=FAIL; FAIL=$((FAIL+1)); say "FAIL $1 — $2"; }
 mark_skip(){ RESULTS["$1"]=SKIP; SKIP=$((SKIP+1)); say "SKIP $1 — $2"; }
 
-# wait_for_incident <detector_id_prefix> [timeout_seconds]
-# Polls the incidents JSONL files looking for an entry whose
-# incident_id starts with <detector_id_prefix>:.
+# now_iso — UTC timestamp in the format used by the sensor's `ts` column.
+now_iso() { date -u +'%Y-%m-%dT%H:%M:%S' ; }
+
+# wait_for_incident <detector_id_prefix> [since_iso] [timeout_seconds]
+# Polls the SQLite `incidents` table for a row whose incident_id begins
+# with <detector_id_prefix>: AND whose ts is >= since_iso.
+# If since_iso is omitted, defaults to the global $RUN_SINCE — captured
+# at setup() — which avoids crediting stale incidents from prior runs.
 wait_for_incident() {
   local prefix="$1"
-  local timeout="${2:-$WAIT_PER_DETECTOR}"
+  local since="${2:-$RUN_SINCE}"
+  local timeout="${3:-$WAIT_PER_DETECTOR}"
   local start; start=$(date +%s)
-  local found=1
   while [ $(($(date +%s) - start)) -lt "$timeout" ]; do
-    if sudo grep -l "\"incident_id\":\"${prefix}:" $INCIDENTS_GLOB >/dev/null 2>&1; then
-      found=0
-      break
+    local hit
+    hit=$(sudo sqlite3 -readonly -bail "$INCIDENTS_DB" \
+      "SELECT 1 FROM incidents WHERE ts >= '$since' AND incident_id LIKE '${prefix}:%' LIMIT 1;" 2>/dev/null)
+    if [ "$hit" = "1" ]; then
+      return 0
     fi
     sleep 1
   done
-  return $found
+  return 1
 }
 
-# trigger <detector_name> <command...>
-# Runs the command, captures the start mark, waits for an incident.
+# trigger <detector_name> [incident_prefix] <command...>
+# Captures a per-test BEFORE_TS so wait_for_incident only credits
+# incidents that fired AFTER the trigger ran. Required because the
+# sensor accumulates incidents from past activity in the same DB.
 trigger() {
   local name="$1"; shift
   local prefix="${1:-$name}"; shift || true
-  say "→ trigger $name"
+  local before; before=$(now_iso)
+  say "→ trigger $name (since $before)"
   "$@" >/dev/null 2>&1 || true
-  if wait_for_incident "$prefix"; then
+  if wait_for_incident "$prefix" "$before"; then
     mark_pass "$name"
   else
     mark_fail "$name" "no incident within ${WAIT_PER_DETECTOR}s"
@@ -78,6 +88,21 @@ trigger() {
 # ─── setup / teardown ────────────────────────────────────────────────
 setup() {
   header "setup"
+  # Lower bound on incident timestamps we will credit. Set BEFORE
+  # any sandbox creation so incidents from the setup useradd are
+  # captured for test_user_creation.
+  RUN_SINCE=$(now_iso)
+  say "RUN_SINCE = $RUN_SINCE"
+  say "incidents DB: $INCIDENTS_DB"
+  if [ ! -r "$INCIDENTS_DB" ] && ! sudo test -r "$INCIDENTS_DB"; then
+    echo "FATAL: $INCIDENTS_DB not readable (even via sudo). Aborting."
+    exit 2
+  fi
+  if ! command -v sqlite3 &>/dev/null; then
+    echo "FATAL: sqlite3 client not installed — apt install sqlite3"
+    exit 2
+  fi
+
   say "scratch dir $SANDBOX"
   mkdir -p "$SANDBOX"
   echo "marker $(date +%s)" > "$SANDBOX/.marker"
@@ -138,20 +163,34 @@ trap teardown EXIT
 #### Discovery (spec 050-PR1) ####
 
 test_nmap_scan() {
-  trigger "nmap_scan" "nmap_scan" \
-    sh -c 'exec -a /usr/bin/nmap /bin/true -sS -p 1-100 127.0.0.1'
+  local before; before=$(now_iso)
+  say "→ trigger nmap_scan (as $TEST_USER, since $before)"
+  sudo -u "$TEST_USER" bash -c 'exec -a /usr/bin/nmap /bin/true -sS -p 1-100 127.0.0.1' >/dev/null 2>&1 || true
+  if wait_for_incident "nmap_scan" "$before"; then
+    mark_pass "nmap_scan"
+  else
+    mark_fail "nmap_scan" "no incident within ${WAIT_PER_DETECTOR}s"
+  fi
 }
 test_wordlist_scan() {
-  trigger "wordlist_scan" "wordlist_scan" \
-    sh -c 'exec -a /usr/bin/gobuster /bin/true dir -u http://127.0.0.1 -w /tmp/iw_smoke_sandbox/.marker'
+  local before; before=$(now_iso)
+  say "→ trigger wordlist_scan (as $TEST_USER, since $before)"
+  sudo -u "$TEST_USER" bash -c 'exec -a /usr/bin/gobuster /bin/true dir -u http://127.0.0.1 -w /tmp/iw_smoke_sandbox/.marker' >/dev/null 2>&1 || true
+  if wait_for_incident "wordlist_scan" "$before"; then
+    mark_pass "wordlist_scan"
+  else
+    mark_fail "wordlist_scan" "no incident within ${WAIT_PER_DETECTOR}s"
+  fi
 }
 test_discovery_anomaly() {
-  # Hit 3 distinct discovery comms from the same uid in rapid succession.
-  sh -c 'exec -a /usr/bin/whoami /bin/true' >/dev/null 2>&1
-  sh -c 'exec -a /usr/bin/id /bin/true' >/dev/null 2>&1
-  sh -c 'exec -a /usr/bin/hostname /bin/true' >/dev/null 2>&1
-  sh -c 'exec -a /usr/bin/uname /bin/true' >/dev/null 2>&1
-  if wait_for_incident "discovery_anomaly"; then
+  local before; before=$(now_iso)
+  # Hit 3+ distinct discovery comms from the SAME uid (the sandbox
+  # user, not root) so exec_context doesn't bucket as OpInteractive.
+  sudo -u "$TEST_USER" bash -c 'exec -a /usr/bin/whoami /bin/true' >/dev/null 2>&1
+  sudo -u "$TEST_USER" bash -c 'exec -a /usr/bin/id /bin/true' >/dev/null 2>&1
+  sudo -u "$TEST_USER" bash -c 'exec -a /usr/bin/hostname /bin/true' >/dev/null 2>&1
+  sudo -u "$TEST_USER" bash -c 'exec -a /usr/bin/uname /bin/true' >/dev/null 2>&1
+  if wait_for_incident "discovery_anomaly" "$before"; then
     mark_pass "discovery_anomaly"
   else
     mark_fail "discovery_anomaly" "no incident within ${WAIT_PER_DETECTOR}s"
@@ -166,19 +205,19 @@ test_clipboard_read() {
     return
   fi
   trigger "clipboard_read" "clipboard_read" \
-    sh -c 'exec -a /usr/bin/xclip /bin/true -selection clipboard -o'
+    bash -c 'exec -a /usr/bin/xclip /bin/true -selection clipboard -o'
 }
 test_screen_capture() {
   trigger "screen_capture" "screen_capture" \
-    sh -c 'exec -a /usr/bin/scrot /bin/true /tmp/iw_smoke_sandbox/shot.png'
+    bash -c 'exec -a /usr/bin/scrot /bin/true /tmp/iw_smoke_sandbox/shot.png'
 }
 test_archive_pwd_protected() {
   trigger "archive_pwd_protected" "archive_pwd_protected" \
-    sh -c "exec -a /usr/bin/zip /bin/true -P attackerpass /tmp/iw_smoke_sandbox/loot.zip $SANDBOX/.marker"
+    bash -c "exec -a /usr/bin/zip /bin/true -P attackerpass /tmp/iw_smoke_sandbox/loot.zip $SANDBOX/.marker"
 }
 test_automated_file_collection() {
   trigger "automated_file_collection" "automated_file_collection" \
-    sh -c "exec -a /usr/bin/tar /bin/true -czf /tmp/iw_smoke_sandbox/loot.tgz /home/$TEST_USER"
+    bash -c "exec -a /usr/bin/tar /bin/true -czf /tmp/iw_smoke_sandbox/loot.tgz /home/$TEST_USER"
 }
 test_keylogger_bash_trap() {
   # Two routes — pick the file.write_access route on the test user's .bashrc.
@@ -195,11 +234,11 @@ test_keylogger_bash_trap() {
 
 test_c2_web_tunnel() {
   trigger "c2_web_tunnel" "c2_web_tunnel" \
-    sh -c 'exec -a /usr/bin/ngrok /bin/true http 8080'
+    bash -c 'exec -a /usr/bin/ngrok /bin/true http 8080'
 }
 test_c2_protocol_tunneling() {
   trigger "c2_protocol_tunneling" "c2_protocol_tunneling" \
-    sh -c 'exec -a /usr/bin/iodine /bin/true -f 127.0.0.1 example.com'
+    bash -c 'exec -a /usr/bin/iodine /bin/true -f 127.0.0.1 example.com'
 }
 test_c2_non_standard_port() {
   # Bind a listener on a non-standard port via python http.server.
@@ -238,7 +277,7 @@ test_capabilities_abuse() {
   fi
 }
 test_lateral_egress_ssh() {
-  sudo -u "$TEST_USER" sh -c 'exec -a /usr/bin/ssh /bin/true attacker@8.8.8.8'
+  sudo -u "$TEST_USER" bash -c 'exec -a /usr/bin/ssh /bin/true attacker@8.8.8.8'
   if wait_for_incident "lateral_egress_ssh"; then
     mark_pass "lateral_egress_ssh"
   else
@@ -299,7 +338,7 @@ test_selinux_apparmor_disable() {
   fi
   # Fall back: just exec the binary (we just need an exec event of
   # `setenforce 0` — SELinux doesn't have to be active).
-  sh -c 'exec -a /usr/sbin/setenforce /bin/true 0'
+  bash -c 'exec -a /usr/sbin/setenforce /bin/true 0'
   if wait_for_incident "selinux_apparmor_disable"; then
     mark_pass "selinux_apparmor_disable"
   else
@@ -319,37 +358,41 @@ test_startup_script_persistence() {
 #### Impact (spec 050-PR6) ####
 
 test_rm_rf_user_data() {
+  local before; before=$(now_iso)
   sudo mkdir -p "$TEST_HOME/loot_dir"
   sudo touch "$TEST_HOME/loot_dir/a" "$TEST_HOME/loot_dir/b"
   sudo rm -rf "$TEST_HOME/loot_dir"
-  if wait_for_incident "data_destruction_pattern"; then
+  if wait_for_incident "data_destruction_pattern:rm_rf_user_data" "$before"; then
     mark_pass "data_destruction_pattern.rm_rf_user_data"
   else
     mark_fail "data_destruction_pattern.rm_rf_user_data" "no incident"
   fi
 }
 test_disk_wipe_loop() {
+  local before; before=$(now_iso)
   sudo dd if=/dev/zero of="$LOOP_DEV" bs=1M count=1 2>/dev/null
-  if wait_for_incident "data_destruction_pattern"; then
+  if wait_for_incident "data_destruction_pattern:disk_wipe" "$before"; then
     mark_pass "data_destruction_pattern.disk_wipe"
   else
     mark_fail "data_destruction_pattern.disk_wipe" "no incident (check argv carries of=$LOOP_DEV)"
   fi
 }
 test_shred_burst() {
+  local before; before=$(now_iso)
   for n in 1 2 3 4; do
     echo data > "$SANDBOX/shred_$n.txt"
   done
   shred -u "$SANDBOX/shred_1.txt" "$SANDBOX/shred_2.txt" "$SANDBOX/shred_3.txt" "$SANDBOX/shred_4.txt"
-  if wait_for_incident "data_destruction_pattern"; then
+  if wait_for_incident "data_destruction_pattern:shred_burst" "$before"; then
     mark_pass "data_destruction_pattern.shred_burst"
   else
     mark_fail "data_destruction_pattern.shred_burst" "no incident"
   fi
 }
 test_mkfs_loop() {
+  local before; before=$(now_iso)
   sudo mkfs.ext4 -F "$LOOP_DEV" >/dev/null 2>&1
-  if wait_for_incident "data_destruction_pattern"; then
+  if wait_for_incident "data_destruction_pattern:mkfs_on_running_volume" "$before"; then
     mark_pass "data_destruction_pattern.mkfs_on_running_volume"
   else
     mark_fail "data_destruction_pattern.mkfs_on_running_volume" "no incident"
@@ -360,9 +403,10 @@ test_luksformat_loop() {
     mark_skip "data_destruction_pattern.cryptsetup_luksformat" "cryptsetup not installed"
     return
   fi
+  local before; before=$(now_iso)
   echo -e "YES\nattackerpass\nattackerpass" \
     | sudo cryptsetup luksFormat "$LOOP_DEV" --batch-mode 2>/dev/null
-  if wait_for_incident "data_destruction_pattern"; then
+  if wait_for_incident "data_destruction_pattern:cryptsetup_luksformat" "$before"; then
     mark_pass "data_destruction_pattern.cryptsetup_luksformat"
   else
     mark_fail "data_destruction_pattern.cryptsetup_luksformat" "no incident"
@@ -541,13 +585,13 @@ PY
 
 test_crypto_miner() {
   trigger "crypto_miner" "crypto_miner" \
-    sh -c 'exec -a /usr/bin/xmrig /bin/true --donate-level=1 --url=pool.minexmr.com:443'
+    bash -c 'exec -a /usr/bin/xmrig /bin/true --donate-level=1 --url=pool.minexmr.com:443'
 }
 
 test_execution_guard() {
   # Whatever the host's allowlist marks as blocked. Use a plausibly-
   # weird argv0 that the agent might guard against.
-  sh -c 'exec -a /usr/bin/nc /bin/true -e /bin/sh 127.0.0.1 4444' >/dev/null 2>&1
+  bash -c 'exec -a /usr/bin/nc /bin/true -e /bin/sh 127.0.0.1 4444' >/dev/null 2>&1
   if wait_for_incident "execution_guard"; then
     mark_pass "execution_guard"
   else
@@ -598,13 +642,12 @@ test_ssh_key_injection() {
 }
 
 test_user_creation() {
-  # We can't useradd a NEW user without leaving residue. Instead,
-  # verify that the setup() useradd already fired the detector
-  # (which it should have).
-  if sudo grep -l '"incident_id":"user_creation:' $INCIDENTS_GLOB >/dev/null 2>&1; then
+  # The setup() useradd should have fired this. Wait up to 30s in case
+  # the auth_log collector hasn't caught the journald entry yet.
+  if wait_for_incident "user_creation" "$RUN_SINCE" 30; then
     mark_pass "user_creation"
   else
-    mark_fail "user_creation" "setup useradd should have fired this"
+    mark_fail "user_creation" "setup useradd should have fired this within 30s"
   fi
 }
 
@@ -646,9 +689,10 @@ test_log_tampering() {
 }
 
 test_data_encoding() {
+  local before; before=$(now_iso)
   local blob; blob=$(base64 </etc/hostname 2>/dev/null | tr -d '\n' | head -c 200)
-  sh -c "exec -a /usr/bin/echo /bin/true '$blob$blob$blob$blob'" >/dev/null 2>&1
-  if wait_for_incident "data_encoding"; then
+  sudo -u "$TEST_USER" bash -c "exec -a /usr/bin/echo /bin/true '$blob$blob$blob$blob'" >/dev/null 2>&1
+  if wait_for_incident "data_encoding" "$before"; then
     mark_pass "data_encoding"
   else
     mark_fail "data_encoding" "no incident"
@@ -658,7 +702,7 @@ test_data_encoding() {
 test_process_tree() {
   # Spawn a shell from a parent comm-stuffed binary so it looks like
   # nginx → sh (unexpected lineage).
-  sh -c 'exec -a /usr/sbin/nginx /bin/bash -c "true"' &
+  bash -c 'exec -a /usr/sbin/nginx /bin/bash -c "true"' &
   if wait_for_incident "process_tree"; then
     mark_pass "process_tree"
   else
@@ -738,10 +782,11 @@ test_port_scan() {
 }
 
 test_discovery_burst() {
+  local before; before=$(now_iso)
   for c in whoami id hostname uname uptime w pwd df free; do
-    sh -c "exec -a /usr/bin/$c /bin/true"
+    sudo -u "$TEST_USER" bash -c "exec -a /usr/bin/$c /bin/true"
   done
-  if wait_for_incident "discovery_burst"; then
+  if wait_for_incident "discovery_burst" "$before"; then
     mark_pass "discovery_burst"
   else
     mark_fail "discovery_burst" "no incident"

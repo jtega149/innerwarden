@@ -216,6 +216,33 @@ fn build_ransomware_burst_event(
     }
 }
 
+/// Derive the final sorted, deduplicated watchlist from the default set
+/// and operator-supplied paths. Defaults are filtered by `.exists()` so a
+/// host that doesn't have (say) `/etc/selinux/config` doesn't show up
+/// with a stale entry; operator paths bypass that filter intentionally
+/// so a config that pre-seeds a path before install still surfaces.
+///
+/// Pulled out of `run()` so it is testable without spinning up a tokio
+/// runtime or an mpsc channel. The `exists_check` closure is injected
+/// so the unit tests can simulate "which paths exist on this host"
+/// without touching the real filesystem.
+fn build_watch_set<F>(defaults: &[&str], operator_paths: &[String], exists_check: F) -> Vec<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    let mut path_set: std::collections::HashSet<PathBuf> = defaults
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| exists_check(p))
+        .collect();
+    for p in operator_paths {
+        path_set.insert(PathBuf::from(p));
+    }
+    let mut paths: Vec<PathBuf> = path_set.into_iter().collect();
+    paths.sort();
+    paths
+}
+
 /// Run the fanotify/polling filesystem monitor.
 ///
 /// On Linux with appropriate permissions, uses inotify (via polling with
@@ -226,15 +253,17 @@ pub async fn run(
     watch_paths: Vec<String>,
     poll_seconds: u64,
 ) {
-    let paths: Vec<PathBuf> = if watch_paths.is_empty() {
-        DEFAULT_WATCH_PATHS
-            .iter()
-            .map(PathBuf::from)
-            .filter(|p| p.exists())
-            .collect()
-    } else {
-        watch_paths.iter().map(PathBuf::from).collect()
-    };
+    // Wave 2026-05-17 fix: UNION defaults with operator-supplied paths
+    // instead of "either-or". The previous behaviour treated any
+    // operator config as a hard replacement for DEFAULT_WATCH_PATHS,
+    // which on hosts that explicitly listed (say) `/etc/sudoers` for
+    // the *integrity* collector meant fanotify silently dropped PAM /
+    // cron / RC / audit / SELinux / shell-startup paths from its
+    // watchlist — leaving every PR1-6 file-write detector deaf.
+    //
+    // The defaults are the security minimum every host should observe
+    // by default; operator-supplied paths extend it.
+    let paths = build_watch_set(DEFAULT_WATCH_PATHS, &watch_paths, |p| p.exists());
 
     if paths.is_empty() {
         warn!("fanotify_watch: no valid paths to monitor — filesystem monitoring disabled");
@@ -512,6 +541,130 @@ mod tests {
         assert_eq!(sensitive.details["filename"], "/etc/shadow");
         // Legacy alias preserved for any older consumer.
         assert_eq!(sensitive.details["path"], "/etc/shadow");
+    }
+
+    // ─── build_watch_set coverage (Wave 2026-05-17) ───────────────────
+    // These tests exercise the actual function `run()` calls. The
+    // injected `exists_check` closure lets us simulate every real-world
+    // scenario without touching the filesystem.
+
+    /// Mock filesystem helper — every path in `existing` is treated as
+    /// present, everything else as missing.
+    fn fake_exists<'a>(existing: &'a [&'a str]) -> impl Fn(&Path) -> bool + 'a {
+        move |p: &Path| existing.iter().any(|e| Path::new(e) == p)
+    }
+
+    #[test]
+    fn build_watch_set_empty_operator_paths_uses_defaults_filtered_by_existence() {
+        // Simplest case: no operator config. Watchset is the defaults
+        // filtered by `.exists()` on this host.
+        let defaults = &["/etc/passwd", "/etc/shadow", "/etc/missing-on-this-host"];
+        let present = fake_exists(&["/etc/passwd", "/etc/shadow"]);
+        let paths = build_watch_set(defaults, &[], present);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&PathBuf::from("/etc/passwd")));
+        assert!(paths.contains(&PathBuf::from("/etc/shadow")));
+        assert!(!paths.contains(&PathBuf::from("/etc/missing-on-this-host")));
+    }
+
+    #[test]
+    fn build_watch_set_unions_operator_paths_with_defaults() {
+        // The bug fix in #675: operator paths must NOT silently replace
+        // the defaults the way they did before. Anchor: an operator list
+        // of one path produces a watchset containing BOTH that path AND
+        // every default-that-exists.
+        let defaults = &["/etc/passwd", "/etc/shadow", "/etc/pam.d/sshd"];
+        let operator = vec!["/etc/operator_added.conf".to_string()];
+        let present = fake_exists(&["/etc/passwd", "/etc/shadow", "/etc/pam.d/sshd"]);
+        let paths = build_watch_set(defaults, &operator, present);
+        assert!(paths.contains(&PathBuf::from("/etc/operator_added.conf")));
+        assert!(paths.contains(&PathBuf::from("/etc/passwd")));
+        assert!(paths.contains(&PathBuf::from("/etc/shadow")));
+        assert!(paths.contains(&PathBuf::from("/etc/pam.d/sshd")));
+        assert_eq!(paths.len(), 4);
+    }
+
+    #[test]
+    fn build_watch_set_operator_paths_bypass_exists_filter() {
+        // Operator may pre-seed a path that doesn't exist yet (a future
+        // install). The defaults are filtered for existence, but
+        // operator paths come in regardless — so the operator can spot a
+        // future-installed path landing without restarting the sensor.
+        let defaults = &["/etc/passwd", "/etc/missing"];
+        let operator = vec!["/etc/future-config".to_string()];
+        let present = fake_exists(&["/etc/passwd"]);
+        let paths = build_watch_set(defaults, &operator, present);
+        assert!(paths.contains(&PathBuf::from("/etc/future-config")));
+        assert!(!paths.contains(&PathBuf::from("/etc/missing")));
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn build_watch_set_dedupes_when_operator_repeats_a_default() {
+        // Operator config that lists a path already in the defaults must
+        // not double-count it.
+        let defaults = &["/etc/passwd", "/etc/shadow"];
+        let operator = vec!["/etc/passwd".to_string()];
+        let present = fake_exists(&["/etc/passwd", "/etc/shadow"]);
+        let paths = build_watch_set(defaults, &operator, present);
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn build_watch_set_is_deterministically_sorted() {
+        // Downstream code iterates the watch list and the operator-
+        // visible log line prints `paths=N`. Sorting the output makes
+        // the behaviour deterministic across rebuilds (HashSet iteration
+        // order is not stable).
+        let defaults = &["/etc/shadow", "/etc/passwd", "/etc/sudoers"];
+        let present = fake_exists(&["/etc/shadow", "/etc/passwd", "/etc/sudoers"]);
+        let paths = build_watch_set(defaults, &[], present);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/etc/passwd"),
+                PathBuf::from("/etc/shadow"),
+                PathBuf::from("/etc/sudoers"),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_watch_set_test001_regression_scenario() {
+        // Verbatim reproduction of the test001 config that produced the
+        // #675 bug. With the union semantics, the watchlist must include
+        // every PR1-6 high-value path AND the operator's integrity paths.
+        let test001_integrity = vec![
+            "/etc/ssh/sshd_config".to_string(),
+            "/etc/sudoers".to_string(),
+        ];
+        // Simulate an Ubuntu 24.04 host where every default exists EXCEPT
+        // /etc/selinux/config (SELinux not installed by default on Ubuntu).
+        let mut exist_set: Vec<&str> = DEFAULT_WATCH_PATHS.to_vec();
+        exist_set.retain(|p| *p != "/etc/selinux/config");
+        let present = fake_exists(&exist_set);
+        let paths = build_watch_set(DEFAULT_WATCH_PATHS, &test001_integrity, present);
+        for must_have in &[
+            "/etc/pam.d/sshd",
+            "/etc/pam.d/su",
+            "/etc/pam.conf",
+            "/etc/crontab",
+            "/etc/rc.local",
+            "/etc/audit/audit.rules",
+            "/etc/profile",
+            "/root/.bashrc",
+            // operator-supplied integrity paths
+            "/etc/ssh/sshd_config",
+            "/etc/sudoers",
+        ] {
+            assert!(
+                paths.contains(&PathBuf::from(must_have)),
+                "test001 watchset must include `{must_have}` (PR1-6 detector dep + \
+                 operator config) — dropping any of these is the #675 regression"
+            );
+        }
+        // /etc/selinux/config filtered out because exists_check says false
+        assert!(!paths.contains(&PathBuf::from("/etc/selinux/config")));
     }
 
     #[test]
