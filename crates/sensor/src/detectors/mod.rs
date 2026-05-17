@@ -274,6 +274,9 @@ pub mod pam_module_change;
 pub mod selinux_apparmor_disable;
 pub mod startup_script_persistence;
 
+// spec 050-PR6 — Impact
+pub mod data_destruction_pattern;
+
 #[cfg(test)]
 mod tests {
     use super::*;

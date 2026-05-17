@@ -164,6 +164,9 @@ struct DetectorSet {
         Option<detectors::selinux_apparmor_disable::SelinuxApparmorDisableDetector>,
     startup_script_persistence:
         Option<detectors::startup_script_persistence::StartupScriptPersistenceDetector>,
+    // spec 050-PR6 — Impact
+    data_destruction_pattern:
+        Option<detectors::data_destruction_pattern::DataDestructionPatternDetector>,
 }
 
 #[derive(Default)]
@@ -840,6 +843,15 @@ async fn main() -> Result<()> {
         startup_script_persistence: Some({
             info!("startup_script_persistence detector enabled (T1037.004 RC scripts)");
             detectors::startup_script_persistence::StartupScriptPersistenceDetector::new(
+                &cfg.agent.host_id,
+            )
+        }),
+        // spec 050-PR6 — Impact
+        data_destruction_pattern: Some({
+            info!(
+                "data_destruction_pattern detector enabled (T1485/T1561.001/T1486 wipe & destruction)"
+            );
+            detectors::data_destruction_pattern::DataDestructionPatternDetector::new(
                 &cfg.agent.host_id,
             )
         }),
@@ -2338,6 +2350,20 @@ fn process_event(
         if !detectors
             .dynamic_allowlist
             .suppress_incident_for_detector(&incident, "startup_script_persistence")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // spec 050-PR6 — Impact
+    let data_destruction_pattern_incident = detectors
+        .data_destruction_pattern
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = data_destruction_pattern_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "data_destruction_pattern")
         {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
