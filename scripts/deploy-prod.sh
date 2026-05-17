@@ -220,16 +220,53 @@ else
 fi
 
 # Step 3: Install + restart
+#
+# Wave 2026-05-17: agent binary swap goes through a watchdog dance on
+# hosts that ship the proprietary `innerwarden-watchdog` supervisor.
+# Without it the watchdog respawns innerwarden-agent the instant the
+# `systemctl stop innerwarden-agent` returns, so the subsequent
+#   sudo cp .../innerwarden-agent /usr/local/bin/innerwarden-agent
+# hits "cp: cannot create regular file '...': Text file busy". The
+# operator caught this on the Oracle prod #680 deploy; the recovery
+# was the manual sequence captured in `reference_prod_deploy` memory:
+#   sudo systemctl stop innerwarden-watchdog && sleep 2
+#   sudo cp <binary>
+#   sudo systemctl start innerwarden-watchdog
+# This codifies that into `install_one` so the next operator who runs
+# `./scripts/deploy-prod.sh agent` doesn't have to know the dance.
 install_one() {
   local pkg="$1"
   local bin="$2"
   local svc="$3"
   echo "[3/4] Installing $bin..."
+
+  # Detect whether innerwarden-watchdog is installed AND active. The
+  # watchdog only supervises the agent, so we run this dance only on
+  # agent swaps. Other packages (sensor / ctl) are unaffected.
+  local has_watchdog=0
+  if [ "$bin" = "innerwarden-agent" ]; then
+    local wd_state
+    wd_state=$($SSH "sudo systemctl is-active innerwarden-watchdog 2>/dev/null" || echo "missing")
+    if [ "$wd_state" = "active" ]; then
+      has_watchdog=1
+      echo "  Watchdog detected — stopping innerwarden-watchdog before binary swap."
+      $SSH "sudo systemctl stop innerwarden-watchdog && sleep 2"
+    fi
+  fi
+
   if [ -n "$svc" ]; then
     $SSH "sudo systemctl stop $svc 2>/dev/null; sleep 1"
   fi
   $SSH "sudo cp $REMOTE_DIR/target/release/$bin $BIN_DIR/$bin"
-  if [ -n "$svc" ]; then
+
+  if [ "$has_watchdog" = "1" ]; then
+    # On watchdog-supervised hosts the agent has no standalone systemd
+    # unit running it (the unit is "loaded; disabled"); the watchdog
+    # is responsible for the next spawn. Starting the watchdog will
+    # cause it to fork the new agent binary within seconds.
+    echo "  Restarting innerwarden-watchdog (re-spawns innerwarden-agent)."
+    $SSH "sudo systemctl start innerwarden-watchdog && sleep 6 && sudo systemctl is-active innerwarden-watchdog"
+  elif [ -n "$svc" ]; then
     $SSH "sudo systemctl start $svc && sleep 2 && sudo systemctl is-active $svc"
   fi
 }

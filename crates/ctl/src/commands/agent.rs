@@ -389,28 +389,40 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
             println!();
             println!("  \x1b[1;36m🤖 Agent Guard Status\x1b[0m");
             println!();
-            // TODO: read from running agent via API
             println!("  Agent guard is enabled. Checking dashboard API...");
             println!();
 
-            // Try to hit the dashboard API
-            match std::process::Command::new("curl")
-                .args(["-s", "http://localhost:8787/api/agent/security-context"])
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    let body = String::from_utf8_lossy(&output.stdout);
-                    if let Ok(ctx) = serde_json::from_str::<serde_json::Value>(&body) {
-                        let level = ctx["threat_level"].as_str().unwrap_or("unknown");
-                        let incidents = ctx["active_incidents_today"].as_u64().unwrap_or(0);
-                        let blocks = ctx["recent_blocks_today"].as_u64().unwrap_or(0);
-                        println!("  Server threat level: {level}");
-                        println!("  Incidents today:     {incidents}");
-                        println!("  IPs blocked today:   {blocks}");
-                    }
+            // Wave 2026-05-17 fix: the dashboard speaks HTTPS only —
+            // `axum_server::bind_rustls` is the default since spec 037
+            // when a self-signed cert lands in /var/lib/innerwarden at
+            // first boot. The previous implementation shelled out to
+            //   curl -s http://localhost:8787/api/agent/security-context
+            // which returns "connection refused" against HTTPS and
+            // printed the misleading "Dashboard not reachable (is
+            // innerwarden-agent running?)" — exactly what the
+            // operator saw on Oracle prod right after the agent
+            // connect succeeded over the SAME dashboard.
+            //
+            // Reuse the dashboard_api_agent + resolve_dashboard_url
+            // helpers that `connect` / `disconnect` use: HTTPS,
+            // self-signed cert allowed on loopback, short timeout.
+            let dashboard_url = resolve_dashboard_url(cli);
+            let url = format!("{dashboard_url}/api/agent/security-context");
+            match dashboard_api_agent(&url).get(&url).call() {
+                Ok(resp) => {
+                    let body: serde_json::Value = resp.into_body().read_json().unwrap_or_default();
+                    let level = body["threat_level"].as_str().unwrap_or("unknown");
+                    let incidents = body["active_incidents_today"].as_u64().unwrap_or(0);
+                    let blocks = body["recent_blocks_today"].as_u64().unwrap_or(0);
+                    println!("  Server threat level: {level}");
+                    println!("  Incidents today:     {incidents}");
+                    println!("  IPs blocked today:   {blocks}");
                 }
-                _ => {
-                    println!("  \x1b[33m⚠\x1b[0m  Dashboard not reachable (is innerwarden-agent running?)");
+                Err(e) => {
+                    println!("  \x1b[33m⚠\x1b[0m  Dashboard not reachable at {url} ({e:#})");
+                    println!(
+                        "       Is innerwarden-agent running? sudo systemctl status innerwarden-agent"
+                    );
                 }
             }
 
@@ -596,8 +608,36 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
                 let url = format!("{dashboard_url}/api/agent-guard/connect");
                 match dashboard_api_agent(&url).post(&url).send_json(&payload) {
                     Ok(resp) => {
+                        // Wave 2026-05-17: respect the `connected: false`
+                        // flag in the server response body. The
+                        // `/api/agent-guard/connect` endpoint returns
+                        // HTTP 200 in BOTH success and structured-error
+                        // paths (e.g. duplicate-pid), so a raw `Ok(resp)`
+                        // doesn't tell us whether the agent was actually
+                        // registered. Previously the CLI printed
+                        //   ✓ <name> (pid <n>) connected as unknown
+                        // for every duplicate-pid call — operator
+                        // thought it succeeded when the server had
+                        // refused. Read the body, branch on the flag,
+                        // surface the `error` string on failure.
                         let body: serde_json::Value =
                             resp.into_body().read_json().unwrap_or_default();
+                        let connected_flag = body
+                            .get("connected")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if !connected_flag {
+                            let reason = body.get("error").and_then(|v| v.as_str()).unwrap_or(
+                                "server returned connected=false without an error string",
+                            );
+                            println!(
+                                "  \x1b[33m!\x1b[0m {name} (pid {selected_pid}) NOT registered — {reason}"
+                            );
+                            // Don't bump `connected` and don't fall
+                            // through to the offline-queue path —
+                            // server is reachable, it just declined.
+                            continue;
+                        }
                         let agent_id = body
                             .get("agent_id")
                             .and_then(|v| v.as_str())
