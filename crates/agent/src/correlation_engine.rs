@@ -2028,6 +2028,13 @@ fn builtin_rules() -> Vec<CorrelationRule> {
         },
         // CL-053: Collection → Exfiltration — stage-then-push.
         // (T1119 / T1115 / T1056.001 → T1048 / T1041)
+        //
+        // Wave 2026-05-17 post-Caldera tuning: added legacy-name
+        // variants `data_archive` / `suspicious_archive` to stage 1
+        // and `data_exfil_cmd` to stage 2. The detectors that fired
+        // in the 2026-05-17 Caldera run emit those names but the
+        // original PR7 rule only carried the new PR1-6 detector
+        // kinds. Without these the chain never matched.
         CorrelationRule {
             id: "CL-053".into(),
             name: "Collection → Exfiltration".into(),
@@ -2035,14 +2042,14 @@ fn builtin_rules() -> Vec<CorrelationRule> {
                 RuleStage {
                     layer: Some(Layer::Userspace),
                     kind_patterns: vec![
-                        "clipboard_read|screen_capture|keylogger_bash_trap|automated_file_collection|archive_pwd_protected".into(),
+                        "clipboard_read|screen_capture|keylogger_bash_trap|automated_file_collection|archive_pwd_protected|data_archive|suspicious_archive".into(),
                     ],
                     entity_must_match: true,
                 },
                 RuleStage {
                     layer: None,
                     kind_patterns: vec![
-                        "lateral_egress_scp_rsync|data_exfiltration|data_exfil_ebpf".into(),
+                        "lateral_egress_scp_rsync|data_exfiltration|data_exfil_ebpf|data_exfil_cmd".into(),
                     ],
                     entity_must_match: true,
                 },
@@ -2124,6 +2131,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
         },
         // CL-057: Discovery Burst → Collection — map-then-grab.
         // (T1083 / T1018 → T1119)
+        // Wave 2026-05-17: legacy collection variants added.
         CorrelationRule {
             id: "CL-057".into(),
             name: "Discovery Burst → Collection".into(),
@@ -2138,7 +2146,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
                 RuleStage {
                     layer: Some(Layer::Userspace),
                     kind_patterns: vec![
-                        "archive_pwd_protected|automated_file_collection".into(),
+                        "archive_pwd_protected|automated_file_collection|data_archive|suspicious_archive".into(),
                     ],
                     entity_must_match: true,
                 },
@@ -2336,6 +2344,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             severity: Severity::High,
         },
         // CL-066: Collection → Lateral Exfil — stage-then-push (T1048.001).
+        // Wave 2026-05-17: legacy variants added to both stages.
         CorrelationRule {
             id: "CL-066".into(),
             name: "Collection → Lateral Exfiltration".into(),
@@ -2343,13 +2352,13 @@ fn builtin_rules() -> Vec<CorrelationRule> {
                 RuleStage {
                     layer: Some(Layer::Userspace),
                     kind_patterns: vec![
-                        "archive_pwd_protected|automated_file_collection|clipboard_read".into(),
+                        "archive_pwd_protected|automated_file_collection|clipboard_read|data_archive|suspicious_archive".into(),
                     ],
                     entity_must_match: true,
                 },
                 RuleStage {
                     layer: None,
-                    kind_patterns: vec!["lateral_egress_scp_rsync".into()],
+                    kind_patterns: vec!["lateral_egress_scp_rsync|data_exfil_cmd".into()],
                     entity_must_match: true,
                 },
             ],
@@ -2432,6 +2441,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
         },
         // CL-069: Insider Exfil — interactive shell + collection +
         // lateral_egress_scp_rsync. Entity-pivoted on shared IP/uid.
+        // Wave 2026-05-17: legacy variants added to stages 2 + 3.
         CorrelationRule {
             id: "CL-069".into(),
             name: "Insider Exfiltration Pattern".into(),
@@ -2444,13 +2454,13 @@ fn builtin_rules() -> Vec<CorrelationRule> {
                 RuleStage {
                     layer: Some(Layer::Userspace),
                     kind_patterns: vec![
-                        "archive_pwd_protected|automated_file_collection".into(),
+                        "archive_pwd_protected|automated_file_collection|data_archive|suspicious_archive".into(),
                     ],
                     entity_must_match: true,
                 },
                 RuleStage {
                     layer: None,
-                    kind_patterns: vec!["lateral_egress_scp_rsync".into()],
+                    kind_patterns: vec!["lateral_egress_scp_rsync|data_exfil_cmd".into()],
                     entity_must_match: true,
                 },
             ],
@@ -3434,5 +3444,58 @@ mod tests {
             "10.0.0.72",
         ));
         assert_chain_fires(&mut engine, "CL-070");
+    }
+
+    // ─── Post-Caldera 2026-05-17 tuning: legacy detector variants ──────────
+    // These tests anchor the OR-pattern updates added after the first
+    // Caldera run, where the chain rules were not firing because the
+    // legacy detectors emit `data_exfil_cmd` / `data_archive` /
+    // `suspicious_archive` instead of the new PR1-6 names that PR7
+    // originally listed.
+
+    #[test]
+    fn cl_053_fires_on_legacy_data_archive_then_data_exfil_cmd() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.153";
+        engine.observe(make_event(Layer::Userspace, "data_archive", ip));
+        engine.observe(make_event(Layer::Userspace, "data_exfil_cmd", ip));
+        assert_chain_fires(&mut engine, "CL-053");
+    }
+
+    #[test]
+    fn cl_053_fires_on_suspicious_archive_variant() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.253";
+        engine.observe(make_event(Layer::Userspace, "suspicious_archive", ip));
+        engine.observe(make_event(Layer::Userspace, "data_exfil_cmd", ip));
+        assert_chain_fires(&mut engine, "CL-053");
+    }
+
+    #[test]
+    fn cl_057_fires_on_legacy_data_archive_after_discovery() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.157";
+        engine.observe(make_event(Layer::Userspace, "discovery_burst", ip));
+        engine.observe(make_event(Layer::Userspace, "data_archive", ip));
+        assert_chain_fires(&mut engine, "CL-057");
+    }
+
+    #[test]
+    fn cl_066_fires_on_data_archive_then_data_exfil_cmd() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.166";
+        engine.observe(make_event(Layer::Userspace, "data_archive", ip));
+        engine.observe(make_event(Layer::Userspace, "data_exfil_cmd", ip));
+        assert_chain_fires(&mut engine, "CL-066");
+    }
+
+    #[test]
+    fn cl_069_fires_on_legacy_archive_and_exfil_variants() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.169";
+        engine.observe(make_event(Layer::Userspace, "shell.command_exec", ip));
+        engine.observe(make_event(Layer::Userspace, "suspicious_archive", ip));
+        engine.observe(make_event(Layer::Userspace, "data_exfil_cmd", ip));
+        assert_chain_fires(&mut engine, "CL-069");
     }
 }
