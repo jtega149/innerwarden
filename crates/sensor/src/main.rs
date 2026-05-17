@@ -136,6 +136,10 @@ struct DetectorSet {
     sandbox_evasion: Option<detectors::sandbox_evasion::SandboxEvasionDetector>,
     threat_intel: Option<detectors::threat_intel::ThreatIntelDetector>,
     proto_anomaly: Option<detectors::proto_anomaly::ProtoAnomalyDetector>,
+    // spec 050-PR1 — Reconnaissance
+    nmap_scan: Option<detectors::nmap_scan::NmapScanDetector>,
+    wordlist_scan: Option<detectors::wordlist_scan::WordlistScanDetector>,
+    discovery_anomaly: Option<detectors::discovery_anomaly::DiscoveryAnomalyDetector>,
 }
 
 #[derive(Default)]
@@ -725,6 +729,19 @@ async fn main() -> Result<()> {
             // throttle covers the 10-minute window the spec targets (cuts
             // SshVersionAnomaly volume).
             detectors::proto_anomaly::ProtoAnomalyDetector::new(&cfg.agent.host_id, 600)
+        }),
+        // spec 050-PR1 — Reconnaissance
+        nmap_scan: Some({
+            info!("nmap_scan detector enabled (network scanner detection on host)");
+            detectors::nmap_scan::NmapScanDetector::new(&cfg.agent.host_id)
+        }),
+        wordlist_scan: Some({
+            info!("wordlist_scan detector enabled (HTTP wordlist enumeration)");
+            detectors::wordlist_scan::WordlistScanDetector::new(&cfg.agent.host_id, 8, 60)
+        }),
+        discovery_anomaly: Some({
+            info!("discovery_anomaly detector enabled (context-aware recon burst)");
+            detectors::discovery_anomaly::DiscoveryAnomalyDetector::new(&cfg.agent.host_id, 10, 30)
         }),
     };
 
@@ -1963,6 +1980,50 @@ fn process_event(
     // Protocol anomaly detection (works on tcp_stream events).
     if let Some(ref mut det) = detectors.proto_anomaly {
         for incident in det.process(&ev) {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // spec 050-PR1 — Reconnaissance trio. Each consults
+    // dynamic_allowlist for post-emit suppression so operators can
+    // tune via `[detectors.<name>]` without recompile. discovery_anomaly
+    // also consults `exec_context::classify` inside its own process().
+    let nmap_incident = if detectors.dynamic_allowlist.is_benign_discovery(&ev) {
+        None
+    } else {
+        detectors.nmap_scan.as_mut().and_then(|d| d.process(&ev))
+    };
+    if let Some(incident) = nmap_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "nmap_scan")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let wordlist_incident = detectors
+        .wordlist_scan
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = wordlist_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "wordlist_scan")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let discovery_anomaly_incident = detectors
+        .discovery_anomaly
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = discovery_anomaly_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "discovery_anomaly")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }

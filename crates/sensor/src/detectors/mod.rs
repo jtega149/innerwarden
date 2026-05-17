@@ -245,6 +245,11 @@ pub mod proto_anomaly;
 pub mod sandbox_evasion;
 pub mod threat_intel;
 
+// spec 050-PR1 — Reconnaissance
+pub mod discovery_anomaly;
+pub mod nmap_scan;
+pub mod wordlist_scan;
+
 #[cfg(test)]
 mod tests {
     use super::*;
