@@ -157,6 +157,13 @@ struct DetectorSet {
     lateral_egress_ssh: Option<detectors::lateral_egress_ssh::LateralEgressSshDetector>,
     lateral_egress_scp_rsync:
         Option<detectors::lateral_egress_scp_rsync::LateralEgressScpRsyncDetector>,
+    // spec 050-PR5 — Persistence + Defense Evasion
+    pam_module_change: Option<detectors::pam_module_change::PamModuleChangeDetector>,
+    auditd_disable: Option<detectors::auditd_disable::AuditdDisableDetector>,
+    selinux_apparmor_disable:
+        Option<detectors::selinux_apparmor_disable::SelinuxApparmorDisableDetector>,
+    startup_script_persistence:
+        Option<detectors::startup_script_persistence::StartupScriptPersistenceDetector>,
 }
 
 #[derive(Default)]
@@ -812,6 +819,27 @@ async fn main() -> Result<()> {
         lateral_egress_scp_rsync: Some({
             info!("lateral_egress_scp_rsync detector enabled (T1048.001 staged exfil)");
             detectors::lateral_egress_scp_rsync::LateralEgressScpRsyncDetector::new(
+                &cfg.agent.host_id,
+            )
+        }),
+        // spec 050-PR5 — Persistence + Defense Evasion
+        pam_module_change: Some({
+            info!("pam_module_change detector enabled (T1556.003 PAM tamper)");
+            detectors::pam_module_change::PamModuleChangeDetector::new(&cfg.agent.host_id)
+        }),
+        auditd_disable: Some({
+            info!("auditd_disable detector enabled (T1562.001 auditd stop/disable)");
+            detectors::auditd_disable::AuditdDisableDetector::new(&cfg.agent.host_id)
+        }),
+        selinux_apparmor_disable: Some({
+            info!("selinux_apparmor_disable detector enabled (T1562.001 MAC disable)");
+            detectors::selinux_apparmor_disable::SelinuxApparmorDisableDetector::new(
+                &cfg.agent.host_id,
+            )
+        }),
+        startup_script_persistence: Some({
+            info!("startup_script_persistence detector enabled (T1037.004 RC scripts)");
+            detectors::startup_script_persistence::StartupScriptPersistenceDetector::new(
                 &cfg.agent.host_id,
             )
         }),
@@ -2257,6 +2285,59 @@ fn process_event(
         if !detectors
             .dynamic_allowlist
             .suppress_incident_for_detector(&incident, "lateral_egress_scp_rsync")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // spec 050-PR5 — Persistence + Defense Evasion
+    let pam_module_change_incident = detectors
+        .pam_module_change
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = pam_module_change_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "pam_module_change")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let auditd_disable_incident = detectors
+        .auditd_disable
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = auditd_disable_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "auditd_disable")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let selinux_apparmor_disable_incident = detectors
+        .selinux_apparmor_disable
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = selinux_apparmor_disable_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "selinux_apparmor_disable")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let startup_script_persistence_incident = detectors
+        .startup_script_persistence
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = startup_script_persistence_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "startup_script_persistence")
         {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }

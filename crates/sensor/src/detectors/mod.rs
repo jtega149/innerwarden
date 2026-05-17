@@ -268,6 +268,12 @@ pub mod lateral_egress_scp_rsync;
 pub mod lateral_egress_ssh;
 pub mod setuid_exploit_pattern;
 
+// spec 050-PR5 — Persistence + Defense Evasion
+pub mod auditd_disable;
+pub mod pam_module_change;
+pub mod selinux_apparmor_disable;
+pub mod startup_script_persistence;
+
 #[cfg(test)]
 mod tests {
     use super::*;
