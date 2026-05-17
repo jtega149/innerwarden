@@ -189,22 +189,47 @@ fn build_sensors_payload(
                 .unwrap_or(0)
         }
     };
-    // Spec 050-hotfix follow-up to #659: per-collector "TELEMETRY STREAMS"
-    // tiles in the Sensors HUD historically rendered `graph.source_counts`
-    // (process-lifetime accumulator restored from the KG snapshot). On
-    // 2026-05-17 the operator screenshot showed EBPF=23M while the chart
-    // below (canonical via #659) and the Home tile (canonical via PR30)
-    // both painted ~270k for the same date — same divergence pattern PR30
-    // and #659 closed for adjacent surfaces.
+    // Spec 050-hotfix follow-up to #660: per-collector "TELEMETRY STREAMS"
+    // tiles need TWO pieces of information composed correctly:
     //
-    // Precedence: canonical timeline (sum-by-source for the date) →
-    // KG `source_counts` (snapshot-restored, lifetime) → telemetry snapshot.
+    //   (a) **The list of collectors that exist** — comes from the KG's
+    //       lifetime-accumulated `source_counts` (which has every
+    //       collector that ever wrote an event, including ones quiet
+    //       today). The dashboard frontend uses this list to render
+    //       active-vs-broken indicators per collector.
+    //
+    //   (b) **The per-date event counts** — comes from canonical SQLite
+    //       via `event_timeline_canonical` so the numbers represent
+    //       today, not lifetime.
+    //
+    // Operator screenshot on 2026-05-17 after #660 deployed: only 2 of
+    // 18 collectors visible — `ebpf` etc. silently vanished because
+    // they had no events in SQLite yet today (UTC just rolled over).
+    // Pre-#660 the lifetime KG counter kept them visible with inflated
+    // numbers; #660 went the other way and dropped them entirely. The
+    // correct shape unions both sources: KG gives the **roster**,
+    // canonical gives the **counts**.
+    //
+    // Precedence:
+    //   1. Canonical present → union(KG-names, canonical-counts) with
+    //      `0` for collectors not in canonical today.
+    //   2. Canonical absent + KG non-empty → legacy lifetime KG path.
+    //   3. Canonical absent + KG empty → telemetry snapshot file fallback.
     let sources: Vec<(String, usize)> = if let Some(canonical) = event_timeline_canonical.as_ref() {
         let mut acc: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        // (b) per-date counts from canonical SQLite.
         for inner in canonical.values() {
             for (src, &cnt) in inner.iter() {
                 *acc.entry(src.clone()).or_insert(0) += cnt as usize;
             }
+        }
+        // (a) ensure the KG roster is represented, even if a collector
+        // is quiet today. `or_insert(0)` is the key — it doesn't
+        // overwrite a real canonical count, only fills the gap so the
+        // tile renders the collector with count=0 (frontend's
+        // active-vs-broken indicator depends on the row existing).
+        for src_arc in graph.source_counts.keys() {
+            acc.entry(src_arc.to_string()).or_insert(0);
         }
         let mut s: Vec<(String, usize)> = acc.into_iter().collect();
         s.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1225,6 +1250,96 @@ mod tests {
             auditd_count, 5_000,
             "auditd tile must sum to canonical bucket value, got {auditd_count}"
         );
+    }
+
+    // Spec 050-hotfix follow-up to #660: when a collector is in the KG
+    // roster but absent from today's canonical timeline (e.g. UTC just
+    // rolled over so SQLite has no events for that source yet), the
+    // collector must STILL appear in the tile list with count=0 so the
+    // operator sees the full roster.
+    //
+    // Operator-reported 2026-05-17 after #660 deploy: only 2/18 tiles
+    // visible. Pre-#660 the lifetime KG counter kept them all visible
+    // with inflated counts. #660 dropped them to 0/18 by reading
+    // canonical only. This anchor pins the corrected union behaviour.
+    #[test]
+    fn build_sensors_payload_sources_includes_kg_roster_with_zero_when_canonical_has_no_today_data()
+    {
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // KG roster: 4 collectors known historically (lifetime counters).
+        {
+            let mut g = kg.write().unwrap();
+            g.source_counts
+                .insert(crate::knowledge_graph::intern::intern("ebpf"), 23_000_000);
+            g.source_counts.insert(
+                crate::knowledge_graph::intern::intern("tcp_stream"),
+                1_000_000,
+            );
+            g.source_counts.insert(
+                crate::knowledge_graph::intern::intern("http_capture"),
+                500_000,
+            );
+            g.source_counts
+                .insert(crate::knowledge_graph::intern::intern("auditd"), 100_000);
+            g.total_events_ingested = 24_600_000;
+        }
+
+        // Canonical: only `auditd` has events today (the UTC-just-rolled-over
+        // shape that broke the dashboard).
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut canonical: std::collections::BTreeMap<
+            String,
+            std::collections::HashMap<String, u64>,
+        > = std::collections::BTreeMap::new();
+        canonical
+            .entry(format!("{today}T00:05"))
+            .or_default()
+            .insert("auditd".to_string(), 94);
+
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, Some(canonical));
+        let sources = payload["sources"]
+            .as_array()
+            .expect("sources must be an array");
+
+        // All 4 KG-known collectors must appear in the tile list.
+        let names: std::collections::HashSet<String> = sources
+            .iter()
+            .filter_map(|v| v["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        for required in ["ebpf", "tcp_stream", "http_capture", "auditd"] {
+            assert!(
+                names.contains(required),
+                "collector {required} must appear in tile list — got {names:?}"
+            );
+        }
+
+        // `auditd` got today's canonical count, NOT the KG lifetime.
+        let auditd_count = sources
+            .iter()
+            .find(|v| v["name"].as_str() == Some("auditd"))
+            .and_then(|v| v["count"].as_u64())
+            .expect("auditd count present");
+        assert_eq!(auditd_count, 94);
+
+        // Quiet collectors render as zero — frontend's active-vs-broken
+        // indicator depends on the row existing with count=0, not on
+        // them being absent.
+        for quiet in ["ebpf", "tcp_stream", "http_capture"] {
+            let count = sources
+                .iter()
+                .find(|v| v["name"].as_str() == Some(quiet))
+                .and_then(|v| v["count"].as_u64())
+                .unwrap_or(u64::MAX);
+            assert_eq!(
+                count, 0,
+                "quiet collector {quiet} must render with count=0 \
+                 (NOT KG lifetime, NOT missing); got {count}"
+            );
+        }
     }
 
     // Spec 050-hotfix (issue #656) anchor: when the caller threads a
