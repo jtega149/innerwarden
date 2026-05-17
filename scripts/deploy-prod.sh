@@ -171,10 +171,39 @@ echo "[1/4] Pulling latest code..."
 $SSH "cd $REMOTE_DIR && git stash -q 2>/dev/null; git pull origin main --ff-only" || die "git pull failed"
 
 # Step 2: Build
+#
+# Sensor build always chains the eBPF bytecode build first. The
+# `ebpf-embedded` feature on the sensor crate baked the bytecode into
+# the binary via `include_bytes!`, so the deployed artefact ships
+# everything it needs to load the eBPF subsystem at runtime — no
+# separate .o file beside the binary, no host-time clang+libbpf at
+# install time. This matches what `.github/workflows/release.yml`
+# produces for every official release.
+#
+# Wave 2026-05-17: the previous version of this script passed only
+# `--features ebpf` to sensor builds and never built the bytecode,
+# so manual deploys silently fell back to the runtime .o lookup at
+# /usr/local/lib/innerwarden/innerwarden-ebpf — which never existed
+# on the deploy targets — and the sensor ran without eBPF.
+build_ebpf_bytecode() {
+  echo "[2/4] Building eBPF bytecode (sensor-ebpf, target bpfel-unknown-none)..."
+  $SSH "source ~/.cargo/env && cd $REMOTE_DIR/crates/sensor-ebpf && \
+    RUSTFLAGS='' cargo +nightly build \
+      --target bpfel-unknown-none \
+      -Z build-std=core \
+      --release \
+      --features dispatcher 2>&1 | tail -1"
+  $SSH "ls -la $REMOTE_DIR/crates/sensor-ebpf/target/bpfel-unknown-none/release/innerwarden-ebpf" \
+    || die "eBPF bytecode build did not produce the expected binary"
+}
+
 build_one() {
   local pkg="$1"
   local features=""
-  [ "$pkg" = "innerwarden-sensor" ] && features="--features ebpf"
+  if [ "$pkg" = "innerwarden-sensor" ]; then
+    features="--features ebpf-embedded"
+    build_ebpf_bytecode
+  fi
   [ "$pkg" = "innerwarden-agent" ] && features="--features local-classifier"
   echo "[2/4] Building $pkg..."
   $SSH "source ~/.cargo/env && cd $REMOTE_DIR && cargo build --release -p $pkg $features 2>&1 | tail -1"

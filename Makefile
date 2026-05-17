@@ -4,16 +4,57 @@ AGENT_DIR    := crates/agent
 RELEASE_DIR  := target/$(TARGET_LINUX)/release
 CARGO        := $(HOME)/.cargo/bin/cargo
 
+# Detect whether eBPF can be built on this host. On Linux with bpf-linker
+# installed we ALWAYS embed the BPF bytecode into the sensor binary so a
+# single artefact ships everything needed to load the eBPF subsystem at
+# runtime — no separate .o file deployed beside the binary, no host-time
+# clang+libbpf dependency. On macOS or any host without bpf-linker we
+# silently fall back to building the sensor with `--features ebpf` and
+# rely on the runtime `EBPF_OBJ_PATH` lookup, which keeps the macOS dev
+# loop fast and unblocks contributors who haven't set up the BPF
+# toolchain yet.
+HOST_OS         := $(shell uname -s)
+HAS_BPF_LINKER  := $(shell command -v bpf-linker 2>/dev/null)
+ifeq ($(HOST_OS),Linux)
+ifneq ($(HAS_BPF_LINKER),)
+  SENSOR_FEATURES := ebpf-embedded
+else
+  SENSOR_FEATURES := ebpf
+endif
+else
+  SENSOR_FEATURES := ebpf
+endif
+
 # ─── Local dev ───────────────────────────────────────────────────────────────
 
+# Build the eBPF bytecode (Linux only, requires bpf-linker + nightly Rust).
+# Pre-requisite for `build-sensor` / `build` when on a host that supports
+# bpf-linker. On macOS or hosts without bpf-linker this becomes a no-op
+# so the dev loop stays fast.
+.PHONY: build-ebpf
+build-ebpf:
+ifeq ($(HOST_OS),Linux)
+ifneq ($(HAS_BPF_LINKER),)
+	@echo "[build-ebpf] cd crates/sensor-ebpf && cargo +nightly build --target bpfel-unknown-none …"
+	@cd crates/sensor-ebpf && RUSTFLAGS="" \
+		cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release --features dispatcher
+	@ls -la crates/sensor-ebpf/target/bpfel-unknown-none/release/innerwarden-ebpf
+else
+	@echo "[build-ebpf] bpf-linker not on PATH — skipping bytecode build (sensor will use runtime .o lookup)"
+	@echo "             Install: cargo +nightly install bpf-linker --locked"
+endif
+else
+	@echo "[build-ebpf] host is $(HOST_OS), not Linux — skipping (sensor on macOS dev does not load eBPF)"
+endif
+
 .PHONY: build
-build:
-	$(CARGO) build -p innerwarden-sensor --features ebpf
+build: build-ebpf
+	$(CARGO) build -p innerwarden-sensor --features $(SENSOR_FEATURES)
 	$(CARGO) build -p innerwarden-agent -p innerwarden-ctl
 
 .PHONY: build-sensor
-build-sensor:
-	$(CARGO) build -p innerwarden-sensor --features ebpf
+build-sensor: build-ebpf
+	$(CARGO) build -p innerwarden-sensor --features $(SENSOR_FEATURES)
 
 .PHONY: build-agent
 build-agent:
@@ -93,7 +134,7 @@ build-linux:
 	@$(dir $(CARGO))cargo-zigbuild --version >/dev/null 2>&1 || \
 		{ echo "cargo-zigbuild not found - install with: cargo install cargo-zigbuild"; exit 1; }
 	@rustup target add $(TARGET_LINUX) 2>/dev/null || true
-	$(CARGO) zigbuild -p innerwarden-sensor --features ebpf \
+	$(CARGO) zigbuild -p innerwarden-sensor --features $(SENSOR_FEATURES) \
 		--target $(TARGET_LINUX) --release
 	$(CARGO) zigbuild -p innerwarden-agent -p innerwarden-ctl \
 		--target $(TARGET_LINUX) --release
