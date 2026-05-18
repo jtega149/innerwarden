@@ -404,24 +404,49 @@ mod tests {
             now
         ));
         assert!(!should_skip_hypervisor_cooldown(
-            Some(now - Duration::hours(25)),
+            Some(now - Duration::hours(24)),
             now
         ));
+        assert!(!should_skip_hypervisor_cooldown(None, now));
+    }
+
+    #[test]
+    fn is_virtual_machine_uses_cached_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        state.hypervisor_environment = None;
+        assert!(!is_virtual_machine(&state));
+
+        state.hypervisor_environment = Some(innerwarden_hypervisor::Environment::BareMetal);
+        assert!(!is_virtual_machine(&state));
+
+        state.hypervisor_environment = Some(innerwarden_hypervisor::Environment::VirtualMachine {
+            hypervisor: "kvm".to_string(),
+        });
+        assert!(is_virtual_machine(&state));
+
+        state.hypervisor_environment = Some(innerwarden_hypervisor::Environment::UnknownHypervisor);
+        assert!(is_virtual_machine(&state));
     }
 
     #[test]
     fn classify_hypervisor_trust_severity_uses_score_bands() {
         // Ensures trust-score thresholds map to stable severity levels used by alerting.
         assert!(matches!(
-            classify_hypervisor_trust_severity(0.2),
+            classify_hypervisor_trust_severity(0.29),
             Severity::Critical
         ));
         assert!(matches!(
-            classify_hypervisor_trust_severity(0.5),
+            classify_hypervisor_trust_severity(0.30),
             Severity::High
         ));
         assert!(matches!(
-            classify_hypervisor_trust_severity(0.8),
+            classify_hypervisor_trust_severity(0.59),
+            Severity::High
+        ));
+        assert!(matches!(
+            classify_hypervisor_trust_severity(0.60),
             Severity::Medium
         ));
     }
@@ -439,6 +464,10 @@ mod tests {
         );
         assert_eq!(
             format_hypervisor_severity(&Severity::Medium),
+            "\u{1f7e1} MEDIUM"
+        );
+        assert_eq!(
+            format_hypervisor_severity(&Severity::Info),
             "\u{1f7e1} MEDIUM"
         );
     }
