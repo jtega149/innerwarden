@@ -135,10 +135,31 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn temp_paths() -> (TempDir, std::path::PathBuf) {
+        let td = TempDir::new().unwrap();
+        let cfg = td.path().join("agent.toml");
+        (td, cfg)
+    }
+
+    fn assert_single_record(
+        dir: &Path,
+        rowid_start: i64,
+        rowid_end: i64,
+        operator: &str,
+        reason: &str,
+    ) {
+        let store = Store::open(dir).unwrap();
+        let records = store.list_chain_breaks().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].rowid_start, rowid_start);
+        assert_eq!(records[0].rowid_end, rowid_end);
+        assert_eq!(records[0].operator, operator);
+        assert_eq!(records[0].reason, reason);
+    }
+
     #[test]
     fn register_then_list_round_trip() {
-        let td = TempDir::new().unwrap();
-        let cfg = td.path().join("agent.toml"); // does not need to exist
+        let (td, cfg) = temp_paths();
         cmd_chain_break_register(
             &cfg,
             td.path(),
@@ -150,18 +171,51 @@ mod tests {
         )
         .unwrap();
         // List must include the registered range.
+        assert_single_record(td.path(), 100, 199, "test-op", "regression test");
+    }
+
+    #[test]
+    fn register_json_mode_persists_same_record() {
+        let (td, cfg) = temp_paths();
+
+        cmd_chain_break_register(
+            &cfg,
+            td.path(),
+            7,
+            7,
+            "json-op",
+            "single row recovery",
+            true,
+        )
+        .unwrap();
+
+        assert_single_record(td.path(), 7, 7, "json-op", "single row recovery");
+    }
+
+    #[test]
+    fn register_multiple_ranges_then_list_succeeds_in_both_modes() {
+        let (td, cfg) = temp_paths();
+
+        cmd_chain_break_register(&cfg, td.path(), 1, 2, "alice", "manual import", false).unwrap();
+        cmd_chain_break_register(&cfg, td.path(), 10, 12, "bob", "schema repair", true).unwrap();
+
+        cmd_chain_break_list(&cfg, td.path(), false).unwrap();
+        cmd_chain_break_list(&cfg, td.path(), true).unwrap();
+
         let store = Store::open(td.path()).unwrap();
         let records = store.list_chain_breaks().unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].rowid_start, 100);
-        assert_eq!(records[0].rowid_end, 199);
-        assert_eq!(records[0].operator, "test-op");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].rowid_start, 1);
+        assert_eq!(records[0].rowid_end, 2);
+        assert_eq!(records[0].operator, "alice");
+        assert_eq!(records[1].rowid_start, 10);
+        assert_eq!(records[1].rowid_end, 12);
+        assert_eq!(records[1].operator, "bob");
     }
 
     #[test]
     fn register_rejects_inverted_range() {
-        let td = TempDir::new().unwrap();
-        let cfg = td.path().join("agent.toml");
+        let (td, cfg) = temp_paths();
         let err =
             cmd_chain_break_register(&cfg, td.path(), 500, 100, "test-op", "should fail", false)
                 .unwrap_err();
@@ -174,8 +228,7 @@ mod tests {
 
     #[test]
     fn list_empty_database_has_no_records() {
-        let td = TempDir::new().unwrap();
-        let cfg = td.path().join("agent.toml");
+        let (td, cfg) = temp_paths();
         // Just calling list on a fresh DB should not error.
         cmd_chain_break_list(&cfg, td.path(), true).unwrap();
         let store = Store::open(td.path()).unwrap();
