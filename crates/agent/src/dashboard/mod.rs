@@ -8356,4 +8356,195 @@ mod tests {
              this wiring the pill code is dead."
         );
     }
+
+    // -----------------------------------------------------------------
+    // Wave 2026-05-18 — cross-file consistency anchors for the
+    // collector-name drift the operator hit on prod. Three pieces
+    // must agree on the same set of names:
+    //   1. `crates/sensor/src/collector_health.rs::COLLECTOR_MANIFEST`
+    //   2. `crates/agent/src/dashboard/sensors.rs::KNOWN_COLLECTORS`
+    //   3. `crates/agent/src/dashboard/frontend/js/sensors.js`'s
+    //      `COLLECTOR_CATEGORY` object literal.
+    // Drift in any of these surfaces causes either phantom rows
+    // ("osquery TELEMETRY 0") or mis-categorised real ones
+    // ("fanotify TELEMETRY 0" instead of ALARM).
+    // -----------------------------------------------------------------
+
+    fn js_collector_category_names() -> std::collections::HashSet<String> {
+        // Extract the keys from the COLLECTOR_CATEGORY object literal
+        // in sensors.js. The object spans from `const COLLECTOR_CATEGORY = {`
+        // to the matching `};`. Each entry looks like `  key: 'value',`
+        // with possible leading whitespace. The test crashes hard if
+        // the literal isn't found — that's the signal a future
+        // rename of the object broke this anchor.
+        let start = JS_SENSORS
+            .find("const COLLECTOR_CATEGORY = {")
+            .expect("sensors.js must define `const COLLECTOR_CATEGORY = {`");
+        let after_open = start + "const COLLECTOR_CATEGORY = {".len();
+        let close = after_open
+            + JS_SENSORS[after_open..]
+                .find("};")
+                .expect("sensors.js COLLECTOR_CATEGORY object missing closing `};`");
+        let body = &JS_SENSORS[after_open..close];
+
+        let mut names = std::collections::HashSet::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            // Each property is `key: 'value',` — pull everything
+            // before the first colon and strip quoting.
+            let Some(colon) = trimmed.find(':') else {
+                continue;
+            };
+            let raw_key = trimmed[..colon].trim();
+            let key = raw_key
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .to_string();
+            if key.is_empty() {
+                continue;
+            }
+            names.insert(key);
+        }
+        names
+    }
+
+    fn rust_manifest_names() -> std::collections::HashSet<String> {
+        // The sensor manifest is the source of truth. Greping the
+        // source string keeps the test independent of crate-dep
+        // shape (agent does not import the sensor crate).
+        const MANIFEST_SRC: &str = include_str!("../../../sensor/src/collector_health.rs");
+        // Lines look like:  ("auth_log", CollectorCategory::Telemetry),
+        let mut names = std::collections::HashSet::new();
+        for line in MANIFEST_SRC.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("(\"") {
+                continue;
+            }
+            // Pull out the quoted name.
+            let rest = trimmed.trim_start_matches("(\"");
+            if let Some(end) = rest.find('"') {
+                let name = &rest[..end];
+                names.insert(name.to_string());
+            }
+        }
+        names
+    }
+
+    fn agent_known_collectors() -> std::collections::HashSet<String> {
+        // Same trick on the agent's KNOWN_COLLECTORS const so all
+        // three surfaces are compared via the same source-grep path.
+        const SRC: &str = include_str!("sensors.rs");
+        let start = SRC
+            .find("pub(super) const KNOWN_COLLECTORS: &[&str] = &[")
+            .expect("sensors.rs must define KNOWN_COLLECTORS");
+        let after_open = start + "pub(super) const KNOWN_COLLECTORS: &[&str] = &[".len();
+        let close = after_open
+            + SRC[after_open..]
+                .find("];")
+                .expect("KNOWN_COLLECTORS missing closing `];`");
+        let body = &SRC[after_open..close];
+
+        let mut names = std::collections::HashSet::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            // Each entry is `"name",`
+            let stripped = trimmed.trim_end_matches(',').trim();
+            if stripped.starts_with('"') && stripped.ends_with('"') && stripped.len() >= 2 {
+                names.insert(stripped[1..stripped.len() - 1].to_string());
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn collector_names_agree_across_sensor_manifest_agent_const_and_js() {
+        let rust = rust_manifest_names();
+        let agent = agent_known_collectors();
+        let js = js_collector_category_names();
+
+        // Sensor manifest is the source of truth — assert the
+        // agent-side roster matches it exactly.
+        let only_in_rust: Vec<_> = rust.difference(&agent).collect();
+        let only_in_agent: Vec<_> = agent.difference(&rust).collect();
+        assert!(
+            only_in_rust.is_empty() && only_in_agent.is_empty(),
+            "drift between sensor COLLECTOR_MANIFEST and agent KNOWN_COLLECTORS:\n\
+             only in sensor manifest: {only_in_rust:?}\n\
+             only in agent KNOWN_COLLECTORS: {only_in_agent:?}\n\
+             Both lists must match — see Wave 2026-05-18."
+        );
+
+        let only_in_rust: Vec<_> = rust.difference(&js).collect();
+        let only_in_js: Vec<_> = js.difference(&rust).collect();
+        assert!(
+            only_in_rust.is_empty() && only_in_js.is_empty(),
+            "drift between sensor COLLECTOR_MANIFEST and frontend COLLECTOR_CATEGORY:\n\
+             only in sensor manifest: {only_in_rust:?}\n\
+             only in frontend JS: {only_in_js:?}\n\
+             Both maps must match — see Wave 2026-05-18. The operator screenshot \
+             on 2026-05-18 showed `osquery` listed as TELEMETRY 0 because the JS \
+             map carried a retired name the manifest had already removed."
+        );
+    }
+
+    #[test]
+    fn collector_names_do_not_contain_retired_phantoms_anywhere() {
+        // Belt-and-suspenders: even if `agree_across_*` somehow let
+        // both sides be wrong in the same way, this test catches the
+        // specific names that were the operator's prod problem.
+        let rust = rust_manifest_names();
+        let agent = agent_known_collectors();
+        let js = js_collector_category_names();
+
+        for phantom in &[
+            "osquery",
+            "osquery_log",
+            "suricata_eve",
+            "suricata_alert",
+            "wazuh_alerts",
+            // A retired SaaS-style log shipper from the same Wave
+            // 8b/8c cleanup belongs in this list too, but it is
+            // covered by a separate CI anti-mention guard at
+            // scripts/verify-no-*.sh that refuses any occurrence of
+            // that vendor's name in crates/agent/src/. These 5
+            // names are enough anchor for this test.
+        ] {
+            assert!(
+                !rust.contains(*phantom),
+                "phantom {phantom} found in sensor COLLECTOR_MANIFEST"
+            );
+            assert!(
+                !agent.contains(*phantom),
+                "phantom {phantom} found in agent KNOWN_COLLECTORS"
+            );
+            assert!(
+                !js.contains(*phantom),
+                "phantom {phantom} found in frontend COLLECTOR_CATEGORY"
+            );
+        }
+
+        // The three drift aliases from the same wave. Same reason:
+        // the canonical wire names are `ebpf`, `auditd`, `fanotify`.
+        for drift in &["ebpf_syscall", "exec_audit", "fanotify_watch"] {
+            assert!(
+                !rust.contains(*drift),
+                "drift alias {drift} re-added to sensor COLLECTOR_MANIFEST"
+            );
+            assert!(
+                !agent.contains(*drift),
+                "drift alias {drift} re-added to agent KNOWN_COLLECTORS"
+            );
+            assert!(
+                !js.contains(*drift),
+                "drift alias {drift} re-added to frontend COLLECTOR_CATEGORY"
+            );
+        }
+    }
 }

@@ -1,0 +1,30 @@
+name: Retired Integrations Guard
+
+# Vendor-neutral guard against stale third-party tool names leaking
+# back into the agent source tree. Inner Warden is a clean-room Rust
+# implementation; earlier waves shipped optional one-way input
+# adapters that were retired when the native eBPF + detector layer
+# covered the same surface. The renamed-to-"rules-only-mode"
+# cleanup in Wave 8f stays honest as long as this guard runs.
+#
+# Script: ./scripts/verify-retired-integrations.sh — header docstring
+# explains scope and exit codes.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - development
+
+permissions:
+  contents: read
+
+jobs:
+  verify-retired-integrations:
+    name: Verify no retired vendor mentions in agent source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run verify-retired-integrations.sh
+        run: ./scripts/verify-retired-integrations.sh

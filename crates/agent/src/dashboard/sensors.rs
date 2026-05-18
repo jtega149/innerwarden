@@ -149,6 +149,57 @@ pub(super) fn tests_only_call_build_sensors_payload(
     )
 }
 
+/// Known collector names this agent will render in the sensors HUD.
+///
+/// Wave 2026-05-18: copy of the sensor crate's `COLLECTOR_MANIFEST`
+/// names. The agent does NOT depend on the sensor crate (they're
+/// separate processes by design), but we need a roster to filter the
+/// KG `source_counts` against — otherwise legacy KG snapshots carry
+/// retired names like `osquery_log` forever and the dashboard
+/// renders them as phantom rows that look like broken telemetry.
+///
+/// A cross-file consistency anchor in `crates/agent/src/dashboard/mod.rs`
+/// (`every_sensor_manifest_name_appears_in_known_collectors_list`)
+/// asserts this list matches the sensor manifest byte-for-byte. Add
+/// or rename a collector → both sides update or CI fails.
+pub(super) const KNOWN_COLLECTORS: &[&str] = &[
+    "auth_log",
+    "auditd",
+    "cgroup",
+    "cloudtrail",
+    "dns_capture",
+    "ebpf",
+    "file_extract",
+    "http_capture",
+    "journald",
+    "kernel_integrity",
+    "macos_log",
+    "net_snapshot",
+    "nginx_access",
+    "nginx_error",
+    "proc_maps",
+    "proto_http",
+    "proto_smb",
+    "proto_ssh",
+    "syslog_firewall",
+    "tcp_stream",
+    "docker",
+    "fanotify",
+    "firmware_integrity",
+    "integrity",
+    "sysctl_drift",
+    "tls_fingerprint",
+    "usb_monitor",
+    "suid_inventory",
+    "systemd_inventory",
+];
+
+/// True iff `name` is in `KNOWN_COLLECTORS`. Pure so the filtering
+/// rule stays unit-testable without spinning up a dashboard.
+pub(super) fn filter_known_collector(name: &str) -> bool {
+    KNOWN_COLLECTORS.contains(&name)
+}
+
 fn build_sensors_payload(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: &std::path::Path,
@@ -257,6 +308,18 @@ fn build_sensors_payload(
             None => vec![],
         }
     };
+
+    // Wave 2026-05-18 fix: drop entries whose `source` name is not
+    // in the current sensor manifest. Legacy KG snapshots may carry
+    // names like `osquery_log` from retired collectors — without
+    // this filter the dashboard renders a phantom "TELEMETRY 0" row
+    // for every retired name and the operator can't tell phantoms
+    // from real broken collectors. The manifest is the source of
+    // truth for "what collectors this binary actually ships".
+    let sources: Vec<(String, usize)> = sources
+        .into_iter()
+        .filter(|(name, _)| filter_known_collector(name))
+        .collect();
 
     let mut kinds: Vec<_> = graph
         .kind_counts
@@ -703,7 +766,12 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
             "log_path": audit_log,
             "detected": file_exists(audit_log),
             "active": recent(file_age_secs(audit_log)),
-            "events_today": count_source("exec_audit"),
+            // Wave 2026-05-18: count_source must match what the collector
+            // actually writes to Event.source — `exec_audit.rs` emits
+            // `source: "auditd"`. Pre-fix this card always showed
+            // `events_today: 0` even when auditd was busy, because the
+            // count was looking up a wire name that never existed.
+            "events_today": count_source("auditd"),
             "desc": "auditd EXECVE events - execution guard and shell command trail"
         },
         {
@@ -1473,6 +1541,98 @@ mod tests {
             "total_events MUST come from snapshot.events_today (the \
              canonical SoT field). If this drops to 0, the SoT \
              contract regressed — see fix in compute_overview_counts_from_sqlite"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 2026-05-18 — telemetry name drift + phantom suppression.
+    // Anchored on the operator's prod screenshot where the sensors HUD
+    // listed 6 telemetry streams at 0 today, including `osquery` (a
+    // retired collector that never shipped) and `fanotify` (mis-
+    // categorised as TELEMETRY when it's actually an ALARM whose
+    // silence means the watched paths are quiet).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn filter_known_collector_accepts_every_current_manifest_name() {
+        // Each name in KNOWN_COLLECTORS must round-trip through the
+        // filter. If a name is added to the list but the filter is
+        // somehow case-sensitive or trimmed wrong, this catches it.
+        for name in KNOWN_COLLECTORS {
+            assert!(
+                filter_known_collector(name),
+                "KNOWN_COLLECTORS contains {name:?} but filter_known_collector rejected it"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_known_collector_rejects_retired_phantom_names() {
+        // Hard regression anchor for the operator's prod screenshot.
+        // If any future PR adds these back without a real collector,
+        // this test fails.
+        for retired in &["osquery", "osquery_log", "suricata_eve", "suricata_alert"] {
+            assert!(
+                !filter_known_collector(retired),
+                "phantom collector {retired:?} should NOT pass the filter"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_known_collector_rejects_drift_aliases_for_renamed_collectors() {
+        // The three drift cases this PR fixed. None of these wire
+        // names should pass the filter — the canonical names
+        // (`ebpf`, `auditd`, `fanotify`) cover them.
+        for drift in &["ebpf_syscall", "exec_audit", "fanotify_watch"] {
+            assert!(
+                !filter_known_collector(drift),
+                "drift alias {drift:?} should NOT pass the filter — the canonical name covers it"
+            );
+        }
+    }
+
+    #[test]
+    fn build_sensors_payload_drops_phantom_kg_entries() {
+        // The literal prod scenario: KG `source_counts` holds a
+        // legacy `osquery_log` entry from a removed collector. The
+        // dashboard payload must NOT include it in the sources roster.
+        let dir = tempfile::TempDir::new().unwrap();
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        {
+            let mut g = kg.write().unwrap();
+            // Seed source_counts with both a real and a phantom name.
+            // Use the same intern() path the live ingestion code uses
+            // so the key shape matches the production path.
+            *g.source_counts
+                .entry(crate::knowledge_graph::intern::intern("ebpf"))
+                .or_insert(0) += 5;
+            *g.source_counts
+                .entry(crate::knowledge_graph::intern::intern("osquery_log"))
+                .or_insert(0) += 42; // phantom
+            *g.source_counts
+                .entry(crate::knowledge_graph::intern::intern("fanotify_watch"))
+                .or_insert(0) += 7; // drift alias
+            g.total_events_ingested = 54;
+        }
+
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, None);
+        let sources = payload["sources"]
+            .as_array()
+            .expect("payload must include sources array");
+
+        let names: Vec<&str> = sources.iter().filter_map(|v| v["name"].as_str()).collect();
+
+        assert!(names.contains(&"ebpf"), "real collector must remain");
+        assert!(
+            !names.contains(&"osquery_log"),
+            "phantom name `osquery_log` leaked into payload: {names:?}"
+        );
+        assert!(
+            !names.contains(&"fanotify_watch"),
+            "drift alias `fanotify_watch` leaked into payload (canonical is `fanotify`): {names:?}"
         );
     }
 }

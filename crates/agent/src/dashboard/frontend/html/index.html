@@ -201,11 +201,17 @@
         <div class="home-onboarding-title">No threats today — everything is being watched.</div>
         <div class="home-onboarding-sub" id="homeOnboardingSub">Sensors are streaming events. Detections appear here as soon as the AI sees them.</div>
       </div>
-      <!-- 2026-05-15: link used to jump to the Sensors view. That
-           view was deleted; the per-collector panel now lives on this
-           same page (`#homeSensorsPanel`) so the link is a same-page
-           anchor jump instead. -->
-      <a class="home-onboarding-link" href="#homeSensorsPanel">Check sensors &rarr;</a>
+      <!-- 2026-05-18: "Check sensors →" link removed. It used to
+           navigate to the standalone Sensors view, which was deleted
+           in Wave 2026-05-15 (per-collector panel folded into Home).
+           The post-Wave version pointed at `#homeSensorsPanel` — an
+           anchor lower on this same page — which made clicks feel
+           like a no-op since the panel is already visible without
+           scrolling on most viewports. Operator: "Check sensors →
+           esse botao na home manda pra uma pagina que nao existe
+           mais". Removed instead of repurposed: the sub-line above
+           ("Sensors are streaming events. Detections appear here
+           …") already tells the user where to look. -->
     </div>
 
     <!-- 5. AI INTELLIGENCE BRIEFING: always visible per operator

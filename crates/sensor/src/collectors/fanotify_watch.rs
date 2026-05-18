@@ -746,4 +746,41 @@ mod tests {
         );
         assert_eq!(ev.severity, Severity::High);
     }
+
+    #[test]
+    fn source_name_matches_dashboard_manifest() {
+        // Wave 2026-05-18 regression anchor. The dashboard's
+        // COLLECTOR_MANIFEST and the frontend's COLLECTOR_CATEGORY
+        // map both classify this collector under the wire name
+        // `fanotify`. If someone renames the source string here to
+        // `fanotify_watch` or anything else, the dashboard will
+        // either render this collector as TELEMETRY 0 (mis-
+        // categorised) or as a phantom row that never fires. The
+        // test asserts that BOTH event-construction paths in this
+        // file use the same canonical name.
+        let now = chrono::Utc::now();
+        let state = FileState {
+            hash: "deadbeef".into(),
+            last_modified: now,
+            size: 1,
+        };
+        let ev = build_file_change_event("test-host", now, "/etc/passwd", &state, None, Some(7.95));
+        assert_eq!(
+            ev.source, "fanotify",
+            "fanotify_watch.rs must emit `source: \"fanotify\"` to match \
+             the dashboard's COLLECTOR_MANIFEST entry (see Wave 2026-05-18). \
+             Drifting this name resurrects the phantom-row bug the operator hit on prod."
+        );
+
+        let tracker = WriteBurstTracker {
+            writes: vec![now; 60],
+            last_alert: None,
+        };
+        let burst_ev = build_ransomware_burst_event("test-host", now, &tracker, "/var/some/path");
+        assert_eq!(
+            burst_ev.source, "fanotify",
+            "ransomware-burst events must also carry `source: \"fanotify\"` so \
+             both event paths route through the same dashboard category."
+        );
+    }
 }

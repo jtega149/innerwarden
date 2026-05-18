@@ -3,7 +3,7 @@
 const SENSOR_COLORS = {
   ebpf: '#7fe7ff', auditd: '#fb7185', auth_log: '#fbbf24', journald: '#4ade80',
   docker: '#60a5fa', nginx: '#f97316', syslog: '#8b9db8', integrity: '#84cc16', cloudtrail: '#3b82f6',
-  exec_audit: '#fb7185', syslog_firewall: '#8b9db8', firmware_integrity: '#84cc16',
+  fanotify: '#fb7185', syslog_firewall: '#8b9db8', firmware_integrity: '#84cc16',
   macos_log: '#a78bfa',  };
 function sensorColor(name) { return SENSOR_COLORS[name] || '#78e5ff'; }
 
@@ -13,6 +13,22 @@ function sensorColor(name) { return SENSOR_COLORS[name] || '#78e5ff'; }
 // Cross-file anchor in `crates/agent/src/dashboard/mod.rs` asserts
 // every Rust manifest entry has a JS entry — drift fails CI.
 const COLLECTOR_CATEGORY = {
+  // Wave 2026-05-18: keys MUST match the wire `source` names emitted
+  // by collectors AND the Rust COLLECTOR_MANIFEST entries. Drift here
+  // means the dashboard either renders phantom rows or mis-categorises
+  // real ones as TELEMETRY 0 (looks broken when it's just silence).
+  // The Rust-side `every_js_collector_appears_in_manifest` test fails
+  // CI if these two maps drift. Three fixes baked in:
+  //
+  //   * `osquery_log` and `suricata_eve` removed — those collectors
+  //     never shipped, the keys were vestiges from a design that was
+  //     abandoned before Wave 8b/8c.
+  //   * `ebpf_syscall` and `exec_audit` removed — duplicates that
+  //     never matched a real `source` name (`ebpf` and `auditd` cover
+  //     their real wire output).
+  //   * `fanotify_watch` renamed to `fanotify` — matches the actual
+  //     source name written by `crates/sensor/src/collectors/fanotify_watch.rs:163`.
+  //
   // Telemetry: always-on, high-volume feeds. Low count → broken.
   auth_log: 'telemetry',
   auditd: 'telemetry',
@@ -20,8 +36,6 @@ const COLLECTOR_CATEGORY = {
   cloudtrail: 'telemetry',
   dns_capture: 'telemetry',
   ebpf: 'telemetry',
-  ebpf_syscall: 'telemetry',
-  exec_audit: 'telemetry',
   file_extract: 'telemetry',
   http_capture: 'telemetry',
   journald: 'telemetry',
@@ -30,17 +44,15 @@ const COLLECTOR_CATEGORY = {
   net_snapshot: 'telemetry',
   nginx_access: 'telemetry',
   nginx_error: 'telemetry',
-  osquery_log: 'telemetry',
   proc_maps: 'telemetry',
   proto_http: 'telemetry',
   proto_smb: 'telemetry',
   proto_ssh: 'telemetry',
-  suricata_eve: 'telemetry',
   syslog_firewall: 'telemetry',
   tcp_stream: 'telemetry',
   // Alarm: event-driven detectors. Silence is healthy.
   docker: 'alarm',
-  fanotify_watch: 'alarm',
+  fanotify: 'alarm',
   firmware_integrity: 'alarm',
   integrity: 'alarm',
   sysctl_drift: 'alarm',

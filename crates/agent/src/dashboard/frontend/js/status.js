@@ -370,7 +370,7 @@ function renderStatus(s, collectors) {
   if (collectors.length > 0) {
     const colIcons = {
       auth_log: lucideIcon('lock'), journald: lucideIcon('clipboard-list'), docker: lucideIcon('server'), nginx_access: lucideIcon('globe'), nginx_error: lucideIcon('alert-triangle'),
-      exec_audit: lucideIcon('search'), ebpf: lucideIcon('flame'),
+      auditd: lucideIcon('search'), ebpf: lucideIcon('flame'),
       syslog_firewall: lucideIcon('shield'), firmware_integrity: lucideIcon('wrench'), cloudtrail: lucideIcon('globe'), macos_log: lucideIcon('cpu'),      };
     const colStyle =
       '.col-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:4px}' +

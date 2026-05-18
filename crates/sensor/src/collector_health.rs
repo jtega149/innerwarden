@@ -197,14 +197,35 @@ pub struct CollectorStatus {
 /// not in this table.
 pub const COLLECTOR_MANIFEST: &[(&str, CollectorCategory)] = &[
     // ── Telemetry: always-on, high-volume feeds. ────────────────────
+    //
+    // Wave 2026-05-18: names here MUST match what the corresponding
+    // collector writes into `Event.source`. Three drift cases were
+    // fixed in this wave:
+    //
+    //   * `ebpf_syscall` was a duplicate slot — the collector emits
+    //     `source: "ebpf"`, never `"ebpf_syscall"`. Dashboard
+    //     dutifully rendered the slot at 0 events lifetime, making
+    //     operators think the syscall feed was broken when it was
+    //     just the wrong name.
+    //
+    //   * `exec_audit` was a duplicate slot — the collector emits
+    //     `source: "auditd"`. Same symptom.
+    //
+    //   * `fanotify_watch` was a real name drift — the collector
+    //     emits `source: "fanotify"`. Renaming the manifest entry to
+    //     match the wire format makes the dashboard's category
+    //     lookup actually succeed (previously it defaulted to
+    //     Telemetry because the wire name wasn't in the manifest).
+    //
+    // A cross-file consistency test in `crates/agent/src/dashboard/mod.rs`
+    // and the `source_name_matches_manifest` anchors below guard this
+    // alignment going forward.
     ("auth_log", CollectorCategory::Telemetry),
     ("auditd", CollectorCategory::Telemetry),
     ("cgroup", CollectorCategory::Telemetry),
     ("cloudtrail", CollectorCategory::Telemetry),
     ("dns_capture", CollectorCategory::Telemetry),
     ("ebpf", CollectorCategory::Telemetry),
-    ("ebpf_syscall", CollectorCategory::Telemetry),
-    ("exec_audit", CollectorCategory::Telemetry),
     ("file_extract", CollectorCategory::Telemetry),
     ("http_capture", CollectorCategory::Telemetry),
     ("journald", CollectorCategory::Telemetry),
@@ -213,15 +234,6 @@ pub const COLLECTOR_MANIFEST: &[(&str, CollectorCategory)] = &[
     ("net_snapshot", CollectorCategory::Telemetry),
     ("nginx_access", CollectorCategory::Telemetry),
     ("nginx_error", CollectorCategory::Telemetry),
-    // ── REMOVED 2026-05-17: phantom entries ──────────────────────────
-    // `osquery_log` and `suricata_eve` were listed here as if they
-    // shipped, but the corresponding collectors were never present in
-    // crates/sensor/src/collectors/. Wave 8b/8c (2026-05-04) cleaned the
-    // source-of-truth drift but missed this registry — so the dashboard
-    // kept rendering the phantom slots forever stuck at 0 events.
-    // See CLAUDE.md "Sensor source layout" note: "Older copies of this
-    // section listed [...] osquery_log and osquery_anomaly / suricata_alert
-    // as if they existed — they never did."
     ("proc_maps", CollectorCategory::Telemetry),
     ("proto_http", CollectorCategory::Telemetry),
     ("proto_smb", CollectorCategory::Telemetry),
@@ -230,7 +242,7 @@ pub const COLLECTOR_MANIFEST: &[(&str, CollectorCategory)] = &[
     ("tcp_stream", CollectorCategory::Telemetry),
     // ── Alarm: event-driven detectors. Silence = healthy. ───────────
     ("docker", CollectorCategory::Alarm),
-    ("fanotify_watch", CollectorCategory::Alarm),
+    ("fanotify", CollectorCategory::Alarm),
     ("firmware_integrity", CollectorCategory::Alarm),
     ("integrity", CollectorCategory::Alarm),
     ("sysctl_drift", CollectorCategory::Alarm),
@@ -466,13 +478,65 @@ mod tests {
     #[test]
     fn category_for_known_alarm_collectors() {
         // Anti-regression for the operator-driven 2026-05-14
-        // classification: tls_fingerprint, fanotify_watch, integrity,
+        // classification: tls_fingerprint, fanotify, integrity,
         // sysctl_drift are alarm-style and their low counts mean the
         // host is healthy, NOT that the collector is broken.
+        //
+        // 2026-05-18: `fanotify_watch` renamed to `fanotify` to match
+        // the wire `source` name the collector actually writes (see
+        // crates/sensor/src/collectors/fanotify_watch.rs:163). The
+        // old name now correctly returns the unknown-default
+        // Telemetry, which is what `source_name_drift_no_longer_in_manifest`
+        // pins below.
         assert_eq!(category_for("tls_fingerprint"), CollectorCategory::Alarm);
-        assert_eq!(category_for("fanotify_watch"), CollectorCategory::Alarm);
+        assert_eq!(category_for("fanotify"), CollectorCategory::Alarm);
         assert_eq!(category_for("integrity"), CollectorCategory::Alarm);
         assert_eq!(category_for("sysctl_drift"), CollectorCategory::Alarm);
+    }
+
+    #[test]
+    fn source_name_drift_no_longer_in_manifest() {
+        // Regression anchor for the 2026-05-18 wire-name drift fix.
+        // These three names used to be in COLLECTOR_MANIFEST but
+        // didn't match what the collectors actually wrote to
+        // Event.source — `ebpf_syscall.rs` emits "ebpf",
+        // `exec_audit.rs` emits "auditd", `fanotify_watch.rs` emits
+        // "fanotify". The dashboard mis-rendered them as TELEMETRY 0
+        // forever. Now the manifest has the canonical names only;
+        // the drift aliases must NOT come back.
+        assert!(
+            !COLLECTOR_MANIFEST
+                .iter()
+                .any(|(name, _)| *name == "ebpf_syscall"),
+            "drift alias `ebpf_syscall` re-added to manifest — collector emits `ebpf`"
+        );
+        assert!(
+            !COLLECTOR_MANIFEST
+                .iter()
+                .any(|(name, _)| *name == "exec_audit"),
+            "drift alias `exec_audit` re-added to manifest — collector emits `auditd`"
+        );
+        assert!(
+            !COLLECTOR_MANIFEST
+                .iter()
+                .any(|(name, _)| *name == "fanotify_watch"),
+            "drift alias `fanotify_watch` re-added to manifest — collector emits `fanotify`"
+        );
+        // Canonical names that DO match Event.source.
+        assert!(
+            COLLECTOR_MANIFEST.iter().any(|(name, _)| *name == "ebpf"),
+            "manifest must keep `ebpf` (the wire name)"
+        );
+        assert!(
+            COLLECTOR_MANIFEST.iter().any(|(name, _)| *name == "auditd"),
+            "manifest must keep `auditd` (the wire name)"
+        );
+        assert!(
+            COLLECTOR_MANIFEST
+                .iter()
+                .any(|(name, _)| *name == "fanotify"),
+            "manifest must keep `fanotify` (the wire name)"
+        );
     }
 
     #[test]
