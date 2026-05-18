@@ -546,6 +546,13 @@ pub(super) async fn api_agent_guard_connect(
     match registry.connect(name, pid, label) {
         Ok(agent_id) => {
             tracing::info!(agent_id = %agent_id, name, pid, "agent-guard: agent connected via API");
+            // 2026-05-18: persist after every successful connect so
+            // the ag-id binding survives an agent restart. Fail-soft:
+            // log on error, do not roll back the in-memory state.
+            let snapshot_path = state.data_dir.join("agent-guard-registry.json");
+            if let Err(e) = registry.save_to(&snapshot_path) {
+                tracing::warn!(error = %e, path = %snapshot_path.display(), "agent-guard: failed to persist registry after connect");
+            }
             Json(serde_json::json!({
                 "connected": true,
                 "agent_id": agent_id,
@@ -575,6 +582,14 @@ pub(super) async fn api_agent_guard_disconnect(
     let agent_id = body["agent_id"].as_str().unwrap_or("");
     let mut registry = state.agent_registry.lock().await;
     let ok = registry.disconnect(agent_id);
+    // 2026-05-18: persist after every disconnect too, so a restart
+    // doesn't resurrect agents the operator explicitly released.
+    if ok {
+        let snapshot_path = state.data_dir.join("agent-guard-registry.json");
+        if let Err(e) = registry.save_to(&snapshot_path) {
+            tracing::warn!(error = %e, path = %snapshot_path.display(), "agent-guard: failed to persist registry after disconnect");
+        }
+    }
     Json(serde_json::json!({ "disconnected": ok }))
 }
 

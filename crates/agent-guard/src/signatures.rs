@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     /// Autonomous agent with persistent memory — installable via `innerwarden agent add`
     Agent,
@@ -207,6 +207,7 @@ pub static KNOWN: &[Signature] = &[
     },
 ];
 
+#[derive(Debug)]
 pub struct SignatureIndex {
     by_process: HashMap<String, usize>,
 }

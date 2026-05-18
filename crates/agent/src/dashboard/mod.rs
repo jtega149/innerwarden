@@ -498,9 +498,35 @@ pub async fn serve(
         session_timeout_minutes,
         max_sessions,
         advisory_cache: advisory_cache.clone(),
-        agent_registry: Arc::new(tokio::sync::Mutex::new(
-            innerwarden_agent_guard::registry::Registry::new(),
-        )),
+        // 2026-05-18: rehydrate the agent-guard registry from the
+        // on-disk snapshot so `agent connect` survives an agent
+        // restart. The watchdog dance from #681 swaps the agent
+        // binary every deploy; before persistence the registry came
+        // back empty and the operator had to re-run `innerwarden
+        // agent connect` after every release. A missing snapshot
+        // (clean install) returns an empty registry — not an error.
+        // A corrupt snapshot is surfaced as a warning and we fall
+        // back to empty so the dashboard still starts.
+        agent_registry: Arc::new(tokio::sync::Mutex::new({
+            let snapshot_path = data_dir.join("agent-guard-registry.json");
+            match innerwarden_agent_guard::registry::Registry::restore_from(&snapshot_path) {
+                Ok(reg) => {
+                    if reg.count_total() > 0 {
+                        info!(
+                            path = %snapshot_path.display(),
+                            agents = reg.count_agents(),
+                            tools = reg.count_tools(),
+                            "agent-guard registry restored from snapshot",
+                        );
+                    }
+                    reg
+                }
+                Err(e) => {
+                    warn!(error = %e, path = %snapshot_path.display(), "failed to restore agent-guard registry; starting empty");
+                    innerwarden_agent_guard::registry::Registry::new()
+                }
+            }
+        })),
         rule_engine,
         agent_alert_tx,
         deep_security,

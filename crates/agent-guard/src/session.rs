@@ -22,6 +22,7 @@ pub struct Alert {
     pub reason: String,
 }
 
+#[derive(Debug)]
 pub struct SessionTracker {
     call_times: Vec<Instant>,
     failures: u32,
