@@ -744,6 +744,125 @@ fn truncate_path(path: &str, max: usize) -> &str {
 mod tests {
     use super::*;
 
+    fn write_bmp_fixture(bytes: usize) -> tempfile::NamedTempFile {
+        let file = tempfile::Builder::new().suffix(".bmp").tempfile().unwrap();
+        let mut bmp = vec![0u8; 54 + bytes];
+        bmp[0] = b'B';
+        bmp[1] = b'M';
+        let size = bmp.len() as u32;
+        bmp[2..6].copy_from_slice(&size.to_le_bytes());
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&10u32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&10u32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        for (i, b) in bmp[54..].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        std::fs::write(file.path(), bmp).unwrap();
+        file
+    }
+
+    fn file_event(kind: &str, filename: &str, ts: DateTime<Utc>) -> Event {
+        Event {
+            ts,
+            host: "source-host".into(),
+            source: "fixture".into(),
+            kind: kind.into(),
+            severity: Severity::Info,
+            summary: String::new(),
+            details: serde_json::json!({
+                "filename": filename,
+                "comm": "writer",
+                "pid": 4242u64,
+            }),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detector_emits_incident_for_supported_image_and_enforces_cooldown() {
+        let image = write_bmp_fixture(1200);
+        let filename = image.path().to_str().unwrap();
+        let now = Utc::now();
+        let mut detector = StegoDetector::new("analysis-host", 300);
+        detector.threshold = -1.0;
+
+        let incident = detector
+            .process(&file_event("file.write_access", filename, now))
+            .expect("forced low threshold should emit incident");
+
+        assert_eq!(incident.host, "analysis-host");
+        assert_eq!(incident.severity, Severity::High);
+        assert!(incident.title.contains("Steganography detected"));
+        assert_eq!(incident.evidence[0]["filename"], filename);
+        assert_eq!(incident.evidence[0]["comm"], "writer");
+        assert_eq!(incident.evidence[0]["pid"], 4242);
+        assert!(incident.tags.contains(&"steganography".to_string()));
+        assert_eq!(incident.entities.len(), 1);
+
+        assert!(detector
+            .process(&file_event(
+                "file.realtime_modified",
+                filename,
+                now + Duration::seconds(1),
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn detector_ignores_unsupported_events_and_file_sizes() {
+        let image = write_bmp_fixture(1200);
+        let filename = image.path().to_str().unwrap();
+        let mut detector = StegoDetector::new("analysis-host", 300);
+        detector.threshold = -1.0;
+
+        assert!(detector
+            .process(&file_event("process.exec", filename, Utc::now()))
+            .is_none());
+        assert!(detector
+            .process(&file_event(
+                "file.write_access",
+                "/tmp/not-image.txt",
+                Utc::now()
+            ))
+            .is_none());
+
+        let small = write_bmp_fixture(16);
+        assert!(detector
+            .process(&file_event(
+                "file.write_access",
+                small.path().to_str().unwrap(),
+                Utc::now(),
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn ppm_extraction_handles_comments_and_invalid_headers() {
+        let mut ppm = b"P6\n# comment\n2 1\n255\n".to_vec();
+        ppm.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+
+        assert_eq!(extract_ppm_pixels(&ppm).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert!(extract_ppm_pixels(b"P3\n2 1\n255\n1 2 3").is_none());
+    }
+
+    #[test]
+    fn png_and_bmp_decoders_reject_invalid_headers() {
+        assert!(extract_png_pixels(b"not-a-png").is_none());
+        assert!(extract_bmp_pixels(b"not-a-bmp").is_none());
+
+        let mut compressed_bmp = vec![0u8; 54 + 12];
+        compressed_bmp[0] = b'B';
+        compressed_bmp[1] = b'M';
+        compressed_bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        compressed_bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        compressed_bmp[30..34].copy_from_slice(&1u32.to_le_bytes());
+        assert!(extract_bmp_pixels(&compressed_bmp).is_none());
+    }
+
     #[test]
     fn chi_square_natural_data() {
         // Simulate natural image: values clustered with odd/even asymmetry
