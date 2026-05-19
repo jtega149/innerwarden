@@ -184,6 +184,52 @@ mod tests {
     }
 
     #[test]
+    fn render_environment_label_formats_bare_metal_and_unknown_variants() {
+        let bare_metal = render_environment_label(&Environment::BareMetal);
+        let unknown = render_environment_label(&Environment::UnknownHypervisor);
+
+        assert!(bare_metal.contains("Bare Metal"));
+        assert!(bare_metal.starts_with("\x1b[32m"));
+        assert!(unknown.contains("UNKNOWN HYPERVISOR"));
+        assert!(unknown.starts_with("\x1b[31;1m"));
+    }
+
+    #[test]
+    fn format_trust_thresholds_are_inclusive_at_band_boundaries() {
+        let trusted = format_trust(0.90);
+        let degraded = format_trust(0.60);
+        let compromised = format_trust(0.599);
+
+        assert!(trusted.contains("90% — TRUSTED"));
+        assert!(degraded.contains("60% — DEGRADED"));
+        assert!(compromised.contains("59% — COMPROMISED"));
+    }
+
+    #[test]
+    fn format_trust_truncates_fractional_percent_without_rounding_up() {
+        let trust = format_trust(0.899);
+
+        assert!(trust.contains("89%"));
+        assert!(trust.contains("DEGRADED"));
+        assert!(!trust.contains("90%"));
+    }
+
+    #[test]
+    fn status_style_returns_distinct_icons_for_each_state() {
+        let styles = [
+            status_style(&CheckStatus::Secure),
+            status_style(&CheckStatus::Warning),
+            status_style(&CheckStatus::Critical),
+            status_style(&CheckStatus::Unavailable),
+        ];
+        let icons: std::collections::HashSet<_> = styles.iter().map(|(icon, _)| *icon).collect();
+        let colors: std::collections::HashSet<_> = styles.iter().map(|(_, color)| *color).collect();
+
+        assert_eq!(icons.len(), 4);
+        assert_eq!(colors.len(), 4);
+    }
+
+    #[test]
     fn status_style_maps_every_check_state() {
         // Guards icon/color mapping used by deep-check rendering for all
         // status variants emitted by the audit pipeline.
