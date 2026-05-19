@@ -348,30 +348,16 @@ fn write_forensics(data_dir: &Path, forensics: &KillChainForensics) -> Result<()
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn dry_run_with_c2_and_pid() {
-        let ctx = SkillContext {
+    fn skill_context(evidence: serde_json::Value, data_dir: std::path::PathBuf) -> SkillContext {
+        SkillContext {
             incident: innerwarden_core::incident::Incident {
                 ts: Utc::now(),
                 host: "host".to_string(),
                 incident_id: "kill_chain:reverse_shell:test".to_string(),
                 severity: innerwarden_core::event::Severity::Critical,
                 title: "Reverse shell blocked".to_string(),
-                summary: "Kernel LSM blocked reverse shell to 185.234.1.1:4444".to_string(),
-                evidence: serde_json::json!([{
-                    "kind": "kill_chain_blocked",
-                    "pattern": "REVERSE_SHELL",
-                    "c2_ip": "185.234.1.1:4444",
-                    "pid": 1234,
-                    "process": "python3",
-                    "uid": 1000,
-                    "timeline": [
-                        "connect(185.234.1.1:4444)",
-                        "dup2(stdin)",
-                        "dup2(stdout)",
-                        "execve(/bin/sh) BLOCKED"
-                    ]
-                }]),
+                summary: "Kernel LSM blocked reverse shell".to_string(),
+                evidence,
                 recommended_checks: vec![],
                 tags: vec!["kill_chain".to_string()],
                 entities: vec![],
@@ -381,10 +367,31 @@ mod tests {
             target_container: None,
             duration_secs: None,
             host: "host".to_string(),
-            data_dir: std::env::temp_dir(),
+            data_dir,
             honeypot: crate::skills::HoneypotRuntimeConfig::default(),
             ai_provider: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_with_c2_and_pid() {
+        let ctx = skill_context(
+            serde_json::json!([{
+                "kind": "kill_chain_blocked",
+                "pattern": "REVERSE_SHELL",
+                "c2_ip": "185.234.1.1:4444",
+                "pid": 1234,
+                "process": "python3",
+                "uid": 1000,
+                "timeline": [
+                    "connect(185.234.1.1:4444)",
+                    "dup2(stdin)",
+                    "dup2(stdout)",
+                    "execve(/bin/sh) BLOCKED"
+                ]
+            }]),
+            std::env::temp_dir(),
+        );
 
         let res = KillChainResponse.execute(&ctx, true).await;
         assert!(res.success);
@@ -422,6 +429,86 @@ mod tests {
         let res = KillChainResponse.execute(&ctx, true).await;
         assert!(!res.success);
         assert!(res.message.contains("no C2 IP or PID"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_with_only_c2_defaults_unknown_pattern() {
+        let ctx = skill_context(
+            serde_json::json!([{
+                "kind": "kill_chain_blocked",
+                "c2_ip": "203.0.113.9:8443"
+            }]),
+            std::env::temp_dir(),
+        );
+
+        let res = KillChainResponse.execute(&ctx, true).await;
+        assert!(res.success);
+        assert!(res.message.contains("DRY RUN"));
+        assert!(res.message.contains("UNKNOWN"));
+        assert!(res.message.contains("203.0.113.9:8443"));
+        assert!(!res.message.contains("PID"));
+        assert!(res
+            .message
+            .contains("would capture network + process forensics"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_with_zero_pid_and_empty_c2_fails() {
+        let ctx = skill_context(
+            serde_json::json!([{
+                "kind": "kill_chain_blocked",
+                "pattern": "REVERSE_SHELL",
+                "c2_ip": "",
+                "pid": 0
+            }]),
+            std::env::temp_dir(),
+        );
+
+        let res = KillChainResponse.execute(&ctx, true).await;
+        assert!(!res.success);
+        assert!(res.message.contains("no C2 IP or PID"));
+    }
+
+    #[tokio::test]
+    async fn capture_proc_snapshot_reports_missing_process() {
+        let snapshot = capture_proc_snapshot(u64::MAX).await;
+        assert!(snapshot.contains("no longer exists"));
+        assert!(snapshot.contains(&u64::MAX.to_string()));
+    }
+
+    #[test]
+    fn write_forensics_creates_sanitized_json_file() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let forensics = KillChainForensics {
+            ts: Utc::now(),
+            incident_id: "kill/chain:incident id".to_string(),
+            pattern: "REVERSE_SHELL".to_string(),
+            c2_ip: "203.0.113.9:8443".to_string(),
+            pid: 42,
+            process_tree_killed: true,
+            c2_blocked_xdp: false,
+            network_snapshot: "tcp snapshot".to_string(),
+            proc_snapshot: "proc snapshot".to_string(),
+            actions_taken: vec!["killed PID 42".to_string()],
+        };
+
+        write_forensics(data_dir.path(), &forensics).expect("write forensics");
+
+        let entries = std::fs::read_dir(data_dir.path().join("kill-chain-forensics"))
+            .expect("read forensics dir")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("entries");
+        assert_eq!(entries.len(), 1);
+
+        let path = entries[0].path();
+        let filename = path.file_name().unwrap().to_string_lossy();
+        assert!(filename.contains("kill_chain_incident_id"));
+        assert!(!filename.contains('/'));
+        assert!(!filename.contains(':'));
+
+        let content = std::fs::read_to_string(path).expect("read forensics");
+        assert!(content.contains("REVERSE_SHELL"));
+        assert!(content.contains("killed PID 42"));
     }
 
     #[tokio::test]
