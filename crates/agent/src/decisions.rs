@@ -348,11 +348,61 @@ fn append_chained_locked(
     Ok(line)
 }
 
+const MIRROR_MAX_ATTEMPTS: u32 = 3;
+const MIRROR_INITIAL_BACKOFF_MS: u64 = 50;
+
+/// Try an SQLite-write closure up to `max_attempts` times with
+/// exponential backoff (`initial_backoff_ms << (attempt - 1)`). Returns
+/// the closure's last error on permanent failure so the caller can
+/// surface it. Extracted from `mirror_to_sqlite` so the retry policy
+/// can be unit-tested with a closure that does not require a real
+/// `innerwarden_store::Store`.
+///
+/// `sleep` is a test injection point — production passes
+/// `std::thread::sleep`; tests pass a no-op so backoffs do not slow
+/// the suite.
+fn retry_sqlite_write<F, E, S>(
+    mut op: F,
+    max_attempts: u32,
+    initial_backoff_ms: u64,
+    mut sleep: S,
+) -> std::result::Result<u32, E>
+where
+    F: FnMut() -> std::result::Result<(), E>,
+    S: FnMut(std::time::Duration),
+{
+    let mut last_err = None;
+    for attempt in 1..=max_attempts {
+        match op() {
+            Ok(()) => return Ok(attempt),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < max_attempts {
+                    let backoff_ms = initial_backoff_ms << (attempt - 1);
+                    sleep(std::time::Duration::from_millis(backoff_ms));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt must have run"))
+}
+
 /// Write a decision row to the SQLite `decisions` table. Shared by
 /// `DecisionWriter::write` and `append_chained` so the two writers can
 /// never drift in what they mirror. A mirror failure degrades to a `warn!`:
 /// the JSONL audit trail has already succeeded, and a transient SQLite
 /// error must not discard the whole decision.
+///
+/// Retry policy lives in `retry_sqlite_write`: up to `MIRROR_MAX_ATTEMPTS`
+/// attempts with exponential backoff. The store layer already uses
+/// `BEGIN IMMEDIATE` + `PRAGMA busy_timeout = 30000` so the first
+/// attempt succeeds in ~all real-world cases; the retries are
+/// belt-and-suspenders against worst-case WAL contention (e.g.
+/// concurrent honeypot accept fan-out vs background graph-snapshot
+/// transaction). On final failure we surface the error inline in the
+/// `warn!` message — operators read this in plain `journalctl` output,
+/// not `-o verbose`, so the error must not hide behind a structured
+/// field alone.
 fn mirror_to_sqlite(store: &innerwarden_store::Store, entry: &DecisionEntry, line: &str) {
     let row = innerwarden_store::decisions::DecisionRow {
         ts: entry.ts.to_rfc3339(),
@@ -365,11 +415,22 @@ fn mirror_to_sqlite(store: &innerwarden_store::Store, entry: &DecisionEntry, lin
         reason: Some(entry.reason.clone()),
         data: line.to_owned(),
     };
-    if let Err(e) = store.insert_decision(&row) {
+
+    if let Err(e) = retry_sqlite_write(
+        || store.insert_decision(&row).map(|_| ()),
+        MIRROR_MAX_ATTEMPTS,
+        MIRROR_INITIAL_BACKOFF_MS,
+        std::thread::sleep,
+    ) {
+        // All retries exhausted. Surface the underlying error in the
+        // message (not just the structured field) so operators see the
+        // cause without needing `journalctl -o verbose`. The JSONL row
+        // is the canonical record at this point.
         warn!(
             incident_id = %entry.incident_id,
+            ai_provider = %entry.ai_provider,
             error = %e,
-            "decision written to JSONL but sqlite mirror failed"
+            "decision written to JSONL but sqlite mirror failed after {MIRROR_MAX_ATTEMPTS} attempts: {e}"
         );
     }
 }
@@ -1142,5 +1203,97 @@ mod tests {
             );
             prev_hash = Some(sha256_hex(line));
         }
+    }
+
+    // ── retry_sqlite_write anchors (2026-05-19 prod-bug
+    // fix/sqlite-mirror-lock-race) ─────────────────────────────────────
+    //
+    // The retry helper is extracted from `mirror_to_sqlite` so we can
+    // unit-test the policy without needing a real `innerwarden_store::Store`
+    // that can be forced into transient failure. The closure form lets
+    // us simulate "BUSY-N-then-success" and "permanent-failure" without
+    // touching SQLite at all.
+
+    #[test]
+    fn retry_sqlite_write_returns_first_attempt_on_immediate_success() {
+        let mut calls = 0u32;
+        let mut sleep_calls = 0u32;
+        let result = retry_sqlite_write(
+            || -> std::result::Result<(), &'static str> {
+                calls += 1;
+                Ok(())
+            },
+            3,
+            50,
+            |_| sleep_calls += 1,
+        );
+        assert_eq!(result, Ok(1), "first-attempt success must report attempt=1");
+        assert_eq!(calls, 1, "closure must run exactly once on success");
+        assert_eq!(sleep_calls, 0, "no backoff sleep on first-attempt success");
+    }
+
+    #[test]
+    fn retry_sqlite_write_retries_transient_failures_then_succeeds() {
+        let mut calls = 0u32;
+        let mut sleeps: Vec<std::time::Duration> = Vec::new();
+        let result = retry_sqlite_write(
+            || -> std::result::Result<(), &'static str> {
+                calls += 1;
+                if calls < 3 {
+                    Err("database is locked")
+                } else {
+                    Ok(())
+                }
+            },
+            3,
+            50,
+            |d| sleeps.push(d),
+        );
+        assert_eq!(result, Ok(3), "succeeds on third attempt");
+        assert_eq!(calls, 3, "closure called once per attempt");
+        assert_eq!(
+            sleeps,
+            vec![
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(100),
+            ],
+            "exponential backoff: 50ms then 100ms between three attempts"
+        );
+    }
+
+    #[test]
+    fn retry_sqlite_write_returns_last_error_after_exhausting_attempts() {
+        let mut calls = 0u32;
+        let result = retry_sqlite_write(
+            || -> std::result::Result<(), String> {
+                calls += 1;
+                Err(format!("attempt {calls} failed"))
+            },
+            3,
+            50,
+            |_| {},
+        );
+        assert_eq!(calls, 3, "must run all three attempts on permanent failure");
+        // The LAST error must propagate — operators need the most recent
+        // SQLite error message, not the first one.
+        assert_eq!(result, Err("attempt 3 failed".to_string()));
+    }
+
+    #[test]
+    fn retry_sqlite_write_skips_backoff_after_final_attempt() {
+        // Anti-regression: a naïve loop might sleep after the final
+        // failure too, adding latency for nothing. The current
+        // implementation sleeps only BETWEEN attempts.
+        let mut sleeps = 0u32;
+        let _ = retry_sqlite_write(
+            || -> std::result::Result<(), &'static str> { Err("nope") },
+            3,
+            50,
+            |_| sleeps += 1,
+        );
+        assert_eq!(
+            sleeps, 2,
+            "3 attempts → 2 backoff sleeps (between attempts 1→2 and 2→3), never after the final attempt"
+        );
     }
 }

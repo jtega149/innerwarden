@@ -1,7 +1,7 @@
 //! Event storage operations.
 
 use innerwarden_core::event::Event;
-use rusqlite::params;
+use rusqlite::{params, TransactionBehavior};
 
 use crate::error::Result;
 use crate::Store;
@@ -128,7 +128,14 @@ impl Store {
     /// to `None` (see `events_for_training`).
     pub fn backfill_events_src_ip(&self, batch_size: usize) -> Result<usize> {
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        // IMMEDIATE: the body is SELECT WHERE src_ip IS NULL → UPDATE,
+        // a read-then-write pattern. The default DEFERRED transaction
+        // would let a concurrent writer (e.g. event ingest, or another
+        // backfill tick under a long-lived prod loop) race the upgrade
+        // from SHARED to RESERVED and one side gets `SQLITE_BUSY`
+        // immediately, bypassing `PRAGMA busy_timeout`. The same root
+        // cause as `insert_decision` — keep both writers in lockstep.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut updated = 0usize;
         {
             let mut select = tx

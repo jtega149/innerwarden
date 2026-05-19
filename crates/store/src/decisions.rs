@@ -4,7 +4,7 @@
 //! and `row_hash` (SHA-256 of `prev_hash || data`). This enables tamper
 //! detection: if any row is modified, the chain breaks.
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, StoreError};
@@ -89,9 +89,23 @@ impl Store {
     /// reads the last `row_hash`, computes `new_hash = SHA-256(prev_hash || data)`,
     /// and inserts the row atomically.
     pub fn insert_decision(&self, row: &DecisionRow) -> Result<i64> {
-        let conn = self.conn()?;
-        // Use a transaction to ensure atomicity of read-last-hash + insert
-        let tx = conn.unchecked_transaction()?;
+        let mut conn = self.conn()?;
+        // Use a transaction to ensure atomicity of read-last-hash + insert.
+        //
+        // IMMEDIATE (not DEFERRED, which is the rusqlite default): the body
+        // is SELECT row_hash → INSERT, i.e. a read-then-write pattern. With
+        // DEFERRED, both transactions promote from SHARED to RESERVED on
+        // the INSERT, and only one wins — the loser gets `SQLITE_BUSY`
+        // *immediately*, bypassing `PRAGMA busy_timeout` entirely (the
+        // 30 s wait does NOT apply to lock-upgrade contention, only to
+        // lock acquisition at transaction start). Prod symptom (2026-05-19,
+        // ~22 h after v0.14.0 install): 13 honeypot:abuseipdb_gate
+        // decisions JSONL-only with `F_ERROR=sqlite error: database is
+        // locked` while the JSONL audit trail was healthy. IMMEDIATE
+        // grabs RESERVED up-front, so the second writer waits under
+        // busy_timeout instead of dying — and parallel honeypot accepts
+        // serialise cleanly instead of racing the WAL.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let prev_hash: Option<String> = tx
             .query_row(
@@ -1051,6 +1065,82 @@ mod tests {
         assert!(
             store.has_decision_for_incident("inc-killchain").unwrap(),
             "two rows must still report true"
+        );
+    }
+
+    /// 2026-05-19 prod-bug anchor (fix/sqlite-mirror-lock-race): the
+    /// always-on honeypot AbuseIPDB gate path lost 13 decisions from
+    /// SQLite over 22 h post v0.14.0 install. Root cause: `insert_decision`
+    /// used `BEGIN DEFERRED` (rusqlite default), so when two concurrent
+    /// honeypot accepts both ran `SELECT row_hash → INSERT decisions`,
+    /// both acquired SHARED on the read, then BOTH tried to upgrade to
+    /// RESERVED on the INSERT. One won; the other got `SQLITE_BUSY`
+    /// IMMEDIATELY — `PRAGMA busy_timeout = 30000` does NOT apply to
+    /// lock upgrades, only to lock acquisition at transaction start.
+    /// JSONL had the row; SQLite did not.
+    ///
+    /// Fix: `BEGIN IMMEDIATE` grabs RESERVED at transaction start.
+    /// Concurrent writers then queue under `busy_timeout` instead of
+    /// dying. This test reproduces the prod call pattern (parallel
+    /// inserts from threads sharing one file-backed `Store`) and
+    /// asserts every insert succeeds and every row lands. The same
+    /// test against the pre-fix code (DEFERRED) flakes within a few
+    /// runs with "database is locked"; against IMMEDIATE it is stable
+    /// for any thread count up to the pool size.
+    #[test]
+    fn concurrent_insert_decision_does_not_deadlock_under_immediate_tx() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::open(dir.path()).expect("open file-backed store"));
+
+        const THREADS: usize = 6;
+        const PER_THREAD: usize = 10;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || -> Result<()> {
+                    for i in 0..PER_THREAD {
+                        store
+                            .insert_decision(&sample_decision(
+                                &format!("inc-thread-{t}-{i}"),
+                                "block_ip",
+                            ))
+                            .map_err(|e| {
+                                // Surface the actual SQLite error in the
+                                // panic message — without this, a flake
+                                // shows as a generic JoinError.
+                                StoreError::Other(format!("thread {t} iter {i}: {e}"))
+                            })?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join()
+                .expect("thread did not panic")
+                .expect("every concurrent insert must succeed under IMMEDIATE + busy_timeout");
+        }
+
+        // Cross-check: total row count matches the expected fan-in.
+        let conn = store.conn().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM decisions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count as usize, THREADS * PER_THREAD);
+
+        // The hash chain must verify cleanly across the concurrent
+        // insertions — IMMEDIATE serialises the read-prev-hash + insert,
+        // so the chain is contiguous despite the threading.
+        let result = store.verify_hash_chain().expect("verify chain");
+        assert!(
+            result.intact,
+            "hash chain must remain intact across concurrent IMMEDIATE inserts; broken_at = {:?}",
+            result.broken_at
         );
     }
 }
