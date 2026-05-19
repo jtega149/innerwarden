@@ -293,6 +293,89 @@ fn is_private_or_loopback(addr: std::net::IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    fn cfg_for_url(url: String, api_key: &str) -> CrowdSecConfig {
+        CrowdSecConfig {
+            enabled: true,
+            url,
+            api_key: api_key.to_string(),
+            poll_secs: 60,
+            max_per_sync: 50,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_stream_handles_204_as_empty_delta() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", "/v1/decisions/stream")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("startup".into(), "true".into()),
+                mockito::Matcher::UrlEncoded("scopes".into(), "ip".into()),
+            ]))
+            .match_header("x-api-key", "test-key")
+            .with_status(204)
+            .create_async()
+            .await;
+        let client = CrowdSecClient::new(&cfg_for_url(server.url(), "test-key"));
+
+        let (new_ips, deleted_ips) = client.fetch_stream(true).await.expect("204 is empty");
+        assert!(new_ips.is_empty());
+        assert!(deleted_ips.is_empty());
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn sync_threat_list_adds_public_ips_removes_deleted_and_skips_simulated_private() {
+        let mut server = mockito::Server::new_async().await;
+        let body = r#"{
+            "new": [
+                {"id":1,"origin":"CAPI","type":"ban","scope":"ip","value":"8.8.8.8","duration":"3600s"},
+                {"id":2,"origin":"CAPI","type":"ban","scope":"ip","value":"192.168.1.8","duration":"3600s"},
+                {"id":3,"origin":"CAPI","type":"ban","scope":"ip","value":"9.9.9.9","duration":"3600s","simulated":true}
+            ],
+            "deleted": [
+                {"id":4,"origin":"CAPI","type":"ban","scope":"ip","value":"1.1.1.1","duration":"0s"}
+            ]
+        }"#;
+        let m = server
+            .mock("GET", "/v1/decisions/stream")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("startup".into(), "true".into()),
+                mockito::Matcher::UrlEncoded("scopes".into(), "ip".into()),
+            ]))
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+        let mut state = CrowdSecState::new(&cfg_for_url(server.url(), "test-key"));
+        state.insert_known_threat_for_test("1.1.1.1");
+
+        let (added, removed) = sync_threat_list(&mut state).await;
+        assert_eq!((added, removed), (1, 1));
+        assert!(state.is_known_threat("8.8.8.8"));
+        assert!(!state.is_known_threat("192.168.1.8"));
+        assert!(!state.is_known_threat("9.9.9.9"));
+        assert!(!state.is_known_threat("1.1.1.1"));
+        assert_eq!(state.threat_count(), 1);
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_stream_reports_invalid_api_key_on_403() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/v1/decisions/stream")
+            .match_query(mockito::Matcher::Any)
+            .with_status(403)
+            .with_body("Forbidden")
+            .create_async()
+            .await;
+        let client = CrowdSecClient::new(&cfg_for_url(server.url(), "bad-key"));
+
+        let err = client.fetch_stream(false).await.unwrap_err().to_string();
+        assert!(err.contains("invalid API key"));
+    }
+
     #[test]
     fn parse_stream_response() {
         // Decode path: stream payloads should deserialize both additions and
