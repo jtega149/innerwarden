@@ -2789,6 +2789,66 @@ mod tests {
         assert!(!is_passthrough_source("external.ids"));
     }
 
+    #[test]
+    fn cli_parses_default_and_custom_config_path() {
+        let default_cli =
+            Cli::try_parse_from(["innerwarden-sensor"]).expect("default CLI should parse");
+        assert_eq!(default_cli.config, "config.toml");
+
+        let custom_cli = Cli::try_parse_from([
+            "innerwarden-sensor",
+            "--config",
+            "/etc/innerwarden/sensor.toml",
+        ])
+        .expect("custom config CLI should parse");
+        assert_eq!(custom_cli.config, "/etc/innerwarden/sensor.toml");
+    }
+
+    #[test]
+    fn parse_blocked_ips_deduplicates_and_keeps_comment_lines_as_tokens() {
+        // The feedback file is intentionally a raw one-IP-per-line token list;
+        // comment-looking lines are kept rather than interpreted as syntax.
+        let parsed = parse_blocked_ips("1.2.3.4\n 1.2.3.4 \n# operator note\n");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains("1.2.3.4"));
+        assert!(parsed.contains("# operator note"));
+    }
+
+    #[test]
+    fn load_blocked_ips_returns_empty_for_missing_feedback_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked = load_blocked_ips(dir.path());
+        assert!(blocked.is_empty());
+    }
+
+    #[test]
+    fn load_blocked_ips_reads_agent_feedback_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            blocked_ips_path_for(dir.path()),
+            "203.0.113.8\n198.51.100.9\n",
+        )
+        .expect("write blocked ips");
+
+        let blocked = load_blocked_ips(dir.path());
+        assert_eq!(blocked.len(), 2);
+        assert!(blocked.contains("203.0.113.8"));
+        assert!(blocked.contains("198.51.100.9"));
+    }
+
+    #[test]
+    fn should_enable_syslog_sink_requires_non_empty_host() {
+        assert!(!should_enable_syslog_sink(""));
+        assert!(should_enable_syslog_sink("127.0.0.1"));
+    }
+
+    #[test]
+    fn parse_syslog_port_rejects_out_of_range_values() {
+        assert_eq!(parse_syslog_port(Some("0")), 0);
+        assert_eq!(parse_syslog_port(Some("65535")), 65535);
+        assert_eq!(parse_syslog_port(Some("65536")), 514);
+    }
+
     // ── Wave 9f anchors (2026-05-04) — journald-detection contract ───────
     //
     // AUDIT-009 root: tracing-subscriber writes plain text to stdout which
