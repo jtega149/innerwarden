@@ -1390,6 +1390,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_attacker_profiles_applies_cloud_filter_pagination_and_bucket_counts() {
+        crate::cloud_safelist::init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let profiles = serde_json::json!([
+            {"ip": "34.253.181.30", "risk_score": 95, "total_incidents": 9, "last_seen": "2026-05-03"},
+            {"ip": "185.234.1.1", "risk_score": 80, "total_incidents": 5, "last_seen": "2026-05-02"},
+            {"ip": "92.118.39.23", "risk_score": 45, "total_incidents": 3, "last_seen": "2026-05-01"}
+        ]);
+        std::fs::write(
+            dir.path().join("attacker-profiles.json"),
+            serde_json::to_string(&profiles).unwrap(),
+        )
+        .expect("write profiles");
+
+        let q = Query(AttackerProfilesQuery {
+            limit: Some(1),
+            offset: Some(1),
+            sort: Some("risk_score".to_string()),
+            min_risk: Some(0),
+            exclude_cloud: Some(true),
+        });
+        let Json(out) = api_attacker_profiles(State(state), q).await;
+
+        assert_eq!(out["total"], 2);
+        assert_eq!(out["totals_by_risk"]["high"], 1);
+        assert_eq!(out["totals_by_risk"]["medium"], 1);
+        assert_eq!(out["totals_by_risk"]["low"], 0);
+        let page = out["profiles"].as_array().expect("profiles array");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["ip"], "92.118.39.23");
+        assert!(page[0]["cloud_provider"].is_null());
+    }
+
+    #[tokio::test]
+    async fn api_attacker_profile_detail_enriches_found_profile_and_reports_missing() {
+        crate::cloud_safelist::init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let profiles = serde_json::json!([
+            {"ip": "104.26.12.38", "risk_score": 60},
+            {"ip": "203.0.113.42", "risk_score": 80}
+        ]);
+        std::fs::write(
+            dir.path().join("attacker-profiles.json"),
+            serde_json::to_string(&profiles).unwrap(),
+        )
+        .expect("write profiles");
+
+        let Json(found) = api_attacker_profile_detail(
+            State(state.clone()),
+            axum::extract::Path("104.26.12.38".to_string()),
+        )
+        .await;
+        assert_eq!(found["ip"], "104.26.12.38");
+        assert_eq!(found["cloud_provider"], "Cloudflare");
+
+        let Json(missing) = api_attacker_profile_detail(
+            State(state),
+            axum::extract::Path("203.0.113.99".to_string()),
+        )
+        .await;
+        assert_eq!(missing["error"], "profile not found");
+    }
+
+    #[tokio::test]
+    async fn api_campaigns_and_correlation_chains_read_json_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        std::fs::write(
+            dir.path().join("campaigns.json"),
+            r#"[{"id":"camp-1","score":7},{"id":"camp-2","score":3}]"#,
+        )
+        .expect("write campaigns");
+        std::fs::write(
+            dir.path().join("attack-chains.json"),
+            r#"[{"id":"chain-1"}]"#,
+        )
+        .expect("write chains");
+
+        let Json(campaigns) = api_campaigns(State(state.clone())).await;
+        assert_eq!(campaigns["total"], 2);
+        assert_eq!(campaigns["campaigns"][0]["id"], "camp-1");
+
+        let Json(chains) = api_correlation_chains(State(state)).await;
+        assert_eq!(chains["total"], 1);
+        assert_eq!(chains["chains"][0]["id"], "chain-1");
+    }
+
+    #[tokio::test]
+    async fn graph_handlers_return_empty_shapes_for_empty_or_missing_graph_inputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+
+        let Json(view) = api_graph_view(State(state.clone())).await;
+        assert!(view["nodes"].as_array().unwrap().is_empty());
+        assert!(view["edges"].as_array().unwrap().is_empty());
+
+        let Json(neighborhood) = api_graph_neighborhood(
+            State(state.clone()),
+            Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert!(neighborhood["nodes"].as_array().unwrap().is_empty());
+        assert!(neighborhood["edges"].as_array().unwrap().is_empty());
+
+        let Json(path) = api_graph_path(
+            State(state),
+            Query(std::collections::HashMap::from([
+                ("from".to_string(), "1".to_string()),
+                ("to".to_string(), "2".to_string()),
+                ("max_depth".to_string(), "99".to_string()),
+            ])),
+        )
+        .await;
+        assert!(path["path"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn api_threat_report_rejects_invalid_month_format() {
         // Path-traversal guard from the existing `is_valid_month`
         // check. Anchoring here so a refactor that drops the
