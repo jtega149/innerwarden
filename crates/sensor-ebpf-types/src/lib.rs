@@ -722,3 +722,52 @@ pub fn bytes_to_str(buf: &[u8]) -> &[u8] {
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     &buf[..len]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_to_str_returns_prefix_before_first_nul() {
+        assert_eq!(bytes_to_str(b"bash\0ignored"), b"bash");
+        assert_eq!(bytes_to_str(b"/usr/bin/python\0--flag"), b"/usr/bin/python");
+    }
+
+    #[test]
+    fn bytes_to_str_keeps_full_slice_when_no_nul_exists() {
+        let filename = b"/tmp/payload.sh";
+        assert_eq!(bytes_to_str(filename), filename);
+    }
+
+    #[test]
+    fn bytes_to_str_handles_leading_nul_and_empty_input() {
+        assert_eq!(bytes_to_str(b"\0hidden"), b"");
+        assert_eq!(bytes_to_str(b""), b"");
+    }
+
+    #[test]
+    fn constants_match_kernel_buffer_contract() {
+        assert_eq!(MAX_COMM_LEN, 64);
+        assert_eq!(MAX_FILENAME_LEN, 256);
+        assert_eq!(MAX_ARGS, 8);
+        assert_eq!(MAX_ARG_LEN, 128);
+        assert_eq!(XDP_BLOCKLIST_MAX, 10_000);
+    }
+
+    #[test]
+    fn syscall_kind_discriminants_are_stable_for_ebpf_abi() {
+        assert_eq!(SyscallKind::Execve as u32, 1);
+        assert_eq!(SyscallKind::Connect as u32, 2);
+        assert_eq!(SyscallKind::FileOpen as u32, 3);
+        assert_eq!(SyscallKind::FileWrite as u32, 4);
+        assert_eq!(SyscallKind::Truncate as u32, 34);
+    }
+
+    #[test]
+    fn timing_target_discriminants_are_stable_for_ebpf_abi() {
+        assert_eq!(TimingTarget::IterateDir as u32, 1);
+        assert_eq!(TimingTarget::Filldir64 as u32, 2);
+        assert_eq!(TimingTarget::Tcp4SeqShow as u32, 3);
+        assert_eq!(TimingTarget::ProcPidReaddir as u32, 4);
+    }
+}
