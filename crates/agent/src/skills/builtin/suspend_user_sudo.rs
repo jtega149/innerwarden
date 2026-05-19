@@ -455,43 +455,112 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn dry_run_succeeds() {
-        let ctx = SkillContext {
+    fn skill_context(user: Option<&str>, duration_secs: Option<u64>) -> SkillContext {
+        SkillContext {
             incident: innerwarden_core::incident::Incident {
                 ts: Utc::now(),
                 host: "host".to_string(),
                 incident_id: "sudo_abuse:deploy:test".to_string(),
                 severity: innerwarden_core::event::Severity::Critical,
-                title: "t".to_string(),
-                summary: "s".to_string(),
+                title: "sudo abuse".to_string(),
+                summary: "suspicious sudo use".to_string(),
                 evidence: serde_json::json!({}),
                 recommended_checks: vec![],
                 tags: vec![],
                 entities: vec![],
             },
             target_ip: None,
-            target_user: Some("deploy".to_string()),
+            target_user: user.map(str::to_string),
             target_container: None,
-            duration_secs: Some(600),
+            duration_secs,
             host: "host".to_string(),
             data_dir: std::env::temp_dir(),
             honeypot: crate::skills::HoneypotRuntimeConfig::default(),
             ai_provider: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_succeeds() {
+        let ctx = skill_context(Some("deploy"), Some(600));
 
         let res = SuspendUserSudo.execute(&ctx, true).await;
         assert!(res.success);
         assert!(res.message.contains("DRY RUN"));
+        assert!(res.message.contains("deploy"));
+        assert!(res.message.contains("600s"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_clamps_ttl_and_uses_sanitized_filename() {
+        let too_short = skill_context(Some("john.doe"), Some(1));
+        let res = SuspendUserSudo.execute(&too_short, true).await;
+        assert!(res.success);
+        assert!(res.message.contains("60s"));
+        assert!(res.message.contains("zz-innerwarden-deny-john_doe"));
+        assert!(!res.message.contains("zz-innerwarden-deny-john.doe"));
+
+        let too_long = skill_context(Some("deploy"), Some(MAX_TTL_SECS + 1));
+        let res = SuspendUserSudo.execute(&too_long, true).await;
+        assert!(res.success);
+        assert!(res.message.contains("86400s"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_missing_or_invalid_user_before_sudo() {
+        let missing = skill_context(None, Some(600));
+        let res = SuspendUserSudo.execute(&missing, false).await;
+        assert!(!res.success);
+        assert!(res.message.contains("no target user"));
+
+        let invalid = skill_context(Some("../etc/passwd"), Some(600));
+        let res = SuspendUserSudo.execute(&invalid, false).await;
+        assert!(!res.success);
+        assert!(res.message.contains("invalid username"));
     }
 
     #[test]
     fn username_validation_is_strict() {
         assert!(is_valid_username("deploy"));
         assert!(is_valid_username("svc_user-1"));
+        assert!(is_valid_username("john.doe"));
+        assert!(is_valid_username("machine$"));
         assert!(!is_valid_username(""));
         assert!(!is_valid_username("../etc/passwd"));
         assert!(!is_valid_username("bad user"));
+        assert!(!is_valid_username("@bad"));
+        assert!(!is_valid_username(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn render_sudo_deny_rule_contains_operator_metadata_and_deny_rule() {
+        let expires_at = Utc::now() + Duration::minutes(30);
+        let rule = render_sudo_deny_rule("deploy", expires_at);
+        assert!(rule.contains("# Managed by Inner Warden"));
+        assert!(rule.contains("# user=deploy"));
+        assert!(rule.contains(&format!("# expires_at={expires_at}")));
+        assert!(rule.contains("deploy ALL=(ALL:ALL) !ALL"));
+    }
+
+    #[test]
+    fn write_metadata_persists_reason_and_paths() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let meta = SuspensionMetadata {
+            user: "deploy".to_string(),
+            deny_file: "/etc/sudoers.d/zz-innerwarden-deny-deploy".to_string(),
+            created_at: Utc::now(),
+            expires_at: Utc::now() + Duration::minutes(30),
+            reason: "suspicious sudo use".to_string(),
+        };
+
+        write_metadata(data_dir.path(), &meta).expect("metadata write");
+        let path = metadata_dir(data_dir.path()).join("deploy.json");
+        let persisted: SuspensionMetadata =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("metadata should exist"))
+                .expect("valid metadata json");
+        assert_eq!(persisted.user, "deploy");
+        assert_eq!(persisted.deny_file, meta.deny_file);
+        assert_eq!(persisted.reason, "suspicious sudo use");
     }
 
     // ── Wave 3 anchors (AUDIT-WAVE3-SYNC-IO) ───────────────────────────
@@ -514,6 +583,23 @@ mod tests {
         };
         let path = dir.join(format!("{user}.json"));
         std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_dry_run_removes_expired_metadata_without_sudo() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let dir = metadata_dir(data_dir.path());
+        std::fs::create_dir_all(&dir).expect("metadata dir");
+        let now = chrono::Utc::now();
+        write_meta_at(&dir, "expired_one", now - chrono::Duration::seconds(1));
+        write_meta_at(&dir, "fresh_one", now + chrono::Duration::hours(1));
+
+        let removed = cleanup_expired_sudo_suspensions(data_dir.path(), true)
+            .await
+            .expect("dry-run cleanup");
+        assert_eq!(removed, 1);
+        assert!(!dir.join("expired_one.json").exists());
+        assert!(dir.join("fresh_one.json").exists());
     }
 
     #[test]
