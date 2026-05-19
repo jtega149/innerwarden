@@ -978,6 +978,63 @@ mod tests {
     }
 
     #[test]
+    fn read_collector_health_file_returns_null_for_missing_or_malformed_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_collector_health_file(dir.path()),
+            serde_json::Value::Null
+        );
+
+        std::fs::write(dir.path().join("collector-health.json"), "not json")
+            .expect("write malformed health file");
+        assert_eq!(
+            read_collector_health_file(dir.path()),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn read_collector_health_file_preserves_valid_json_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let health = serde_json::json!({
+            "collectors": {
+                "auth_log": { "detected": true, "active": true },
+                "docker": { "detected": false, "active": false }
+            }
+        });
+        std::fs::write(
+            dir.path().join("collector-health.json"),
+            serde_json::to_string(&health).expect("serialize health"),
+        )
+        .expect("write health file");
+
+        assert_eq!(read_collector_health_file(dir.path()), health);
+    }
+
+    #[test]
+    fn build_sensors_payload_includes_collector_health_when_file_is_valid() {
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("collector-health.json"),
+            r#"{"collectors":{"auth_log":{"detected":true,"active":false}}}"#,
+        )
+        .expect("write health file");
+
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, None);
+        assert_eq!(
+            payload["collector_health"]["collectors"]["auth_log"]["detected"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            payload["collector_health"]["collectors"]["auth_log"]["active"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn build_sensors_payload_uses_canonical_when_threaded() {
         // PR30 match branch: `Some(n) => n as usize`. Canonical helper
         // had already done the SQLite per-date read; the HUD trusts
@@ -1330,6 +1387,36 @@ mod tests {
         assert_eq!(
             auditd_count, 5_000,
             "auditd tile must sum to canonical bucket value, got {auditd_count}"
+        );
+    }
+
+    #[test]
+    fn build_sensors_payload_canonical_sources_drop_unknown_collectors() {
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut canonical: std::collections::BTreeMap<
+            String,
+            std::collections::HashMap<String, u64>,
+        > = std::collections::BTreeMap::new();
+        canonical
+            .entry(format!("{today}T01:00"))
+            .or_default()
+            .insert("auth_log".to_string(), 2);
+        canonical
+            .entry(format!("{today}T01:01"))
+            .or_default()
+            .insert("retired_collector".to_string(), 99);
+
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, Some(canonical));
+        let sources = payload["sources"].as_array().expect("sources array");
+        let names: Vec<_> = sources.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert!(names.contains(&"auth_log"));
+        assert!(
+            !names.contains(&"retired_collector"),
+            "canonical source names must still be filtered through KNOWN_COLLECTORS: {names:?}"
         );
     }
 
