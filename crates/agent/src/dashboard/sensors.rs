@@ -1193,8 +1193,21 @@ mod tests {
         let mut g = crate::knowledge_graph::KnowledgeGraph::new();
         // Force `total_events_ingested > 0` so the per-source path is
         // taken (the chart-fold bug only affected dated buckets, not
-        // the per-source counters tested above).
-        g.record_event_telemetry("auth_log", "ssh.login_failed", chrono::Utc::now());
+        // the per-source counters tested above). We deliberately do NOT
+        // pass `Utc::now()` here — when CI ran at 2026-05-19T03:15:03Z
+        // the resulting bucket key was `2026-05-19T03:15`, which the
+        // strip-date projection turned into the literal `03:15` key the
+        // assertion below tests for absence (yesterday's 03:15 bucket
+        // would NOT have leaked, but TODAY's 03:15 bucket from this
+        // bootstrap call confounds the assertion). Pin the bootstrap
+        // event at today-noon UTC so the bucket key (`12:00`) never
+        // collides with the asserted slots regardless of wall clock.
+        let today_noon = chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("12:00 is always valid")
+            .and_utc();
+        g.record_event_telemetry("auth_log", "ssh.login_failed", today_noon);
 
         // Seed the event_timeline with both today's and yesterday's
         // buckets. Yesterday's value for a slot today hasn't reached
