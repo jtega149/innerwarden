@@ -226,14 +226,22 @@ impl AiProvider for LocalClassifier {
         }
         .to_string();
 
+        let markers = build_decision_markers(ctx, target_ip.as_deref());
+        let markers_section = if markers.is_empty() {
+            String::new()
+        } else {
+            format!(" Markers: {}.", markers.join(", "))
+        };
+
         Ok(AiDecision {
             action,
             confidence: conf,
             auto_execute: conf >= self.auto_exec_threshold,
             reason: format!(
-                "Local Warden decided {} with confidence {:.3}. Alternatives: {}.",
+                "Local Warden decided {} with confidence {:.3}.{} Alternatives: {}.",
                 action_name,
                 conf,
+                markers_section,
                 alternatives.join(", ")
             ),
             alternatives,
@@ -252,6 +260,80 @@ fn pad_or_truncate(v: &mut Vec<i64>, len: usize, pad: i64) {
     } else {
         v.resize(len, pad);
     }
+}
+
+/// Build human-meaningful disclosure markers for the Local Warden's
+/// decision reason field. The on-device classifier is a black-box
+/// transformer that outputs probabilities; this helper surfaces the
+/// *heuristic context* the operator can verify by eye:
+///
+///   - `safelist=<provider>` — cloud-safelist hit (Cloudflare, AWS, etc.).
+///     This is the single most common reason for `dismiss`/`ignore` on
+///     real prod traffic, so surfacing it short-circuits "why did it
+///     dismiss?" investigations.
+///   - `abuseipdb=<score>` — AbuseIPDB confidence score 0-100 if enrichment
+///     ran. Operator sees at a glance whether a third-party reputation
+///     hit shaped the decision.
+///   - `country=<XX>` — two-letter country code from GeoIP enrichment.
+///   - `already_blocked=true` — the target IP is already on the agent's
+///     blocklist. Common reason for `monitor`/`ignore` (no point blocking
+///     twice).
+///   - `recent_events=N` — count of recent events from this entity. Helps
+///     operator distinguish "first time" from "repeat offender".
+///   - `related_incidents=N` — count of temporally correlated incidents
+///     sharing pivot(s).
+///   - `incident_tags=[...]` — concise list of incident tags (capped at 3)
+///     so the operator can verify the incident shape the classifier saw.
+///
+/// Returns markers in fixed insertion order so the audit string is
+/// stable across runs (test-friendly + dashboard-grep-friendly).
+/// Skips markers whose value would be uninformative (e.g. zero counts,
+/// missing enrichment) so the reason field stays compact when nothing
+/// notable is present.
+fn build_decision_markers(ctx: &DecisionContext<'_>, target_ip: Option<&str>) -> Vec<String> {
+    let mut markers = Vec::new();
+
+    if let Some(ip) = target_ip {
+        if let Some(provider) = crate::cloud_safelist::safelist_label(ip) {
+            markers.push(format!("safelist={provider}"));
+        }
+        if ctx.already_blocked.iter().any(|b| b == ip) {
+            markers.push("already_blocked=true".to_string());
+        }
+    }
+
+    if let Some(rep) = &ctx.ip_reputation {
+        // AbuseIPDB enrichment present — even a 0 score is signal
+        // ("checked + clean"), so emit unconditionally when the field is Some.
+        markers.push(format!("abuseipdb={}", rep.confidence_score));
+    }
+
+    if let Some(geo) = &ctx.ip_geo {
+        if !geo.country_code.is_empty() {
+            markers.push(format!("country={}", geo.country_code));
+        }
+    }
+
+    if !ctx.recent_events.is_empty() {
+        markers.push(format!("recent_events={}", ctx.recent_events.len()));
+    }
+
+    if !ctx.related_incidents.is_empty() {
+        markers.push(format!("related_incidents={}", ctx.related_incidents.len()));
+    }
+
+    let tags: Vec<&str> = ctx
+        .incident
+        .tags
+        .iter()
+        .take(3)
+        .map(String::as_str)
+        .collect();
+    if !tags.is_empty() {
+        markers.push(format!("incident_tags=[{}]", tags.join(",")));
+    }
+
+    markers
 }
 
 /// Build an `AiAction` from the classifier's predicted action name + the
@@ -489,5 +571,180 @@ mod tests {
             AiAction::BlockIp { skill_id, .. } => assert_eq!(skill_id, "block-ip-xdp"),
             other => panic!("expected BlockIp, got {other:?}"),
         }
+    }
+
+    // ── 2026-05-20 anchors: decision-marker disclosure ───────────────────
+    //
+    // The on-device classifier is a black-box transformer; the `reason`
+    // field used to carry only `action + confidence + alternatives`. PR
+    // (this one) adds heuristic markers — cloud_safelist hit, AbuseIPDB
+    // score, country, recent_events count, related_incidents count,
+    // incident tags — so the operator can verify by eye WHY the model
+    // decided what it did without spelunking the incident detail. These
+    // tests pin the disclosure contract.
+
+    fn minimal_incident(
+        incident_id: &str,
+        tags: Vec<String>,
+    ) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: incident_id.to_string(),
+            severity: innerwarden_core::event::Severity::Info,
+            title: "test".to_string(),
+            summary: "test".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags,
+            entities: vec![],
+        }
+    }
+
+    fn ctx_with<'a>(
+        incident: &'a innerwarden_core::incident::Incident,
+        already_blocked: Vec<String>,
+        ip_reputation: Option<crate::abuseipdb::IpReputation>,
+        ip_geo: Option<crate::geoip::GeoInfo>,
+    ) -> DecisionContext<'a> {
+        DecisionContext {
+            incident,
+            recent_events: vec![],
+            related_incidents: vec![],
+            already_blocked,
+            available_skills: vec![],
+            ip_reputation,
+            ip_geo,
+            graph_context: None,
+            graph_subgraph: None,
+        }
+    }
+
+    #[test]
+    fn build_decision_markers_returns_empty_when_no_context_signal() {
+        // A bare incident with no IP, no enrichment, no recent events,
+        // and no tags should produce no markers. Without this anchor a
+        // future refactor that always emits "incident_tags=[]" or
+        // "recent_events=0" would silently bloat every reason string.
+        let incident = minimal_incident("test:1", vec![]);
+        let ctx = ctx_with(&incident, vec![], None, None);
+        let markers = build_decision_markers(&ctx, None);
+        assert!(
+            markers.is_empty(),
+            "no input signal should produce no markers; got {markers:?}"
+        );
+    }
+
+    #[test]
+    fn build_decision_markers_labels_cloudflare_ip_via_cloud_safelist() {
+        // The most operator-visible marker: when local_classifier
+        // dismisses something, the #1 question is "was this just a
+        // cloud-safelisted IP?". safelist=Cloudflare answers it in one
+        // line. Picks 104.16.0.1 because it's inside Cloudflare's
+        // canonical /13 range published at cloud_safelist.rs:79.
+        crate::cloud_safelist::init();
+        let incident = minimal_incident("test:cf", vec![]);
+        let ctx = ctx_with(&incident, vec![], None, None);
+        let markers = build_decision_markers(&ctx, Some("104.16.0.1"));
+        assert!(
+            markers.iter().any(|m| m.starts_with("safelist=")),
+            "expected safelist marker for Cloudflare IP, got {markers:?}"
+        );
+    }
+
+    #[test]
+    fn build_decision_markers_emits_already_blocked_only_for_target_ip_match() {
+        // Pins the exact-string match contract. If the target IP is
+        // 203.0.113.10 and the blocklist contains 203.0.113.10, the
+        // marker fires. If the blocklist contains a DIFFERENT IP
+        // (203.0.113.11), the marker must NOT fire.
+        crate::cloud_safelist::init();
+        let incident = minimal_incident("test:blocked", vec![]);
+
+        let ctx_hit = ctx_with(&incident, vec!["203.0.113.10".to_string()], None, None);
+        let markers_hit = build_decision_markers(&ctx_hit, Some("203.0.113.10"));
+        assert!(
+            markers_hit.contains(&"already_blocked=true".to_string()),
+            "expected already_blocked=true when target IP is in blocklist; got {markers_hit:?}"
+        );
+
+        let ctx_miss = ctx_with(&incident, vec!["203.0.113.11".to_string()], None, None);
+        let markers_miss = build_decision_markers(&ctx_miss, Some("203.0.113.10"));
+        assert!(
+            !markers_miss.iter().any(|m| m == "already_blocked=true"),
+            "already_blocked must NOT fire when target IP differs from blocklist entry; got {markers_miss:?}"
+        );
+    }
+
+    #[test]
+    fn build_decision_markers_includes_abuseipdb_score_and_country_when_enriched() {
+        // Even a 0-score AbuseIPDB hit is signal ("checked + clean").
+        // Emit when the enrichment field is Some, regardless of score.
+        let incident = minimal_incident("test:enriched", vec![]);
+        let rep = crate::abuseipdb::IpReputation {
+            confidence_score: 87,
+            total_reports: 42,
+            distinct_users: 8,
+            country_code: Some("RU".to_string()),
+            isp: Some("Bulletproof VPS".to_string()),
+            is_tor: false,
+        };
+        let geo = crate::geoip::GeoInfo {
+            country: "Russia".to_string(),
+            country_code: "RU".to_string(),
+            city: "Moscow".to_string(),
+            isp: "Bulletproof VPS".to_string(),
+            asn: "AS12345".to_string(),
+        };
+        let ctx = ctx_with(&incident, vec![], Some(rep), Some(geo));
+        let markers = build_decision_markers(&ctx, Some("185.234.1.1"));
+        assert!(
+            markers.contains(&"abuseipdb=87".to_string()),
+            "expected abuseipdb=87 in {markers:?}"
+        );
+        assert!(
+            markers.contains(&"country=RU".to_string()),
+            "expected country=RU in {markers:?}"
+        );
+    }
+
+    #[test]
+    fn build_decision_markers_caps_incident_tags_at_three() {
+        // The reason field is rendered verbatim in the audit JSONL +
+        // operator dashboard. A 20-tag incident must not produce a
+        // 200-char tag list. Cap at 3 — enough to identify the
+        // incident class, short enough to keep `reason` readable.
+        let incident = minimal_incident(
+            "test:many-tags",
+            vec![
+                "tag1".to_string(),
+                "tag2".to_string(),
+                "tag3".to_string(),
+                "tag4".to_string(),
+                "tag5".to_string(),
+            ],
+        );
+        let ctx = ctx_with(&incident, vec![], None, None);
+        let markers = build_decision_markers(&ctx, None);
+        let tags_marker = markers
+            .iter()
+            .find(|m| m.starts_with("incident_tags="))
+            .expect("incident_tags marker must be present");
+        // Counts commas inside the bracketed list — 3 tags == 2 commas.
+        let commas = tags_marker.matches(',').count();
+        assert_eq!(
+            commas, 2,
+            "incident_tags must be capped at 3 elements (2 commas); got {tags_marker:?}"
+        );
+        assert!(
+            tags_marker.contains("tag1")
+                && tags_marker.contains("tag2")
+                && tags_marker.contains("tag3"),
+            "expected first 3 tags preserved in {tags_marker:?}"
+        );
+        assert!(
+            !tags_marker.contains("tag4") && !tags_marker.contains("tag5"),
+            "expected tag4/tag5 to be dropped beyond the cap in {tags_marker:?}"
+        );
     }
 }
