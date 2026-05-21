@@ -49,6 +49,34 @@ pub struct TelemetrySnapshot {
     pub real_execution_count: u64,
 }
 
+/// Map a physical (source, kind) tuple to its logical telemetry stream id.
+///
+/// The Sensors panel on the dashboard groups events by stream, not by raw
+/// collector source. Most events map straight through (stream = source),
+/// but a few logical streams are fed by more than one physical collector
+/// and silently report 0 if we attribute by source alone. The current
+/// cross-source pairing is the kernel firewall log: both
+/// `syslog_firewall` (reading /var/log/syslog) and `journald` (reading
+/// systemd-journald's kernel facility) parse the same `[UFW BLOCK]`
+/// lines, so we attribute either physical emitter to the
+/// `syslog_firewall` stream key.
+///
+/// Pure function so the mapping table is unit-testable without spinning
+/// up the agent loop. Keep the match arms exhaustive and add new
+/// cross-source pairings here when the dashboard introduces a new
+/// logical stream.
+pub fn telemetry_stream_for<'a>(source: &'a str, kind: &'a str) -> &'a str {
+    // Kernel firewall blocks: journald and syslog_firewall both emit
+    // `kind = "network.connection_blocked"` from the same source-of-truth
+    // (kernel ringbuffer). Pin both to the syslog_firewall stream so the
+    // dashboard reports the real block count, regardless of which physical
+    // collector won the race to the line.
+    if kind == "network.connection_blocked" {
+        return "syslog_firewall";
+    }
+    source
+}
+
 #[derive(Debug, Default)]
 pub struct TelemetryState {
     events_by_collector: BTreeMap<Arc<str>, u64>,
@@ -83,9 +111,19 @@ impl TelemetryState {
             // shared across every observe_events call with the same
             // collector name. Pre-Wave-6b each call allocated a fresh
             // String even when the entry already existed.
+            //
+            // 2026-05-21: attribute by *telemetry stream* rather than raw
+            // physical source. The dashboard's Sensors panel groups events
+            // by logical stream (e.g. "syslog_firewall" = firewall blocks
+            // regardless of whether the kernel line was read via the
+            // syslog_firewall collector or via journald's kernel parser).
+            // `telemetry_stream_for` picks the right bucket so the panel
+            // does not silently report 0 for a stream that two separate
+            // collectors are feeding.
+            let stream = telemetry_stream_for(&event.source, &event.kind);
             *self
                 .events_by_collector
-                .entry(crate::knowledge_graph::intern::intern(&event.source))
+                .entry(crate::knowledge_graph::intern::intern(stream))
                 .or_insert(0) += 1;
         }
     }
@@ -341,6 +379,36 @@ mod tests {
         incident::Incident,
     };
     use tempfile::TempDir;
+
+    /// 2026-05-21 anchor: events from any collector whose kind is
+    /// `network.connection_blocked` (syslog_firewall + journald both
+    /// emit this for kernel UFW lines) get aggregated into the
+    /// `syslog_firewall` telemetry stream. Pre-fix the Sensors panel
+    /// reported 0 firewall blocks because the journald-sourced events
+    /// landed in a separate bucket the panel did not query.
+    #[test]
+    fn telemetry_stream_for_pins_kernel_firewall_to_syslog_firewall() {
+        assert_eq!(
+            telemetry_stream_for("syslog_firewall", "network.connection_blocked"),
+            "syslog_firewall",
+            "syslog_firewall emitting its own kind stays on the stream"
+        );
+        assert_eq!(
+            telemetry_stream_for("journald", "network.connection_blocked"),
+            "syslog_firewall",
+            "journald-parsed UFW lines belong on the syslog_firewall stream"
+        );
+        // Pass-through for any non-cross-sourced kind: the stream id
+        // equals the physical source.
+        assert_eq!(
+            telemetry_stream_for("journald", "ssh.login_failed"),
+            "journald"
+        );
+        assert_eq!(
+            telemetry_stream_for("docker", "container.started"),
+            "docker"
+        );
+    }
 
     /// Wave 6b (AUDIT-WAVE6B-INTERN) anchor: 1000 events with the same
     /// `source = "auth_log"` produce a `events_by_collector` BTreeMap

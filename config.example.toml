@@ -36,6 +36,26 @@ paths = [
   "/etc/cron.d",
 ]
 
+[collectors.syslog_firewall]
+# Reads kernel firewall drop lines (UFW BLOCK / iptables DROP / nftables)
+# from rsyslog. On hosts where journald also captures kernel messages
+# the agent attributes both collectors to the same `syslog_firewall`
+# telemetry stream — see `agent/src/telemetry.rs::telemetry_stream_for`.
+enabled = true
+path = "/var/log/syslog"
+
+[collectors.systemd_inventory]
+# Periodic snapshot of installed/enabled systemd units. Detects newly
+# created services, masked legitimate units, and freshly enabled
+# persistence vectors. Emits `system.unit_*` events.
+enabled = true
+
+[collectors.suid_inventory]
+# Periodic snapshot of suid/sgid binaries on common privilege paths.
+# Detects newly created suid binaries (a classic privilege-escalation
+# persistence technique). Emits `file.suid_*` events.
+enabled = true
+
 [detectors.ssh_bruteforce]
 enabled = true
 # attempts per window triggers incident

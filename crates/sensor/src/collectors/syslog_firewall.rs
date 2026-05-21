@@ -55,6 +55,20 @@ impl SyslogFirewallCollector {
                 }
             };
 
+            // Log rotation detection (same shape as exec_audit::poll). When
+            // `/var/log/syslog` gets rotated by logrotate the new file is
+            // smaller than the saved offset, so seeking would jump past
+            // EOF and the inner read_line loop would tight-spin returning
+            // `Ok(0)` forever, silently dropping every line. Reset to 0
+            // whenever the file has shrunk so the collector actually
+            // re-reads the new file.
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if file_len < offset {
+                warn!(path = %path, "log rotation detected, resetting syslog_firewall offset");
+                offset = 0;
+                shared_offset.store(0, Ordering::Relaxed);
+            }
+
             let mut reader = BufReader::new(file);
             if let Err(e) = reader.seek(SeekFrom::Start(offset)) {
                 warn!("syslog_firewall: seek failed: {e:#}");
