@@ -618,6 +618,32 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
         }
     }
 
+    // PR-D: mmap_file LSM hook — real-time RWX block from chain-flagged PIDs.
+    // Observe by default; blocks only when caller PID is in BLOCKED_PIDS.
+    match bpf.program_mut("innerwarden_lsm_mmap_file") {
+        Some(prog) => {
+            let lsm_res: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_res {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("mmap_file", b) {
+                            warn!("innerwarden_lsm_mmap_file: failed to load: {:?}", e);
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_mmap_file: failed to attach");
+                        } else {
+                            info!("eBPF: innerwarden_lsm_mmap_file → mmap_file (PR-D real-time RWX block) ✅");
+                        }
+                    }
+                }
+                Err(e) => info!(error = %e, "innerwarden_lsm_mmap_file: not available as Lsm"),
+            }
+        }
+        None => {
+            info!("innerwarden_lsm_mmap_file program not found in .o");
+        }
+    }
+
     match bpf.program_mut("innerwarden_lsm_exec") {
         Some(prog) => {
             let lsm_try: Result<&mut Lsm, _> = prog.try_into();

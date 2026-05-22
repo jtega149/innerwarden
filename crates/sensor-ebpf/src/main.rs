@@ -1096,6 +1096,58 @@ pub fn innerwarden_lsm_bpf_prog_load(_ctx: LsmContext) -> i32 {
     -1 // -EPERM — block eBPF weaponization attempt
 }
 
+// ── PR-D: mmap_file LSM hook (real-time RWX block) ─────────────────
+//
+// `security_mmap_file(struct file *file, unsigned long reqprot,
+//   unsigned long prot, unsigned long flags)` fires on every mmap()
+// of a file. We hook it specifically to deny PROT_EXEC mappings from
+// chain-flagged PIDs — the kernel-side equivalent of our proc_maps
+// polling for `memory.rwx_memory` events but REAL-TIME (at mmap
+// instant, not on next 5s scan).
+//
+// Default behaviour: observe + block only when PID is in BLOCKED_PIDS.
+// We do NOT block all PROT_EXEC mmaps unconditionally — that would
+// break every JIT compiler (V8/Node, JVM, PyPy, .NET, LuaJIT) and
+// dynamic linker on the system. Legitimate users pass through
+// because they're never registered as attackers.
+//
+// Note: we don't inspect `prot` from ctx because that requires
+// `bpf_probe_read_kernel` from args (verifier complexity risk).
+// Instead we treat ALL mmap_file calls from blocked PIDs as denial-
+// worthy — broad but the block target is already a known attacker.
+#[lsm(hook = "mmap_file", sleepable)]
+pub fn innerwarden_lsm_mmap_file(_ctx: LsmContext) -> i32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = pid_tgid as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
+        .copied()
+        .unwrap_or(0)
+        != 0;
+    let blocked_by_pid = !blocked_by_tgid
+        && unsafe { BLOCKED_PIDS.get(&pid) }
+            .copied()
+            .unwrap_or(0)
+            != 0;
+
+    if !(blocked_by_tgid || blocked_by_pid) {
+        return 0; // allow (all JIT compilers + dynamic linkers unaffected)
+    }
+
+    if let Some(mut entry) = EVENTS.reserve::<LsmDecisionEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::LsmDecision as u32;
+        event.pid = pid;
+        event.tgid = tgid;
+        event.reason = innerwarden_ebpf_types::LSM_HOOK_MMAP_FILE;
+        event.ts_ns = unsafe { bpf_ktime_get_ns() };
+        entry.submit(0);
+    }
+
+    -1 // -EPERM — block mmap from chain-flagged PID
+}
+
 fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
     // ── Container drift detection (ALWAYS runs, even without guard mode) ──
     // Check if the binary is on an overlayfs upper layer (dropped after container start).
