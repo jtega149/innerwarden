@@ -393,8 +393,7 @@ impl KnowledgeGraph {
     // Returns the same neighbourhood as `attack_narrative`, but as a
     // compact JSON payload the LLM can reason over directly instead of
     // re-deriving structure from prose. Measured delta on qwen2.5:3b:
-    // action accuracy 53% → 73%, target hallucination 47% → 7%
-    // (see `.specify/features/025-structured-ai-prompt/spec.md`).
+    // action accuracy 53% → 73%, target hallucination 47% → 7%.
     //
     // Output shape:
     //   { nodes: [ { id, type, label, ...selected_fields } ],

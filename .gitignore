@@ -42,6 +42,7 @@ CLAUDE.md
 # Project docs live in the GitHub wiki, not the repo
 docs/
 .specify/
+specs/
 
 # graphify knowledge graph (local-only, regenerable)
 graphify-out/
