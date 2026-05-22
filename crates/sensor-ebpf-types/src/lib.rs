@@ -249,6 +249,33 @@ pub struct ProcessExitEvent {
     pub ts_ns: u64,
 }
 
+/// Reasons a PID gets registered in BLOCKED_PIDS by the agent.
+/// Surfaced in `LsmDecisionEvent.reason` for operator triage.
+pub const LSM_REASON_KILL_CHAIN: u32 = 1;
+pub const LSM_REASON_MANUAL: u32 = 2;
+pub const LSM_REASON_RULE: u32 = 3;
+
+/// Emitted by `innerwarden_lsm_exec_min` when a process is denied at
+/// `bprm_check_security`. Allow decisions are NOT emitted (every execve
+/// would generate one — high volume; the absence of this event for an
+/// observed execve means the LSM hook allowed it). The userspace agent
+/// joins this event with the existing `innerwarden_execve` tracepoint
+/// stream by PID to recover {comm, filename, uid} context.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LsmDecisionEvent {
+    /// Always SyscallKind::LsmBlocked (= 6).
+    pub kind: u32,
+    /// Thread PID of the calling task at hook time.
+    pub pid: u32,
+    /// Thread group ID of the calling task at hook time.
+    pub tgid: u32,
+    /// Why this PID was registered as blocked. See LSM_REASON_*.
+    pub reason: u32,
+    /// Timestamp (nanoseconds since boot).
+    pub ts_ns: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2 event types - kernel-level detection expansion
 // ---------------------------------------------------------------------------

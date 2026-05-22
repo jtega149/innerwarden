@@ -30,7 +30,7 @@ use aya_ebpf::{
         bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, kretprobe, lsm, map, tracepoint, xdp},
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, LruHashMap, RingBuf},
     programs::{LsmContext, ProbeContext, RetProbeContext, TracePointContext, XdpContext},
     EbpfContext,
 };
@@ -41,10 +41,11 @@ use aya_ebpf::{macros::raw_tracepoint, maps::ProgramArray, programs::RawTracePoi
 use aya_log_ebpf::info;
 use innerwarden_ebpf_types::{
     AcceptEvent, AcpiEvalEvent, BpfLoadEvent, CloneEvent, ConnectEvent, DupEvent, ExecveEvent,
-    IopermEvent, IoplEvent, KillEvent, ListenEvent, MemfdCreateEvent, ModuleLoadEvent, MountEvent,
-    MprotectEvent, MsrWriteEvent, PrctlEvent, PrivEscEvent, ProcessExitEvent, PtraceEvent,
-    RenameEvent, SetUidEvent, SocketBindEvent, SyscallKind, TimingProbeEvent, TimingTarget,
-    TruncateEvent, UnlinkEvent, UtimensatEvent, MAX_COMM_LEN, MAX_FILENAME_LEN,
+    IopermEvent, IoplEvent, KillEvent, ListenEvent, LsmDecisionEvent, MemfdCreateEvent,
+    ModuleLoadEvent, MountEvent, MprotectEvent, MsrWriteEvent, PrctlEvent, PrivEscEvent,
+    ProcessExitEvent, PtraceEvent, RenameEvent, SetUidEvent, SocketBindEvent, SyscallKind,
+    TimingProbeEvent, TimingTarget, TruncateEvent, UnlinkEvent, UtimensatEvent, MAX_COMM_LEN,
+    MAX_FILENAME_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -768,6 +769,16 @@ fn try_privesc(ctx: &ProbeContext) -> Result<(), i64> {
 #[map]
 static LSM_POLICY: HashMap<u32, u32> = HashMap::with_max_entries(16, 0);
 
+/// Per-PID and per-TGID block list consulted by `innerwarden_lsm_exec_min`.
+/// Spec 052 / INV-LSM-06: LRU eviction at capacity so a worm-style burst can't
+/// silently drop new registrations. INV-LSM-07: the agent inserts BOTH the PID
+/// (thread id) and TGID (process id) of each blocked task — kernel hook checks
+/// TGID first, falls back to PID — so cross-thread chains don't slip past.
+/// Pinned at `/sys/fs/bpf/innerwarden/blocked_pids` by the userspace loader so
+/// the map survives sensor restart. Value byte: 1 = block, anything else = allow.
+#[map]
+static BLOCKED_PIDS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(4096, 0);
+
 /// sizeof(struct inode) for the running kernel - populated by userspace from BTF.
 /// Used for overlayfs upper-layer detection: __upperdentry is at inode_ptr + sizeof(struct inode).
 /// Key: 0. Value: sizeof(struct inode) in bytes.
@@ -857,6 +868,69 @@ pub fn innerwarden_lsm_exec(ctx: LsmContext) -> i32 {
         Ok(ret) => ret,
         Err(_) => 0, // fail-open: allow on error
     }
+}
+
+// ── Spec 052 Phase 1: minimal LSM hook ────────────────────────────────
+// Empirically verified on kernel 6.8.0-1052-oracle (branch
+// lsm/diagnostic-minimal, since deleted) to load successfully where
+// `innerwarden_lsm_exec` above fails. The body deliberately stays
+// trivial — only map lookups, helper calls, and a single fixed-shape
+// ringbuf submit. Anything that pushes verifier complexity (dentry
+// reads, `bpf_probe_read_kernel` traversal, branching state machines)
+// goes through the older hook above, which is kept in parallel during
+// the Phase 1 soak and retired in Phase 3.
+//
+// INV-LSM-02: this body must NOT call check_overlay_drift, must NOT
+// call `bpf_probe_read_kernel` on dentry/file paths, must NOT emit
+// variable-length payloads. Only one `submit` call with the constant
+// 24-byte `LsmDecisionEvent`. The CI script
+// `scripts/verify-lsm-minimal.sh` grep-checks this contract.
+//
+// INV-LSM-07: kernel checks the TGID first, then the PID, so a chain
+// matched against a thread that is not the one calling execve still
+// fires the block.
+#[lsm(hook = "bprm_check_security", sleepable)]
+pub fn innerwarden_lsm_exec_min(_ctx: LsmContext) -> i32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = pid_tgid as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+
+    // INV-LSM-07: TGID first, PID fallback. Distinct keys covered.
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
+        .copied()
+        .unwrap_or(0)
+        != 0;
+    let blocked_by_pid = !blocked_by_tgid
+        && unsafe { BLOCKED_PIDS.get(&pid) }
+            .copied()
+            .unwrap_or(0)
+            != 0;
+
+    if !(blocked_by_tgid || blocked_by_pid) {
+        return 0; // allow: no event emitted (silent allow per spec)
+    }
+
+    // Emit a 24-byte fixed-shape decision event. Userspace agent joins
+    // by pid against the existing `innerwarden_execve` tracepoint stream
+    // to recover {comm, filename, uid}. Reason is set by userspace at
+    // registration time; the kernel hook can't know it here, so the
+    // value sent is a sentinel (0) — Phase 1 follow-up can extend the
+    // map value type from u8 to (u8, u8) carrying the reason.
+    if let Some(mut entry) = EVENTS.reserve::<LsmDecisionEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::LsmBlocked as u32;
+        event.pid = pid;
+        event.tgid = tgid;
+        event.reason = 0; // unknown at kernel time; userspace can infer
+        event.ts_ns = unsafe { bpf_ktime_get_ns() };
+        entry.submit(0);
+    }
+    // If the ringbuf is full we still block — the decision is more
+    // important than the event log. Userspace will detect the gap by
+    // seeing a process_exit for a pid in BLOCKED_PIDS without a
+    // corresponding decision event.
+
+    -1 // -EPERM
 }
 
 fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {

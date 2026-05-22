@@ -492,6 +492,9 @@ const LSM_POLICY_PIN: &str = "/sys/fs/bpf/innerwarden/lsm_policy";
 const CGROUP_CAP_PIN: &str = "/sys/fs/bpf/innerwarden/cgroup_capabilities";
 /// Pin path for per-comm capability map.
 const COMM_CAP_PIN: &str = "/sys/fs/bpf/innerwarden/comm_capabilities";
+/// Pin path for the BLOCKED_PIDS LRU map consulted by `innerwarden_lsm_exec_min`.
+/// The agent populates this via `agent::lsm_policy::register_blocked_pid`.
+const BLOCKED_PIDS_PIN: &str = "/sys/fs/bpf/innerwarden/blocked_pids";
 
 /// Attach LSM execution policy and pin the policy map.
 /// Requires `lsm=...,bpf` in kernel boot cmdline.
@@ -500,45 +503,73 @@ const COMM_CAP_PIN: &str = "/sys/fs/bpf/innerwarden/comm_capabilities";
 fn attach_lsm(bpf: &mut aya::Ebpf) {
     use aya::programs::Lsm;
 
-    match bpf.program_mut("innerwarden_lsm_exec") {
+    // Spec 052 Phase 1: run the minimal LSM loader FIRST. The existing
+    // `innerwarden_lsm_exec` block below uses `return;` on load failure
+    // (kernel ≥ 6.4 always fails due to body complexity — see spec 052),
+    // which would short-circuit past this new loader. Putting it first
+    // avoids that pre-existing latent control-flow bug without disturbing
+    // the legacy paths.
+    match bpf.program_mut("innerwarden_lsm_exec_min") {
         Some(prog) => {
-            let lsm: &mut Lsm = match prog.try_into() {
-                Ok(l) => l,
-                Err(e) => {
-                    info!(error = %e, "innerwarden_lsm_exec: not available (kernel may lack lsm=bpf)");
-                    return;
+            let lsm_res: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_res {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("bprm_check_security", b) {
+                            warn!("innerwarden_lsm_exec_min: failed to load: {:?}", e);
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_exec_min: failed to attach");
+                        } else {
+                            info!("eBPF: innerwarden_lsm_exec_min → bprm_check_security (Spec 052 Phase 1) ✅");
+                        }
+                    } else {
+                        info!("innerwarden_lsm_exec_min: BTF not available; skipping");
+                    }
                 }
-            };
-
-            let btf = aya::Btf::from_sys_fs().ok();
-            if let Err(e) = lsm.load("bprm_check_security", &btf.as_ref().unwrap()) {
-                // 2026-05-21 v2: previous diagnostic used `error = %e`
-                // (Display) which produced the empty `F_ERROR = None`
-                // structured field on Oracle prod — aya's `ProgramError`
-                // Display impl is lossy for the variant that's actually
-                // firing. Inline the Debug-formatted error into the
-                // MESSAGE body so it shows up in plain journalctl output.
-                //
-                // Diagnostic hints the operator should check first:
-                //   grep bpf /sys/kernel/security/lsm   # bpf present?
-                //   ls /sys/kernel/btf/vmlinux           # BTF available?
-                //   uname -r                             # kernel ≥ 5.7?
-                info!(
-                    "innerwarden_lsm_exec: failed to load bprm_check_security hook: {:?} \
-                     — see /sys/kernel/security/lsm, /sys/kernel/btf/vmlinux, kernel >= 5.7",
-                    e
-                );
-                return;
+                Err(e) => {
+                    info!(error = %e, "innerwarden_lsm_exec_min: not available as Lsm");
+                }
             }
-            if let Err(e) = lsm.attach() {
-                warn!(error = %e, "innerwarden_lsm_exec: failed to attach");
-                return;
-            }
-            info!("eBPF: innerwarden_lsm_exec → bprm_check_security (LSM enforcement) ✅");
         }
         None => {
-            info!("eBPF: innerwarden_lsm_exec program not found - LSM not available");
-            return;
+            info!("innerwarden_lsm_exec_min program not found in .o (sensor built without Spec 052 Phase 1?)");
+        }
+    }
+
+    match bpf.program_mut("innerwarden_lsm_exec") {
+        Some(prog) => {
+            let lsm_try: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_try {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("bprm_check_security", b) {
+                            // 2026-05-22: this is the legacy 600-LOC hook that
+                            // never loads on kernel ≥ 6.4 (verifier complexity).
+                            // Spec 052 supersedes it via innerwarden_lsm_exec_min
+                            // (loaded above). Logging kept for one release cycle
+                            // for diff visibility; Phase 3 retires this block.
+                            info!(
+                                "innerwarden_lsm_exec: failed to load (expected on kernel ≥ 6.4, superseded by Spec 052): {:?}",
+                                e
+                            );
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_exec: failed to attach");
+                        } else {
+                            info!(
+                                "eBPF: innerwarden_lsm_exec → bprm_check_security (legacy hook) ✅"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    info!(error = %e, "innerwarden_lsm_exec: not available (kernel may lack lsm=bpf)");
+                }
+            }
+        }
+        None => {
+            info!("eBPF: innerwarden_lsm_exec program not found");
         }
     }
 
@@ -546,21 +577,23 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
     // Non-critical — if it fails, we still have observe-only via the openat tracepoint.
     match bpf.program_mut("innerwarden_lsm_file_open") {
         Some(prog) => {
-            let lsm: &mut Lsm = match prog.try_into() {
-                Ok(l) => l,
+            let lsm_try: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_try {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("file_open", b) {
+                            info!(error = %e, "innerwarden_lsm_file_open: failed to load");
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_file_open: failed to attach");
+                        } else {
+                            info!("eBPF: innerwarden_lsm_file_open → file_open (sensitive path protection) ✅");
+                        }
+                    }
+                }
                 Err(e) => {
                     info!(error = %e, "innerwarden_lsm_file_open: not available");
-                    // Continue — the exec LSM is the critical one
-                    return pin_lsm_policy(bpf);
                 }
-            };
-            let btf = aya::Btf::from_sys_fs().ok();
-            if let Err(e) = lsm.load("file_open", &btf.as_ref().unwrap()) {
-                info!(error = %e, "innerwarden_lsm_file_open: failed to load");
-            } else if let Err(e) = lsm.attach() {
-                warn!(error = %e, "innerwarden_lsm_file_open: failed to attach");
-            } else {
-                info!("eBPF: innerwarden_lsm_file_open → file_open (sensitive path protection) ✅");
             }
         }
         None => {
@@ -614,9 +647,12 @@ fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     }
 
     // Pin capability maps so the agent can grant per-cgroup/per-comm permissions.
+    // Spec 052 Phase 1: pin BLOCKED_PIDS alongside the existing capability maps
+    // so `agent::lsm_policy::register_blocked_pid` can open it via `MapData::from_pin`.
     for (map_name, pin_path) in [
         ("CGROUP_CAPABILITIES", CGROUP_CAP_PIN),
         ("COMM_CAPABILITIES", COMM_CAP_PIN),
+        ("BLOCKED_PIDS", BLOCKED_PIDS_PIN),
     ] {
         if let Some(map) = bpf.map_mut(map_name) {
             let _ = std::fs::remove_file(pin_path);
