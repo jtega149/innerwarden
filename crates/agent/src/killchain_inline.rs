@@ -53,6 +53,23 @@ pub(crate) fn process_events(
                 .and_then(|s| s.as_str())
                 .unwrap_or("medium");
 
+            // Spec 052 Phase 1b: register the offending PID with the
+            // kernel LSM block so the chain's NEXT execve hits -EPERM
+            // synchronously (instead of waiting for the agent's
+            // kill_process skill to race against the malicious exec).
+            // Idempotent + best-effort: if the BLOCKED_PIDS map isn't
+            // pinned (sensor off, built without LSM, etc.) this is a
+            // logged no-op and the existing userspace skill pipeline
+            // continues unchanged.
+            if let Some(pid) = inc
+                .get("evidence")
+                .and_then(|e| e.get("pid"))
+                .and_then(|p| p.as_u64())
+            {
+                let reason = format!("kill_chain:{pattern}");
+                crate::lsm_policy::register_blocked_pid(pid as u32, &reason);
+            }
+
             let kind = format!("killchain.{}", pattern);
             let mut corr_event = correlation_engine::CorrelationEngine::killchain_event(
                 &kind,

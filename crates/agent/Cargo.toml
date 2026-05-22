@@ -28,6 +28,11 @@ tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_mall
 # severity filters work as documented.
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = "0.3"
+# Spec 052 Phase 1b: aya userspace opens the pinned BLOCKED_PIDS map and
+# writes PID/TGID entries the kernel LSM hook consults. Aya is Linux-only
+# (depends on libc symbols that don't exist on macOS/Windows); the
+# `lsm_policy` module stubs to no-ops on non-Linux via cfg.
+aya = "0.13"
 
 [dependencies]
 innerwarden_core = { path = "../core" }

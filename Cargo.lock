@@ -2223,6 +2223,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "aya",
  "base64 0.22.1",
  "bytes",
  "chrono",

@@ -126,6 +126,13 @@ pub enum SyscallKind {
     Utimensat = 33,
     /// File truncation (do_truncate kprobe) — detect log tampering (T1070.003)
     Truncate = 34,
+
+    // ── Spec 052 Phase 1: minimal LSM hook ─────────────────────────────
+    /// Emitted by `innerwarden_lsm_exec_min` on a kernel-side block.
+    /// Distinct from `LsmBlocked` (= 6) which the legacy hook uses with
+    /// the larger `ExecveEvent` shape — this kind always carries a
+    /// fixed-shape `LsmDecisionEvent` (24 bytes).
+    LsmDecision = 35,
 }
 
 /// Identifies which kernel function a timing probe measured.
@@ -264,7 +271,8 @@ pub const LSM_REASON_RULE: u32 = 3;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LsmDecisionEvent {
-    /// Always SyscallKind::LsmBlocked (= 6).
+    /// Always SyscallKind::LsmDecision (= 35). Distinct from LsmBlocked
+    /// (= 6) which the legacy hook uses with the larger ExecveEvent shape.
     pub kind: u32,
     /// Thread PID of the calling task at hook time.
     pub pid: u32,

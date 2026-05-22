@@ -918,7 +918,7 @@ pub fn innerwarden_lsm_exec_min(_ctx: LsmContext) -> i32 {
     // map value type from u8 to (u8, u8) carrying the reason.
     if let Some(mut entry) = EVENTS.reserve::<LsmDecisionEvent>(0) {
         let event = unsafe { &mut *entry.as_mut_ptr() };
-        event.kind = SyscallKind::LsmBlocked as u32;
+        event.kind = SyscallKind::LsmDecision as u32;
         event.pid = pid;
         event.tgid = tgid;
         event.reason = 0; // unknown at kernel time; userspace can infer

@@ -127,6 +127,7 @@ mod kg_fp_suppression;
 mod killchain_inline;
 mod knowledge_graph;
 mod loops;
+mod lsm_policy;
 mod mesh;
 mod mitre;
 mod narrative;
