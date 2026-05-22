@@ -833,9 +833,46 @@ fn has_capability(cap_bit: u32) -> bool {
     false
 }
 
-#[lsm(hook = "bprm_check_security")]
-pub fn innerwarden_lsm_exec(ctx: LsmContext) -> i32 {
-    match try_lsm_exec(&ctx) {
+/// Forward-declared kernel struct for the LSM hook's first argument.
+///
+/// Kernel ≥ 6.4 tightened the BPF verifier so that LSM programs must
+/// declare arg0 with the exact BTF type the kernel hook expects
+/// (`struct linux_binprm *` for `bprm_check_security`). aya's
+/// `#[lsm(hook = "...")]` macro — including the current main-branch
+/// version — emits the entry point as `fn(ctx: *mut c_void) -> i32`,
+/// which the new verifier rejects with `EINVAL` plus a verifier log
+/// pointing at `func 'bpf_lsm_bprm_check_security' arg0 has btf_id
+/// <N> type STRUCT 'linux_binprm'`.
+///
+/// The fix is to emit the entry point ourselves with the typed arg.
+/// The struct is intentionally opaque — the existing `check_overlay_drift`
+/// path walks the kernel layout via `bpf_probe_read_kernel` with
+/// hard-coded offsets, so we never dereference fields directly in
+/// Rust. The kernel verifier only checks arg0's BTF name + kind, not
+/// the field layout, so an empty struct named `linux_binprm` (with
+/// `#[repr(C)]` so Rust emits a struct in BTF) is enough to pass.
+///
+/// Documented separately because future hooks (`file_open`, `bpf`) need
+/// the same treatment with their own kernel structs (`file`, `bpf_prog`).
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct linux_binprm {
+    _opaque: [u8; 0],
+}
+
+// Manual replacement for `#[lsm(hook = "bprm_check_security")]`.
+// Mirrors what aya-ebpf-macros emits — `no_mangle` + `link_section =
+// "lsm/bprm_check_security"` — but with `*const linux_binprm` as arg0
+// so the kernel verifier's BTF type check passes on kernel ≥ 6.4. The
+// body keeps using `LsmContext` for compatibility with the existing
+// helpers (`try_lsm_exec`, `check_overlay_drift`, …) — `LsmContext`
+// is just a thin wrapper around a `*mut c_void`, so we cast our
+// typed pointer into it once and reuse all the existing code.
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "lsm/bprm_check_security")]
+pub fn innerwarden_lsm_exec(ctx: *const linux_binprm) -> i32 {
+    let lsm_ctx = LsmContext::new(ctx as *mut core::ffi::c_void);
+    match try_lsm_exec(&lsm_ctx) {
         Ok(ret) => ret,
         Err(_) => 0, // fail-open: allow on error
     }
