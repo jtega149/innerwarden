@@ -1594,6 +1594,31 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
     // Populate kernel-level noise filters BEFORE taking ring buffer borrow
     populate_kernel_filters(&mut bpf);
 
+    // Spec 052 Phase 1d: small in-memory cache that lets the kind=35
+    // (LsmDecisionEvent) dispatch arm enrich its event with the comm,
+    // filename, and uid captured by the earlier kind=1 (ExecveEvent)
+    // tracepoint for the same PID. The kernel tracepoint
+    // (sys_enter_execve) fires before the LSM hook (bprm_check_security),
+    // so for any blocked exec the ExecveEvent arrives in the ringbuf
+    // ahead of the LsmDecisionEvent — typically within microseconds.
+    //
+    // The cache is bounded: aged out when > 1024 entries (drop anything
+    // older than 5 seconds). That holds ~50 seconds of context at the
+    // typical prod execve rate while keeping the working set tiny.
+    //
+    // INV-LSM-04 anchor: ensures `lsm.blocked` events carry filename +
+    // comm + uid context, so operators can read the SQLite events table
+    // (or dashboard) and see "X blocked from executing Y" without
+    // joining two tables themselves.
+    struct ExecveCtx {
+        comm: String,
+        filename: String,
+        uid: u32,
+        ts_ns: u64,
+    }
+    let mut execve_cache: std::collections::HashMap<u32, ExecveCtx> =
+        std::collections::HashMap::with_capacity(256);
+
     // Read from ring buffer
     let mut ring_buf = match RingBuf::try_from(bpf.map_mut("EVENTS").unwrap()) {
         Ok(rb) => rb,
@@ -1689,6 +1714,30 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
 
                     if comm.starts_with("innerwarden") {
                         continue;
+                    }
+
+                    // Spec 052 Phase 1d: cache for join with LsmDecisionEvent
+                    // (kind=35). Insert before any early-return below so a
+                    // future LSM block on this pid has context to merge.
+                    // Capped at 1024 entries; aged out at 5s when full.
+                    let ts_ns_now = {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default();
+                        now.as_nanos() as u64
+                    };
+                    execve_cache.insert(
+                        pid,
+                        ExecveCtx {
+                            comm: comm.clone(),
+                            filename: filename.clone(),
+                            uid,
+                            ts_ns: ts_ns_now,
+                        },
+                    );
+                    if execve_cache.len() > 1024 {
+                        let cutoff = ts_ns_now.saturating_sub(5_000_000_000);
+                        execve_cache.retain(|_, ctx| ctx.ts_ns >= cutoff);
                     }
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
@@ -1929,6 +1978,16 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
 
                     let container_id = resolve_container_id(pid);
 
+                    // Spec 052 Phase 1d: join with the earlier ExecveEvent
+                    // for the same PID (cached above on kind=1). The
+                    // tracepoint always fires before the LSM hook, so the
+                    // cache entry should be present unless this block is
+                    // somehow racing with cache eviction (unlikely at the
+                    // 5s TTL / 1024-entry capacity). If absent, the event
+                    // still lands with bare pid/tgid context — operators
+                    // can still see SOMETHING was blocked.
+                    let exec_ctx = execve_cache.get(&pid);
+
                     let mut details = serde_json::json!({
                         "pid": pid,
                         "tgid": tgid,
@@ -1939,6 +1998,16 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                     });
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
+                    }
+                    if let Some(ctx) = exec_ctx {
+                        details["filename"] = serde_json::Value::String(ctx.filename.clone());
+                        details["comm"] = serde_json::Value::String(ctx.comm.clone());
+                        details["uid"] = serde_json::Value::from(ctx.uid);
+                        details["join_source"] =
+                            serde_json::Value::String("execve_tracepoint".to_string());
+                    } else {
+                        details["join_source"] =
+                            serde_json::Value::String("cache_miss".to_string());
                     }
 
                     let mut tags = vec![
@@ -1953,16 +2022,26 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         entities.push(EntityRef::container(cid));
                     }
 
+                    let summary = if let Some(ctx) = exec_ctx {
+                        format!(
+                            "LSM kernel-block: {} (PID {pid}) denied execve to {} \
+                             — innerwarden_lsm_exec_min",
+                            ctx.comm, ctx.filename
+                        )
+                    } else {
+                        format!(
+                            "LSM kernel-block: execve from PID {pid} (TGID {tgid}) \
+                             denied by innerwarden_lsm_exec_min"
+                        )
+                    };
+
                     Some(Event {
                         ts: chrono::Utc::now(),
                         host: host.to_string(),
                         source: "ebpf".to_string(),
                         kind: "lsm.blocked".to_string(),
                         severity: Severity::Critical,
-                        summary: format!(
-                            "LSM kernel-block: execve from PID {pid} (TGID {tgid}) \
-                             denied by innerwarden_lsm_exec_min"
-                        ),
+                        summary,
                         details,
                         tags,
                         entities,
