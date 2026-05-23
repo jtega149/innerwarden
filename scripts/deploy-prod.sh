@@ -325,7 +325,15 @@ fi
 
 # Always check the full service set so an unrelated inactive unit
 # is surfaced even on a sensor-only or agent-only deploy.
+#
+# Special case for innerwarden-agent: on prod with the proprietary
+# watchdog, the agent runs as a CHILD process of innerwarden-watchdog,
+# not as its own systemd unit. `systemctl is-active innerwarden-agent`
+# returns "inactive" in that case even though the agent IS running.
+# When the watchdog is active, fall back to a pgrep check so we don't
+# print a false "agent NOT active" warning on every prod deploy.
 deploy_health=0
+watchdog_active=$($SSH "sudo systemctl is-active innerwarden-watchdog 2>/dev/null" || echo "unknown")
 for svc in innerwarden-sensor innerwarden-agent innerwarden-watchdog; do
   unit_present=$($SSH "systemctl list-unit-files --no-legend 2>/dev/null | grep -c '^$svc\\.service'" 2>/dev/null || echo "0")
   if [ "${unit_present:-0}" = "0" ]; then
@@ -333,10 +341,16 @@ for svc in innerwarden-sensor innerwarden-agent innerwarden-watchdog; do
     continue
   fi
   status=$($SSH "sudo systemctl is-active $svc" 2>/dev/null || echo "unknown")
+  if [ "$svc" = "innerwarden-agent" ] && [ "$status" != "active" ] && [ "$watchdog_active" = "active" ]; then
+    # Watchdog supervises the agent — confirm via process check.
+    if $SSH "pgrep -f '^/usr/local/bin/innerwarden-agent ' >/dev/null" 2>/dev/null; then
+      status="active (watchdog-supervised)"
+    fi
+  fi
   bin_name="$svc"
   version=$($SSH "$BIN_DIR/$bin_name --version 2>/dev/null" || echo "?")
   echo "  $svc: $status ($version)"
-  if [ "$status" != "active" ]; then
+  if [ "${status%% *}" != "active" ]; then
     deploy_health=1
     echo "    WARN: $svc is NOT active. Remediation:"
     echo "      ssh $SERVER 'sudo systemctl status $svc --no-pager'"
