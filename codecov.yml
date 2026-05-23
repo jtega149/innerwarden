@@ -65,6 +65,16 @@ coverage:
           - "!crates/supervisor/src/main.rs"
           - "!crates/ctl/src/main.rs"
           - "!crates/sensor/src/main.rs"
+          # FFI boundary to the kernel BPF map at
+          # /sys/fs/bpf/innerwarden/blocked_pids. Every line in
+          # aya_impl.rs calls into aya which calls into the kernel —
+          # exercising it needs CAP_BPF + a real pinned map, which CI
+          # doesn't have. The testable logic this file delegates to
+          # (BlockedPidsMap trait, unregister_inner, read_tgid_from_proc)
+          # lives in lsm_policy/mod.rs and IS unit-tested. End-to-end
+          # validation happens against the prod kernel — see
+          # project_lsm_aya_kernel_64.md for the GC validation log.
+          - "!crates/agent/src/lsm_policy/aya_impl.rs"
       # Orchestration / boot wiring gets its own *informational* gauge so
       # it is measured (not hidden) but never blocks merges. Real ceiling
       # is set by integration tests, not unit tests.

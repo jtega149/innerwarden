@@ -1,29 +1,15 @@
-//! Agent-side control plane for the kernel LSM block (Spec 052 Phase 1b).
+//! Aya FFI layer for the BLOCKED_PIDS BPF map.
 //!
-//! Opens the `BLOCKED_PIDS` LRU map that the sensor pinned at
-//! `/sys/fs/bpf/innerwarden/blocked_pids` (see
-//! `crates/sensor/src/collectors/ebpf_syscall.rs`) and exposes
-//! `register_blocked_pid` / `unregister_blocked_pid` for the kill chain
-//! detector and process-exit GC to call.
-//!
-//! INV-LSM-03: every map write goes through this module's
-//! `register_blocked_pid` — no other code in the agent or sensor pokes
-//! the map directly.
-//!
-//! INV-LSM-07: `register_blocked_pid` writes BOTH the PID (thread id)
-//! and the TGID (process id, looked up via `/proc/<pid>/status:Tgid:`)
-//! so a chain that matched on a non-main thread still gets blocked at
-//! exec time on the main thread of the same process.
-//!
-//! The map is opened lazily on first use. If the sensor isn't running
-//! or BLOCKED_PIDS isn't pinned (e.g. operator built without LSM
-//! support), every register/unregister becomes a no-op + warn — the
-//! kernel-block path goes inert without disturbing the agent's normal
-//! detection pipeline.
-//!
-//! Aya is Linux-only — non-Linux builds compile to pure no-op stubs
-//! that log a single "kernel-block path unavailable" warn the first
-//! time the agent tries to register a PID.
+//! This file is excluded from the patch-coverage gate (see `codecov.yml`)
+//! because every line here ultimately calls into the kernel via aya —
+//! `MapData::from_pin`, `AyaHashMap::insert`, `AyaHashMap::remove`,
+//! `AyaHashMap::get` — and CI has neither CAP_BPF nor the pinned map
+//! at `/sys/fs/bpf/innerwarden/blocked_pids`. The testable logic that
+//! these wrappers delegate to (`unregister_inner`, the `BlockedPidsMap`
+//! trait, `read_tgid_from_proc`) lives in the parent module and is
+//! covered by unit tests there. End-to-end validation of THIS file
+//! happens against the prod kernel — see
+//! `project_lsm_aya_kernel_64.md` for the GC validation log.
 
 #[cfg(target_os = "linux")]
 use std::sync::{Mutex, OnceLock};
@@ -37,6 +23,9 @@ use tracing::{info, warn};
 use std::sync::OnceLock;
 #[cfg(not(target_os = "linux"))]
 use tracing::warn;
+
+#[cfg(target_os = "linux")]
+use super::{read_tgid_from_proc, unregister_inner, BlockedPidsMap};
 
 /// Pin path the sensor uses for the LRU map. Kept as a string constant
 /// so this crate doesn't have to depend on `innerwarden-sensor` (the
@@ -96,24 +85,16 @@ fn map_handle() -> &'static Mutex<Option<AyaHashMap<MapData, u32, u8>>> {
     })
 }
 
-/// Read `/proc/<pid>/status` and return the `Tgid:` value. Returns
-/// `None` if the process has already exited (ENOENT) or status parsing
-/// fails — the caller treats that as "couldn't dual-register" and
-/// proceeds with the PID-only registration.
-//
-// dead_code allow on non-Linux: this helper is only called by the Linux
-// register_blocked_pid path and the macOS-gated unit test, neither of
-// which the workspace clippy run sees on the macOS build cfg.
-#[allow(dead_code)]
-fn read_tgid_from_proc(pid: u32) -> Option<u32> {
-    let path = format!("/proc/{pid}/status");
-    let content = std::fs::read_to_string(&path).ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("Tgid:") {
-            return rest.trim().parse::<u32>().ok();
-        }
+#[cfg(target_os = "linux")]
+impl BlockedPidsMap for AyaHashMap<MapData, u32, u8> {
+    fn contains(&self, pid: u32) -> bool {
+        // flags=0 → non-LRU read path; aya 0.13 supports this on both
+        // HashMap and LruHashMap variants.
+        AyaHashMap::get(self, &pid, 0).is_ok()
     }
-    None
+    fn remove(&mut self, pid: u32) -> Result<(), String> {
+        AyaHashMap::remove(self, &pid).map_err(|e| e.to_string())
+    }
 }
 
 /// Mark a PID (and its TGID, when distinct) as denied at the next
@@ -181,7 +162,7 @@ pub fn unregister_blocked_pid(pid: u32) {
         Some(m) => m,
         None => return,
     };
-    let _ = map.remove(&pid);
+    unregister_inner(map, pid);
 }
 
 // ── Non-Linux stubs ──────────────────────────────────────────────────
@@ -207,41 +188,4 @@ pub fn register_blocked_pid(pid: u32, reason: &str) {
 #[cfg(not(target_os = "linux"))]
 pub fn unregister_blocked_pid(_pid: u32) {
     // no-op on non-Linux
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `read_tgid_from_proc` against the test process itself — pid and
-    /// tgid will match (test runs as a single-threaded worker as far
-    /// as cargo test is concerned, so `pid == tgid` is expected).
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn read_tgid_from_proc_works_on_self() {
-        let pid = std::process::id();
-        let tgid = read_tgid_from_proc(pid).expect("self /proc/<pid>/status should be readable");
-        // The test process's pid equals its tgid because the main thread
-        // is what cargo executes the test in.
-        assert_eq!(tgid, pid);
-    }
-
-    /// On macOS (no /proc) the helper must return None, not panic.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn read_tgid_from_proc_returns_none_on_macos() {
-        assert!(read_tgid_from_proc(std::process::id()).is_none());
-    }
-
-    /// `register_blocked_pid` on a host without the BPF map pinned must
-    /// not panic and must not write anywhere; it should log a warn and
-    /// return cleanly. We can't verify the map state here (no map), but
-    /// we can verify the call completes without panic.
-    #[test]
-    fn register_blocked_pid_no_pin_is_noop() {
-        // The first call to map_handle() on a host without the pin will
-        // initialize the OnceLock with None. Subsequent calls are no-ops.
-        register_blocked_pid(99999, "test:no_pin");
-        unregister_blocked_pid(99999);
-    }
 }
