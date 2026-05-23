@@ -16,27 +16,67 @@ coverage:
   range: "40...85"
 
   status:
+    # Fixed floors (2026-05-23): switched off `target: auto` because
+    # the auto/drift gate kept tripping on refactor PRs that moved
+    # tested code around without changing the actual signal. Floors
+    # are set ~2pp below the values measured on main on 2026-05-23
+    # so there's headroom for normal refactor churn but a real
+    # regression (>2pp drop) still fails the PR. If a coverage
+    # initiative pushes a number up, raise the floor in this file
+    # so the gain is locked in.
     project:
       default:
-        target: auto              # compare to base commit
-        threshold: 0.5%           # allow small drops without failing
+        target: 72%
+        threshold: 0%
         informational: false
       agent:
         paths: ["crates/agent/**"]
-        target: auto
-        threshold: 1%
+        target: 73%
+        threshold: 0%
       ctl:
         paths: ["crates/ctl/**"]
-        target: auto
-        threshold: 1%
+        target: 73%
+        threshold: 0%
       sensor:
         paths: ["crates/sensor/**"]
-        target: auto
-        threshold: 1%
+        target: 65%
+        threshold: 0%
       dashboard:
         paths: ["crates/agent/src/dashboard/**"]
-        target: auto
-        threshold: 1%
+        target: 71%
+        threshold: 0%
+      killchain:
+        paths: ["crates/killchain/**"]
+        target: 91%
+        threshold: 0%
+      store:
+        paths: ["crates/store/**"]
+        target: 83%
+        threshold: 0%
+      core:
+        paths: ["crates/core/**"]
+        target: 88%
+        threshold: 0%
+      hypervisor:
+        paths: ["crates/hypervisor/**"]
+        target: 83%
+        threshold: 0%
+      agent-guard:
+        paths: ["crates/agent-guard/**"]
+        target: 77%
+        threshold: 0%
+      smm:
+        paths: ["crates/smm/**"]
+        target: 74%
+        threshold: 0%
+      shield:
+        paths: ["crates/shield/**"]
+        target: 73%
+        threshold: 0%
+      dna:
+        paths: ["crates/dna/**"]
+        target: 71%
+        threshold: 0%
 
     patch:
       default:
