@@ -191,6 +191,19 @@ sensor_defaults = {
         "threshold": "12",
         "window_seconds": "60",
     },
+    # kernel_devnode_exposed defaults to enabled=true in prod because
+    # the whole point is to surface misconfigured /dev nodes without
+    # operator action. Scenario QA runners (GitHub Actions ubuntu hosts)
+    # typically have /dev/kvm and /dev/vhost-* world-or-group-accessible
+    # by default, which would emit Medium "integrity.devnode_exposed"
+    # events on every scenario run and break the tight expected.json
+    # incident envelopes (every scenario would be over by 2-4 incidents
+    # depending on the CI runner's /dev inventory). Force it off here
+    # exactly like every other detector — scenarios opt-in via their
+    # own overrides.toml when they want to test the detector itself.
+    "detectors.kernel_devnode_exposed": {
+        "enabled": "false",
+    },
 }
 
 agent_defaults = {

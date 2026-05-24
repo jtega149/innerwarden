@@ -49,7 +49,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 It lives where the action is. Not a tool watching from outside, not an alert in someone else's dashboard. Inner Warden runs inside the server, sees what every program does, and decides what to do — all without leaving the box. One binary, one SQLite database, no SIEM bundle, no external IDS, no cloud control plane. Two Rust daemons and a CLI.
 
-49 eBPF kernel programs. 77 detectors. 29 collectors. 68 cross-layer correlation rules. 90+ MITRE ATT&CK techniques covered across all 14 Linux tactics. 8000+ unit tests (665 named anchors that pin past bug fixes — see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change. 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. Monthly threat reports. Mesh collaborative defense. **Unified SQLite store** for every artifact (incidents, decisions, KV cache, graph snapshots, attacker profiles). **Intelligent notifications**: incidents group into a single Telegram message per IP instead of one-per-event. **Circuit breaker**: per-hour cap on autonomous block decisions protects against runaway enforcement (pause / log-only / dry-run modes). **Continuous trust scoring**: graduated enforcement plus daily self-check. **Regression safety net**: `make scenario-qa` gates every PR against drift for 7 canonical attack scenarios.
+49 eBPF kernel programs. 78 detectors. 29 collectors. 68 cross-layer correlation rules. 90+ MITRE ATT&CK techniques covered across all 14 Linux tactics. 8000+ unit tests (665 named anchors that pin past bug fixes — see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change. 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. Monthly threat reports. Mesh collaborative defense. **Unified SQLite store** for every artifact (incidents, decisions, KV cache, graph snapshots, attacker profiles). **Intelligent notifications**: incidents group into a single Telegram message per IP instead of one-per-event. **Circuit breaker**: per-hour cap on autonomous block decisions protects against runaway enforcement (pause / log-only / dry-run modes). **Continuous trust scoring**: graduated enforcement plus daily self-check. **Regression safety net**: `make scenario-qa` gates every PR against drift for 7 canonical attack scenarios.
 
 <h3 align="center">
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
@@ -117,7 +117,7 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 │       └───────────┴───────────────┴─────────────┘                 │
 │                          │                                        │
 │                    ┌─────▼──────┐                                 │
-│                    │77 detectors│ + 8 YARA + 8 Sigma              │
+│                    │78 detectors│ + 8 YARA + 8 Sigma              │
 │                    │ stateful   │                                 │
 │                    └─────┬──────┘                                 │
 │                          │                                        │

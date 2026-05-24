@@ -2499,6 +2499,66 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             min_confidence: 0.85,
             severity: Severity::Critical,
         },
+        // CL-071: Kernel devnode exposure → unprivileged abuse →
+        // privilege escalation.
+        //
+        // Motivation: the `kernel_devnode_exposed` detector (sensor)
+        // continuously polls a watchlist of sensitive `/dev/*` nodes
+        // and emits a Medium incident when permissions are wider than
+        // the documented safe-default (e.g. Azure mana_ib shipping
+        // `/dev/infiniband/uverbs0` mode 0666 by default). That signal
+        // is hardening-only on its own. This rule promotes it to a
+        // Critical chain ONLY when the agent observes a process
+        // actually opening the exposed devnode AND subsequently
+        // gaining capabilities. The three-stage shape mirrors the
+        // post-2026 page-cache family rules: configuration exposure
+        // → exercise → outcome.
+        //
+        // Stage 1: integrity.devnode_exposed (Medium baseline)
+        // Stage 2: any sensitive-write or open against the same path
+        //          entity (entity_must_match=true keeps the chain
+        //          scoped to ONE exposed devnode at a time)
+        // Stage 3: privesc / kill_chain — the actual outcome that
+        //          turns "config risk" into "active compromise"
+        CorrelationRule {
+            id: "CL-071".into(),
+            name: "Kernel Devnode Exposure → Abuse → Privilege Escalation".into(),
+            stages: vec![
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["integrity.devnode_exposed".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "sensitive_write".into(),
+                        "sensitive_write:*".into(),
+                        "file.open".into(),
+                        "file.write_access".into(),
+                        "ioctl_anomaly".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "privesc".into(),
+                        "privilege.escalation".into(),
+                        "kill_chain_detected".into(),
+                        "credential_harvest".into(),
+                    ],
+                    entity_must_match: false,
+                },
+            ],
+            // 1 hour window: from the moment the agent first sees the
+            // exposure to the moment a process exploits it.
+            window_secs: 3600,
+            // 0.85 = 3 stages with entity-match in middle stage is a
+            // tight pattern; rare to false-positive.
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
     ]
 }
 
@@ -2673,8 +2733,9 @@ mod tests {
     #[test]
     fn engine_starts_empty() {
         let engine = CorrelationEngine::new();
-        // 47 original (CL-001 → CL-047) + 20 spec 050-PR7 (CL-051 → CL-070).
-        assert_eq!(engine.rule_count(), 67);
+        // 47 original (CL-001 → CL-047) + 20 spec 050-PR7 (CL-051 → CL-070)
+        // + CL-071 (kernel devnode exposure chain — this PR).
+        assert_eq!(engine.rule_count(), 68);
         assert_eq!(engine.pending_count(), 0);
     }
 
@@ -3447,6 +3508,88 @@ mod tests {
             "10.0.0.72",
         ));
         assert_chain_fires(&mut engine, "CL-070");
+    }
+
+    /// Helper for path-entity events (CL-071 is the first rule that
+    /// pivots on a path entity instead of an IP entity).
+    fn make_path_event(layer: Layer, kind: &str, path: &str) -> CorrelationEvent {
+        CorrelationEvent {
+            ts: Utc::now(),
+            layer,
+            source: intern("test"),
+            kind: intern(kind),
+            severity: Severity::Medium,
+            entities: vec![EntityRef::path(path)],
+            details: serde_json::json!({}),
+            incident_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn cl_071_kernel_devnode_exposure_to_privesc_chain() {
+        let mut engine = CorrelationEngine::new();
+        let exposed = "/dev/infiniband/uverbs0";
+        // Stage 1: detector emits the exposure (Medium). Entity = path.
+        engine.observe(make_path_event(
+            Layer::Userspace,
+            "integrity.devnode_exposed",
+            exposed,
+        ));
+        // Stage 2: a process actually opens / writes the same path
+        // (entity_must_match=true keeps unrelated devnode opens from
+        // chaining a different exposure into the wrong incident).
+        engine.observe(make_path_event(
+            Layer::Userspace,
+            "sensitive_write",
+            exposed,
+        ));
+        // Stage 3: subsequent privesc anywhere on the host. Entity
+        // does NOT have to match — the exploit chain may pivot to a
+        // different process / user.
+        engine.observe(make_event(Layer::Userspace, "privesc", "10.0.0.171"));
+        assert_chain_fires(&mut engine, "CL-071");
+    }
+
+    #[test]
+    fn cl_071_does_not_fire_without_matching_path_in_stage_2() {
+        let mut engine = CorrelationEngine::new();
+        // Exposure on uverbs0…
+        engine.observe(make_path_event(
+            Layer::Userspace,
+            "integrity.devnode_exposed",
+            "/dev/infiniband/uverbs0",
+        ));
+        // …but the sensitive_write hit /etc/passwd, a completely
+        // different path. Stage 2 entity_must_match must reject this.
+        engine.observe(make_path_event(
+            Layer::Userspace,
+            "sensitive_write",
+            "/etc/passwd",
+        ));
+        engine.observe(make_event(Layer::Userspace, "privesc", "10.0.0.172"));
+        let chains = engine.drain_completed();
+        assert!(
+            !chains.iter().any(|c| c.rule_id == "CL-071"),
+            "CL-071 must NOT fire when stage-2 entity differs from stage-1"
+        );
+    }
+
+    #[test]
+    fn cl_071_does_not_fire_with_only_exposure_signal() {
+        // The exposure alone is a hardening hint, not a chain. Without
+        // stage 2 (open) AND stage 3 (privesc) the rule must stay
+        // silent so it doesn't dilute Critical signal noise.
+        let mut engine = CorrelationEngine::new();
+        engine.observe(make_path_event(
+            Layer::Userspace,
+            "integrity.devnode_exposed",
+            "/dev/kvm",
+        ));
+        let chains = engine.drain_completed();
+        assert!(
+            !chains.iter().any(|c| c.rule_id == "CL-071"),
+            "CL-071 must NOT fire on the exposure signal alone"
+        );
     }
 
     // ─── Post-Caldera 2026-05-17 tuning: legacy detector variants ──────────

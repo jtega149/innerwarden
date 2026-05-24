@@ -208,6 +208,8 @@ pub struct DetectorsConfig {
     pub suspicious_login: SuspiciousLoginConfig,
     #[serde(default)]
     pub suid_page_cache_integrity: SuidPageCacheIntegrityConfig,
+    #[serde(default)]
+    pub kernel_devnode_exposed: KernelDevnodeExposedConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -247,6 +249,54 @@ fn default_suid_page_cache_integrity_allowlist() -> Vec<String> {
         .iter()
         .map(|path| (*path).to_string())
         .collect()
+}
+
+/// Per-pattern entry in the operator-tunable kernel devnode watchlist.
+///
+/// `max_allowed_mode_octal` is parsed as octal (so a TOML value like
+/// "0o660" or "660" both work). When parsing fails we fall back to the
+/// hardcoded default for that pattern so a typo cannot accidentally
+/// disable detection by widening the allowed mode to all bits.
+#[derive(Debug, Deserialize, Clone)]
+pub struct KernelDevnodeWatchEntryConfig {
+    pub pattern: String,
+    pub max_allowed_mode_octal: String,
+    #[serde(default)]
+    pub surface: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KernelDevnodeExposedConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_kernel_devnode_exposed_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Per-path explicit exclusions. A path matched by `expand()` that
+    /// appears here is silently skipped even when exposed — useful for
+    /// dedicated RDMA / KVM hosts where the operator intentionally
+    /// widens permissions.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+    /// Operator overrides for the default watchlist. Each entry replaces
+    /// the built-in entry for the same `pattern` if present; otherwise
+    /// it extends the watchlist with a new pattern.
+    #[serde(default)]
+    pub overrides: Vec<KernelDevnodeWatchEntryConfig>,
+}
+
+impl Default for KernelDevnodeExposedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_secs: default_kernel_devnode_exposed_poll_interval_secs(),
+            allowlist: Vec::new(),
+            overrides: Vec::new(),
+        }
+    }
+}
+
+fn default_kernel_devnode_exposed_poll_interval_secs() -> u64 {
+    crate::detectors::kernel_devnode_exposed::DEFAULT_POLL_INTERVAL_SECS
 }
 
 #[derive(Debug, Deserialize)]
@@ -1453,6 +1503,61 @@ trusted_users = ["alice", "bob"]
     }
 
     #[test]
+    fn kernel_devnode_exposed_toml_round_trip_loads_allowlist_and_overrides() {
+        // Anchors the TOML schema for [detectors.kernel_devnode_exposed].
+        // Operators write this section when they have legitimately
+        // widened a devnode mode (allowlist) or when they want to add
+        // a new pattern to the watchlist (overrides). The keys here
+        // are the contract that future config refactors must keep.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devnode.toml");
+        std::fs::write(
+            &path,
+            r#"
+[agent]
+host_id = "host-c"
+
+[output]
+data_dir = "/var/lib/innerwarden"
+write_events = true
+
+[detectors.kernel_devnode_exposed]
+enabled = true
+poll_interval_secs = 600
+allowlist = ["/dev/infiniband/uverbs0", "/dev/kvm"]
+
+[[detectors.kernel_devnode_exposed.overrides]]
+pattern = "/dev/custom-driver"
+max_allowed_mode_octal = "660"
+surface = "operator-defined driver"
+
+[[detectors.kernel_devnode_exposed.overrides]]
+pattern = "/dev/kvm"
+max_allowed_mode_octal = "0o666"
+surface = "dedicated kvm host"
+"#,
+        )
+        .unwrap();
+        let cfg = load(path.to_str().unwrap()).unwrap();
+        let devnode = &cfg.detectors.kernel_devnode_exposed;
+        assert!(devnode.enabled);
+        assert_eq!(devnode.poll_interval_secs, 600);
+        assert_eq!(
+            devnode.allowlist,
+            vec![
+                "/dev/infiniband/uverbs0".to_string(),
+                "/dev/kvm".to_string()
+            ]
+        );
+        assert_eq!(devnode.overrides.len(), 2);
+        assert_eq!(devnode.overrides[0].pattern, "/dev/custom-driver");
+        assert_eq!(devnode.overrides[0].max_allowed_mode_octal, "660");
+        assert_eq!(devnode.overrides[0].surface, "operator-defined driver");
+        assert_eq!(devnode.overrides[1].pattern, "/dev/kvm");
+        assert_eq!(devnode.overrides[1].max_allowed_mode_octal, "0o666");
+    }
+
+    #[test]
     fn config_default_structs_preserve_runtime_security_thresholds() {
         let exec = ExecAuditConfig::default();
         assert!(!exec.enabled);
@@ -1483,6 +1588,15 @@ trusted_users = ["alice", "bob"]
         assert!(suid_page_cache
             .allowlist
             .contains(&"/usr/bin/su".to_string()));
+
+        // kernel_devnode_exposed: on by default, 15-min poll, no
+        // overrides — operators only fill these if they intentionally
+        // widened a devnode mode.
+        let devnode = KernelDevnodeExposedConfig::default();
+        assert!(devnode.enabled);
+        assert_eq!(devnode.poll_interval_secs, 900);
+        assert!(devnode.allowlist.is_empty());
+        assert!(devnode.overrides.is_empty());
 
         let stuffing = CredentialStuffingConfig::default();
         assert!(!stuffing.enabled);

@@ -24,7 +24,7 @@
 │  innerwarden-agent.service   (or via watchdog on prod)                │
 │  └─ Reader: byte-offset cursors on JSONL (or Redis Streams)           │
 │  └─ Pipeline: enrichment → AI → MITRE map → skill exec → audit        │
-│  └─ Correlation engine (67 rules, see §7)                             │
+│  └─ Correlation engine (68 rules, see §7)                             │
 │  └─ Skills (12 response actions, see §6)                              │
 │  └─ Dashboard SPA on :8787                                            │
 │                                                                       │

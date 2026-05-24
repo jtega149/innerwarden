@@ -222,6 +222,7 @@ pub mod user_creation;
 pub mod web_shell;
 
 pub mod discovery_burst;
+pub mod kernel_devnode_exposed;
 pub mod sensitive_write;
 pub mod suid_page_cache_integrity;
 
