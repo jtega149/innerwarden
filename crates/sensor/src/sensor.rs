@@ -253,13 +253,12 @@ pub(crate) async fn boot_init(cfg: Config) -> Result<SensorContext> {
 /// until shutdown. Consumes the [`SensorContext`] produced by
 /// [`boot_init`].
 ///
-/// Not unit-tested directly — the moment `spawn_collectors` runs it
-/// starts a handful of unconditional tokio tasks (eBPF syscall,
-/// firmware_integrity, proc_maps, fanotify_watch, kernel_integrity,
-/// …) that loop forever and hold clones of `tx` alive, so
-/// `rx.recv()` never returns `None` and there is no clean way to
-/// `await` to completion in a test. Integration anchors stop at
-/// [`boot_init`].
+/// Testable end-to-end via [`run`] with [`Config::test_default`] —
+/// every collector defaults to disabled in `Config::test_default`'s
+/// [`CollectorsConfig::all_disabled`], so `spawn_collectors` returns
+/// after spawning zero tasks, `tx` drops at the bottom of that
+/// function, and `rx.recv()` returns `None` on first poll. See
+/// `run_*` tests in the `tests` module below.
 pub(crate) async fn run_loop(ctx: SensorContext) -> Result<()> {
     let SensorContext {
         cfg,
@@ -352,20 +351,25 @@ mod tests {
         cfg
     }
 
-    /// Every anchor below wraps `boot_init(cfg)` in `tokio::time::timeout`
-    /// so a regression that causes the boot pipeline to hang fails loudly
-    /// with "timed out after Xs" instead of stalling the whole `cargo
-    /// test` run.
+    /// Every anchor below wraps the function under test in
+    /// `tokio::time::timeout` so a regression that causes the boot
+    /// pipeline to hang fails loudly with "timed out after Xs" instead
+    /// of stalling the whole `cargo test` run.
     ///
-    /// Why `boot_init` and not `run`: `run` calls `run_loop` which calls
-    /// `boot::spawn_collectors::spawn_collectors`, and that function
-    /// unconditionally `tokio::spawn`s ~10 collector tasks (eBPF syscall,
-    /// firmware_integrity, proc_maps, fanotify_watch, kernel_integrity,
-    /// …) that loop forever holding clones of `tx`. `rx.recv()` would
-    /// never return `None`, so `run()` would never return. `boot_init`
-    /// stops just before the spawn so the test can assert "boot worked,
-    /// sinks created, snapshot written" and then drop the context — at
-    /// which point `tx` and `rx` close cleanly with no leaked tasks.
+    /// Anchors come in two flavours:
+    ///
+    /// - **`boot_init_*`** — call `boot_init(cfg).await`, assert the
+    ///   returned `SensorContext` carries the expected boot state,
+    ///   then drop it. No tokio tasks are spawned at this point.
+    /// - **`run_*`** — call `run(cfg).await` end-to-end. With
+    ///   `Config::test_default` every collector is disabled (see
+    ///   `CollectorsConfig::all_disabled`), so `spawn_collectors`
+    ///   returns immediately, `tx` drops, and `rx.recv()` returns
+    ///   `None` on first poll — `run` exits via the "all collectors
+    ///   stopped" branch of `run_event_loop`. The whole call resolves
+    ///   in well under a second; the 10-second timeout is the loud-
+    ///   failure tripwire for any future change that re-introduces an
+    ///   ungated `tokio::spawn` in the always-on collector path.
     const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[tokio::test]
@@ -447,5 +451,121 @@ mod tests {
             !content.is_empty(),
             "collector-health.json must not be empty"
         );
+    }
+
+    #[tokio::test]
+    async fn run_with_no_collectors_returns_within_timeout() {
+        // Anchor: end-to-end run(cfg) — boot + spawn + loop — must
+        // exit cleanly when every collector is disabled. With
+        // `CollectorsConfig::all_disabled` (called inside
+        // `Config::test_default`), spawn_collectors spawns zero
+        // tasks, drops `tx`, and rx.recv() returns None on first
+        // poll. run_event_loop logs "all collectors stopped" and
+        // returns Ok.
+        //
+        // This is the regression tripwire that PR-F3 (#813) could
+        // not write: any future change that adds a `tokio::spawn(…)`
+        // without a config gate in boot/spawn_collectors.rs will
+        // make this test hit the 10-second timeout and fail loudly,
+        // since the orphan task will hold a clone of `tx` and rx
+        // will never close.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(BOOT_TIMEOUT, run(cfg)).await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Ok(Ok(())) => {
+                // Healthy: full pipeline returned cleanly.
+            }
+            Ok(Err(e)) => panic!("run() returned error: {e:#}"),
+            Err(_) => panic!(
+                "run() hung for {elapsed:?} (>{BOOT_TIMEOUT:?}). \
+                 Some part of boot/spawn_collectors.rs spawned a \
+                 task without a config gate — the orphan is holding \
+                 a clone of `tx`, so rx.recv() never returns None. \
+                 Find the new ungated `tokio::spawn(...)` and either \
+                 gate it on `cfg.collectors.X.enabled` or add an \
+                 `AlwaysOnCollectorConfig` field for the collector \
+                 and disable it in `CollectorsConfig::all_disabled`."
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_persists_state_file_on_shutdown() {
+        // Anchor: run_event_loop's shutdown branch must call
+        // `state.save(state_path)`. State persistence is how the
+        // sensor resumes log tailing across restarts — losing it
+        // means the next boot starts every log from byte 0 and the
+        // operator sees a flood of duplicate events. Asserting the
+        // state file exists post-`run` proves the shutdown branch
+        // executes; without spawned tasks dropping `tx`, the
+        // shutdown branch is the only way `run` can reach this
+        // point.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+
+        tokio::time::timeout(BOOT_TIMEOUT, run(cfg))
+            .await
+            .expect("run timed out")
+            .expect("run errored");
+
+        let state_path = tmp.path().join("state.json");
+        assert!(
+            state_path.exists(),
+            "state.json must be written on shutdown so the \
+             next boot can resume log cursors instead of restarting \
+             from byte 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_does_not_leak_temp_files_when_all_disabled() {
+        // Anchor: after `run(cfg)` returns cleanly, the data_dir
+        // should contain exactly the artefacts boot writes
+        // (innerwarden.db + collector-health.json + state.json
+        // + the seeded datasets/ dir) and nothing else. Catches a
+        // future regression where a collector starts opening
+        // tempfiles unconditionally in module init — that would
+        // leak filesystem state even when the collector is disabled.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+
+        tokio::time::timeout(BOOT_TIMEOUT, run(cfg))
+            .await
+            .expect("run timed out")
+            .expect("run errored");
+
+        // Expected entries — anything else is suspicious.
+        let expected: std::collections::HashSet<&str> = [
+            "innerwarden.db",
+            "innerwarden.db-shm",
+            "innerwarden.db-wal",
+            "collector-health.json",
+            "state.json",
+            "datasets",
+        ]
+        .into_iter()
+        .collect();
+
+        let entries: Vec<String> = std::fs::read_dir(tmp.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+
+        for entry in &entries {
+            assert!(
+                expected.contains(entry.as_str()),
+                "unexpected file in data_dir after run with all collectors \
+                 disabled: {entry} (expected one of: {expected:?}). \
+                 A collector probably created this file in module init \
+                 even though it was disabled — file I/O belongs inside \
+                 the spawned task body, not at module / new() level."
+            );
+        }
     }
 }

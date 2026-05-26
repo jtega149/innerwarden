@@ -57,6 +57,112 @@ pub struct CollectorsConfig {
     pub syslog_firewall: SyslogFirewallConfig,
     #[serde(default)]
     pub cloudtrail: CloudTrailConfig,
+
+    // Always-on collectors. Pre-2026-05-25 each of these was hard-coded
+    // to `tokio::spawn(...)` in boot/spawn_collectors.rs with no config
+    // gate. That worked for prod (operator wants every layer of the
+    // defence on by default) but made `run_loop` untestable — the
+    // spawned tasks each cloned `tx` and looped forever, so
+    // `rx.recv()` never returned `None`. Adding individual config
+    // sections (each defaulting to `enabled = true` so prod TOML
+    // doesn't have to declare them — omission == on) lets
+    // `Config::test_default` flip them all off via
+    // `CollectorsConfig::all_disabled` and makes the run_loop side
+    // unit-testable, mirroring the boot_init coverage shipped in #813.
+    #[serde(default)]
+    pub ebpf_syscall: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub firmware_integrity: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub proc_maps: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub fanotify_watch: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub kernel_integrity: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub cgroup_abuse: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub dns_capture: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub http_capture: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub net_snapshot: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub usb_monitor: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub suid_inventory: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub sysctl_drift: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub systemd_inventory: AlwaysOnCollectorConfig,
+    #[serde(default)]
+    pub tcp_stream: AlwaysOnCollectorConfig,
+}
+
+impl CollectorsConfig {
+    /// Construct a CollectorsConfig with every collector explicitly
+    /// disabled — for unit tests that spin up a Config and call
+    /// `boot::spawn_collectors::spawn_collectors` without also kicking
+    /// off every always-on background task.
+    ///
+    /// Unlike `Default::default()`, this is **not** the production
+    /// default — production omits unset sections and they fall back to
+    /// `enabled = true` via [`AlwaysOnCollectorConfig::default`]. Tests
+    /// that just want a quiet Config should prefer
+    /// [`Config::test_default`], which already calls this.
+    pub(crate) fn all_disabled() -> Self {
+        Self {
+            // Sections whose Default already produces enabled = false.
+            integrity: IntegrityConfig::default(),
+            journald: JournaldConfig::default(),
+            docker: DockerConfig::default(),
+            exec_audit: ExecAuditConfig::default(),
+            nginx_access: NginxAccessConfig::default(),
+            nginx_error: NginxErrorConfig::default(),
+            macos_log: MacosLogConfig::default(),
+            syslog_firewall: SyslogFirewallConfig::default(),
+            cloudtrail: CloudTrailConfig::default(),
+            // auth_log defaults to enabled = true (sshd auth is the
+            // baseline signal everyone wants on). Explicitly disable
+            // it here so tests don't try to tail /var/log/auth.log.
+            auth_log: AuthLogConfig {
+                enabled: false,
+                ..AuthLogConfig::default()
+            },
+            // Always-on collectors: default-true in prod, explicit
+            // false here.
+            ebpf_syscall: AlwaysOnCollectorConfig { enabled: false },
+            firmware_integrity: AlwaysOnCollectorConfig { enabled: false },
+            proc_maps: AlwaysOnCollectorConfig { enabled: false },
+            fanotify_watch: AlwaysOnCollectorConfig { enabled: false },
+            kernel_integrity: AlwaysOnCollectorConfig { enabled: false },
+            cgroup_abuse: AlwaysOnCollectorConfig { enabled: false },
+            dns_capture: AlwaysOnCollectorConfig { enabled: false },
+            http_capture: AlwaysOnCollectorConfig { enabled: false },
+            net_snapshot: AlwaysOnCollectorConfig { enabled: false },
+            usb_monitor: AlwaysOnCollectorConfig { enabled: false },
+            suid_inventory: AlwaysOnCollectorConfig { enabled: false },
+            sysctl_drift: AlwaysOnCollectorConfig { enabled: false },
+            systemd_inventory: AlwaysOnCollectorConfig { enabled: false },
+            tcp_stream: AlwaysOnCollectorConfig { enabled: false },
+        }
+    }
+}
+
+/// Minimal config for collectors that were hard-coded `tokio::spawn`
+/// pre-2026-05-25. Single `enabled: bool` field, defaults to `true`
+/// so existing production configs (which never declared these
+/// sections) keep spawning every always-on collector.
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct AlwaysOnCollectorConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for AlwaysOnCollectorConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1450,8 +1556,24 @@ impl Config {
                 data_dir: "/tmp/innerwarden-test".to_string(),
                 write_events: true,
             },
-            collectors: CollectorsConfig::default(),
-            detectors: DetectorsConfig::default(),
+            collectors: CollectorsConfig::all_disabled(),
+            // Two polling detectors run as their own tokio task (via
+            // `boot::spawn_collectors::spawn_collectors`) rather than
+            // per-event handlers, and both default to `enabled = true`.
+            // They have to be flipped off here so `run` exits cleanly
+            // in tests — every other detector runs inside the consumer
+            // loop and never holds a clone of `tx`.
+            detectors: DetectorsConfig {
+                suid_page_cache_integrity: SuidPageCacheIntegrityConfig {
+                    enabled: false,
+                    ..SuidPageCacheIntegrityConfig::default()
+                },
+                kernel_devnode_exposed: KernelDevnodeExposedConfig {
+                    enabled: false,
+                    ..KernelDevnodeExposedConfig::default()
+                },
+                ..DetectorsConfig::default()
+            },
             calibration: CalibrationConfig::default(),
             allowlist: AllowlistConfig::default(),
         }

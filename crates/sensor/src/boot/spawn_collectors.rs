@@ -289,7 +289,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // Spawn eBPF collector (optional - requires Linux 5.8+, CAP_BPF)
-    {
+    if cfg.collectors.ebpf_syscall.enabled {
         let tx_ebpf = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -298,7 +298,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // Spawn firmware integrity collector (monitors ESP, UEFI vars, ACPI, DMI, tainted)
-    {
+    if cfg.collectors.firmware_integrity.enabled {
         let tx_firmware = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -307,7 +307,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // Spawn proc_maps collector (memory forensics: RWX, deleted files, LD_PRELOAD)
-    {
+    if cfg.collectors.proc_maps.enabled {
         let tx_maps = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -316,7 +316,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // Spawn fanotify filesystem monitor (real-time file modification + ransomware detection)
-    {
+    if cfg.collectors.fanotify_watch.enabled {
         let tx_fan = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         let watch_paths = cfg
@@ -332,7 +332,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // Spawn kernel integrity monitor (syscall table + eBPF inventory + module baseline)
-    {
+    if cfg.collectors.kernel_integrity.enabled {
         let tx_kern = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -341,7 +341,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // Spawn cgroup resource abuse detector (CPU/memory abuse, cryptominer detection)
-    {
+    if cfg.collectors.cgroup_abuse.enabled {
         let tx_cg = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -349,7 +349,11 @@ pub(crate) fn spawn_collectors(
         });
     }
 
-    // Spawn TLS fingerprint collector (JA3/JA4 — requires CAP_NET_RAW + libc)
+    // Spawn TLS fingerprint collector (JA3/JA4 — requires CAP_NET_RAW + libc).
+    // No config gate yet — feature flag is the only off-switch. If we
+    // want this in test_default-quiet mode, add an AlwaysOnCollectorConfig
+    // here too. Today the feature is off in test builds, so it doesn't
+    // spawn during cargo test regardless.
     #[cfg(feature = "ebpf")]
     {
         let tx_tls = tx.clone();
@@ -360,7 +364,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // DNS query capture (AF_PACKET raw socket, captures UDP:53)
-    {
+    if cfg.collectors.dns_capture.enabled {
         let tx_dns = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -369,7 +373,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // HTTP request capture (AF_PACKET raw socket, captures TCP:80/8080/8787/etc.)
-    {
+    if cfg.collectors.http_capture.enabled {
         let tx_http = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -378,7 +382,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // Network snapshot: periodic /proc/net/tcp scan with PID resolution
-    {
+    if cfg.collectors.net_snapshot.enabled {
         let tx_net = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -387,7 +391,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // USB device monitoring: detects BadUSB, rubber ducky, unauthorized storage
-    {
+    if cfg.collectors.usb_monitor.enabled {
         let tx_usb = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -396,7 +400,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // SUID binary inventory: baseline + drift detection
-    {
+    if cfg.collectors.suid_inventory.enabled {
         let tx_suid = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -405,7 +409,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // Sysctl drift: monitors 20 security-critical kernel parameters
-    {
+    if cfg.collectors.sysctl_drift.enabled {
         let tx_sysctl = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -465,7 +469,7 @@ pub(crate) fn spawn_collectors(
     }
 
     // Systemd unit inventory: detects new/suspicious services
-    {
+    if cfg.collectors.systemd_inventory.enabled {
         let tx_sysd = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
@@ -476,7 +480,7 @@ pub(crate) fn spawn_collectors(
     // TCP stream reassembly engine (AF_PACKET, all TCP traffic)
     // Reassembles bidirectional streams, detects protocols on any port,
     // enables deep packet inspection for HTTP, SSH, SMB, etc.
-    {
+    if cfg.collectors.tcp_stream.enabled {
         let tx_tcp = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
