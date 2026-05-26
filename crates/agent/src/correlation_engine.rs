@@ -566,7 +566,7 @@ fn matches_stage(
     true
 }
 
-/// Does `event.details.comm` match a suppression list? Three distinct
+/// Does `event.details.comm` match a suppression list? Four distinct
 /// policies share this gate:
 ///
 /// 1. **InnerWarden binary self-traffic** (Wave 8a + PR ε; rule-agnostic,
@@ -587,7 +587,14 @@ fn matches_stage(
 ///    (`lateral_movement`, `credential_theft`, etc.) still fire on
 ///    `tokio-rt-worker` if their own kind patterns match.
 ///
-/// 3. **Per-rule package manager** (Wave 8a; opt-in by `rule_id`,
+/// 3. **CL-008-only long-running service daemons** (2026-05-26;
+///    CL-008 only). Web servers / PHP-FPM / databases / CrowdSec
+///    legitimately read sensitive files and make outbound calls as
+///    part of their normal job description. On a vanilla LAMP/LEMP
+///    host this chain fired 80x in 2 min in prod before the fix.
+///    See [`CL008_SERVICE_DAEMON_COMMS`].
+///
+/// 4. **Per-rule package manager** (Wave 8a; opt-in by `rule_id`,
 ///    currently only CL-008). Apt/dpkg/dnf/etc. running upgrades
 ///    naturally trigger CL-008's two stages. Operators may want
 ///    package-manager suppression for some chains and not others, so
@@ -612,6 +619,19 @@ pub(crate) fn event_comm_is_suppressed(rule_id: &str, event: &CorrelationEvent) 
     // necessary. Pinned by both `cl008_suppressed_..._tokio_rt_worker`
     // and `tokio_rt_worker_only_suppressed_on_cl008_not_other_rules`.
     if rule_id == "CL-008" && comm == "tokio-rt-worker" {
+        return true;
+    }
+    // 2026-05-26 (CL-008 saturation fix): CL-008-only long-running
+    // service-daemon carve-out. Web servers / PHP-FPM / databases /
+    // CrowdSec all legitimately read sensitive files and make outbound
+    // connections as part of their normal work; on a typical LAMP/LEMP
+    // host that produces an apache2 → php-fpm → mysqld pipeline that
+    // fires CL-008 every request. Same trade-off as the package-manager
+    // list: rule-specific, not rule-agnostic, so other chains
+    // (lateral_movement, credential_theft, …) still see these comms.
+    // Pinned by `cl008_suppressed_when_comm_is_service_daemon_*` and
+    // `service_daemon_suppression_does_not_leak_to_other_rules`.
+    if rule_id == "CL-008" && CL008_SERVICE_DAEMON_COMMS.contains(&comm) {
         return true;
     }
     // Wave 8a: per-rule package-manager suppression.
@@ -703,6 +723,62 @@ const PACKAGE_MANAGER_COMMS: &[&str] = &[
     // Cross-distro service-style package backends
     "PackageKit",
     "packagekitd",
+];
+
+/// 2026-05-26 (CL-008 saturation fix): comm names of long-running
+/// services that legitimately read sensitive files and make outbound
+/// connections as part of their normal job description. Suppressed
+/// for CL-008 only.
+///
+/// **Why this is necessary:** prod incident on 2026-05-26 saw CL-008
+/// fire 80x in 2 min on a host running a vanilla LAMP/LEMP stack.
+/// The chain shape (file.read + outbound connect) is exactly what
+/// `nginx → php-fpm → mysqld` produces on every HTTP request —
+/// nginx reads TLS certs + access logs, php-fpm reads
+/// /etc/php/*/fpm/pool.d/, mysqld reads its data files + replication
+/// state. The outbound side is the response to the client plus any
+/// `mysqli_connect` from PHP. None of this is exfiltration; all of
+/// it lit up CL-008.
+///
+/// **Why per-rule and not rule-agnostic:** the safety argument from
+/// PR ε still applies. `apache2` / `nginx` / `mysqld` are plausible
+/// pivot targets — an attacker that hijacks the web stack and uses
+/// it to exfil data should still trigger e.g. `c2_callback` (kind
+/// pattern is different) or `lateral_movement` (different entity
+/// shape). The carve-out only relaxes the one chain that operationally
+/// over-fires on this comm set.
+///
+/// **Comm truncation:** Linux truncates `comm` to 15 chars
+/// (TASK_COMM_LEN - 1). Every entry below is <= 15 chars, so no
+/// truncation gymnastics — the kernel emits these literally as
+/// written.
+///
+/// All entries match `event.details.comm` exactly.
+const CL008_SERVICE_DAEMON_COMMS: &[&str] = &[
+    // Web servers
+    "apache2", // Debian / Ubuntu
+    "httpd",   // RHEL / Fedora / Rocky / Alma
+    "nginx",   // most distros (master + workers share comm)
+    "caddy",   // increasingly common
+    // PHP-FPM (every Debian-tracked version through 8.3 — older / newer
+    // versions land here when their packages ship). Workers inherit the
+    // master's comm because the rename happens via prctl(PR_SET_NAME)
+    // in argv[0], not execve.
+    "php-fpm",
+    "php-fpm7.4",
+    "php-fpm8.0",
+    "php-fpm8.1",
+    "php-fpm8.2",
+    "php-fpm8.3",
+    // Relational databases
+    "mysqld",
+    "mysqld_safe", // 11 chars
+    "mariadbd",    // 8 chars (MariaDB 10.5+; older versions still use mysqld)
+    "postgres",    // 8 chars (master + autovacuum + WAL writer all share comm)
+    // CrowdSec — defensive tooling co-deployed with the agent that
+    // legitimately reads /var/log/* and posts to its central API.
+    "crowdsec",
+    "cscli",
 ];
 
 /// PR ε (2026-05-04): comm names of InnerWarden's own binaries.
@@ -3236,6 +3312,121 @@ mod tests {
                 !event_comm_is_suppressed(rule_id, &ev),
                 "rule {rule_id:?} must NOT suppress tokio-rt-worker - this comm is not InnerWarden-specific"
             );
+        }
+    }
+
+    // ── 2026-05-26 — CL-008 saturation fix: service-daemon suppression ──
+    //
+    // Prod 2026-05-26: CL-008 fired 80x in 2 min on a host running a
+    // vanilla LAMP/LEMP stack. Every nginx → php-fpm → mysqld pipeline
+    // matched the chain shape (file.read + outbound connect) because
+    // that is literally how a PHP-backed HTTP request works. Pre-this
+    // fix the suppression list only covered package managers + Tokio
+    // workers + InnerWarden binaries; web/db daemons were left out.
+
+    #[test]
+    fn cl008_suppressed_when_comm_is_service_daemon_web_server() {
+        // Apache (apache2 on Debian/Ubuntu, httpd on RHEL/Fedora/Rocky),
+        // nginx, and Caddy all fall into this bucket. The originating
+        // event in prod was `nginx` reading the TLS private key, but
+        // any of the four would have produced the same chain.
+        for comm in &["apache2", "httpd", "nginx", "caddy"] {
+            let mut ev = make_event(Layer::Userspace, "file.read_access", "127.0.0.1");
+            ev.details = serde_json::json!({
+                "pid": 1, "comm": comm, "path": "/etc/letsencrypt/live/example.com/privkey.pem"
+            });
+            assert!(
+                event_comm_is_suppressed("CL-008", &ev),
+                "web server {comm:?} reading TLS private key must be suppressed for CL-008 — \
+                 it does this on every cert reload, not as exfiltration"
+            );
+        }
+    }
+
+    #[test]
+    fn cl008_suppressed_when_comm_is_service_daemon_php_fpm() {
+        // PHP-FPM master + workers all carry the same `comm` because
+        // the worker rename happens via PR_SET_NAME on argv[0], not
+        // execve. Every supported Debian-packaged version belongs here.
+        for comm in &[
+            "php-fpm",
+            "php-fpm7.4",
+            "php-fpm8.0",
+            "php-fpm8.1",
+            "php-fpm8.2",
+            "php-fpm8.3",
+        ] {
+            let mut ev = make_event(Layer::Network, "network.outbound_connect", "10.0.0.5");
+            ev.details = serde_json::json!({
+                "pid": 1, "comm": comm, "dst_ip": "10.0.0.5", "dst_port": 3306
+            });
+            assert!(
+                event_comm_is_suppressed("CL-008", &ev),
+                "PHP-FPM {comm:?} mysqli_connect to MySQL must be suppressed for CL-008 — \
+                 it does this on every HTTP request that hits a DB"
+            );
+        }
+    }
+
+    #[test]
+    fn cl008_suppressed_when_comm_is_service_daemon_database() {
+        // mysqld + the newer mariadbd + Postgres. All three legitimately
+        // read their own data files + emit outbound for replication,
+        // backups, or — for Postgres — pg_basebackup / pglogical.
+        for comm in &["mysqld", "mysqld_safe", "mariadbd", "postgres"] {
+            let mut ev = make_event(Layer::Userspace, "file.read_access", "127.0.0.1");
+            ev.details = serde_json::json!({
+                "pid": 1, "comm": comm, "path": "/var/lib/mysql/users/users.ibd"
+            });
+            assert!(
+                event_comm_is_suppressed("CL-008", &ev),
+                "database daemon {comm:?} reading its own data file must be suppressed for CL-008"
+            );
+        }
+    }
+
+    #[test]
+    fn cl008_suppressed_when_comm_is_service_daemon_crowdsec() {
+        // CrowdSec (`crowdsec`) + its CLI (`cscli`) are defensive
+        // tooling commonly deployed alongside InnerWarden. CrowdSec
+        // tails /var/log/* (file.read) and posts to its central API
+        // (outbound) — same chain shape as exfiltration.
+        for comm in &["crowdsec", "cscli"] {
+            let mut ev = make_event(Layer::Network, "network.outbound_connect", "203.0.113.10");
+            ev.details = serde_json::json!({
+                "pid": 1, "comm": comm, "dst_ip": "203.0.113.10", "dst_port": 443
+            });
+            assert!(
+                event_comm_is_suppressed("CL-008", &ev),
+                "CrowdSec component {comm:?} outbound to its API must be suppressed for CL-008"
+            );
+        }
+    }
+
+    #[test]
+    fn service_daemon_suppression_does_not_leak_to_other_rules() {
+        // Anti-regression: the new CL-008 carve-out must NOT bleed
+        // into rule-agnostic territory. If an attacker hijacks the web
+        // stack and uses nginx / php-fpm to drive a credential-theft
+        // chain (CL-011) or a lateral-movement chain, those rules must
+        // still fire. Same safety argument that pinned `tokio-rt-worker`
+        // to CL-008 only.
+        for comm in &["apache2", "nginx", "php-fpm", "mysqld", "crowdsec"] {
+            let mut ev = make_event(Layer::Network, "network.outbound_connect", "203.0.113.99");
+            ev.details = serde_json::json!({
+                "pid": 999, "comm": comm, "dst_ip": "203.0.113.99", "dst_port": 4444
+            });
+            assert!(
+                event_comm_is_suppressed("CL-008", &ev),
+                "{comm:?} must be suppressed for CL-008 (per service-daemon carve-out)"
+            );
+            for rule_id in &["CL-001", "CL-002", "CL-011", "CL-014", "CL-XXX-future"] {
+                assert!(
+                    !event_comm_is_suppressed(rule_id, &ev),
+                    "rule {rule_id:?} must NOT suppress {comm:?} — service-daemon \
+                     comms aren't InnerWarden-specific; a hijacked web stack still has to fire"
+                );
+            }
         }
     }
 
