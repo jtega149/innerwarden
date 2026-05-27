@@ -213,7 +213,23 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
         );
     }
 
+    let event_pipeline = {
+        let rules_dir = if std::path::Path::new(&cfg.event_pipeline.rules_dir).is_absolute() {
+            std::path::PathBuf::from(&cfg.event_pipeline.rules_dir)
+        } else {
+            data_dir.join(&cfg.event_pipeline.rules_dir)
+        };
+        if cfg.event_pipeline.enabled {
+            info!(rules_dir = %rules_dir.display(), "event_pipeline enabled");
+            crate::event_pipeline::EventPipeline::new(&rules_dir, true)
+        } else {
+            info!("event_pipeline disabled by config");
+            crate::event_pipeline::EventPipeline::new_disabled()
+        }
+    };
+
     DetectorSet {
+        event_pipeline,
         dynamic_allowlist,
         allowlist_last_check: std::time::Instant::now(),
         blocked_ips,

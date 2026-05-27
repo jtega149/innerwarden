@@ -69,12 +69,18 @@ pub(crate) fn process_event(
 ) {
     use innerwarden_core::event::Severity;
 
+    let mut ev = ev;
+    let persist = detectors.event_pipeline.should_persist(&mut ev);
+
     info!(kind = %ev.kind, summary = %ev.summary, "event");
-    sqlite.write_event(&ev);
-    stats.events_written += 1;
-    // Syslog CEF output (if configured)
-    if let Some(ref mut cef) = syslog {
-        cef.write_event(&ev);
+    if persist {
+        sqlite.write_event(&ev);
+        stats.events_written += 1;
+        if let Some(ref mut cef) = syslog {
+            cef.write_event(&ev);
+        }
+    } else {
+        stats.events_dropped += 1;
     }
 
     // LSM blocked execution → immediate Critical incident.
@@ -133,6 +139,11 @@ pub(crate) fn process_event(
     if ev.kind == "integrity.devnode_exposed" {
         let incident = devnode_exposed_incident(&ev);
         write_incident(sqlite, stats, incident, syslog, dedup_cache);
+    }
+
+    // Reload event pipeline rules every 60s (checks dir mtime, no-op if unchanged).
+    if detectors.event_pipeline.reload_if_changed() {
+        info!("event_pipeline rules reloaded");
     }
 
     // Reload dynamic allowlist every 60s (checks file mtime, no-op if unchanged).

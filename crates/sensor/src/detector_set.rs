@@ -62,6 +62,14 @@ pub(crate) struct DetectorSet {
     /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
     /// Checked before all detectors -- if a process/IP is allowlisted,
     /// the event is still logged but no incident is generated.
+    /// Event pipeline: declarative filter/sample/promote engine.
+    /// Controls which events are persisted to disk. `None` when
+    /// `[event_pipeline] enabled = false` in config.
+    pub(crate) event_pipeline: crate::event_pipeline::EventPipeline,
+
+    /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
+    /// Checked before all detectors -- if a process/IP is allowlisted,
+    /// the event is still logged but no incident is generated.
     pub(crate) dynamic_allowlist: detectors::allowlists::DynamicAllowlist,
     /// Last time we checked the allowlist file for changes.
     pub(crate) allowlist_last_check: std::time::Instant,
