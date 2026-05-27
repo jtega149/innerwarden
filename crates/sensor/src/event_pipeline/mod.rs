@@ -45,6 +45,8 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     ),
 ];
 
+const PID_SCORE_MAP_CAP: usize = 10_000;
+
 pub struct EventPipeline {
     rules: Vec<CompiledRule>,
     rules_dir: PathBuf,
@@ -53,6 +55,13 @@ pub struct EventPipeline {
     enabled: bool,
     sample_counter: u64,
     counters: HashMap<String, RuleCounters>,
+    pid_scores: HashMap<u32, PidScoreEntry>,
+}
+
+struct PidScoreEntry {
+    score: u32,
+    last_bump: Instant,
+    decay_per_minute: f64,
 }
 
 #[derive(Default, Clone)]
@@ -72,6 +81,7 @@ impl EventPipeline {
             enabled,
             sample_counter: 0,
             counters: HashMap::new(),
+            pid_scores: HashMap::new(),
         };
         pipeline.reload();
         pipeline
@@ -86,6 +96,7 @@ impl EventPipeline {
             enabled: false,
             sample_counter: 0,
             counters: HashMap::new(),
+            pid_scores: HashMap::new(),
         }
     }
 
@@ -179,8 +190,27 @@ impl EventPipeline {
             return true;
         }
 
+        if event.kind == "process.exit" {
+            if let Some(pid) = event.details.get("pid").and_then(|v| v.as_u64()) {
+                self.pid_scores.remove(&(pid as u32));
+            }
+        }
+
+        let event_pid = event
+            .details
+            .get("pid")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
         for i in 0..self.rules.len() {
-            if !self.rules[i].matches(event) {
+            if let Some(min_score) = self.rules[i].pid_score_min {
+                let pid_score = event_pid
+                    .and_then(|pid| self.current_score(pid))
+                    .unwrap_or(0);
+                if pid_score < min_score {
+                    continue;
+                }
+            } else if !self.rules[i].matches(event) {
                 continue;
             }
 
@@ -219,13 +249,75 @@ impl EventPipeline {
                 CompiledAction::Emit => {
                     bump(&mut self.counters, &rule_id, Counter::Emitted);
                 }
-                CompiledAction::ScoreIncrement { .. } => {
+                CompiledAction::ScoreIncrement {
+                    score,
+                    decay_minutes,
+                } => {
+                    if let Some(pid) = event_pid {
+                        self.bump_pid_score(pid, score, decay_minutes);
+                    }
                     bump(&mut self.counters, &rule_id, Counter::Emitted);
                 }
             }
         }
 
         true
+    }
+
+    fn current_score(&self, pid: u32) -> Option<u32> {
+        let entry = self.pid_scores.get(&pid)?;
+        let elapsed_min = entry.last_bump.elapsed().as_secs_f64() / 60.0;
+        let decayed = entry.score as f64 - (elapsed_min * entry.decay_per_minute);
+        let score = decayed.round().max(0.0) as u32;
+        if score == 0 {
+            None
+        } else {
+            Some(score)
+        }
+    }
+
+    fn bump_pid_score(&mut self, pid: u32, score: u32, decay_minutes: u32) {
+        let decay_per_min = if decay_minutes > 0 {
+            score as f64 / decay_minutes as f64
+        } else {
+            0.0
+        };
+
+        let entry = self.pid_scores.entry(pid).or_insert(PidScoreEntry {
+            score: 0,
+            last_bump: Instant::now(),
+            decay_per_minute: decay_per_min,
+        });
+        entry.score = entry.score.saturating_add(score).min(100);
+        entry.last_bump = Instant::now();
+        entry.decay_per_minute = decay_per_min;
+
+        if self.pid_scores.len() > PID_SCORE_MAP_CAP {
+            self.evict_lowest_scores();
+        }
+    }
+
+    fn evict_lowest_scores(&mut self) {
+        let target = PID_SCORE_MAP_CAP * 3 / 4;
+        let mut entries: Vec<(u32, u32)> = self
+            .pid_scores
+            .iter()
+            .map(|(&pid, e)| {
+                let elapsed_min = e.last_bump.elapsed().as_secs_f64() / 60.0;
+                let effective = (e.score as f64 - elapsed_min * e.decay_per_minute).max(0.0) as u32;
+                (pid, effective)
+            })
+            .collect();
+        entries.sort_by_key(|&(_, score)| score);
+        let to_remove = self.pid_scores.len() - target;
+        for &(pid, _) in entries.iter().take(to_remove) {
+            self.pid_scores.remove(&pid);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn scored_pids_count(&self) -> usize {
+        self.pid_scores.len()
     }
 }
 
@@ -917,11 +1009,213 @@ rules:
     fn rule_count_includes_all_builtin_packs() {
         let dir = tempfile::tempdir().unwrap();
         let pipeline = EventPipeline::new(dir.path(), true);
-        // 5 built-in packs, each with 1 rule = 5 rules minimum
         assert!(
             pipeline.rule_count() >= 5,
             "expected at least 5 built-in rules, got {}",
             pipeline.rule_count()
+        );
+    }
+
+    #[test]
+    fn score_increment_bumps_pid_score() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use network event (not in defensive-allowlist) so score_increment fires
+        let yaml = r#"
+version: 1
+rules:
+  - id: score-suspicious-port
+    priority: 999
+    match:
+      source: ebpf
+      kind: network.outbound_connect
+      dst_port_in: [4444]
+    action: score_increment
+    score_increment:
+      score: 50
+      decay_minutes: 60
+"#;
+        std::fs::write(dir.path().join("10-score.yml"), yaml).unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        let mut ev = make_event(
+            "ebpf",
+            "network.outbound_connect",
+            serde_json::json!({"comm": "nc", "pid": 1234, "dst_port": 4444, "dst_ip": "1.2.3.4"}),
+        );
+        pipeline.should_persist(&mut ev);
+
+        assert_eq!(pipeline.current_score(1234), Some(50));
+        assert_eq!(pipeline.scored_pids_count(), 1);
+    }
+
+    #[test]
+    fn pid_score_min_emits_subsequent_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: score-suspicious-port
+    priority: 999
+    match:
+      source: ebpf
+      kind: network.outbound_connect
+      dst_port_in: [4444]
+    action: score_increment
+    score_increment:
+      score: 50
+      decay_minutes: 60
+  - id: emit-scored-pids
+    priority: 500
+    match:
+      source: ebpf
+      pid_score_min: 1
+    action: force_emit
+    tags: [pid-escalated]
+"#;
+        std::fs::write(dir.path().join("10-score.yml"), yaml).unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        // First: PID 1234 connects to port 4444, gets score 50
+        let mut ev1 = make_event(
+            "ebpf",
+            "network.outbound_connect",
+            serde_json::json!({"comm": "nc", "pid": 1234, "dst_port": 4444, "dst_ip": "1.2.3.4"}),
+        );
+        assert!(pipeline.should_persist(&mut ev1));
+
+        // Second: PID 1234 reads a random file. Normally dropped or sampled.
+        // But pid_score_min rule force-emits because PID 1234 has score 50.
+        let mut ev2 = make_event(
+            "ebpf",
+            "file.read_access",
+            serde_json::json!({"comm": "nc", "pid": 1234, "filename": "/tmp/random"}),
+        );
+        assert!(pipeline.should_persist(&mut ev2));
+        assert!(ev2.tags.contains(&"pid-escalated".to_string()));
+    }
+
+    #[test]
+    fn unscored_pid_not_matched_by_pid_score_min() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: emit-scored-pids
+    priority: 500
+    match:
+      source: ebpf
+      pid_score_min: 1
+    action: force_emit
+    tags: [pid-escalated]
+"#;
+        std::fs::write(dir.path().join("10-score.yml"), yaml).unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        let mut ev = make_event(
+            "ebpf",
+            "file.read_access",
+            serde_json::json!({"comm": "nginx", "pid": 5678, "filename": "/tmp/x"}),
+        );
+        // PID 5678 has no score, so pid_score_min rule doesn't match.
+        // Falls through to built-in drop rules (nginx is service daemon).
+        assert!(!pipeline.should_persist(&mut ev));
+        assert!(!ev.tags.contains(&"pid-escalated".to_string()));
+    }
+
+    #[test]
+    fn process_exit_clears_pid_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: score-suspicious-port
+    priority: 999
+    match:
+      source: ebpf
+      kind: network.outbound_connect
+      dst_port_in: [4444]
+    action: score_increment
+    score_increment:
+      score: 50
+      decay_minutes: 60
+"#;
+        std::fs::write(dir.path().join("10-score.yml"), yaml).unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        let mut ev = make_event(
+            "ebpf",
+            "network.outbound_connect",
+            serde_json::json!({"comm": "nc", "pid": 1234, "dst_port": 4444, "dst_ip": "1.2.3.4"}),
+        );
+        pipeline.should_persist(&mut ev);
+        assert_eq!(pipeline.current_score(1234), Some(50));
+
+        // Process exits
+        let mut exit_ev = make_event(
+            "ebpf",
+            "process.exit",
+            serde_json::json!({"pid": 1234, "comm": "cat"}),
+        );
+        pipeline.should_persist(&mut exit_ev);
+        assert_eq!(pipeline.current_score(1234), None);
+        assert_eq!(pipeline.scored_pids_count(), 0);
+    }
+
+    #[test]
+    fn pid_score_caps_at_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: score-big
+    priority: 999
+    match:
+      source: ebpf
+      kind: test.bump
+    action: score_increment
+    score_increment:
+      score: 80
+      decay_minutes: 60
+"#;
+        std::fs::write(dir.path().join("10-score.yml"), yaml).unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        // Bump twice: 80 + 80 = 160, but capped at 100
+        for _ in 0..2 {
+            let mut ev = make_event("ebpf", "test.bump", serde_json::json!({"pid": 42}));
+            pipeline.should_persist(&mut ev);
+        }
+        assert_eq!(pipeline.current_score(42), Some(100));
+    }
+
+    #[test]
+    fn pid_score_map_evicts_when_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: score-all
+    priority: 999
+    match:
+      source: test
+    action: score_increment
+    score_increment:
+      score: 10
+      decay_minutes: 60
+"#;
+        std::fs::write(dir.path().join("10-score.yml"), yaml).unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        // Push more than PID_SCORE_MAP_CAP entries
+        for pid in 0..(PID_SCORE_MAP_CAP as u32 + 100) {
+            let mut ev = make_event("test", "x", serde_json::json!({"pid": pid}));
+            pipeline.should_persist(&mut ev);
+        }
+
+        assert!(
+            pipeline.scored_pids_count() <= PID_SCORE_MAP_CAP,
+            "map should be capped at {PID_SCORE_MAP_CAP}, got {}",
+            pipeline.scored_pids_count()
         );
     }
 }
