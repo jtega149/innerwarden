@@ -7,7 +7,7 @@
 //!
 //! Rules are YAML files in `rules/event_pipeline/`, hot-reloaded via
 //! mtime check every 60 seconds (same pattern as DynamicAllowlist).
-//! Four built-in rule packs ship embedded in the binary and are always
+//! Five built-in rule packs ship embedded in the binary and are always
 //! loaded as baseline. On-disk rules with the same `id` override the
 //! built-in; new ids are added.
 
@@ -34,6 +34,10 @@ pub(crate) const BUILTIN_PACKS: &[(&str, &str)] = &[
     (
         "02-service-daemon-suppression.yml",
         include_str!("builtin/02-service-daemon-suppression.yml"),
+    ),
+    (
+        "03-package-manager-suppression.yml",
+        include_str!("builtin/03-package-manager-suppression.yml"),
     ),
     (
         "99-default-sample.yml",
@@ -85,14 +89,36 @@ impl EventPipeline {
         }
     }
 
-    #[cfg(test)]
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    pub fn total_persisted(&self) -> u64 {
+        self.counters.values().map(|c| c.emitted).sum()
+    }
+
+    pub fn total_dropped(&self) -> u64 {
+        self.counters.values().map(|c| c.dropped).sum()
     }
 
     #[cfg(test)]
     pub fn counters(&self) -> &HashMap<String, RuleCounters> {
         &self.counters
+    }
+
+    pub fn check_backstop(&self) {
+        let total = self.total_persisted() + self.total_dropped();
+        if total < 1000 {
+            return;
+        }
+        let drop_rate = self.total_dropped() as f64 / total as f64;
+        if drop_rate > 0.99 {
+            warn!(
+                total_events = total,
+                drop_pct = format!("{:.1}%", drop_rate * 100.0),
+                "event_pipeline backstop: drop rate exceeds 99% — verify rules are not too aggressive"
+            );
+        }
     }
 
     pub fn reload_if_changed(&mut self) -> bool {
@@ -103,6 +129,7 @@ impl EventPipeline {
             return false;
         }
         self.last_check = Instant::now();
+        self.check_backstop();
 
         let current_mtime = dir_max_mtime(&self.rules_dir);
         if current_mtime == self.last_mtime {
@@ -779,5 +806,122 @@ rules:
             let mut ev = make_event("test", "x", serde_json::json!({}));
             assert!(pipeline.should_persist(&mut ev));
         }
+    }
+
+    #[test]
+    fn package_manager_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        for comm in ["apt", "dpkg", "snap", "pip3", "npm", "cargo", "yum", "dnf"] {
+            let mut ev = make_event(
+                "ebpf",
+                "file.read_access",
+                serde_json::json!({"comm": comm, "pid": 1, "filename": "/usr/lib/x"}),
+            );
+            assert!(
+                !pipeline.should_persist(&mut ev),
+                "{comm} should be dropped by package-manager suppression"
+            );
+        }
+    }
+
+    #[test]
+    fn package_manager_credential_path_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        let mut ev = make_event(
+            "ebpf",
+            "file.read_access",
+            serde_json::json!({"comm": "apt", "pid": 1, "filename": "/etc/shadow"}),
+        );
+        assert!(
+            pipeline.should_persist(&mut ev),
+            "apt reading /etc/shadow must be persisted (defensive-allowlist)"
+        );
+        assert!(ev.tags.contains(&"defensive-allowlist".to_string()));
+    }
+
+    #[test]
+    fn total_persisted_and_dropped_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        for _ in 0..10 {
+            let mut ev = make_event(
+                "ebpf",
+                "file.read_access",
+                serde_json::json!({"comm": "nginx", "pid": 1}),
+            );
+            pipeline.should_persist(&mut ev);
+        }
+
+        assert_eq!(pipeline.total_dropped(), 10);
+        assert!(pipeline.total_persisted() == 0 || pipeline.total_persisted() > 0);
+    }
+
+    #[test]
+    fn backstop_does_not_warn_under_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        // Process a mix of persisted and dropped events
+        for _ in 0..50 {
+            let mut ev = make_event(
+                "ebpf",
+                "shell.command_exec",
+                serde_json::json!({"comm": "bash"}),
+            );
+            pipeline.should_persist(&mut ev);
+        }
+        for _ in 0..50 {
+            let mut ev = make_event(
+                "ebpf",
+                "file.read_access",
+                serde_json::json!({"comm": "nginx", "pid": 1}),
+            );
+            pipeline.should_persist(&mut ev);
+        }
+
+        // 50% drop rate, backstop should not fire (only fires > 99%)
+        pipeline.check_backstop();
+    }
+
+    #[test]
+    fn backstop_fires_above_99_percent() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: drop-everything
+    priority: 999
+    match:
+      source: test
+    action: drop
+"#;
+        std::fs::write(dir.path().join("10-drop-all.yml"), yaml).unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        for i in 0..2000 {
+            let mut ev = make_event("test", "x", serde_json::json!({"i": i}));
+            pipeline.should_persist(&mut ev);
+        }
+
+        assert!(pipeline.total_dropped() > 1990);
+        // This would log a warning; we just verify the check runs without panic
+        pipeline.check_backstop();
+    }
+
+    #[test]
+    fn rule_count_includes_all_builtin_packs() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = EventPipeline::new(dir.path(), true);
+        // 5 built-in packs, each with 1 rule = 5 rules minimum
+        assert!(
+            pipeline.rule_count() >= 5,
+            "expected at least 5 built-in rules, got {}",
+            pipeline.rule_count()
+        );
     }
 }

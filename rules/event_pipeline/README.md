@@ -85,7 +85,7 @@ Fields are extracted from `event.details` JSON: `comm`, `filename`/`path`,
 
 ## Built-in Rules
 
-Four packs ship embedded in the sensor binary. They are always loaded
+Five packs ship embedded in the sensor binary. They are always loaded
 and act as baseline. To override a built-in, create a file in this
 directory with a rule that has the same `id`.
 
@@ -94,6 +94,7 @@ directory with a rule that has the same `id`.
 | `00-defensive-allowlist.yml` | `always-emit-credential-paths` | Credential/config paths ALWAYS persisted (force_emit, priority 1000) |
 | `01-self-traffic-suppression.yml` | `drop-innerwarden-self-reads` | Drop innerwarden's own file access |
 | `02-service-daemon-suppression.yml` | `drop-service-daemon-file-ops` | Drop web/db/auth daemon file access |
+| `03-package-manager-suppression.yml` | `drop-package-manager-file-ops` | Drop apt/dpkg/snap/pip/npm/cargo file access |
 | `99-default-sample.yml` | `sample-remainder-file-ops` | 1% sample of remaining file access events |
 
 ## File Naming Convention
