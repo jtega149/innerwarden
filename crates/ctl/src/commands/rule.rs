@@ -317,6 +317,147 @@ fn parse_rules_from_yaml(yaml: &str, source: &str) -> Result<Vec<RuleInfo>, Stri
     Ok(rules)
 }
 
+pub fn cmd_migrate_allowlist(allowlist_path: &Path, output: Option<&Path>) -> Result<()> {
+    let content = std::fs::read_to_string(allowlist_path)
+        .with_context(|| format!("reading {}", allowlist_path.display()))?;
+
+    let yaml = convert_allowlist_to_pipeline_yaml(&content);
+
+    if let Some(out_path) = output {
+        std::fs::write(out_path, &yaml)
+            .with_context(|| format!("writing {}", out_path.display()))?;
+        println!("Pipeline rule written to {}", out_path.display());
+        println!("Move it to your rules/event_pipeline/ directory to activate.");
+    } else {
+        print!("{yaml}");
+    }
+
+    Ok(())
+}
+
+fn convert_allowlist_to_pipeline_yaml(content: &str) -> String {
+    let mut processes: Vec<String> = Vec::new();
+    let mut ips: Vec<String> = Vec::new();
+    let mut ports: Vec<u16> = Vec::new();
+    let mut per_detector: HashMap<String, Vec<String>> = HashMap::new();
+
+    let mut section = String::new();
+    let mut detector_section: Option<String> = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].to_string();
+            detector_section = if section.starts_with("detectors.") {
+                Some(section.strip_prefix("detectors.").unwrap().to_string())
+            } else {
+                None
+            };
+            continue;
+        }
+        if let Some((key, _)) = line.split_once('=') {
+            let key = key.trim().trim_matches('"');
+            match section.as_str() {
+                "processes" => {
+                    if !processes.contains(&key.to_string()) {
+                        processes.push(key.to_string());
+                    }
+                }
+                "ips" => {
+                    if !ips.contains(&key.to_string()) {
+                        ips.push(key.to_string());
+                    }
+                }
+                "ports" => {
+                    let val = line.split_once('=').unwrap().1;
+                    for part in val.trim().split(',') {
+                        if let Ok(port) = part.trim().parse::<u16>() {
+                            if !ports.contains(&port) {
+                                ports.push(port);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(ref det) = detector_section {
+                        per_detector
+                            .entry(det.clone())
+                            .or_default()
+                            .push(key.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut yaml = String::new();
+    yaml.push_str("# Auto-generated from allowlist.toml by `innerwarden rule migrate-allowlist`\n");
+    yaml.push_str(&format!(
+        "# Generated: {}\n",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
+    ));
+    yaml.push_str("#\n");
+    yaml.push_str("# Review and adjust priorities before activating.\n");
+    yaml.push_str("# Per-detector suppressions (below) are informational comments;\n");
+    yaml.push_str("# they map to the existing DynamicAllowlist and remain active there\n");
+    yaml.push_str("# until fully migrated in a future release.\n\n");
+    yaml.push_str("version: 1\n");
+    yaml.push_str("metadata:\n");
+    yaml.push_str("  description: >-\n");
+    yaml.push_str("    Migrated from /etc/innerwarden/allowlist.toml. Process and IP\n");
+    yaml.push_str("    allowlist entries converted to event pipeline drop rules.\n\n");
+    yaml.push_str("rules:\n");
+
+    if !processes.is_empty() {
+        yaml.push_str("  - id: migrated-process-allowlist\n");
+        yaml.push_str("    priority: 85\n");
+        yaml.push_str("    match:\n");
+        yaml.push_str("      source: ebpf\n");
+        yaml.push_str("      kind_in:\n");
+        yaml.push_str("        - file.read_access\n");
+        yaml.push_str("        - file.write_access\n");
+        yaml.push_str("      comm_in:\n");
+        for p in &processes {
+            yaml.push_str(&format!("        - \"{p}\"\n"));
+        }
+        yaml.push_str("    action: drop\n");
+        yaml.push_str("    drop_reason: migrated-process-allowlist\n\n");
+    }
+
+    if !ips.is_empty() {
+        yaml.push_str("  # NOTE: IP-based filtering is not yet supported in the event\n");
+        yaml.push_str("  # pipeline DSL. These IPs remain in allowlist.toml for now.\n");
+        yaml.push_str("  # IPs from allowlist.toml:\n");
+        for ip in &ips {
+            yaml.push_str(&format!("  #   - {ip}\n"));
+        }
+        yaml.push('\n');
+    }
+
+    if !ports.is_empty() {
+        yaml.push_str("  # NOTE: Ignored ports remain in allowlist.toml for now.\n");
+        yaml.push_str(&format!("  # Ports: {:?}\n\n", ports));
+    }
+
+    if !per_detector.is_empty() {
+        yaml.push_str("  # Per-detector suppressions (remain in allowlist.toml):\n");
+        let mut detectors: Vec<_> = per_detector.iter().collect();
+        detectors.sort_by_key(|(k, _)| (*k).clone());
+        for (det, entries) in detectors {
+            yaml.push_str(&format!("  # [detectors.{det}]\n"));
+            for entry in entries {
+                yaml.push_str(&format!("  #   {entry}\n"));
+            }
+        }
+        yaml.push('\n');
+    }
+
+    yaml
+}
+
 fn resolve_rules_dir(data_dir: &Path, sensor_config: &Path) -> PathBuf {
     if let Ok(content) = std::fs::read_to_string(sensor_config) {
         for line in content.lines() {
@@ -452,5 +593,72 @@ rules:
         let dir = tempfile::tempdir().unwrap();
         let result = cmd_rule_list(dir.path(), Path::new("/nonexistent"));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn migrate_allowlist_converts_processes() {
+        let toml = r#"
+[processes]
+"brew" = "Linuxbrew"
+"narrate.py" = "narrator tool"
+
+[ips]
+"172.18.0.0/16" = "Docker internal"
+
+[ports]
+ignored = 9, 67
+
+[detectors.kernel_module_load]
+"bcache" = "Ubuntu cache module"
+"#;
+        let yaml = convert_allowlist_to_pipeline_yaml(toml);
+        assert!(yaml.contains("id: migrated-process-allowlist"));
+        assert!(yaml.contains("brew"));
+        assert!(yaml.contains("narrate.py"));
+        assert!(yaml.contains("action: drop"));
+        assert!(yaml.contains("172.18.0.0/16"));
+        assert!(yaml.contains("kernel_module_load"));
+        assert!(yaml.contains("bcache"));
+    }
+
+    #[test]
+    fn migrate_allowlist_empty_input() {
+        let yaml = convert_allowlist_to_pipeline_yaml("");
+        assert!(yaml.contains("version: 1"));
+        assert!(yaml.contains("rules:"));
+        assert!(!yaml.contains("id: migrated"));
+    }
+
+    #[test]
+    fn migrate_allowlist_roundtrip_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("allowlist.toml");
+        let out_path = dir.path().join("20-migrated.yml");
+
+        std::fs::write(&toml_path, "[processes]\n\"nginx\" = \"web server\"\n").unwrap();
+
+        let result = cmd_migrate_allowlist(&toml_path, Some(&out_path));
+        assert!(result.is_ok());
+        assert!(out_path.exists());
+
+        let content = std::fs::read_to_string(&out_path).unwrap();
+        assert!(content.contains("nginx"));
+        assert!(content.contains("version: 1"));
+    }
+
+    #[test]
+    fn migrate_allowlist_deduplicates_repeated_sections() {
+        let toml = r#"
+[processes]
+"brew" = "first"
+
+[processes]
+"cargo" = "second"
+"#;
+        let yaml = convert_allowlist_to_pipeline_yaml(toml);
+        assert!(yaml.contains("brew"));
+        assert!(yaml.contains("cargo"));
+        // Should appear in one rule, not two
+        assert_eq!(yaml.matches("id: migrated-process-allowlist").count(), 1);
     }
 }

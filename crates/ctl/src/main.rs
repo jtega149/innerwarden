@@ -1042,6 +1042,25 @@ enum RuleCommand {
         /// Rule ID to enable
         id: String,
     },
+
+    /// Convert allowlist.toml to event pipeline YAML rules.
+    ///
+    /// Reads the legacy allowlist.toml and outputs equivalent pipeline
+    /// rules. Per-detector suppressions and IP/port entries are included
+    /// as comments (not yet supported in the pipeline DSL).
+    ///
+    /// Examples:
+    ///   innerwarden rule migrate-allowlist
+    ///   innerwarden rule migrate-allowlist --output rules/event_pipeline/20-migrated.yml
+    MigrateAllowlist {
+        /// Path to allowlist.toml (defaults to /etc/innerwarden/allowlist.toml)
+        #[arg(long, default_value = "/etc/innerwarden/allowlist.toml")]
+        input: PathBuf,
+
+        /// Write output to file instead of stdout
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2531,6 +2550,10 @@ fn main() -> Result<()> {
             RuleCommand::Enable { ref id } => {
                 commands::rule::cmd_rule_enable(&cli.data_dir, &cli.sensor_config, id)
             }
+            RuleCommand::MigrateAllowlist {
+                ref input,
+                ref output,
+            } => commands::rule::cmd_migrate_allowlist(input, output.as_deref()),
         },
         Command::Module { ref command } => dispatch_module(&cli, command),
         Command::Agent { ref command } => commands::agent::cmd_agent(&cli, command.as_ref()),
