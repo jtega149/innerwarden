@@ -9,6 +9,60 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-05-28
+
+**Headline:** Three specs closed in two days. Spec 053 ships the event pipeline DSL (declarative filter / sample / promote in the sensor, hot-reloaded YAML). Spec 054 unifies all rule paths under `/etc/innerwarden/rules/{event_pipeline,sigma,yara,atr,correlation}/` and deprecates `allowlist.toml`. Spec 055 migrates the 68 cross-layer correlation rules from a 1770-line Rust literal to YAML in five small phases, also shipped today. Net: rules are operator-editable and hot-reloadable across the entire detection stack, with `innerwarden rule list/disable/enable` covering all five rule types.
+
+### Added — Spec 053 event pipeline (sensor)
+
+- **Declarative filter / sample / promote engine** (#826). YAML rules in `/etc/innerwarden/rules/event_pipeline/` decide which events the sensor persists. Four built-in rule packs ship embedded in the binary; operator files merge in lexicographic order with override-by-id semantics. Hot-reload every 60s via mtime. Resolves the 3.1 M events/day disk crisis (prod disk usage dropped 83 % → 73 % after the post-deploy soak).
+- **Package-manager + backstop incident packs** (#828). Suppresses dpkg / apt / rpm / yum / pip / npm / cargo etc. exec noise; keeps a backstop incident path so safety floor stays intact even with operator overrides.
+- **Per-PID forensic scoring** (#832). Each PID accumulates a deterministic score from emit-tier events; `force_emit` on credential paths keeps high-signal events through aggressive sampling.
+- **Sigma rule suppression wired into detector** (#840). The pipeline's `suppress_incident` action now affects the sigma detector, not just event_pipeline drops.
+- **Named lists in event pipeline DSL** (#842). Operators define lists once (`$service_daemons`, `$package_managers`, etc.) and reference them in any rule predicate. Built-in packs migrated to use them.
+
+### Added — Spec 054 config consolidation
+
+- **Unified rules dir** (#837). All five rule types (event_pipeline, sigma, yara, atr, correlation) now live under `/etc/innerwarden/rules/<type>/`. Sensor + agent both read from this shared tree.
+- **Agent reads YAML rules from shared dir** (#841). Removes the old per-crate path divergence.
+- **`allowlist.toml` deprecated + `innerwarden rule migrate-allowlist`** (#831, #838). Process and per-detector entries convert to pipeline `drop` and `suppress_incident` rules. Operators run the migration once; `allowlist.toml` becomes dead config.
+
+### Added — Spec 055 correlation rules in YAML (5 phases, same day)
+
+- **Phase 1: YAML loader + byte-equality parallel mode** (#843). New `crates/agent/src/correlation_engine_yaml/` with embedded `00-builtin.yml`. Byte-for-byte equality anchor against the hardcoded Rust literal as the safety floor.
+- **Phase 2: hot-reload + operator workflow** (#845). mtime-based 60 s reload, schema validation with `#[serde(deny_unknown_fields)]`, invalid rules skipped with a WARN.
+- **Phase 3: CTL integration** (#851). `innerwarden rule list --type correlation` shows 68 CL-rules (id / severity / window / stages / name); `innerwarden rule disable CL-024` auto-routes to the correlation dir. Built-in correlation YAML embedded via `include_str!` across the crate boundary so CTL stays decoupled.
+- **Phase 4: named lists in `kind_patterns`** (#857). Four built-in lists (`exfil_kinds`, `recon_kinds`, `persistence_kinds`, `c2_kinds`) usable with `$name` in any correlation rule. Same first-defined-wins semantics as the event pipeline lists from #842.
+- **Phase 5: delete hardcoded `builtin_rules()`** (#858). The 1770-line Rust literal is gone; `builtin_rules()` is now a thin wrapper around `correlation_engine_yaml::load_builtin()`. `correlation_engine.rs` 3872 → 2124 lines (-1748 net).
+
+### Fixed
+
+- **eBPF connect/bind handlers had inverted IPv4 byte order** (#836). `.to_be()` was double-flipping octets, so GitHub IPs (140.82.0.0/16) rendered as US DoD (32.140.0.0/16) in attribution. Single-line fix; large impact on every IP-pivoted detector.
+- **`silent_stream` alert severity** (#827, #844). Was Medium → bundled into the daily briefing instead of pushed immediately. Now High, fires through the push path within the on-call window.
+- **`innerwarden rule disable` YAML indentation** (#834). `ensure_disabled` now inserts `disabled: true` at the correct sibling-field indent so re-parsing stays clean.
+
+### Tests + infra
+
+- **Elite anchors: backstop incident + Caldera replay assertions** (#833). The `suppress_incident` action gets a permanent regression guard; Caldera replay diffs catch correlation-engine drift before it reaches prod.
+- **`abuseipdb.rs` pure helpers anchored** (#829, #820). Coverage and behavioural regressions both addressed.
+
+### Operator-visible numbers
+
+- Workspace version: `0.14.4` → `0.14.5`.
+- `correlation_engine.rs`: 3872 → 2124 lines (-45 %).
+- Prod disk usage on Oracle 130.162.171.105: 83 % → 73 % under spec 053 event filtering.
+- `events-*.jsonl` files no longer ship in `/var/lib/innerwarden/` by default (filtered out by the pipeline); raw event taps are now a deliberate operator opt-in via YAML.
+- 21 PRs since v0.14.4 (16 on 2026-05-27 + 5 on 2026-05-28).
+- All five rule types now operator-editable and hot-reloadable: event_pipeline, sigma, yara, atr, correlation.
+
+### Deploy
+
+Oracle prod (130.162.171.105) cut over piecewise as PRs landed: event pipeline + config consolidation + spec 055 Phases 1-2 deployed 2026-05-28 07:13 UTC; Phase 3 (CTL) at 06:13 UTC; Phase 4 at 07:15 UTC; Phase 5 mid-afternoon same day. Watchdog respawned the agent cleanly each cycle (root child per the documented dual-path; the `innerwarden-agent.service` systemd unit stays disabled). Post-deploy: zero panics in watchdog log, 28+ incidents detected today against the YAML rule set, cloud_safelist gate working against AWS prefixes during the kill_chain DATA_EXFIL bursts that fired post-restart.
+
+### Why this version exists
+
+Three specs were in flight: 053 (event pipeline DSL) had been blocking the 3.1 M events/day disk-pressure story; 054 (config consolidation) was the natural follow-on once events lived in YAML; 055 (correlation rules in YAML) was the third leg, originally scoped to a week of soak between phases. All three landed in 48 hours because the work shared the same YAML/rules-dir machinery — testing one validated the next. The 1-week soak gate on spec 055 Phase 5 was overridden per the founder-pace operator preference after 5h+ of clean prod signal on Phases 1-4.
+
 ## [0.14.4] - 2026-05-26
 
 **Headline:** End of the `async fn main` decomposition that started mid-May. Four PRs (#813 → #816) cut sensor::run into a testable `boot_init` + `run_loop` split, config-gated 14 always-on collectors, extracted `DetectorSet` out of `main.rs`, and root-fixed a CL-008 correlation-engine saturation that fired 80 chains in 2 min on every vanilla LAMP/LEMP host the agent ran on (2026-05-26 prod incident).
