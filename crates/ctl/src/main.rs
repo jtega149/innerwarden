@@ -168,15 +168,18 @@ enum Command {
         command: Option<SystemCommand>,
     },
 
-    /// Manage event pipeline rules (filter/sample/promote).
+    /// Manage detection rules (event_pipeline, sigma, yara, atr, correlation).
     ///
-    /// The event pipeline controls which events the sensor persists to disk.
-    /// Rules are YAML files in the rules directory, hot-reloaded every 60s.
+    /// Rules are YAML files under /etc/innerwarden/rules/, hot-reloaded every
+    /// 60s. Cross-layer correlation rule IDs (CL-NNN) route to the correlation
+    /// subdir automatically.
     ///
     /// Examples:
     ///   innerwarden rule list
+    ///   innerwarden rule list --type correlation
     ///   innerwarden rule disable drop-service-daemon-file-ops
-    ///   innerwarden rule enable drop-service-daemon-file-ops
+    ///   innerwarden rule disable CL-024
+    ///   innerwarden rule enable CL-024
     Rule {
         #[command(subcommand)]
         command: RuleCommand,
@@ -1028,27 +1031,33 @@ enum IntegrateCommand {
 
 #[derive(Subcommand)]
 enum RuleCommand {
-    /// List rules. Shows all types by default (event_pipeline, sigma, yara, atr).
+    /// List rules. Shows all types by default
+    /// (event_pipeline, sigma, yara, atr, correlation).
     ///
     /// Examples:
     ///   innerwarden rule list
     ///   innerwarden rule list --type sigma
-    ///   innerwarden rule list --type event_pipeline
+    ///   innerwarden rule list --type correlation
     List {
-        /// Filter by rule type: event_pipeline, sigma, yara, atr
+        /// Filter by rule type: event_pipeline, sigma, yara, atr, correlation
         #[arg(long, short = 't')]
         r#type: Option<String>,
     },
 
     /// Disable a rule by ID (adds `disabled: true` to the YAML file).
+    ///
+    /// CL-NNN IDs route to /etc/innerwarden/rules/correlation/; other IDs
+    /// route to the event pipeline rules directory.
     Disable {
-        /// Rule ID to disable (e.g. drop-service-daemon-file-ops)
+        /// Rule ID to disable (e.g. drop-service-daemon-file-ops or CL-024)
         id: String,
     },
 
     /// Enable a previously disabled rule by ID.
+    ///
+    /// CL-NNN IDs route to /etc/innerwarden/rules/correlation/.
     Enable {
-        /// Rule ID to enable
+        /// Rule ID to enable (e.g. drop-service-daemon-file-ops or CL-024)
         id: String,
     },
 

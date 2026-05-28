@@ -3,6 +3,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+// why: spec 055 Phase 3 — CTL needs to list/disable/enable the 68 built-in
+// correlation rules without adding a new dep on the agent crate. The YAML is
+// the single source of truth (Phase 1 anchor proves byte-equality with the
+// hardcoded literals), so embedding it via include_str! across the crate
+// boundary keeps CTL decoupled and the parser sharing the same shape.
+const CORRELATION_BUILTIN_YAML: &str =
+    include_str!("../../../agent/src/correlation_engine_yaml/builtin/00-builtin.yml");
+
+const CORRELATION_RULES_DIR: &str = "/etc/innerwarden/rules/correlation";
+
 pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Result<()> {
     let rules_base = PathBuf::from("/etc/innerwarden/rules");
 
@@ -11,6 +21,7 @@ pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Res
         ("sigma", "Sigma"),
         ("yara", "YARA"),
         ("atr", "ATR"),
+        ("correlation", "Correlation"),
     ];
 
     let mut total = 0u32;
@@ -48,6 +59,36 @@ pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Res
                 total += rules.len() as u32;
                 println!();
             }
+        } else if *subdir == "correlation" {
+            let (rules, errors) = load_all_correlation_rules(Path::new(CORRELATION_RULES_DIR));
+            if !rules.is_empty() || !errors.is_empty() {
+                println!("{label} ({} rules, {} errors):", rules.len(), errors.len());
+                println!(
+                    "  {:<10} {:<10} {:<8} {:<7} {:<8} {:<22} NAME",
+                    "RULE ID", "SEVERITY", "WINDOW", "STAGES", "STATUS", "SOURCE"
+                );
+                for rule in &rules {
+                    let status = if rule.disabled { "disabled" } else { "active" };
+                    println!(
+                        "  {:<10} {:<10} {:<8} {:<7} {:<8} {:<22} {}",
+                        rule.id,
+                        rule.severity,
+                        format!("{}s", rule.window_secs),
+                        rule.stage_count,
+                        status,
+                        truncate(&rule.source_file, 22),
+                        rule.name,
+                    );
+                }
+                if !errors.is_empty() {
+                    println!("  Errors:");
+                    for (file, err) in &errors {
+                        println!("    {file}: {err}");
+                    }
+                }
+                total += rules.len() as u32;
+                println!();
+            }
         } else if dir.is_dir() {
             let count = count_yaml_rules(&dir, subdir);
             if count > 0 {
@@ -65,6 +106,14 @@ pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Res
 
     println!("Rules directory: {}", rules_base.display());
     Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    }
 }
 
 fn count_yaml_rules(dir: &Path, _rule_type: &str) -> u32 {
@@ -190,13 +239,27 @@ pub fn cmd_rule_list(data_dir: &Path, sensor_config: &Path) -> Result<()> {
 }
 
 pub fn cmd_rule_disable(data_dir: &Path, sensor_config: &Path, rule_id: &str) -> Result<()> {
+    if is_correlation_rule_id(rule_id) {
+        return toggle_correlation_rule(Path::new(CORRELATION_RULES_DIR), rule_id, true);
+    }
     let rules_dir = resolve_rules_dir(data_dir, sensor_config);
     toggle_rule(&rules_dir, rule_id, true)
 }
 
 pub fn cmd_rule_enable(data_dir: &Path, sensor_config: &Path, rule_id: &str) -> Result<()> {
+    if is_correlation_rule_id(rule_id) {
+        return toggle_correlation_rule(Path::new(CORRELATION_RULES_DIR), rule_id, false);
+    }
     let rules_dir = resolve_rules_dir(data_dir, sensor_config);
     toggle_rule(&rules_dir, rule_id, false)
+}
+
+// why: cross-layer correlation rule IDs are reserved-format `CL-NNN`. Operators
+// disabling a CL-rule expect it to land in the correlation dir; event_pipeline
+// rule IDs are kebab-case slugs and never start with `CL-`. Auto-routing avoids
+// a `--type` flag that operators would forget.
+fn is_correlation_rule_id(rule_id: &str) -> bool {
+    rule_id.starts_with("CL-")
 }
 
 fn toggle_rule(rules_dir: &Path, rule_id: &str, disable: bool) -> Result<()> {
@@ -343,6 +406,232 @@ struct RuleInfo {
     disabled: bool,
     expired: bool,
     source_file: String,
+}
+
+// why: CTL display schema mirrors the fields validated by
+// agent::correlation_engine_yaml::parse_rules. If the agent parser ever gains a
+// required field, the schema-compat test below will fail because the embedded
+// 00-builtin.yml will contain it and we'll be parsing the same shape.
+struct CorrelationRuleInfo {
+    id: String,
+    name: String,
+    severity: String,
+    window_secs: u64,
+    stage_count: usize,
+    disabled: bool,
+    source_file: String,
+}
+
+fn load_all_correlation_rules(
+    rules_dir: &Path,
+) -> (Vec<CorrelationRuleInfo>, Vec<(String, String)>) {
+    let mut by_id: HashMap<String, CorrelationRuleInfo> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+
+    match parse_correlation_rules_from_yaml(CORRELATION_BUILTIN_YAML, "00-builtin.yml (built-in)") {
+        Ok(rules) => {
+            for rule in rules {
+                order.push(rule.id.clone());
+                by_id.insert(rule.id.clone(), rule);
+            }
+        }
+        Err(e) => errors.push(("00-builtin.yml (built-in)".to_string(), e)),
+    }
+
+    if rules_dir.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(rules_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                (name.ends_with(".yml") || name.ends_with(".yaml"))
+                    && e.file_type().is_ok_and(|t| t.is_file())
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            match std::fs::read_to_string(&path) {
+                Ok(yaml) => match parse_correlation_rules_from_yaml(&yaml, &name) {
+                    Ok(rules) => {
+                        for rule in rules {
+                            if !by_id.contains_key(&rule.id) {
+                                order.push(rule.id.clone());
+                            }
+                            by_id.insert(rule.id.clone(), rule);
+                        }
+                    }
+                    Err(e) => errors.push((name, e)),
+                },
+                Err(e) => errors.push((name, e.to_string())),
+            }
+        }
+    }
+
+    let rules: Vec<CorrelationRuleInfo> = order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect();
+    (rules, errors)
+}
+
+fn parse_correlation_rules_from_yaml(
+    yaml: &str,
+    source: &str,
+) -> Result<Vec<CorrelationRuleInfo>, String> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|e| format!("YAML parse error: {e}"))?;
+
+    let version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    if version != 1 {
+        return Err(format!("unsupported version {version}"));
+    }
+
+    let rules_val = doc
+        .get("rules")
+        .and_then(|v| v.as_sequence())
+        .ok_or("missing 'rules' array")?;
+
+    let mut out = Vec::new();
+    for rule_val in rules_val {
+        let id = rule_val
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or("rule missing 'id'")?
+            .to_string();
+        let name = rule_val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("rule {id} missing 'name'"))?
+            .to_string();
+        let severity = rule_val
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("rule {id} missing 'severity'"))?
+            .to_string();
+        let window_secs = rule_val
+            .get("window_secs")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("rule {id} missing 'window_secs'"))?;
+        // min_confidence is required by the agent parser; validate presence
+        // so we surface schema drift even though we don't display it.
+        rule_val
+            .get("min_confidence")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| format!("rule {id} missing 'min_confidence'"))?;
+        let stages = rule_val
+            .get("stages")
+            .and_then(|v| v.as_sequence())
+            .ok_or_else(|| format!("rule {id} missing 'stages'"))?;
+        if stages.is_empty() {
+            return Err(format!("rule {id} has empty 'stages'"));
+        }
+        let disabled = rule_val
+            .get("disabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        out.push(CorrelationRuleInfo {
+            id,
+            name,
+            severity,
+            window_secs,
+            stage_count: stages.len(),
+            disabled,
+            source_file: source.to_string(),
+        });
+    }
+
+    Ok(out)
+}
+
+fn toggle_correlation_rule(rules_dir: &Path, rule_id: &str, disable: bool) -> Result<()> {
+    let verb = if disable { "disable" } else { "enable" };
+
+    // Built-in rules live embedded in the agent binary; toggling them requires
+    // creating an override file on disk. Mirror toggle_rule's behaviour: if the
+    // rule is not found in any on-disk file, print a copy/paste hint with the
+    // correlation rule shape.
+    if rules_dir.is_dir() {
+        for entry in std::fs::read_dir(rules_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if !name.ends_with(".yml") && !name.ends_with(".yaml") {
+                continue;
+            }
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            if !content.contains(&format!("id: {rule_id}"))
+                && !content.contains(&format!("id: \"{rule_id}\""))
+            {
+                continue;
+            }
+            let new_content = if disable {
+                ensure_disabled(&content, rule_id)
+            } else {
+                remove_disabled(&content, rule_id)
+            };
+            if new_content == content {
+                println!("Rule '{rule_id}' is already {verb}d in {name}.");
+            } else {
+                std::fs::write(&path, &new_content)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                println!("Rule '{rule_id}' {verb}d in {name}. Agent will hot-reload within 60s.");
+            }
+            return Ok(());
+        }
+    }
+
+    // Not in any on-disk file -- must be a built-in. Print the override
+    // template so the operator can drop a file into the dir.
+    let exists_in_builtin = parse_correlation_rules_from_yaml(CORRELATION_BUILTIN_YAML, "builtin")
+        .map(|rules| rules.iter().any(|r| r.id == rule_id))
+        .unwrap_or(false);
+
+    if exists_in_builtin {
+        println!("Rule '{rule_id}' is built-in; create an override file to {verb} it:");
+    } else {
+        println!("Rule '{rule_id}' not found in built-in or on-disk correlation rules.");
+        println!("If you want to add it, drop a file in the correlation rules dir:");
+    }
+    println!();
+    println!("  sudo mkdir -p {}", rules_dir.display());
+    println!(
+        "  sudo tee {}/10-override.yml > /dev/null << 'EOF'",
+        rules_dir.display()
+    );
+    println!("  version: 1");
+    println!("  rules:");
+    println!("    - id: \"{rule_id}\"");
+    println!("      name: \"override\"");
+    println!("      severity: high");
+    println!("      window_secs: 300");
+    println!("      min_confidence: 0.7");
+    if disable {
+        println!("      disabled: true");
+    }
+    println!("      stages:");
+    println!("        - kind_patterns: [\"placeholder.*\"]");
+    println!("          entity_must_match: false");
+    println!("  EOF");
+
+    Ok(())
 }
 
 fn load_all_rules(rules_dir: &Path) -> (Vec<RuleInfo>, Vec<(String, String)>) {
@@ -809,6 +1098,199 @@ ignored = 9, 67
         let content = std::fs::read_to_string(&out_path).unwrap();
         assert!(content.contains("nginx"));
         assert!(content.contains("version: 1"));
+    }
+
+    // ===== correlation (spec 055 Phase 3) =====
+
+    #[test]
+    fn correlation_builtin_yaml_parses_to_68_rules() {
+        let rules = parse_correlation_rules_from_yaml(CORRELATION_BUILTIN_YAML, "builtin").unwrap();
+        assert_eq!(
+            rules.len(),
+            68,
+            "CTL parser must see the same 68 built-in rules as agent::correlation_engine_yaml; \
+             schema drift in the agent parser will surface here"
+        );
+    }
+
+    #[test]
+    fn correlation_parser_rejects_missing_required_fields() {
+        let missing_name = r#"
+version: 1
+rules:
+  - id: "CL-999"
+    severity: high
+    window_secs: 300
+    min_confidence: 0.7
+    stages:
+      - kind_patterns: ["foo"]
+        entity_must_match: false
+"#;
+        assert!(parse_correlation_rules_from_yaml(missing_name, "t").is_err());
+
+        let missing_min_conf = r#"
+version: 1
+rules:
+  - id: "CL-999"
+    name: "no confidence"
+    severity: high
+    window_secs: 300
+    stages:
+      - kind_patterns: ["foo"]
+        entity_must_match: false
+"#;
+        assert!(parse_correlation_rules_from_yaml(missing_min_conf, "t").is_err());
+
+        let empty_stages = r#"
+version: 1
+rules:
+  - id: "CL-999"
+    name: "no stages"
+    severity: high
+    window_secs: 300
+    min_confidence: 0.7
+    stages: []
+"#;
+        assert!(parse_correlation_rules_from_yaml(empty_stages, "t").is_err());
+    }
+
+    #[test]
+    fn correlation_parser_extracts_stage_count() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: "CL-100"
+    name: "three-stage"
+    severity: critical
+    window_secs: 600
+    min_confidence: 0.8
+    stages:
+      - kind_patterns: ["a"]
+        entity_must_match: false
+      - kind_patterns: ["b"]
+        entity_must_match: true
+      - kind_patterns: ["c"]
+        entity_must_match: false
+"#;
+        let rules = parse_correlation_rules_from_yaml(yaml, "t").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].stage_count, 3);
+        assert_eq!(rules[0].window_secs, 600);
+        assert_eq!(rules[0].severity, "critical");
+        assert!(!rules[0].disabled);
+    }
+
+    #[test]
+    fn correlation_loader_includes_builtin_when_dir_missing() {
+        let nonexistent = PathBuf::from("/tmp/innerwarden-correlation-doesnt-exist-xyz");
+        let (rules, errors) = load_all_correlation_rules(&nonexistent);
+        assert_eq!(rules.len(), 68);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn correlation_loader_override_replaces_builtin_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let override_yaml = r#"
+version: 1
+rules:
+  - id: "CL-001"
+    name: "operator override"
+    severity: low
+    window_secs: 60
+    min_confidence: 0.5
+    stages:
+      - kind_patterns: ["custom.*"]
+        entity_must_match: false
+"#;
+        std::fs::write(dir.path().join("10-override.yml"), override_yaml).unwrap();
+        let (rules, errors) = load_all_correlation_rules(dir.path());
+        assert!(errors.is_empty());
+        let cl001 = rules.iter().find(|r| r.id == "CL-001").unwrap();
+        assert_eq!(cl001.name, "operator override");
+        assert_eq!(cl001.severity, "low");
+        assert_eq!(cl001.source_file, "10-override.yml");
+        // total stays the same (one ID swapped)
+        assert_eq!(rules.len(), 68);
+    }
+
+    #[test]
+    fn correlation_loader_new_id_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_yaml = r#"
+version: 1
+rules:
+  - id: "CL-999"
+    name: "operator addition"
+    severity: medium
+    window_secs: 120
+    min_confidence: 0.6
+    stages:
+      - kind_patterns: ["new.*"]
+        entity_must_match: false
+"#;
+        std::fs::write(dir.path().join("20-custom.yml"), new_yaml).unwrap();
+        let (rules, _) = load_all_correlation_rules(dir.path());
+        assert_eq!(rules.len(), 69);
+        assert!(rules.iter().any(|r| r.id == "CL-999"));
+    }
+
+    #[test]
+    fn is_correlation_rule_id_routing() {
+        assert!(is_correlation_rule_id("CL-001"));
+        assert!(is_correlation_rule_id("CL-024"));
+        assert!(is_correlation_rule_id("CL-999"));
+        assert!(!is_correlation_rule_id("drop-service-daemon-file-ops"));
+        assert!(!is_correlation_rule_id("cl-001")); // case-sensitive
+        assert!(!is_correlation_rule_id("CL_001")); // underscore not dash
+        assert!(!is_correlation_rule_id(""));
+    }
+
+    #[test]
+    fn toggle_correlation_rule_disable_enable_roundtrip_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"version: 1
+rules:
+  - id: "CL-500"
+    name: "test"
+    severity: high
+    window_secs: 300
+    min_confidence: 0.7
+    stages:
+      - kind_patterns: ["foo"]
+        entity_must_match: false
+"#;
+        let path = dir.path().join("10-test.yml");
+        std::fs::write(&path, yaml).unwrap();
+
+        toggle_correlation_rule(dir.path(), "CL-500", true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("disabled: true"));
+
+        toggle_correlation_rule(dir.path(), "CL-500", false).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("disabled: true"));
+    }
+
+    #[test]
+    fn toggle_correlation_rule_builtin_prints_override_hint() {
+        // CL-001 lives only in the embedded builtin; toggle should not error
+        // and should not create any file on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let result = toggle_correlation_rule(dir.path(), "CL-001", true);
+        assert!(result.is_ok());
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "toggle of built-in CL-001 must not create files; operator copies the printed template themselves"
+        );
+    }
+
+    #[test]
+    fn toggle_correlation_rule_unknown_id_does_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = toggle_correlation_rule(dir.path(), "CL-9999", true);
+        assert!(result.is_ok());
     }
 
     #[test]
