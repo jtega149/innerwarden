@@ -305,7 +305,11 @@ fn build_alert_incident(
             source,
             now.format("%Y-%m-%dT%HZ")
         ),
-        severity: Severity::Medium,
+        // High severity so the notification pipeline pushes immediately
+        // via Telegram/Slack/webhook instead of bundling into the daily
+        // briefing's "handled silently" list. A silent telemetry stream
+        // means a detector is blind. Operator must be paged, not summarised.
+        severity: Severity::High,
         title: format!("Telemetry stream silent: {source}"),
         summary: format!(
             "Source `{source}` has produced 0 events today; trailing {}-day baseline was \
@@ -644,7 +648,7 @@ mod tests {
         };
         let inc = build_alert_incident("auditd", &snap, at_utc(10, 0));
 
-        assert_eq!(inc.severity, Severity::Medium);
+        assert_eq!(inc.severity, Severity::High);
         assert!(
             inc.title.contains("auditd"),
             "title must name the source: {}",
