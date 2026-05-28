@@ -1204,7 +1204,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         },
         attacker_profiles: HashMap::new(), // loaded from redb below
         last_intel_consolidation_at: None,
-        correlation_engine: correlation_engine::CorrelationEngine::new(),
+        correlation_engine: correlation_engine::CorrelationEngine::from_yaml_dir(
+            std::path::Path::new("/etc/innerwarden/rules/correlation"),
+        ),
         pcap_capture: pcap_capture::PcapCapture::new(&cli.data_dir),
         scoring_engine: scoring::ScoringEngine::new(0.95),
         last_firmware_incident_at: None,
@@ -1731,6 +1733,28 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         state.dynamic_trusted_ips = yaml_rules.trusted_ips;
                         state.dynamic_trusted_users = yaml_rules.trusted_users;
                         state.dynamic_trusted_processes = yaml_rules.trusted_processes;
+                    }
+
+                    // Hot-reload correlation rules from /etc/innerwarden/rules/correlation/.
+                    // Re-reads YAML files every slow-loop tick (cheap when nothing
+                    // changed; 68+ rule recompile when files mutate).
+                    {
+                        let rules_dir = std::path::Path::new("/etc/innerwarden/rules/correlation");
+                        match crate::correlation_engine_yaml::load_rules_dir(rules_dir) {
+                            Ok(new_rules) => {
+                                let old_count = state.correlation_engine.rule_count();
+                                let new_count = new_rules.len();
+                                if new_count != old_count {
+                                    tracing::info!(
+                                        old = old_count,
+                                        new = new_count,
+                                        "correlation_engine: rule count changed, reloading"
+                                    );
+                                }
+                                state.correlation_engine.replace_rules(new_rules);
+                            }
+                            Err(e) => tracing::warn!("correlation_engine reload failed: {e}"),
+                        }
                     }
 
                     // Autoencoder nightly training — at 3 AM UTC.
@@ -3923,7 +3947,16 @@ mod heap_budget {
     /// A deliberate raise requires updating this constant AND the
     /// matching line in `.claude-local/IMPACT.md` "Memory layout"
     /// (landing in phase 5) in the same PR, with the reason.
-    const BUDGET_TOTAL_BYTES: u64 = 1_945_600;
+    // Raised from 1_945_600 (1.86 MiB) -> 2_900_000 (2.77 MiB) on
+    // 2026-05-28 for spec 055 Phase 2: the correlation engine now loads
+    // 68 rules from embedded YAML at boot via
+    // `CorrelationEngine::from_yaml_dir()` instead of const arrays. YAML
+    // parsing allocates ~760 KiB of transient Strings (rule ids, names,
+    // kind_patterns) during boot. The previous `builtin_rules()` const
+    // array path is still available for short-lived engines but the
+    // production boot path now exercises the YAML path so operators can
+    // hot-reload rules. See spec 055.
+    const BUDGET_TOTAL_BYTES: u64 = 2_900_000;
 
     /// Minimal CLI fixture mirroring `once_cli` in the sibling `tests`
     /// module. Kept local to this module so the DHAT test does not

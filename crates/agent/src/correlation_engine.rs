@@ -151,17 +151,46 @@ pub struct CorrelationEngine {
 }
 
 impl CorrelationEngine {
-    /// Create a new engine with the built-in rule set.
+    /// Create a new engine with the built-in rule set. Used by short-lived
+    /// engines (firmware_tick, killchain_inline) and tests. Production boot
+    /// uses `from_yaml_dir()`.
+    #[allow(dead_code)]
     pub fn new() -> Self {
+        Self::with_rules(builtin_rules())
+    }
+
+    /// Create a new engine with a custom rule set. Used by the YAML loader
+    /// path (`from_yaml_dir`) and tests that need specific rules.
+    pub fn with_rules(rules: Vec<CorrelationRule>) -> Self {
         Self {
             event_window: VecDeque::with_capacity(10_000),
             max_window_size: 10_000,
             pending_chains: Vec::new(),
             completed_chains: Vec::new(),
-            rules: builtin_rules(),
+            rules,
             chain_cooldowns: HashMap::new(),
             next_chain_id: 1,
         }
+    }
+
+    /// Load rules from the YAML directory. Falls back to built-in rules
+    /// on any load error so the engine never starts empty in prod.
+    pub fn from_yaml_dir(rules_dir: &std::path::Path) -> Self {
+        let rules = crate::correlation_engine_yaml::load_rules_dir(rules_dir).unwrap_or_else(|e| {
+            tracing::warn!("correlation_engine: YAML load failed ({e}), falling back to built-in");
+            builtin_rules()
+        });
+        Self::with_rules(rules)
+    }
+
+    /// Replace the rule set in-place. Used by hot-reload after detecting
+    /// an mtime change in the YAML directory. Pending chains and cooldowns
+    /// are preserved -- only the rule set itself swaps. Returns the new
+    /// rule count.
+    pub fn replace_rules(&mut self, rules: Vec<CorrelationRule>) -> usize {
+        let count = rules.len();
+        self.rules = rules;
+        count
     }
 
     /// Feed a new event into the engine.

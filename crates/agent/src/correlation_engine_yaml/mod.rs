@@ -4,11 +4,9 @@
 //! hardcoded Rust literals. Produces byte-for-byte identical rule sets.
 //!
 //! Phase 1 establishes the anchor: YAML output matches hardcoded byte-for-byte.
-//! Phases 2-5 wire this into runtime, hot-reload, CLI, and remove the
-//! hardcoded literals. Until then, the loader exists but is not wired into
-//! production code paths.
-
-#![allow(dead_code)]
+//! Phase 2 wires this into runtime via `CorrelationEngine::from_yaml_dir()`
+//! and hot-reload via mtime tracking. Phases 3-5 add CLI integration, named
+//! lists, and finally remove the hardcoded literals.
 
 use serde::Deserialize;
 
@@ -49,6 +47,83 @@ struct RawStage {
 
 pub fn load_builtin() -> Result<Vec<CorrelationRule>, String> {
     parse_rules(BUILTIN_YAML, "00-builtin.yml")
+}
+
+/// Load all correlation rules from a directory + the embedded built-in.
+/// Built-in rules are always loaded first. On-disk rules with the same
+/// `id` override the built-in; new ids are added. Files are read in
+/// lexicographic order.
+pub fn load_rules_dir(dir: &std::path::Path) -> Result<Vec<CorrelationRule>, String> {
+    use std::collections::HashMap;
+
+    let mut by_id: HashMap<String, CorrelationRule> = HashMap::new();
+
+    // Always load built-in first
+    for rule in load_builtin()? {
+        by_id.insert(rule.id.clone(), rule);
+    }
+
+    if dir.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| format!("read_dir {}: {e}", dir.display()))?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                (s.ends_with(".yml") || s.ends_with(".yaml"))
+                    && e.file_type().is_ok_and(|t| t.is_file())
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            match std::fs::read_to_string(&path) {
+                Ok(yaml) => match parse_rules(&yaml, &name) {
+                    Ok(rules) => {
+                        for rule in rules {
+                            by_id.insert(rule.id.clone(), rule);
+                        }
+                    }
+                    Err(e) => tracing::warn!("correlation_engine_yaml: {e}"),
+                },
+                Err(e) => {
+                    tracing::warn!(file = %name, "correlation_engine_yaml: read error: {e}")
+                }
+            }
+        }
+    }
+
+    let mut rules: Vec<CorrelationRule> = by_id.into_values().collect();
+    // Sort by id for deterministic order
+    rules.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(rules)
+}
+
+/// Compute the max mtime of YAML files in the rules directory. Used by
+/// hot-reload to detect changes without re-parsing. Reserved for Phase 3
+/// when mtime-based reload replaces always-reload.
+#[allow(dead_code)]
+pub fn dir_max_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut max = None;
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                max = Some(match max {
+                    Some(m) if mtime > m => mtime,
+                    Some(m) => m,
+                    None => mtime,
+                });
+            }
+        }
+    }
+    max
 }
 
 pub fn parse_rules(yaml: &str, source: &str) -> Result<Vec<CorrelationRule>, String> {
