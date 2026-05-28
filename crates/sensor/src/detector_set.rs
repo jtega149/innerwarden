@@ -194,3 +194,101 @@ impl DetectorSet {
             .suppress_incident_for_detector(incident, detector_name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_core::event::Severity;
+    use innerwarden_core::incident::Incident;
+
+    fn test_incident(evidence: serde_json::Value) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: "test:incident".to_string(),
+            severity: Severity::High,
+            title: "Test incident".to_string(),
+            summary: "Synthetic detector-set coverage incident".to_string(),
+            evidence,
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    fn empty_detector_set(data_dir: &std::path::Path) -> DetectorSet {
+        let cfg = crate::config::Config::test_default();
+        crate::boot::build_detectors::build_detector_set(&cfg, data_dir)
+    }
+
+    #[test]
+    fn is_incident_suppressed_returns_false_without_matching_rules() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let detectors = empty_detector_set(tmp.path());
+        let incident = test_incident(serde_json::json!([{
+            "comm": "systemctl",
+            "path": "/etc/systemd/system/good.service",
+        }]));
+
+        assert!(
+            !detectors.is_incident_suppressed(&incident, "systemd_persistence"),
+            "fresh detector sets must not suppress incidents without allowlist input"
+        );
+    }
+
+    #[test]
+    fn is_incident_suppressed_honours_dynamic_per_detector_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut detectors = empty_detector_set(tmp.path());
+        detectors.dynamic_allowlist.per_detector.insert(
+            "sensitive_write".to_string(),
+            HashSet::from(["/etc/ld.so.conf.d/".to_string()]),
+        );
+        let incident = test_incident(serde_json::json!([{
+            "comm": "vim",
+            "filename": "/etc/ld.so.conf.d/innerwarden.conf",
+        }]));
+
+        assert!(
+            detectors.is_incident_suppressed(&incident, "sensitive_write"),
+            "per-detector path prefixes should suppress matching post-emit incidents"
+        );
+        assert!(
+            !detectors.is_incident_suppressed(&incident, "rootkit"),
+            "suppression must stay scoped to the requested detector name"
+        );
+    }
+
+    #[test]
+    fn is_incident_suppressed_matches_per_detector_comm_entries() {
+        // Anchor for the comm-based suppression branch in
+        // `suppress_incident_for_detector` — `systemd_persistence` and
+        // friends look at the `comm` evidence field, not `filename` or
+        // `path`. The prior test covers the path-prefix branch; this
+        // one covers the equal-string comm branch so a future refactor
+        // that drops one without the other fails fast.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut detectors = empty_detector_set(tmp.path());
+        detectors.dynamic_allowlist.per_detector.insert(
+            "systemd_persistence".to_string(),
+            HashSet::from(["needrestart".to_string()]),
+        );
+        let suppressable = test_incident(serde_json::json!([{
+            "comm": "needrestart",
+            "path": "/etc/systemd/system/needrestart.service",
+        }]));
+        let other_comm = test_incident(serde_json::json!([{
+            "comm": "evil-binary",
+            "path": "/etc/systemd/system/evil.service",
+        }]));
+
+        assert!(
+            detectors.is_incident_suppressed(&suppressable, "systemd_persistence"),
+            "per-detector comm entry must suppress matching incident"
+        );
+        assert!(
+            !detectors.is_incident_suppressed(&other_comm, "systemd_persistence"),
+            "suppression must not fire when comm does not match the entry"
+        );
+    }
+}

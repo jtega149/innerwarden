@@ -93,7 +93,7 @@ pub(super) fn format_incident_message(
     };
 
     let link_line = dashboard_url
-        .and_then(|base| first_ip_entity(incident).map(|ip| (base, ip)))
+        .zip(first_ip_entity(incident))
         .map(|(base, ip)| {
             format!(
                 "\n\u{1f517} <a href=\"{}/?subject_type=ip&subject={}&date={}\">Investigate</a>",
@@ -590,7 +590,7 @@ pub(super) fn format_simple_message(
     };
 
     let link_line = dashboard_url
-        .and_then(|base| ip_entity.as_ref().map(|ip| (base, ip)))
+        .zip(ip_entity.as_ref())
         .map(|(base, ip)| {
             format!(
                 "\n\n\u{1f517} <a href=\"{}/?subject_type=ip&subject={}&date={}\">View details</a>",

@@ -2265,7 +2265,10 @@ fn dispatch_install_classifier(
 }
 
 fn main() -> Result<()> {
-    let mut cli = Cli::parse();
+    run_cli(Cli::parse())
+}
+
+fn run_cli(mut cli: Cli) -> Result<()> {
     let registry = CapabilityRegistry::default_all();
 
     // macOS uses /usr/local/etc instead of /etc for config files
@@ -3081,6 +3084,53 @@ mod tests {
         }
     }
 
+    fn write_minimal_cli_configs(data_dir: &std::path::Path) {
+        std::fs::write(
+            data_dir.join("config.toml"),
+            format!(
+                r#"
+[agent]
+host_id = "ctl-test-host"
+
+[output]
+data_dir = "{}"
+"#,
+                data_dir.display()
+            ),
+        )
+        .expect("write sensor config");
+        std::fs::write(
+            data_dir.join("agent.toml"),
+            format!(
+                r#"
+data_dir = "{}"
+
+[dashboard]
+bind_addr = "127.0.0.1:8787"
+"#,
+                data_dir.display()
+            ),
+        )
+        .expect("write agent config");
+        let today = epoch_secs_to_date(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        std::fs::write(data_dir.join(format!("telemetry-{today}.jsonl")), "\n")
+            .expect("write empty telemetry");
+    }
+
+    fn runnable_cli(args: &[&str], data_dir: &std::path::Path) -> Cli {
+        let mut cli = Cli::try_parse_from(args).expect("parse runnable cli");
+        cli.sensor_config = data_dir.join("config.toml");
+        cli.agent_config = data_dir.join("agent.toml");
+        cli.data_dir = data_dir.to_path_buf();
+        cli.dry_run = true;
+        cli
+    }
+
     // Anchor (Wave 7b, 2026-05-03): `known_module_id` must recognise
     // module IDs declared in the workspace `registry.toml`, regardless
     // of how the file is whitespace-formatted. The substring scan it
@@ -3335,6 +3385,378 @@ mod tests {
                     }),
             }) => {}
             _ => panic!("expected config mesh status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_representative_commands_across_every_surface() {
+        let cases = vec![
+            vec!["innerwarden", "get", "status", "root", "--days", "7"],
+            vec![
+                "innerwarden",
+                "get",
+                "responses",
+                "--history",
+                "--ip",
+                "1.2.3.4",
+            ],
+            vec!["innerwarden", "get", "metrics"],
+            vec!["innerwarden", "get", "sensors"],
+            vec!["innerwarden", "get", "posture"],
+            vec!["innerwarden", "system", "doctor"],
+            vec!["innerwarden", "system", "test", "--wait", "3"],
+            vec!["innerwarden", "system", "harden", "--verbose"],
+            vec!["innerwarden", "system", "tune", "--days", "14", "--yes"],
+            vec!["innerwarden", "system", "calibrate"],
+            vec![
+                "innerwarden",
+                "system",
+                "scan",
+                "--modules-dir",
+                "/tmp/modules",
+            ],
+            vec![
+                "innerwarden",
+                "system",
+                "watchdog",
+                "--threshold",
+                "600",
+                "--status",
+            ],
+            vec![
+                "innerwarden",
+                "system",
+                "export",
+                "events",
+                "--format",
+                "csv",
+            ],
+            vec![
+                "innerwarden",
+                "system",
+                "backup",
+                "--output",
+                "/tmp/iw.tar.gz",
+            ],
+            vec![
+                "innerwarden",
+                "system",
+                "gdpr",
+                "export",
+                "--entity",
+                "root",
+            ],
+            vec![
+                "innerwarden",
+                "system",
+                "navigator",
+                "--output",
+                "/tmp/nav.json",
+            ],
+            vec!["innerwarden", "system", "smm", "--json", "--baseline"],
+            vec!["innerwarden", "system", "hypervisor", "--json"],
+            vec!["innerwarden", "system", "circuit-status", "--json"],
+            vec!["innerwarden", "system", "circuit-reset", "--json"],
+            vec!["innerwarden", "system", "reconcile-blocks", "--apply"],
+            vec![
+                "innerwarden",
+                "system",
+                "chain-break",
+                "register",
+                "--start",
+                "10",
+                "--end",
+                "20",
+                "--operator",
+                "ops",
+                "--reason",
+                "manual repair",
+            ],
+            vec!["innerwarden", "system", "chain-break", "list", "--json"],
+            vec![
+                "innerwarden",
+                "module",
+                "validate",
+                "/tmp/module",
+                "--strict",
+            ],
+            vec!["innerwarden", "module", "enable", "/tmp/module", "--yes"],
+            vec!["innerwarden", "module", "disable", "/tmp/module", "--yes"],
+            vec![
+                "innerwarden",
+                "module",
+                "list",
+                "--modules-dir",
+                "/tmp/modules",
+            ],
+            vec!["innerwarden", "module", "status", "ssh-protection"],
+            vec!["innerwarden", "module", "search", "ssh"],
+            vec![
+                "innerwarden",
+                "module",
+                "install",
+                "ssh-protection",
+                "--enable",
+                "--yes",
+            ],
+            vec![
+                "innerwarden",
+                "module",
+                "uninstall",
+                "ssh-protection",
+                "--yes",
+            ],
+            vec!["innerwarden", "module", "publish", "/tmp/module"],
+            vec!["innerwarden", "module", "update-all", "--check"],
+            vec!["innerwarden", "agent", "add", "openclaw"],
+            vec!["innerwarden", "agent", "scan"],
+            vec!["innerwarden", "agent", "status"],
+            vec![
+                "innerwarden",
+                "agent",
+                "connect",
+                "1234",
+                "--name",
+                "codex",
+                "--label",
+                "dev",
+            ],
+            vec!["innerwarden", "agent", "disconnect", "ag-0001"],
+            vec!["innerwarden", "agent", "list"],
+            vec!["innerwarden", "daily", "status"],
+            vec!["innerwarden", "daily", "threats", "--days", "2", "--live"],
+            vec!["innerwarden", "daily", "actions", "--days", "3"],
+            vec!["innerwarden", "daily", "report", "--date", "yesterday"],
+            vec!["innerwarden", "daily", "doctor"],
+            vec!["innerwarden", "daily", "test", "--wait", "5"],
+            vec!["innerwarden", "daily", "agent", "connect", "1234"],
+            vec![
+                "innerwarden",
+                "notify",
+                "telegram",
+                "--token",
+                "t",
+                "--chat-id",
+                "c",
+            ],
+            vec![
+                "innerwarden",
+                "notify",
+                "slack",
+                "--webhook-url",
+                "https://hooks.example.invalid",
+                "--min-severity",
+                "medium",
+            ],
+            vec![
+                "innerwarden",
+                "notify",
+                "webhook",
+                "--url",
+                "https://example.invalid/hook",
+            ],
+            vec!["innerwarden", "notify", "dashboard", "--user", "ops"],
+            vec!["innerwarden", "notify", "test", "--channel", "telegram"],
+            vec![
+                "innerwarden",
+                "notify",
+                "web-push",
+                "--subject",
+                "mailto:ops@example.com",
+            ],
+            vec!["innerwarden", "notify", "digest", "9"],
+            vec!["innerwarden", "notify", "budget", "5"],
+            vec![
+                "innerwarden",
+                "config",
+                "responder",
+                "--enable",
+                "--dry-run",
+                "false",
+            ],
+            vec!["innerwarden", "config", "sensitivity", "quiet"],
+            vec!["innerwarden", "config", "2fa"],
+            vec![
+                "innerwarden",
+                "config",
+                "test-alert",
+                "--channel",
+                "webhook",
+            ],
+            vec!["innerwarden", "config", "geoip"],
+            vec!["innerwarden", "config", "abuseipdb", "--api-key", "abc"],
+            vec![
+                "innerwarden",
+                "config",
+                "cloudflare",
+                "--zone-id",
+                "z",
+                "--api-token",
+                "t",
+            ],
+            vec!["innerwarden", "config", "watchdog", "--interval", "5"],
+            vec![
+                "innerwarden",
+                "config",
+                "mesh",
+                "add-peer",
+                "https://peer",
+                "--label",
+                "prod",
+            ],
+            vec!["innerwarden", "integrate", "geoip"],
+            vec![
+                "innerwarden",
+                "integrate",
+                "abuseipdb",
+                "--auto-block-threshold",
+                "90",
+            ],
+            vec!["innerwarden", "integrate", "cloudflare", "--zone-id", "z"],
+            vec!["innerwarden", "integrate", "watchdog", "--interval", "15"],
+            vec!["innerwarden", "mesh", "enable"],
+            vec!["innerwarden", "mesh", "disable"],
+            vec!["innerwarden", "mesh", "status"],
+            vec!["innerwarden", "rule", "list", "--type", "sigma"],
+            vec!["innerwarden", "rule", "disable", "CL-024"],
+            vec!["innerwarden", "rule", "enable", "CL-024"],
+            vec![
+                "innerwarden",
+                "rule",
+                "migrate-allowlist",
+                "--output",
+                "/tmp/rules.yml",
+            ],
+            vec!["innerwarden", "completions", "zsh"],
+            vec![
+                "innerwarden",
+                "replay",
+                "--fixture",
+                "/tmp/fixtures",
+                "--expected",
+                "/tmp/expected.json",
+            ],
+            vec!["innerwarden", "upgrade", "--check", "--notify"],
+            vec!["innerwarden", "enable", "shell-audit", "--yes"],
+            vec!["innerwarden", "disable", "shell-audit", "--yes"],
+            vec!["innerwarden", "list"],
+            vec!["innerwarden", "status", "root", "--days", "3"],
+            vec!["innerwarden", "scan", "--modules-dir", "/tmp/modules"],
+            vec!["innerwarden", "welcome"],
+            vec!["innerwarden", "navigator", "--output", "/tmp/nav.json"],
+            vec!["innerwarden", "report", "--date", "today"],
+            vec!["innerwarden", "watchdog", "--threshold", "300", "--notify"],
+            vec!["innerwarden", "sensor-status"],
+            vec!["innerwarden", "export", "incidents", "--format", "json"],
+            vec!["innerwarden", "tail", "--type", "events", "--interval", "1"],
+            vec!["innerwarden", "incidents", "--severity", "medium"],
+            vec![
+                "innerwarden",
+                "block",
+                "203.0.113.10",
+                "--reason",
+                "coverage",
+            ],
+            vec![
+                "innerwarden",
+                "unblock",
+                "203.0.113.10",
+                "--reason",
+                "coverage",
+            ],
+            vec!["innerwarden", "entity", "root", "--days", "5"],
+            vec!["innerwarden", "test", "--wait", "1"],
+            vec!["innerwarden", "backup", "--output", "/tmp/backup.tar.gz"],
+            vec!["innerwarden", "metrics"],
+            vec!["innerwarden", "gdpr", "erase", "--entity", "root", "--yes"],
+            vec!["innerwarden", "suppress", "add", "firmware:trust_degraded"],
+        ];
+
+        for args in cases {
+            Cli::try_parse_from(&args)
+                .unwrap_or_else(|err| panic!("expected CLI parse to succeed for {args:?}: {err}"));
+        }
+    }
+
+    #[test]
+    fn run_cli_dispatches_safe_readonly_and_dry_run_commands() {
+        let cases = vec![
+            vec!["innerwarden"],
+            vec!["innerwarden", "get"],
+            vec!["innerwarden", "get", "decisions"],
+            vec!["innerwarden", "get", "incidents"],
+            vec!["innerwarden", "get", "report"],
+            vec!["innerwarden", "get", "metrics"],
+            vec!["innerwarden", "get", "sensors"],
+            vec!["innerwarden", "get", "posture"],
+            vec!["innerwarden", "action"],
+            vec![
+                "innerwarden",
+                "action",
+                "block",
+                "203.0.113.10",
+                "--reason",
+                "coverage",
+            ],
+            vec![
+                "innerwarden",
+                "action",
+                "unblock",
+                "203.0.113.10",
+                "--reason",
+                "coverage",
+            ],
+            vec!["innerwarden", "trust"],
+            vec!["innerwarden", "trust", "list"],
+            vec!["innerwarden", "trust", "suppressions"],
+            vec!["innerwarden", "system"],
+            vec!["innerwarden", "system", "watchdog", "--status"],
+            vec!["innerwarden", "system", "export", "incidents"],
+            vec![
+                "innerwarden",
+                "system",
+                "gdpr",
+                "export",
+                "--entity",
+                "root",
+            ],
+            vec!["innerwarden", "system", "navigator"],
+            vec!["innerwarden", "system", "circuit-status", "--json"],
+            vec!["innerwarden", "system", "circuit-reset", "--json"],
+            vec![
+                "innerwarden",
+                "system",
+                "chain-break",
+                "register",
+                "--start",
+                "1",
+                "--end",
+                "2",
+                "--operator",
+                "coverage",
+                "--reason",
+                "dispatch smoke",
+            ],
+            vec!["innerwarden", "system", "chain-break", "list", "--json"],
+            vec!["innerwarden", "rule", "list"],
+            vec!["innerwarden", "agent", "list"],
+            vec!["innerwarden", "daily", "actions"],
+            vec!["innerwarden", "daily", "report"],
+            vec!["innerwarden", "status", "root"],
+            vec!["innerwarden", "decisions"],
+            vec!["innerwarden", "entity", "root"],
+            vec!["innerwarden", "allowlist", "list"],
+            vec!["innerwarden", "suppress", "list"],
+            vec!["innerwarden", "metrics"],
+            vec!["innerwarden", "gdpr", "export", "--entity", "root"],
+        ];
+
+        for args in cases {
+            let tmp = TempDir::new().expect("tempdir");
+            write_minimal_cli_configs(tmp.path());
+            let cli = runnable_cli(&args, tmp.path());
+            run_cli(cli)
+                .unwrap_or_else(|err| panic!("expected run_cli to succeed for {args:?}: {err:#}"));
         }
     }
 

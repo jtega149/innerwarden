@@ -492,3 +492,113 @@ pub(crate) fn spawn_collectors(
     // When all collector tasks finish, all senders drop and rx.recv() returns None.
     drop(tx);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn write_temp_file(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, "seed\n").expect("write temp file");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn spawn_collectors_all_disabled_closes_the_channel() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = Config::test_default();
+        let state = State::default();
+        let cursors = SharedCursors::new();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        spawn_collectors(&cfg, tmp.path(), &state, tx, &cursors);
+
+        assert!(
+            rx.recv().await.is_none(),
+            "with every collector disabled, dropping the original sender should close rx"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_collectors_seeds_resume_cursors_for_enabled_collectors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::test_default();
+        cfg.agent.host_id = "spawn-test-host".to_string();
+        cfg.collectors.auth_log.enabled = true;
+        cfg.collectors.auth_log.path = write_temp_file(tmp.path(), "auth.log");
+        cfg.collectors.integrity.enabled = true;
+        cfg.collectors.integrity.paths = vec![write_temp_file(tmp.path(), "watched.conf")];
+        cfg.collectors.journald.enabled = true;
+        cfg.collectors.docker.enabled = true;
+        cfg.collectors.exec_audit.enabled = true;
+        cfg.collectors.exec_audit.path = write_temp_file(tmp.path(), "exec.log");
+        cfg.collectors.nginx_access.enabled = true;
+        cfg.collectors.nginx_access.path = write_temp_file(tmp.path(), "access.log");
+        cfg.collectors.nginx_error.enabled = true;
+        cfg.collectors.nginx_error.path = write_temp_file(tmp.path(), "error.log");
+        cfg.collectors.macos_log.enabled = true;
+        cfg.collectors.syslog_firewall.enabled = true;
+        cfg.collectors.syslog_firewall.path = write_temp_file(tmp.path(), "syslog.log");
+        cfg.collectors.cloudtrail.enabled = true;
+        cfg.collectors.cloudtrail.dir =
+            tmp.path().join("cloudtrail").to_string_lossy().into_owned();
+        cfg.collectors.ebpf_syscall.enabled = true;
+        cfg.collectors.firmware_integrity.enabled = true;
+        cfg.collectors.proc_maps.enabled = true;
+        cfg.collectors.fanotify_watch.enabled = true;
+        cfg.collectors.kernel_integrity.enabled = true;
+        cfg.collectors.cgroup_abuse.enabled = true;
+        cfg.collectors.dns_capture.enabled = true;
+        cfg.collectors.http_capture.enabled = true;
+        cfg.collectors.net_snapshot.enabled = true;
+        cfg.collectors.usb_monitor.enabled = true;
+        cfg.collectors.suid_inventory.enabled = true;
+        cfg.collectors.sysctl_drift.enabled = true;
+        cfg.collectors.systemd_inventory.enabled = true;
+        cfg.collectors.tcp_stream.enabled = true;
+        cfg.detectors.suid_page_cache_integrity.enabled = true;
+        cfg.detectors.kernel_devnode_exposed.enabled = true;
+
+        let mut state = State::default();
+        state.set_cursor("auth_log", serde_json::json!(17));
+        state.set_cursor(
+            "integrity",
+            serde_json::json!({"/etc/innerwarden/config.toml": "hash-a"}),
+        );
+        state.set_cursor("journald", serde_json::json!("s=journal-cursor"));
+        state.set_cursor("docker", serde_json::json!("2026-05-28T00:00:00Z"));
+        state.set_cursor("exec_audit", serde_json::json!(23));
+        state.set_cursor("nginx_access", serde_json::json!(31));
+        state.set_cursor("nginx_error", serde_json::json!(37));
+        state.set_cursor("syslog_firewall", serde_json::json!(41));
+
+        let cursors = SharedCursors::new();
+        let (tx, _rx) = mpsc::channel(32);
+
+        spawn_collectors(&cfg, tmp.path(), &state, tx, &cursors);
+
+        assert_eq!(cursors.auth_offset.load(Ordering::Relaxed), 17);
+        assert_eq!(cursors.exec_audit_offset.load(Ordering::Relaxed), 23);
+        assert_eq!(cursors.nginx_offset.load(Ordering::Relaxed), 31);
+        assert_eq!(cursors.nginx_error_offset.load(Ordering::Relaxed), 37);
+        assert_eq!(cursors.syslog_firewall_offset.load(Ordering::Relaxed), 41);
+        assert_eq!(
+            cursors.journald_cursor.lock().unwrap().as_deref(),
+            Some("s=journal-cursor")
+        );
+        assert_eq!(
+            cursors.docker_since.lock().unwrap().as_deref(),
+            Some("2026-05-28T00:00:00Z")
+        );
+        assert_eq!(
+            cursors
+                .integrity_hashes
+                .lock()
+                .unwrap()
+                .get("/etc/innerwarden/config.toml")
+                .map(String::as_str),
+            Some("hash-a")
+        );
+    }
+}

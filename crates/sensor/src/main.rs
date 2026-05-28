@@ -53,12 +53,19 @@ pub(crate) struct WriteStats {
     pub(crate) incidents_written: u64,
 }
 
+fn load_config_for_cli(cli: &Cli) -> Result<config::Config> {
+    config::load(&cli.config)
+}
+
+async fn run_cli(cli: Cli) -> Result<()> {
+    tracing_init::init_tracing()?;
+    let cfg = load_config_for_cli(&cli)?;
+    sensor::run(cfg).await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_init::init_tracing()?;
-    let cli = Cli::parse();
-    let cfg = config::load(&cli.config)?;
-    sensor::run(cfg).await
+    run_cli(Cli::parse()).await
 }
 
 // 11 small helpers (load_blocked_ips, state_path_for, blocked_ips_path_for,
@@ -78,7 +85,6 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use innerwarden_core::event::Severity;
 
     // (parse_blocked_ips / helper_paths_resolve_inside_data_dir /
     //  should_spawn_integrity_collector / parse_syslog_port /
@@ -109,6 +115,149 @@ mod tests {
         ])
         .expect("custom config CLI should parse");
         assert_eq!(custom_cli.config, "/etc/innerwarden/sensor.toml");
+    }
+
+    #[test]
+    fn load_config_for_cli_reads_the_selected_config_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("sensor.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[agent]
+host_id = "main-test-host"
+
+[output]
+data_dir = "{}"
+"#,
+                tmp.path().display()
+            ),
+        )
+        .expect("write config");
+        let cli = Cli {
+            config: config_path.to_string_lossy().into_owned(),
+        };
+
+        let cfg = load_config_for_cli(&cli).expect("config should load");
+
+        assert_eq!(cfg.agent.host_id, "main-test-host");
+        assert_eq!(cfg.output.data_dir, tmp.path().to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn run_cli_with_all_collectors_disabled_returns_cleanly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let datasets_dir = tmp.path().join("datasets");
+        std::fs::create_dir_all(&datasets_dir).expect("mkdir datasets");
+        std::fs::write(datasets_dir.join("feodo-ips.txt"), "203.0.113.1\n").expect("seed datasets");
+        let config_path = tmp.path().join("sensor.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[agent]
+host_id = "main-test-host"
+
+[output]
+data_dir = "{}"
+write_events = true
+
+[event_pipeline]
+enabled = false
+
+[collectors.auth_log]
+enabled = false
+
+[collectors.integrity]
+enabled = false
+
+[collectors.journald]
+enabled = false
+
+[collectors.docker]
+enabled = false
+
+[collectors.exec_audit]
+enabled = false
+
+[collectors.nginx_access]
+enabled = false
+
+[collectors.nginx_error]
+enabled = false
+
+[collectors.macos_log]
+enabled = false
+
+[collectors.syslog_firewall]
+enabled = false
+
+[collectors.cloudtrail]
+enabled = false
+
+[collectors.ebpf_syscall]
+enabled = false
+
+[collectors.firmware_integrity]
+enabled = false
+
+[collectors.proc_maps]
+enabled = false
+
+[collectors.fanotify_watch]
+enabled = false
+
+[collectors.kernel_integrity]
+enabled = false
+
+[collectors.cgroup_abuse]
+enabled = false
+
+[collectors.dns_capture]
+enabled = false
+
+[collectors.http_capture]
+enabled = false
+
+[collectors.net_snapshot]
+enabled = false
+
+[collectors.usb_monitor]
+enabled = false
+
+[collectors.suid_inventory]
+enabled = false
+
+[collectors.sysctl_drift]
+enabled = false
+
+[collectors.systemd_inventory]
+enabled = false
+
+[collectors.tcp_stream]
+enabled = false
+
+[detectors.suid_page_cache_integrity]
+enabled = false
+
+[detectors.kernel_devnode_exposed]
+enabled = false
+"#,
+                tmp.path().display()
+            ),
+        )
+        .expect("write config");
+        let cli = Cli {
+            config: config_path.to_string_lossy().into_owned(),
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), run_cli(cli))
+            .await
+            .expect("run_cli timed out")
+            .expect("run_cli should return Ok");
+
+        assert!(tmp.path().join("state.json").exists());
     }
 
     // (5 helper unit tests moved to main_helpers.rs as part of PR2:

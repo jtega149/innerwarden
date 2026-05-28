@@ -1617,4 +1617,91 @@ ignored = 0, 9, 67
         ev.kind = "process.exec".to_string();
         assert!(al.is_benign_discovery(&ev));
     }
+
+    // ===== reload_if_changed (operator-facing hot-reload behaviour) =====
+
+    #[test]
+    fn reload_if_changed_picks_up_new_processes_after_mtime_change() {
+        // Hot-reload contract: when the operator edits allowlist.toml the
+        // sensor must read the new content on the next 60 s poll. We assert
+        // both halves: (1) mtime change triggers reload_if_changed = true,
+        // (2) the parsed state reflects the edit.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("allowlist.toml");
+        std::fs::write(&path, "[processes]\n\"original\" = \"comment\"\n").expect("write initial");
+        let mut al = DynamicAllowlist::load(&path);
+        assert!(al.is_process_allowed("original", None));
+        assert!(!al.is_process_allowed("added-later", None));
+
+        // mtime granularity on some filesystems is coarse; bump it
+        // explicitly so the reload predicate cannot tie.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::write(
+            &path,
+            "[processes]\n\"original\" = \"comment\"\n\"added-later\" = \"comment\"\n",
+        )
+        .expect("write update");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(later))
+            .expect("bump mtime");
+
+        assert!(
+            al.reload_if_changed(),
+            "mtime change must drive reload_if_changed to return true"
+        );
+        assert!(al.is_process_allowed("added-later", None));
+        assert!(al.is_process_allowed("original", None));
+    }
+
+    #[test]
+    fn reload_if_changed_returns_false_when_file_untouched() {
+        // Anti-flake: reload_if_changed must NOT report a reload when the
+        // file mtime is the same as the last successful load. Otherwise
+        // every 60 s tick re-parses, log spam grows, and noise hides real
+        // operator edits.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("allowlist.toml");
+        std::fs::write(&path, "[processes]\n\"steady\" = \"\"\n").expect("write");
+        let mut al = DynamicAllowlist::load(&path);
+        assert!(al.is_process_allowed("steady", None));
+
+        // No mtime change → no reload.
+        assert!(!al.reload_if_changed());
+        assert!(!al.reload_if_changed());
+    }
+
+    // ===== is_internal_ip_with_overrides (free function) =====
+
+    #[test]
+    fn is_internal_ip_with_overrides_demotes_test_external_to_external() {
+        // Lab override path: an operator marks 10.0.0.5 as
+        // `test_external` so `is_internal_ip_with_overrides` treats it as
+        // external even though it is technically RFC1918. This is how
+        // sensor tests use the Mac (10.0.0.x) as if it were an internet
+        // attacker against the VM.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("allowlist.toml");
+        std::fs::write(
+            &path,
+            "[test_external_ips]\n\"10.0.0.5\" = \"mac under test\"\n",
+        )
+        .expect("write");
+        let al = DynamicAllowlist::load(&path);
+        assert!(
+            !is_internal_ip_with_overrides("10.0.0.5", &al),
+            "test_external override must demote a private IP to external"
+        );
+        // Sibling RFC1918 IPs without override stay internal.
+        assert!(is_internal_ip_with_overrides("10.0.0.6", &al));
+    }
+
+    #[test]
+    fn is_internal_ip_with_overrides_passes_public_ips_to_baseline_classifier() {
+        // Without any overrides, the function delegates to the static
+        // `is_internal_ip` classifier — public IPs return false, RFC1918
+        // returns true. This is the production happy path.
+        let al = DynamicAllowlist::load(Path::new("/nonexistent"));
+        assert!(!is_internal_ip_with_overrides("8.8.8.8", &al));
+        assert!(is_internal_ip_with_overrides("192.168.1.1", &al));
+        assert!(is_internal_ip_with_overrides("172.16.0.10", &al));
+    }
 }

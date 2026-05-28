@@ -974,6 +974,154 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    fn seed_datasets(data_dir: &std::path::Path) -> detectors::datasets::Datasets {
+        let datasets_dir = data_dir.join("datasets");
+        std::fs::create_dir_all(&datasets_dir).expect("mkdir datasets");
+        detectors::datasets::Datasets::load(&datasets_dir, 3600)
+    }
+
+    fn quiet_detector_set(data_dir: &std::path::Path) -> DetectorSet {
+        let cfg = crate::config::Config::test_default();
+        let mut detectors = crate::boot::build_detectors::build_detector_set(&cfg, data_dir);
+        detectors.event_pipeline = crate::event_pipeline::EventPipeline::new_disabled();
+        detectors
+    }
+
+    fn test_event(
+        kind: &str,
+        severity: innerwarden_core::event::Severity,
+    ) -> innerwarden_core::event::Event {
+        innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            source: "unit-test".to_string(),
+            kind: kind.to_string(),
+            severity,
+            summary: format!("synthetic {kind}"),
+            details: serde_json::json!({
+                "pid": 4242,
+                "comm": "curl",
+                "filename": "/tmp/payload",
+                "ip": "203.0.113.10",
+            }),
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    fn test_incident(
+        pid: u32,
+        severity: innerwarden_core::event::Severity,
+    ) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: format!("test:dedup:{pid}:{severity:?}"),
+            severity,
+            title: "dedup coverage incident".to_string(),
+            summary: "synthetic incident for write_incident coverage".to_string(),
+            evidence: serde_json::json!([{ "pid": pid, "comm": "curl" }]),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn process_event_persists_normal_event_and_walks_disabled_fanout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sqlite = SqliteWriter::new(tmp.path(), true).expect("sqlite");
+        let mut detectors = quiet_detector_set(tmp.path());
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+        let datasets = seed_datasets(tmp.path());
+
+        process_event(
+            test_event("unit.normal", innerwarden_core::event::Severity::Low),
+            &sqlite,
+            &mut detectors,
+            &mut stats,
+            &mut syslog,
+            &mut dedup_cache,
+            &datasets,
+        );
+
+        assert_eq!(stats.events_written, 1);
+        assert_eq!(stats.events_dropped, 0);
+        assert_eq!(stats.incidents_written, 0);
+        assert!(dedup_cache.is_empty());
+    }
+
+    #[test]
+    fn process_event_promotes_lsm_blocks_and_dedups_same_pid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sqlite = SqliteWriter::new(tmp.path(), true).expect("sqlite");
+        let mut detectors = quiet_detector_set(tmp.path());
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+        let datasets = seed_datasets(tmp.path());
+
+        for _ in 0..2 {
+            process_event(
+                test_event(
+                    "lsm.exec_blocked",
+                    innerwarden_core::event::Severity::Critical,
+                ),
+                &sqlite,
+                &mut detectors,
+                &mut stats,
+                &mut syslog,
+                &mut dedup_cache,
+                &datasets,
+            );
+        }
+
+        assert_eq!(stats.events_written, 2);
+        assert_eq!(
+            stats.incidents_written, 1,
+            "equal severity incidents for the same PID inside the dedup window should collapse"
+        );
+        assert!(dedup_cache.contains_key(&4242));
+    }
+
+    #[test]
+    fn write_incident_keeps_higher_severity_inside_dedup_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sqlite = SqliteWriter::new(tmp.path(), true).expect("sqlite");
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+
+        write_incident(
+            &sqlite,
+            &mut stats,
+            test_incident(7, innerwarden_core::event::Severity::Low),
+            &mut syslog,
+            &mut dedup_cache,
+        );
+        write_incident(
+            &sqlite,
+            &mut stats,
+            test_incident(7, innerwarden_core::event::Severity::Low),
+            &mut syslog,
+            &mut dedup_cache,
+        );
+        write_incident(
+            &sqlite,
+            &mut stats,
+            test_incident(7, innerwarden_core::event::Severity::Critical),
+            &mut syslog,
+            &mut dedup_cache,
+        );
+
+        assert_eq!(
+            stats.incidents_written, 2,
+            "equal severity should be suppressed, but a later higher severity must be retained"
+        );
+    }
+
     // ── Anchor: blocked-IP early-return must STAY removed ────────────────
     //
     // 2026-05-23: an old `process_event` had this pattern just before the
