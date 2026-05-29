@@ -1683,24 +1683,41 @@ mod tests {
     }
 
     #[test]
-    fn matches_incident_data_exfil_needs_prod_tag() {
+    fn matches_incident_data_exfil_real_killchain_format() {
+        // Regression anchor for the 2026-05-29 finding: `--playbook-replay`
+        // over 204 real prod incidents showed this playbook matched ZERO
+        // because (a) the kind_glob used the `kill_chain_detected_DATA_EXFIL`
+        // underscore form but the engine emits
+        // `kill_chain:detected:DATA_EXFIL:<pid>:<ts>` (colons), and (b) an
+        // `asset_tags: [env=prod]` gate could never pass (asset tags are
+        // unsettable until spec 058). Both are fixed; this test pins the
+        // real format so the playbook can never silently go dead again.
         let pbs = super::super::load_builtins().unwrap();
         let exfil = pbs
             .iter()
             .find(|p| p.metadata.id.as_str() == "pb-data-exfil-default")
             .unwrap();
-        let mut inc = crate::tests::test_incident("198.51.100.42");
-        inc.tags.push("CL-002".to_string());
+
+        // Real production incident id shape (colons, uppercase pattern).
+        let inc = crate::tests::test_incident_with_kind(
+            "198.51.100.42",
+            "kill_chain:detected:DATA_EXFIL:943297:2026-05-29T01:21Z",
+        );
         let tctx = TriggerCtx::from_incident(&inc);
-        // CL-002 arms it, but env=prod asset tag is required.
-        assert!(!matches_incident(exfil, &inc, &tctx, &[], &[]));
-        assert!(matches_incident(
-            exfil,
-            &inc,
-            &tctx,
-            &[],
-            &["env=prod".to_string()]
-        ));
+        // No asset tag required any more -> matches on a clean external IP.
+        assert!(
+            matches_incident(exfil, &inc, &tctx, &[], &[]),
+            "data-exfil builtin must match the real kill_chain colon format"
+        );
+        // The ip_not_in floor still blocks a trusted source.
+        let trusted = vec!["198.51.100.42".to_string()];
+        assert!(!matches_incident(exfil, &inc, &tctx, &trusted, &[]));
+
+        // The legacy CL-002 chain_id trigger still arms it too.
+        let mut cl = crate::tests::test_incident("198.51.100.43");
+        cl.tags.push("CL-002".to_string());
+        let tctx_cl = TriggerCtx::from_incident(&cl);
+        assert!(matches_incident(exfil, &cl, &tctx_cl, &[], &[]));
     }
 
     #[test]

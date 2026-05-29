@@ -12,14 +12,26 @@ metadata:
 triggers:
   - chain_id: "CL-002"
   - chain_id: "CL-008"
-  - kind_glob: "kill_chain_detected_DATA_EXFIL*"
+  # The kill chain engine emits incident ids of the form
+  # `kill_chain:detected:DATA_EXFIL:<pid>:<ts>` (colons, uppercase
+  # pattern) — verified against 204 real production incidents via
+  # `innerwarden-agent --playbook-replay`. The earlier
+  # `kill_chain_detected_DATA_EXFIL*` (underscore) glob matched ZERO real
+  # incidents. This `*`-separated glob matches the real id; the lowercase
+  # `data_exfil` tag is also a match candidate.
+  - kind_glob: "kill_chain*DATA_EXFIL*"
 
 conditions:
   # Skip cloud provider safelist + operator trusted_ips. Skill_gate would
   # refuse the block-ip step anyway, but evaluating the condition first
   # avoids logging a refused gate attempt for every cloud-provider sweep.
   ip_not_in: ["$cloud_safelist", "$trusted_ips"]
-  asset_tags: ["env=prod"]
+  # No asset_tags gate: until spec 058 ships, host asset tags cannot be
+  # set, so an `asset_tags: ["env=prod"]` requirement made this playbook
+  # dead on every host. A DATA_EXFIL kill chain (sensitive read + outbound
+  # socket) warrants blocking the external source regardless of host role;
+  # the ip_not_in floor + shadow mode keep it safe. Operators can add
+  # `asset_tags` to scope it per host once spec 058 lands.
   sample_rate: 1.0
 
 steps:
