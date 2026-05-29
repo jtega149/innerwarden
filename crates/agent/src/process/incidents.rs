@@ -578,6 +578,22 @@ pub(crate) async fn process_incidents(
             continue;
         }
 
+        // Spec 056 Phase 2: run deterministic SOC playbooks BEFORE AI triage.
+        // The enable-gate (`[playbooks] enabled`, default false) lives inside
+        // the helper, so this call is a cheap no-op until an operator opts in.
+        // Matching playbooks execute through the same skill_gate floor the AI
+        // path uses; the AI router sees the outcome as context (Phase 4).
+        let _playbook_outcomes = crate::playbook_engine::executor::run_for_incident_if_enabled(
+            incident,
+            cfg,
+            data_dir,
+            &state.skill_registry,
+            super::post_decision::honeypot_runtime(cfg),
+            state.ai_router.any_llm(),
+            state.sqlite_store.clone(),
+        )
+        .await;
+
         // Build graph context: attack narrative from knowledge graph neighborhood.
         // Phase 015: prefer the Incident node as center (richest context after 014-D
         // incident enrichment links incidents to processes), fall back to entity nodes.

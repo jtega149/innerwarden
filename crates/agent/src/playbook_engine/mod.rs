@@ -38,6 +38,8 @@
 //! the module level keeps the API discoverable while Phase 2 catches up.
 #![allow(dead_code)]
 
+pub mod executor;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;

@@ -25,6 +25,12 @@ pub struct AgentConfig {
     pub honeypot: HoneypotConfig,
     #[serde(default)]
     pub responder: ResponderConfig,
+    /// Spec 056: SOC response playbooks. Default disabled so existing
+    /// installs keep their current behaviour (playbooks load + list via CTL
+    /// but the agent does not execute them on incidents) until the operator
+    /// opts in with `[playbooks] enabled = true`.
+    #[serde(default)]
+    pub playbooks: PlaybooksConfig,
     #[serde(default)]
     pub telegram: TelegramConfig,
     /// Data retention settings. Historic prod deploys labelled this section
@@ -2189,6 +2195,41 @@ pub struct AllowlistConfig {
     /// Examples: ["deploy", "backup"]
     #[serde(default)]
     pub trusted_users: Vec<String>,
+}
+
+/// Spec 056 SOC response playbooks.
+///
+/// Playbooks are deterministic, operator-authored incident-response runbooks
+/// in `/etc/innerwarden/rules/playbooks/`. Phase 1 shipped the loader; Phase
+/// 2 adds the executor. The `enabled` master switch defaults to `false` so a
+/// fresh install (or an upgrade that has not yet opted in) never starts
+/// auto-executing block/suspend steps from the built-in playbooks. CTL
+/// (`innerwarden rule list --type playbooks`) lists them regardless.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaybooksConfig {
+    /// Master switch. When false the agent does not run playbooks on
+    /// incidents. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory of operator playbook YAML files. Built-ins are always
+    /// embedded regardless of this path. Default
+    /// `/etc/innerwarden/rules/playbooks`.
+    #[serde(default = "default_playbooks_dir")]
+    pub rules_dir: String,
+}
+
+fn default_playbooks_dir() -> String {
+    "/etc/innerwarden/rules/playbooks".to_string()
+}
+
+impl Default for PlaybooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rules_dir: default_playbooks_dir(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
