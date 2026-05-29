@@ -25,11 +25,12 @@
 //!   hash-chained [`crate::decisions::append_chained`]) AND a dedicated
 //!   `playbook_steps-<date>.jsonl`.
 //!
-//! Virtual skills (`route_alert`, `capture_pcap`, `open_ticket`, `wait`,
-//! `emit_metric`, `set_tag`, `block_subnet`) are recognised but return
-//! [`StepStatus::Deferred`] until Phase 3 implements them. This keeps the
-//! built-in playbooks loadable + matchable today without pretending the
-//! routing/pcap/ticket wiring exists yet.
+//! Virtual skills wrap existing agent capabilities behind a uniform skill
+//! surface (see [`super::virtual_skills`]). Phase 3a implements the four
+//! that need nothing beyond what [`RegistryStepExecutor`] already carries
+//! (`wait`, `emit_metric`, `block_subnet`, `open_ticket`). The three that
+//! need `&mut AgentState` subsystems (`route_alert`, `capture_pcap`,
+//! `set_tag`) still return [`StepStatus::Deferred`] until Phase 3b.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -211,10 +212,9 @@ impl StepExecutor for RegistryStepExecutor<'_> {
             let skill = call.skill;
 
             if is_virtual_skill(skill) {
-                return StepRunResult {
-                    status: StepStatus::Deferred,
-                    message: format!("virtual skill '{skill}' lands in Phase 3"),
-                };
+                return self
+                    .dispatch_virtual(skill, call.args, call.primary_ip)
+                    .await;
             }
 
             // Playbook YAML uses snake_case skill names (`block_ip_xdp`);

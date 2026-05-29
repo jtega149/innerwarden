@@ -39,6 +39,7 @@
 #![allow(dead_code)]
 
 pub mod executor;
+mod virtual_skills;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

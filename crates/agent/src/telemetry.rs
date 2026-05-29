@@ -77,6 +77,55 @@ pub fn telemetry_stream_for<'a>(source: &'a str, kind: &'a str) -> &'a str {
     source
 }
 
+/// Spec 056 Phase 3: process-global named-counter registry backing the
+/// playbook `emit_metric` virtual skill.
+///
+/// `emit_metric` lets an operator count how often a playbook step runs
+/// (hit rate per host) without threading `&mut AgentState` into the
+/// declarative executor — the same decoupling the gate-suppressed /
+/// telegram-sent counters use via `Arc<AtomicU64>`, except the metric
+/// name is operator-chosen so a fixed struct field cannot hold it. The
+/// registry is monotonic for the process lifetime; the dashboard
+/// endpoint (Phase 5) reads it via [`playbook_metrics_snapshot`].
+static PLAYBOOK_METRICS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, u64>>> =
+    std::sync::OnceLock::new();
+
+fn playbook_metrics() -> &'static std::sync::Mutex<BTreeMap<String, u64>> {
+    PLAYBOOK_METRICS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Increment the named playbook counter by `by` and return the new total.
+/// A poisoned lock (a prior panic while holding it) is recovered rather
+/// than propagated — a metric counter must never crash the incident loop.
+pub fn emit_counter(name: &str, by: u64) -> u64 {
+    let mut map = playbook_metrics().lock().unwrap_or_else(|p| p.into_inner());
+    let entry = map.entry(name.to_string()).or_insert(0);
+    *entry = entry.saturating_add(by);
+    *entry
+}
+
+/// Current value of a single playbook counter (0 if never emitted).
+/// Read path: the Phase 5 dashboard/CLI introspection surfaces these;
+/// today only the test suite reads them, so allow dead_code until then.
+#[allow(dead_code)]
+pub fn playbook_metric_value(name: &str) -> u64 {
+    playbook_metrics()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(name)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Snapshot of every playbook counter, for dashboard / CLI introspection.
+#[allow(dead_code)]
+pub fn playbook_metrics_snapshot() -> BTreeMap<String, u64> {
+    playbook_metrics()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
 #[derive(Debug, Default)]
 pub struct TelemetryState {
     events_by_collector: BTreeMap<Arc<str>, u64>,
