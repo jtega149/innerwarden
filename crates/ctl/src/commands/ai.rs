@@ -598,6 +598,7 @@ pub(crate) fn cmd_install_classifier(
     url_override: Option<&str>,
     sha256_override: Option<&str>,
     yes: bool,
+    configure: bool,
 ) -> Result<()> {
     cmd_install_classifier_with_target(
         cli,
@@ -605,16 +606,29 @@ pub(crate) fn cmd_install_classifier(
         url_override,
         sha256_override,
         yes,
+        configure,
         CLASSIFIER_INSTALL_DIR,
     )
 }
 
+/// Write the canonical `[ai.warden]` section into `agent_config` so the
+/// agent's provider resolver picks the on-device Decide head on its next
+/// restart. Shared by `install-warden --configure` (headless / install.sh)
+/// and the interactive setup wizard so the two paths can never drift.
+pub(crate) fn write_warden_config(agent_config: &std::path::Path, base_url: &str) -> Result<()> {
+    crate::config_editor::write_str(agent_config, "ai.warden", "provider", "local_warden")?;
+    crate::config_editor::write_str(agent_config, "ai.warden", "base_url", base_url)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_install_classifier_with_target(
     cli: &Cli,
     model: &str,
     url_override: Option<&str>,
     sha256_override: Option<&str>,
     yes: bool,
+    configure: bool,
     target_dir: &str,
 ) -> Result<()> {
     if !cli.dry_run {
@@ -688,10 +702,29 @@ fn cmd_install_classifier_with_target(
         println!("[dry-run] would download {url}");
         println!("[dry-run] would verify SHA-256 against {expected_sha}");
         println!("[dry-run] would extract into {target_dir}");
+        if configure {
+            println!(
+                "[dry-run] would write [ai.warden] into {}",
+                cli.agent_config.display()
+            );
+        }
         return Ok(());
     }
 
     install_classifier_archive(url, expected_sha, target_dir)?;
+
+    // `--configure` (used by install.sh headless provisioning): wire the
+    // [ai.warden] section in the same shot so the model is not just on disk
+    // but actually selected as the Decide provider. Without it the operator
+    // must run `innerwarden configure ai` separately.
+    if configure {
+        write_warden_config(&cli.agent_config, target_dir)?;
+        println!();
+        println!(
+            "Wired [ai.warden] in {} (provider=local_warden).",
+            cli.agent_config.display()
+        );
+    }
 
     println!();
     println!("Done. Restart the agent to load the classifier:");
@@ -1161,6 +1194,7 @@ mod tests {
             None,
             Some("deadbeef"),
             true,
+            false,
             tmp.path().to_str().expect("utf8 temp path"),
         )
         .expect_err("unknown variant must fail");
@@ -1186,6 +1220,7 @@ mod tests {
             None,
             None,
             true,
+            false,
             tmp.path().to_str().expect("utf8 temp path"),
         )
         .expect_err("missing override hash must fail until pin is published");
@@ -1200,15 +1235,22 @@ mod tests {
     fn cmd_install_classifier_with_target_dry_run_allows_explicit_sha() {
         let tmp = TempDir::new().expect("tempdir");
         let cli = make_cli(tmp.path(), true);
+        // configure = true exercises the dry-run "would write [ai.warden]"
+        // branch; dry-run must NOT actually touch agent.toml.
         cmd_install_classifier_with_target(
             &cli,
             "minilm-l6",
             Some("https://example.invalid/classifier.tar.gz"),
             Some("0123456789abcdef"),
             true,
+            true,
             tmp.path().to_str().expect("utf8 temp path"),
         )
         .expect("dry-run with explicit hash should pass");
+        assert!(
+            !cli.agent_config.exists(),
+            "dry-run must not write agent.toml"
+        );
     }
 
     #[test]
@@ -1265,12 +1307,31 @@ mod tests {
             Some(url.as_str()),
             Some(sha.as_str()),
             true,
+            true, // configure -> also write [ai.warden]
             target.to_str().expect("utf8 target path"),
         )
         .expect("local install should succeed");
 
         assert!(target.join("model.onnx").is_file());
         assert!(target.join("tokenizer.json").is_file());
+        // configure = true wired the on-device provider into agent.toml.
+        let agent_toml = std::fs::read_to_string(&cli.agent_config).expect("agent.toml written");
+        assert!(
+            agent_toml.contains("provider = \"local_warden\""),
+            "agent.toml must select local_warden, got: {agent_toml}"
+        );
+        assert!(agent_toml.contains(target.to_str().unwrap()));
+    }
+
+    #[test]
+    fn write_warden_config_writes_canonical_section() {
+        let tmp = TempDir::new().expect("tempdir");
+        let agent_toml = tmp.path().join("agent.toml");
+        write_warden_config(&agent_toml, "/var/lib/innerwarden/models/classifier")
+            .expect("write [ai.warden]");
+        let content = std::fs::read_to_string(&agent_toml).expect("read agent.toml");
+        assert!(content.contains("provider = \"local_warden\""));
+        assert!(content.contains("/var/lib/innerwarden/models/classifier"));
     }
 
     #[test]

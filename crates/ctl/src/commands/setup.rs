@@ -1019,12 +1019,16 @@ fn apply_setup_warden_plan(cli: &Cli, plan: &SetupWardenPlan) -> Result<bool> {
     // with a pinned SHA-256 in `commands::ai::CLASSIFIER_VARIANTS`.
     // `--yes` skips the interactive confirmation since the wizard is
     // already a confirmation flow.
+    // `configure = true` makes the install path also persist `[ai.warden]`
+    // via the shared `write_warden_config` helper, so the wizard and the
+    // headless `install.sh` provisioning can never drift on the config shape.
     match crate::commands::ai::cmd_install_classifier(
         cli,
         "minilm-l6",
         None, // url override — use the pinned URL
         None, // sha256 override — use the pinned digest
         true, // yes — wizard already asked
+        true, // configure — write [ai.warden] in the same shot
     ) {
         Ok(()) => {}
         Err(err) => {
@@ -1036,17 +1040,6 @@ fn apply_setup_warden_plan(cli: &Cli, plan: &SetupWardenPlan) -> Result<bool> {
             return Ok(false);
         }
     }
-
-    // Persist `[ai.warden]` so the agent's provider resolver picks the
-    // local_warden head. The constants here mirror the canonical config
-    // shape documented in `.claude/CLAUDE.md` Local Warden Model section.
-    config_editor::write_str(&cli.agent_config, "ai.warden", "provider", "local_warden")?;
-    config_editor::write_str(
-        &cli.agent_config,
-        "ai.warden",
-        "base_url",
-        "/var/lib/innerwarden/models/classifier",
-    )?;
 
     Ok(true)
 }

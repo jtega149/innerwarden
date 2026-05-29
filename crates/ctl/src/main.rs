@@ -559,6 +559,12 @@ enum Command {
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
+
+        /// After installing, also write the `[ai.warden]` section into
+        /// agent.toml so the agent selects the on-device model on its next
+        /// restart. Used by `install.sh` for hands-off provisioning.
+        #[arg(long)]
+        configure: bool,
     },
 }
 
@@ -2301,8 +2307,9 @@ fn dispatch_install_classifier(
     url: Option<&str>,
     sha256: Option<&str>,
     yes: bool,
+    configure: bool,
 ) -> Result<()> {
-    commands::ai::cmd_install_classifier(cli, model, url, sha256, yes)
+    commands::ai::cmd_install_classifier(cli, model, url, sha256, yes, configure)
 }
 
 fn main() -> Result<()> {
@@ -2877,7 +2884,15 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             ref url,
             ref sha256,
             yes,
-        } => dispatch_install_classifier(&cli, model, url.as_deref(), sha256.as_deref(), yes),
+            configure,
+        } => dispatch_install_classifier(
+            &cli,
+            model,
+            url.as_deref(),
+            sha256.as_deref(),
+            yes,
+            configure,
+        ),
     }
 }
 
@@ -3841,11 +3856,13 @@ bind_addr = "127.0.0.1:8787"
                 url,
                 sha256,
                 yes,
+                configure,
             }) => {
                 assert_eq!(model, "minilm-l6");
                 assert!(url.is_none());
                 assert!(sha256.is_none());
                 assert!(!yes);
+                assert!(!configure, "--configure defaults off");
             }
             _ => panic!("expected install-warden command"),
         }
@@ -3885,7 +3902,9 @@ bind_addr = "127.0.0.1:8787"
                 url,
                 sha256,
                 yes,
+                configure,
             }) => {
+                assert!(!configure);
                 assert_eq!(model, "roberta-v1");
                 assert_eq!(
                     url.as_deref(),
@@ -3910,11 +3929,13 @@ bind_addr = "127.0.0.1:8787"
             Some("https://example.invalid/minilm.tar.gz"),
             Some("deadbeef"),
             true,
+            false,
         );
         assert!(ok.is_ok(), "dry-run dispatch should succeed: {ok:#?}");
 
-        let err = dispatch_install_classifier(&cli, "unknown-model", None, Some("deadbeef"), true)
-            .expect_err("unknown model should fail");
+        let err =
+            dispatch_install_classifier(&cli, "unknown-model", None, Some("deadbeef"), true, false)
+                .expect_err("unknown model should fail");
         assert!(err.to_string().contains("unknown classifier variant"));
     }
 

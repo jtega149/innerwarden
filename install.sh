@@ -1277,5 +1277,28 @@ if ! innerwarden welcome 2>/dev/null; then
   echo ""
 fi
 
-# Auto-run setup with terminal input via /dev/tty (curl pipe consumes stdin)
-$SUDO innerwarden setup < /dev/tty
+# Provision the Local Warden Model (on-device AI) BEFORE the interactive
+# setup, so it lands even on headless / no-TTY installs (cloud-init,
+# Ansible, golden images - i.e. how a SOC mass-installs at client boxes).
+# `--configure` also wires `[ai.warden]` so the agent selects the local
+# Decide head on next restart. One-time ~87 MB download, pinned SHA-256.
+# The agent transparently falls back to cloud AI if this step fails.
+# Opt out (cloud-AI-only deployments) with INNERWARDEN_NO_WARDEN=1.
+if [[ "${INNERWARDEN_NO_WARDEN:-0}" != "1" ]]; then
+  vlog "Provisioning Local Warden Model (on-device AI, no per-call API cost)..."
+  if ! $SUDO innerwarden install-warden --yes --configure; then
+    vlog "WARN: Local Warden provisioning failed - agent will use the configured cloud AI."
+    vlog "      Retry later: sudo innerwarden install-warden --configure"
+  fi
+fi
+
+# Auto-run setup with terminal input via /dev/tty (curl pipe consumes stdin).
+# Headless installs (no /dev/tty: cloud-init, CI, Ansible) must NOT abort
+# here - warden + its config were already provisioned above, so just skip
+# the interactive wizard and tell the operator how to finish later.
+if [[ -e /dev/tty ]] && [[ -r /dev/tty ]]; then
+  $SUDO innerwarden setup < /dev/tty
+else
+  vlog "No TTY detected (headless install) - skipping interactive setup."
+  vlog "Run 'sudo innerwarden setup' later to configure AI provider / notifications."
+fi
