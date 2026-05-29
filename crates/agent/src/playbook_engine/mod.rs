@@ -51,6 +51,9 @@ use serde::Deserialize;
 pub const BUILTIN_DATA_EXFIL: &str = include_str!("builtin/00-data-exfil-default.yml");
 pub const BUILTIN_CREDENTIAL_STUFFING: &str =
     include_str!("builtin/00-credential-stuffing-default.yml");
+/// Spec 056 Phase 6: bundled CVE playbook. Pairs with the built-in Sigma
+/// rule `cve-2021-44228-log4shell` (sensor) that ships in the same release.
+pub const BUILTIN_CVE_LOG4SHELL: &str = include_str!("builtin/10-cve-2021-44228-log4shell.yml");
 
 /// All two-tuple `(name, yaml)` pairs of embedded playbooks. CTL reads
 /// these directly via `include_str!` across the crate boundary (same
@@ -61,6 +64,7 @@ pub const BUILTIN_PLAYBOOKS: &[(&str, &str)] = &[
         "00-credential-stuffing-default.yml",
         BUILTIN_CREDENTIAL_STUFFING,
     ),
+    ("10-cve-2021-44228-log4shell.yml", BUILTIN_CVE_LOG4SHELL),
 ];
 
 /// Type-stable wrapper around a playbook id. Catches the class of bug
@@ -885,15 +889,18 @@ mod tests {
     }
 
     #[test]
-    fn load_builtins_returns_two() {
+    fn load_builtins_returns_all() {
         let pbs = load_builtins().expect("load_builtins");
-        assert_eq!(pbs.len(), 2);
+        assert_eq!(pbs.len(), 3);
         assert!(pbs
             .iter()
             .any(|p| p.metadata.id.as_str() == "pb-data-exfil-default"));
         assert!(pbs
             .iter()
             .any(|p| p.metadata.id.as_str() == "pb-credential-stuffing-default"));
+        assert!(pbs
+            .iter()
+            .any(|p| p.metadata.id.as_str() == "pb-cve-2021-44228-log4shell"));
     }
 
     #[test]
@@ -1200,7 +1207,7 @@ steps:
     fn load_dir_with_no_dir_returns_only_builtins() {
         let bogus = std::path::PathBuf::from("/tmp/iw-playbook-no-such-dir-xyz-12345");
         let pbs = load_dir(&bogus).expect("missing dir is not an error");
-        assert_eq!(pbs.len(), 2);
+        assert_eq!(pbs.len(), 3);
     }
 
     #[test]
@@ -1220,7 +1227,7 @@ steps:
 "#;
         std::fs::write(tmp.path().join("10-override.yml"), yaml).expect("write");
         let pbs = load_dir(tmp.path()).expect("load");
-        assert_eq!(pbs.len(), 2, "override must not change the playbook count");
+        assert_eq!(pbs.len(), 3, "override must not change the playbook count");
         let exfil = pbs
             .iter()
             .find(|p| p.metadata.id.as_str() == "pb-data-exfil-default")
@@ -1250,7 +1257,7 @@ steps:
 "#;
         std::fs::write(tmp.path().join("20-custom.yml"), yaml).expect("write");
         let pbs = load_dir(tmp.path()).expect("load");
-        assert_eq!(pbs.len(), 3);
+        assert_eq!(pbs.len(), 4); // 3 built-ins + 1 operator-custom
         assert!(pbs
             .iter()
             .any(|p| p.metadata.id.as_str() == "pb-operator-custom"));

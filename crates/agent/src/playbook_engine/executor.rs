@@ -1698,6 +1698,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn matches_incident_cve_log4shell_builtin() {
+        // Spec 056 Phase 6: the bundled Log4Shell playbook triggers on the
+        // `sigma:cve-2021-44228-log4shell:*` kind_glob, matching the
+        // incident_id the sensor's Sigma rule emits.
+        let pbs = super::super::load_builtins().unwrap();
+        let pb = pbs
+            .iter()
+            .find(|p| p.metadata.id.as_str() == "pb-cve-2021-44228-log4shell")
+            .expect("log4shell builtin present");
+        let inc = crate::tests::test_incident_with_kind(
+            "198.51.100.42",
+            "sigma:cve-2021-44228-log4shell",
+        );
+        let tctx = TriggerCtx::from_incident(&inc);
+        // Clean attacker IP -> matches and would respond.
+        assert!(matches_incident(pb, &inc, &tctx, &[], &[]));
+        // Operator-trusted source -> ip_not_in floor blocks the response.
+        let trusted = vec!["198.51.100.42".to_string()];
+        assert!(!matches_incident(pb, &inc, &tctx, &trusted, &[]));
+        // An unrelated incident kind does not arm it.
+        let other = crate::tests::test_incident("198.51.100.42"); // ssh_bruteforce
+        let tctx2 = TriggerCtx::from_incident(&other);
+        assert!(!matches_incident(pb, &other, &tctx2, &[], &[]));
+    }
+
     // ---- helpers --------------------------------------------------------
 
     #[test]

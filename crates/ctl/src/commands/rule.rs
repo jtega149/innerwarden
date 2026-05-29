@@ -19,11 +19,18 @@ const PLAYBOOK_BUILTIN_DATA_EXFIL: &str =
     include_str!("../../../agent/src/playbook_engine/builtin/00-data-exfil-default.yml");
 const PLAYBOOK_BUILTIN_CRED_STUFF: &str =
     include_str!("../../../agent/src/playbook_engine/builtin/00-credential-stuffing-default.yml");
+// Spec 056 Phase 6: bundled CVE playbook.
+const PLAYBOOK_BUILTIN_CVE_LOG4SHELL: &str =
+    include_str!("../../../agent/src/playbook_engine/builtin/10-cve-2021-44228-log4shell.yml");
 const PLAYBOOK_BUILTINS: &[(&str, &str)] = &[
     ("00-data-exfil-default.yml", PLAYBOOK_BUILTIN_DATA_EXFIL),
     (
         "00-credential-stuffing-default.yml",
         PLAYBOOK_BUILTIN_CRED_STUFF,
+    ),
+    (
+        "10-cve-2021-44228-log4shell.yml",
+        PLAYBOOK_BUILTIN_CVE_LOG4SHELL,
     ),
 ];
 const PLAYBOOK_RULES_DIR: &str = "/etc/innerwarden/rules/playbooks";
