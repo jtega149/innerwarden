@@ -447,6 +447,50 @@ pub(crate) async fn process_incidents(
         );
         incident_enrichment::log_threat_feed_match(incident, state);
 
+        // Spec 056: SOC playbooks run with PRECEDENCE — ahead of the
+        // deterministic auto-handle gates (auto_rules / autodismiss /
+        // obvious / abuseipdb+crowdsec autoblock / honeypot routing) so an
+        // operator's customised response wins over the built-in handling.
+        // Inert unless `[playbooks] enabled`. The skill_gate floor still
+        // applies. The AI router sees the outcome as context (Phase 4).
+        //
+        // SHADOW vs LIVE precedence:
+        //  - shadow: the playbook only OBSERVES (forced dry_run + command
+        //    drain suppressed). It must NOT consume the incident, so the
+        //    real gates + AI still handle it for real. This is also why,
+        //    positioned here, shadow finally sees every incident the gates
+        //    would otherwise have eaten first.
+        //  - live + matched: the playbook IS the response -> mark handled
+        //    and skip the gates + AI.
+        let playbook_outcomes = crate::playbook_engine::executor::run_for_incident_if_enabled(
+            incident,
+            cfg,
+            data_dir,
+            &state.skill_registry,
+            super::post_decision::honeypot_runtime(cfg),
+            state.ai_router.any_llm(),
+            state.sqlite_store.clone(),
+        )
+        .await;
+        drain_playbook_commands(
+            &playbook_outcomes,
+            incident,
+            data_dir,
+            cfg,
+            state,
+            &notification_thresholds,
+        )
+        .await;
+        // Phase 4: surface what the playbook did to the AI router (used on
+        // the shadow / no-match fall-through below). `None` if nothing fired.
+        let playbook_ai_context =
+            crate::playbook_engine::executor::summarize_outcomes(&playbook_outcomes);
+        if !playbook_outcomes.is_empty() && cfg.playbooks.enabled && !cfg.playbooks.shadow {
+            state.grouping_engine.mark_auto_resolved(incident);
+            handled += 1;
+            continue;
+        }
+
         // 2. Auto-response rules (Layer 1) — deterministic, no AI needed.
         //    Runs BEFORE noise-gate so it sees ALL incidents regardless of severity.
         if incident_auto_rules::try_handle_auto_rule(incident, data_dir, cfg, state).await {
@@ -578,41 +622,9 @@ pub(crate) async fn process_incidents(
             continue;
         }
 
-        // Spec 056 Phase 2: run deterministic SOC playbooks BEFORE AI triage.
-        // The enable-gate (`[playbooks] enabled`, default false) lives inside
-        // the helper, so this call is a cheap no-op until an operator opts in.
-        // Matching playbooks execute through the same skill_gate floor the AI
-        // path uses; the AI router sees the outcome as context (Phase 4).
-        let playbook_outcomes = crate::playbook_engine::executor::run_for_incident_if_enabled(
-            incident,
-            cfg,
-            data_dir,
-            &state.skill_registry,
-            super::post_decision::honeypot_runtime(cfg),
-            state.ai_router.any_llm(),
-            state.sqlite_store.clone(),
-        )
-        .await;
-        // Spec 056 Phase 3b: drain the side effects the playbook queued
-        // (route_alert / capture_pcap / set_tag) against `&mut AgentState`
-        // here, where the loop holds the state the executor could not. The
-        // borrow of `state` inside the run call above has been released by
-        // the time this runs.
-        drain_playbook_commands(
-            &playbook_outcomes,
-            incident,
-            data_dir,
-            cfg,
-            state,
-            &notification_thresholds,
-        )
-        .await;
-        // Spec 056 Phase 4: surface what the deterministic playbook already
-        // did to the AI router as context, so the AI enriches rather than
-        // duplicates it (invariant #5: AI sees playbook output, never the
-        // inverse). `None` when nothing fired -> prompt identical to before.
-        let playbook_ai_context =
-            crate::playbook_engine::executor::summarize_outcomes(&playbook_outcomes);
+        // (SOC playbooks already ran with precedence above, before the
+        // auto-handle gates — see the Spec 056 block near the top of the
+        // loop. `playbook_ai_context` from there flows into the AI ctx below.)
 
         // Build graph context: attack narrative from knowledge graph neighborhood.
         // Phase 015: prefer the Incident node as center (richest context after 014-D
@@ -1225,6 +1237,42 @@ mod tests {
 
         assert!(handled >= 1);
         assert!(state.circuit_breaker_until.is_some());
+    }
+
+    #[tokio::test]
+    async fn playbooks_run_with_precedence_before_auto_handle_gates() {
+        // Spec 056 precedence: with `[playbooks] enabled` (live, not shadow),
+        // a matching playbook runs AHEAD of the auto-handle gates and is the
+        // response. An ssh_bruteforce incident arms the credential built-in;
+        // the playbook's audit log proves it executed in the live loop (it
+        // could only do so by being reached before the gates).
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        crate::tests::insert_test_incident(&store, &crate::tests::test_incident("198.51.100.42"));
+        state.sqlite_store = Some(store);
+        let mut cfg = config::AgentConfig::default();
+        cfg.ai.enabled = false;
+        cfg.responder.dry_run = true; // skills dry-run, no real firewall
+        cfg.playbooks.enabled = true; // LIVE precedence (shadow defaults false)
+        let mut cursor = reader::AgentCursor::default();
+
+        let handled =
+            process_incidents(dir.path(), &mut cursor, &cfg, &mut state, &advisory_cache()).await;
+
+        assert!(handled >= 1);
+        let wrote_playbook_steps = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("playbook_steps-")
+            });
+        assert!(
+            wrote_playbook_steps,
+            "credential playbook must have executed with precedence (before the gates)"
+        );
     }
 
     #[tokio::test]
