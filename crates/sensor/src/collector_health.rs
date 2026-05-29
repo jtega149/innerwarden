@@ -379,6 +379,42 @@ pub fn build_status(
     }
 }
 
+/// Build the health row for the eBPF syscall collector. Unlike
+/// file-backed collectors there is no path to probe; eBPF health is a
+/// platform/kernel question answered by
+/// `ebpf_syscall::ebpf_unavailability_reason` (kernel >= 5.8, BTF,
+/// bytecode). `unavailability_reason` is `None` when eBPF can load, or
+/// the specific cause otherwise.
+///
+/// This wires the `CollectorHealth::Unsupported` variant that has sat
+/// reserved "for ebpf without recent kernel" since PR25 but was never
+/// emitted, so the Sensors HUD now shows the kernel feed as
+/// `unsupported` with a reason instead of silently appearing healthy
+/// while ~44 eBPF programs are dark. Boot-time/static check only; a
+/// runtime CAP_BPF load failure is a separate follow-up.
+pub fn build_ebpf_status(
+    enabled_in_config: bool,
+    unavailability_reason: Option<String>,
+    _now: chrono::DateTime<chrono::Utc>,
+) -> CollectorStatus {
+    let health = if !enabled_in_config {
+        CollectorHealth::DisabledByConfig
+    } else {
+        match unavailability_reason {
+            None => CollectorHealth::Active,
+            Some(reason) => CollectorHealth::Unsupported { reason },
+        }
+    };
+    CollectorStatus {
+        // Matches the wire `source` the collector emits and the dashboard
+        // SENSOR_COLLECTORS id (see COLLECTOR_MANIFEST note on the ebpf row).
+        name: "ebpf".to_string(),
+        category: category_for("ebpf"),
+        health,
+        source: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +686,44 @@ mod tests {
                 "duplicate collector name in manifest: {name}"
             );
         }
+    }
+
+    #[test]
+    fn build_ebpf_status_maps_disabled_active_and_unsupported() {
+        let now = chrono::Utc::now();
+
+        // Disabled in config -> not a fault.
+        let disabled = build_ebpf_status(false, Some("kernel too old".into()), now);
+        assert_eq!(disabled.name, "ebpf");
+        assert_eq!(disabled.category, CollectorCategory::Telemetry);
+        assert!(disabled.source.is_none());
+        assert!(matches!(disabled.health, CollectorHealth::DisabledByConfig));
+
+        // Enabled and available -> Active.
+        let active = build_ebpf_status(true, None, now);
+        assert!(matches!(active.health, CollectorHealth::Active));
+
+        // Enabled but unavailable -> Unsupported carrying the reason, so
+        // the HUD shows WHY the kernel feed is dark instead of nothing.
+        let unsupported =
+            build_ebpf_status(true, Some("/sys/kernel/btf/vmlinux missing".into()), now);
+        match unsupported.health {
+            // The reason is preserved verbatim so the HUD can show it.
+            CollectorHealth::Unsupported { reason } => {
+                assert_eq!(reason, "/sys/kernel/btf/vmlinux missing")
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_ebpf_status_serializes_with_state_and_reason() {
+        // The dashboard keys on the serde-tagged `state` field + reason.
+        let now = chrono::Utc::now();
+        let status = build_ebpf_status(true, Some("kernel 4.18 is older than 5.8".into()), now);
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(json["name"], "ebpf");
+        assert_eq!(json["health"]["state"], "unsupported");
+        assert!(json["health"]["reason"].as_str().unwrap().contains("5.8"));
     }
 }

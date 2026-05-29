@@ -181,6 +181,16 @@ pub(crate) async fn boot_init(cfg: Config) -> Result<SensorContext> {
     {
         let now = chrono::Utc::now();
         let statuses = vec![
+            // eBPF is the highest-value telemetry feed (~44 kernel programs
+            // + LSM enforcement). It fails OPEN on kernels without BTF / too
+            // old / lacking caps, so report its real availability here: the
+            // Sensors HUD shows `unsupported` + reason instead of the feed
+            // silently appearing healthy while the kernel layer is dark.
+            collector_health::build_ebpf_status(
+                cfg.collectors.ebpf_syscall.enabled,
+                crate::collectors::ebpf_syscall::ebpf_unavailability_reason(),
+                now,
+            ),
             collector_health::build_status(
                 "auth_log",
                 cfg.collectors.auth_log.enabled,
@@ -456,6 +466,14 @@ mod tests {
         assert!(
             !content.is_empty(),
             "collector-health.json must not be empty"
+        );
+        // B5: the eBPF feed must be reported (it fails open silently
+        // otherwise). On a disabled-collector test cfg it shows as
+        // disabled; on a BTF-less / non-Linux host it would be
+        // `unsupported` with a reason. Either way the row exists.
+        assert!(
+            content.contains("\"name\": \"ebpf\""),
+            "collector-health.json must include the ebpf row, got: {content}"
         );
     }
 

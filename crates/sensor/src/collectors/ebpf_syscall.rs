@@ -30,32 +30,87 @@ const EBPF_OBJ_PATH_DEV: &str =
 
 /// Check if eBPF is available on this system.
 pub fn is_ebpf_available() -> bool {
-    if cfg!(not(target_os = "linux")) {
-        return false;
-    }
+    ebpf_unavailability_reason().is_none()
+}
 
-    // Kernel version >= 5.8
-    if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
-        let parts: Vec<u32> = release
-            .trim()
-            .split('.')
-            .take(2)
-            .filter_map(|p| p.parse().ok())
-            .collect();
-        if parts.len() >= 2 && (parts[0] < 5 || (parts[0] == 5 && parts[1] < 8)) {
-            return false;
+/// Why eBPF cannot load on this host, or `None` when it can.
+///
+/// This is the operator-facing companion to [`is_ebpf_available`]. When
+/// eBPF is unavailable the sensor still runs (fail-open: userspace
+/// collectors keep working), but ~44 kernel programs and all LSM-based
+/// enforcement go dark. Pre-2026-05-29 that happened with only a `warn!`
+/// in the journal, so an operator on a BTF-less kernel ran a sensor that
+/// looked healthy while its kernel layer was silent. The returned reason
+/// flows into `collector-health.json` (eBPF row -> `Unsupported`) so the
+/// Sensors HUD says plainly why the kernel feed is dark.
+///
+/// Note: this is the BOOT-TIME, STATIC check (Linux + kernel >= 5.8 +
+/// BTF + bytecode present). A runtime load failure caused by a missing
+/// `CAP_BPF` is detected later, inside the collector task, and is not yet
+/// reflected here (tracked as a follow-up; would need runtime health
+/// write-back).
+pub fn ebpf_unavailability_reason() -> Option<String> {
+    let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
+    let btf_exists = std::path::Path::new("/sys/kernel/btf/vmlinux").exists();
+    classify_ebpf_availability(
+        cfg!(target_os = "linux"),
+        osrelease.as_deref(),
+        btf_exists,
+        has_ebpf_bytecode(),
+    )
+}
+
+/// Pure classifier behind [`ebpf_unavailability_reason`]. Kept free of
+/// I/O so every branch is unit-testable on any OS. Returns `None` when
+/// eBPF can load, or `Some(reason)` with an operator-readable cause.
+/// Check order mirrors the historical `is_ebpf_available` short-circuits
+/// (platform -> kernel version -> BTF -> bytecode) so behaviour is
+/// unchanged; only the explanation is new.
+fn classify_ebpf_availability(
+    is_linux: bool,
+    osrelease: Option<&str>,
+    btf_exists: bool,
+    bytecode_exists: bool,
+) -> Option<String> {
+    if !is_linux {
+        return Some("not Linux: eBPF kernel instrumentation is Linux-only".to_string());
+    }
+    match osrelease {
+        None => {
+            return Some(
+                "could not read /proc/sys/kernel/osrelease to verify the kernel version"
+                    .to_string(),
+            );
         }
-    } else {
-        return false;
+        Some(release) => {
+            let parts: Vec<u32> = release
+                .trim()
+                .split('.')
+                .take(2)
+                .filter_map(|p| p.parse().ok())
+                .collect();
+            if parts.len() >= 2 && (parts[0] < 5 || (parts[0] == 5 && parts[1] < 8)) {
+                return Some(format!(
+                    "kernel {}.{} is older than 5.8 (eBPF CO-RE requires 5.8+)",
+                    parts[0], parts[1]
+                ));
+            }
+        }
     }
-
-    // BTF available
-    if !std::path::Path::new("/sys/kernel/btf/vmlinux").exists() {
-        return false;
+    if !btf_exists {
+        return Some(
+            "/sys/kernel/btf/vmlinux missing: kernel built without CONFIG_DEBUG_INFO_BTF, \
+             so CO-RE relocations cannot resolve"
+                .to_string(),
+        );
     }
-
-    // eBPF bytecode exists: embedded builds always have it, otherwise check disk.
-    has_ebpf_bytecode()
+    if !bytecode_exists {
+        return Some(
+            "eBPF bytecode object not found (built without `ebpf-embedded` and no object on disk)"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Check if eBPF bytecode is available (embedded or on disk).
@@ -3063,6 +3118,62 @@ mod tests {
     fn ebpf_availability_on_non_linux() {
         if cfg!(target_os = "macos") {
             assert!(!is_ebpf_available());
+        }
+    }
+
+    #[test]
+    fn classify_ebpf_available_when_all_prereqs_met() {
+        assert_eq!(
+            classify_ebpf_availability(true, Some("6.8.0-generic"), true, true),
+            None
+        );
+        // 5.8 exactly is the floor and is allowed.
+        assert_eq!(
+            classify_ebpf_availability(true, Some("5.8.0"), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_ebpf_reasons_are_specific_and_ordered() {
+        // Non-Linux short-circuits before any kernel/BTF check.
+        assert!(classify_ebpf_availability(false, Some("6.8.0"), true, true)
+            .unwrap()
+            .contains("Linux"));
+        // Unreadable osrelease.
+        assert!(classify_ebpf_availability(true, None, true, true)
+            .unwrap()
+            .contains("osrelease"));
+        // Kernel too old names the version and the 5.8 floor.
+        let old = classify_ebpf_availability(true, Some("4.18.0-el8"), true, true).unwrap();
+        assert!(old.contains("4.18") && old.contains("5.8"));
+        // 5.7 is just under the floor.
+        assert!(classify_ebpf_availability(true, Some("5.7.19"), true, true)
+            .unwrap()
+            .contains("5.8"));
+        // BTF missing (the common RHEL8 / custom-kernel silent case).
+        assert!(classify_ebpf_availability(true, Some("6.8.0"), false, true)
+            .unwrap()
+            .contains("BTF"));
+        // Bytecode missing.
+        assert!(classify_ebpf_availability(true, Some("6.8.0"), true, false)
+            .unwrap()
+            .contains("bytecode"));
+    }
+
+    #[test]
+    fn classify_ebpf_reasons_have_no_em_dashes() {
+        for reason in [
+            classify_ebpf_availability(false, Some("6.8.0"), true, true),
+            classify_ebpf_availability(true, None, true, true),
+            classify_ebpf_availability(true, Some("4.18.0"), true, true),
+            classify_ebpf_availability(true, Some("6.8.0"), false, true),
+            classify_ebpf_availability(true, Some("6.8.0"), true, false),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(!reason.contains('\u{2014}'), "no em dashes: {reason}");
         }
     }
 
