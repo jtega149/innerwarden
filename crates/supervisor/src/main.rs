@@ -25,8 +25,16 @@ struct Cli {
     #[arg(long = "agent-arg", allow_hyphen_values = true)]
     agent_args: Vec<String>,
 
-    /// Agent HTTP API base URL for the periodic health probe.
-    #[arg(long, default_value = "http://127.0.0.1:8787")]
+    /// Agent API base URL for the periodic health probe (HTTPS by default;
+    /// the agent serves TLS, and loopback cert verification is auto-skipped).
+    // HTTPS: the agent serves its dashboard/API over TLS by default (a
+    // self-signed cert on a fresh install). The health checker auto-skips
+    // cert verification for loopback HTTPS (see health.rs AUDIT-005). An
+    // `http://` default here would hit the TLS listener with a plaintext
+    // request, fail every probe, and the supervisor would SIGKILL a
+    // perfectly healthy agent in a loop. Verified live on test001
+    // 2026-05-30: /livez returns 200 on https, connection-refused on http.
+    #[arg(long, default_value = "https://127.0.0.1:8787")]
     agent_api: String,
 
     /// Health check interval in seconds.
@@ -102,7 +110,7 @@ mod tests {
             PathBuf::from("/usr/local/bin/innerwarden-agent")
         );
         assert!(cli.agent_args.is_empty());
-        assert_eq!(cli.agent_api, "http://127.0.0.1:8787");
+        assert_eq!(cli.agent_api, "https://127.0.0.1:8787");
         assert_eq!(cli.health_interval, 30);
         assert_eq!(cli.max_restarts_per_hour, 10);
         assert_eq!(cli.log_level, "info");

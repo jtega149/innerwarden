@@ -38,7 +38,7 @@ ExecStart=/usr/local/bin/innerwarden-supervisor \
   --agent-arg --data-dir --agent-arg /var/lib/innerwarden \
   --agent-arg --config --agent-arg /etc/innerwarden/agent.toml \
   --agent-arg --dashboard \
-  --agent-api http://127.0.0.1:8787 \
+  --agent-api https://127.0.0.1:8787 \
   --health-interval 30 \
   --max-restarts-per-hour 10
 # Supervisor-level restart: if the supervisor process itself dies, systemd
