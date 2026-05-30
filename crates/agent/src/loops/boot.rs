@@ -2650,6 +2650,28 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 "mesh: TTL expired blocks removed"
                             );
                         }
+
+                        // Spec 062 Phase 6b: apply inbound suppression advisories
+                        // under THIS host's local second gate (corroborate-only,
+                        // never originate). Logic lives in the unit-tested
+                        // `apply_advisory_suppressions` helper.
+                        let advisories = m.drain_advisory_suppressions();
+                        if !advisories.is_empty() {
+                            let applied = crate::mesh::apply_advisory_suppressions(
+                                m,
+                                &advisories,
+                                state.sqlite_store.as_deref(),
+                                cfg.learning.mesh_suppression_corroboration,
+                                &cli.data_dir,
+                                chrono::Utc::now(),
+                            );
+                            info!(
+                                received = advisories.len(),
+                                applied,
+                                "mesh: drained suppression advisories (advisory-only, local-gated)"
+                            );
+                        }
+
                         m.persist().ok();
                     }
                     false

@@ -146,6 +146,7 @@ pub(crate) fn decide(
     severity: &Severity,
     stats: ShapeDismissalStats,
     min_dismissals: u64,
+    mesh_corroboration: u64,
 ) -> LearnedVerdict {
     if !may_learn_suppress(severity) {
         return LearnedVerdict::PassThrough;
@@ -158,7 +159,21 @@ pub(crate) fn decide(
     // min_dismissals == 0 would suppress on the first sight, defeating the
     // "repeated" premise; treat <1 as 1 (defensive — config validates too).
     let n = min_dismissals.max(1);
-    if stats.genuine_dismissals >= n {
+
+    // Spec 062 Phase 6b — mesh fleet corroboration. A high-trust peer's
+    // advisory can only HELP a shape this host has ALREADY dismissed at least
+    // once (never originate a suppression from peers alone), and is capped at
+    // n/2 so peers can shave the threshold but the host still needs real local
+    // repetition (e.g. n=5 → cap 2 → ≥3 local dismissals required even with
+    // full corroboration). The reported count stays the honest LOCAL count.
+    let corroboration = if stats.genuine_dismissals >= 1 {
+        mesh_corroboration.min(n / 2)
+    } else {
+        0
+    };
+    let effective = stats.genuine_dismissals + corroboration;
+
+    if effective >= n {
         LearnedVerdict::Suppress {
             dismissals: stats.genuine_dismissals,
         }
@@ -176,6 +191,7 @@ pub(crate) fn evaluate(
     store: &innerwarden_store::Store,
     incident: &Incident,
     min_dismissals: u64,
+    mesh_corroboration: u64,
 ) -> LearnedVerdict {
     if !may_learn_suppress(&incident.severity) {
         return LearnedVerdict::PassThrough;
@@ -204,7 +220,12 @@ pub(crate) fn evaluate(
             return LearnedVerdict::PassThrough;
         }
     };
-    decide(&incident.severity, stats, min_dismissals)
+    decide(
+        &incident.severity,
+        stats,
+        min_dismissals,
+        mesh_corroboration,
+    )
 }
 
 /// Build the human/audit reason for a learned-suppression dismiss.
@@ -338,11 +359,11 @@ mod tests {
 
     #[test]
     fn decide_suppresses_low_at_threshold_with_no_actioned() {
-        let v = decide(&Severity::Low, stats(5, 0), 5);
+        let v = decide(&Severity::Low, stats(5, 0), 5, 0);
         assert_eq!(v, LearnedVerdict::Suppress { dismissals: 5 });
         // and above
         assert_eq!(
-            decide(&Severity::Medium, stats(1105, 0), 5),
+            decide(&Severity::Medium, stats(1105, 0), 5, 0),
             LearnedVerdict::Suppress { dismissals: 1105 }
         );
     }
@@ -350,7 +371,7 @@ mod tests {
     #[test]
     fn decide_passes_through_below_threshold() {
         assert_eq!(
-            decide(&Severity::Low, stats(4, 0), 5),
+            decide(&Severity::Low, stats(4, 0), 5, 0),
             LearnedVerdict::PassThrough
         );
     }
@@ -359,11 +380,11 @@ mod tests {
     fn decide_never_suppresses_high_or_critical() {
         // Even with overwhelming dismissal history.
         assert_eq!(
-            decide(&Severity::High, stats(9999, 0), 5),
+            decide(&Severity::High, stats(9999, 0), 5, 0),
             LearnedVerdict::PassThrough
         );
         assert_eq!(
-            decide(&Severity::Critical, stats(9999, 0), 5),
+            decide(&Severity::Critical, stats(9999, 0), 5, 0),
             LearnedVerdict::PassThrough
         );
     }
@@ -373,7 +394,7 @@ mod tests {
         // "Com peso confirma": a single block in the shape's history
         // disqualifies it forever, regardless of dismissal count.
         assert_eq!(
-            decide(&Severity::Low, stats(1000, 1), 5),
+            decide(&Severity::Low, stats(1000, 1), 5, 0),
             LearnedVerdict::PassThrough
         );
     }
@@ -382,12 +403,50 @@ mod tests {
     fn decide_treats_zero_threshold_as_one() {
         // Defensive: N=0 must not suppress on first sight.
         assert_eq!(
-            decide(&Severity::Low, stats(0, 0), 0),
+            decide(&Severity::Low, stats(0, 0), 0, 0),
             LearnedVerdict::PassThrough
         );
         assert_eq!(
-            decide(&Severity::Low, stats(1, 0), 0),
+            decide(&Severity::Low, stats(1, 0), 0, 0),
             LearnedVerdict::Suppress { dismissals: 1 }
+        );
+    }
+
+    // ── Spec 062 Phase 6b: mesh corroboration ──
+
+    #[test]
+    fn mesh_corroboration_helps_locally_dismissed_shape_reach_threshold() {
+        // n=5, cap n/2=2. 3 local + 2 corroboration = 5 → suppress.
+        assert_eq!(
+            decide(&Severity::Low, stats(3, 0), 5, 2),
+            LearnedVerdict::Suppress { dismissals: 3 } // honest LOCAL count
+        );
+    }
+
+    #[test]
+    fn mesh_corroboration_is_capped_at_half_n() {
+        // 1 local + unlimited peers is still capped at n/2=2 → effective 3 < 5.
+        assert_eq!(
+            decide(&Severity::Low, stats(1, 0), 5, 9999),
+            LearnedVerdict::PassThrough
+        );
+    }
+
+    #[test]
+    fn mesh_corroboration_never_originates_from_peers_alone() {
+        // 0 local dismissals → corroboration contributes nothing, ever.
+        assert_eq!(
+            decide(&Severity::Low, stats(0, 0), 5, 9999),
+            LearnedVerdict::PassThrough
+        );
+    }
+
+    #[test]
+    fn mesh_corroboration_cannot_revive_an_actioned_shape() {
+        // Weighty history disqualifies regardless of corroboration.
+        assert_eq!(
+            decide(&Severity::Low, stats(1000, 1), 5, 9999),
+            LearnedVerdict::PassThrough
         );
     }
 
@@ -511,8 +570,27 @@ mod tests {
         }
         let inc = low_incident("imds_ssrf", ip);
         assert_eq!(
-            evaluate(&store, &inc, 5),
+            evaluate(&store, &inc, 5, 0),
             LearnedVerdict::Suppress { dismissals: 6 }
+        );
+    }
+
+    #[test]
+    fn evaluate_mesh_corroboration_threads_through_store_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(&tmp);
+        let ip = "169.254.169.254";
+        // 3 genuine local dismissals — below N=5 on its own.
+        for i in 0..3 {
+            seed_dismiss(&store, &format!("imds_ssrf:{ip}:{i}"), ip, "noise-gate");
+        }
+        let inc = low_incident("imds_ssrf", ip);
+        // No corroboration → passes through.
+        assert_eq!(evaluate(&store, &inc, 5, 0), LearnedVerdict::PassThrough);
+        // 2 corroborating peers (cap n/2=2) → 3+2=5 → suppress, honest local 3.
+        assert_eq!(
+            evaluate(&store, &inc, 5, 2),
+            LearnedVerdict::Suppress { dismissals: 3 }
         );
     }
 
@@ -532,7 +610,7 @@ mod tests {
         }
         let inc = low_incident("imds_ssrf", ip);
         assert_eq!(
-            evaluate(&store, &inc, 5),
+            evaluate(&store, &inc, 5, 0),
             LearnedVerdict::PassThrough,
             "orphan-recovery dismissals must NOT be laundered into learning"
         );
@@ -552,7 +630,7 @@ mod tests {
             );
         }
         let inc = low_incident("imds_ssrf", ip);
-        assert_eq!(evaluate(&store, &inc, 5), LearnedVerdict::PassThrough);
+        assert_eq!(evaluate(&store, &inc, 5, 0), LearnedVerdict::PassThrough);
     }
 
     #[test]
@@ -566,7 +644,7 @@ mod tests {
         // One block in history → weighty → never auto-suppress.
         seed_action(&store, &format!("port_scan:{ip}:blk"), ip, "block_ip");
         let inc = low_incident("port_scan", ip);
-        assert_eq!(evaluate(&store, &inc, 5), LearnedVerdict::PassThrough);
+        assert_eq!(evaluate(&store, &inc, 5, 0), LearnedVerdict::PassThrough);
     }
 
     #[test]
@@ -580,7 +658,7 @@ mod tests {
             seed_dismiss(&store, &format!("imds_ssrf:{ip}:{i}"), ip, "noise-gate");
         }
         let inc = low_incident("reverse_shell", ip);
-        assert_eq!(evaluate(&store, &inc, 5), LearnedVerdict::PassThrough);
+        assert_eq!(evaluate(&store, &inc, 5, 0), LearnedVerdict::PassThrough);
     }
 
     #[test]
@@ -593,7 +671,7 @@ mod tests {
         }
         let mut inc = low_incident("imds_ssrf", ip);
         inc.severity = Severity::High;
-        assert_eq!(evaluate(&store, &inc, 5), LearnedVerdict::PassThrough);
+        assert_eq!(evaluate(&store, &inc, 5, 0), LearnedVerdict::PassThrough);
     }
 
     #[test]
@@ -612,6 +690,6 @@ mod tests {
             tags: vec![],
             entities: vec![],
         };
-        assert_eq!(evaluate(&store, &inc, 5), LearnedVerdict::PassThrough);
+        assert_eq!(evaluate(&store, &inc, 5, 0), LearnedVerdict::PassThrough);
     }
 }

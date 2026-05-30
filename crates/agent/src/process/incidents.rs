@@ -384,7 +384,7 @@ pub(crate) async fn process_incidents(
         // history are auto-dismissed; orphan-recovery + own output are
         // excluded from the count (anti-laundering). Default shadow:
         // logs would-suppress, changes nothing until operator promotes.
-        if try_learned_suppression(incident, cfg, state, data_dir) {
+        if try_learned_suppression(incident, cfg, state, data_dir).await {
             handled += 1;
             continue;
         }
@@ -948,7 +948,7 @@ async fn drain_playbook_commands(
 /// targeted FP helpers + kg-fp so its genuine-dismissal count reflects
 /// everything those paths resolved. Full policy + anti-laundering rules
 /// live in `crate::learned_suppression`.
-fn try_learned_suppression(
+async fn try_learned_suppression(
     incident: &innerwarden_core::incident::Incident,
     cfg: &crate::config::AgentConfig,
     state: &mut crate::AgentState,
@@ -969,7 +969,32 @@ fn try_learned_suppression(
     let Some(store) = state.sqlite_store.clone() else {
         return false;
     };
-    let verdict = evaluate(&store, incident, cfg.learning.min_dismissals);
+
+    // Spec 062 Phase 6b: high-trust mesh peers can corroborate (never
+    // originate) a suppression. Gated off by default; even on, it only helps a
+    // shape this host already dismisses locally (enforced inside `decide`).
+    let mesh_corroboration = if cfg.learning.mesh_suppression_corroboration {
+        match primary_ip(incident) {
+            Some(ip) => {
+                let shape = format!("{}|{}", detector_of(&incident.incident_id), ip);
+                state
+                    .mesh
+                    .as_ref()
+                    .map(|m| m.corroboration_for(&shape))
+                    .unwrap_or(0)
+            }
+            None => 0,
+        }
+    } else {
+        0
+    };
+
+    let verdict = evaluate(
+        &store,
+        incident,
+        cfg.learning.min_dismissals,
+        mesh_corroboration,
+    );
     let LearnedVerdict::Suppress { dismissals } = verdict else {
         return false;
     };
@@ -1064,6 +1089,17 @@ fn try_learned_suppression(
                     &incident.summary,
                 );
                 crate::warden_labels::append_label(data_dir, &sample, now);
+            }
+
+            // Spec 062 Phase 6b: teach the fleet. Broadcast this local
+            // suppression to mesh peers as an advisory (they apply their own
+            // local gate). No-op when mesh is off / auto_broadcast is false /
+            // the shape has no IP. Best-effort; failures are warn!-only inside.
+            if !ip.is_empty() {
+                if let Some(mesh) = state.mesh.as_ref() {
+                    mesh.broadcast_local_suppression(&detector, &ip, dismissals, 24 * 3600)
+                        .await;
+                }
             }
             true
         }
@@ -1700,8 +1736,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn try_learned_suppression_off_mode_is_noop() {
+    #[tokio::test]
+    async fn try_learned_suppression_off_mode_is_noop() {
         let dir = TempDir::new().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
         let store = crate::tests::test_sqlite_store(dir.path());
@@ -1713,11 +1749,11 @@ mod tests {
         let mut cfg = crate::config::AgentConfig::default();
         cfg.learning.suppression_mode = "off".to_string();
         let inc = ls_low_incident("imds_ssrf", ip);
-        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
+        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()).await);
     }
 
-    #[test]
-    fn try_learned_suppression_shadow_logs_but_passes_through() {
+    #[tokio::test]
+    async fn try_learned_suppression_shadow_logs_but_passes_through() {
         let dir = TempDir::new().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
         let store = crate::tests::test_sqlite_store(dir.path());
@@ -1731,7 +1767,7 @@ mod tests {
         cfg.learning.min_dismissals = 5;
         let inc = ls_low_incident("imds_ssrf", ip);
         // Shadow never handles (returns false) but MUST write a shadow log.
-        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
+        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()).await);
         let logged = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -1743,8 +1779,8 @@ mod tests {
         assert!(logged, "shadow mode must write a shadow log file");
     }
 
-    #[test]
-    fn try_learned_suppression_enforce_writes_dismiss() {
+    #[tokio::test]
+    async fn try_learned_suppression_enforce_writes_dismiss() {
         let dir = TempDir::new().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
         let store = crate::tests::test_sqlite_store(dir.path());
@@ -1757,11 +1793,11 @@ mod tests {
         cfg.learning.suppression_mode = "enforce".to_string();
         cfg.learning.min_dismissals = 5;
         let inc = ls_low_incident("imds_ssrf", ip);
-        assert!(try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
+        assert!(try_learned_suppression(&inc, &cfg, &mut state, dir.path()).await);
     }
 
-    #[test]
-    fn try_learned_suppression_enforce_passes_through_below_threshold() {
+    #[tokio::test]
+    async fn try_learned_suppression_enforce_passes_through_below_threshold() {
         let dir = TempDir::new().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
         let store = crate::tests::test_sqlite_store(dir.path());
@@ -1772,17 +1808,17 @@ mod tests {
         cfg.learning.suppression_mode = "enforce".to_string();
         cfg.learning.min_dismissals = 5;
         let inc = ls_low_incident("imds_ssrf", ip);
-        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
+        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()).await);
     }
 
-    #[test]
-    fn try_learned_suppression_no_store_returns_false() {
+    #[tokio::test]
+    async fn try_learned_suppression_no_store_returns_false() {
         let dir = TempDir::new().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
         state.sqlite_store = None;
         let mut cfg = crate::config::AgentConfig::default();
         cfg.learning.suppression_mode = "enforce".to_string();
         let inc = ls_low_incident("imds_ssrf", "169.254.169.254");
-        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
+        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()).await);
     }
 }

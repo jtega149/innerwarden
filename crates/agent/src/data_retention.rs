@@ -75,6 +75,17 @@ pub fn cleanup(data_dir: &Path, cfg: &DataRetentionConfig) -> usize {
         // (low volume; only human decisions + learned suppressions land here).
         ("labels-", ".jsonl", cfg.decisions_keep_days),
         ("labels-", ".jsonl.gz", cfg.decisions_keep_days),
+        // Spec 062 Phase 6b mesh suppression-advisory audit.
+        (
+            "mesh_advisory_suppressions-",
+            ".jsonl",
+            cfg.decisions_keep_days,
+        ),
+        (
+            "mesh_advisory_suppressions-",
+            ".jsonl.gz",
+            cfg.decisions_keep_days,
+        ),
         ("telemetry-", ".jsonl", cfg.telemetry_keep_days),
         ("telemetry-", ".jsonl.gz", cfg.telemetry_keep_days),
         ("admin-actions-", ".jsonl", cfg.decisions_keep_days),

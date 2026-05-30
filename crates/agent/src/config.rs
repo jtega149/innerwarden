@@ -1966,6 +1966,16 @@ pub struct LearningConfig {
     /// and is worthless if off. Set `false` to opt out of the corpus entirely.
     #[serde(default = "default_true")]
     pub emit_labels: bool,
+
+    /// Spec 062 Phase 6b — let high-trust mesh peers' suppression advisories
+    /// CORROBORATE (never originate) a learned suppression. When `true`, a
+    /// shape this host has already dismissed locally at least once can reach
+    /// the suppression threshold with bounded peer help (capped at N/2). When
+    /// `false` (default — disabled-by-default per spec 062), advisories are
+    /// still received, gated, and audited, but never change a suppression
+    /// decision. The honeypot/imds shapes prove out on the lab first.
+    #[serde(default)]
+    pub mesh_suppression_corroboration: bool,
 }
 
 fn default_learned_suppression_mode() -> String {
@@ -1989,6 +1999,7 @@ impl Default for LearningConfig {
             llm_escalation_min_confidence: default_llm_escalation_min_confidence(),
             needs_review_notify: false,
             emit_labels: true,
+            mesh_suppression_corroboration: false,
         }
     }
 }
@@ -4667,6 +4678,8 @@ enabled = true
         assert!(!cfg.learning.needs_review_notify);
         // Spec 062 Phase 6a: label channel is additive, on by default.
         assert!(cfg.learning.emit_labels);
+        // Spec 062 Phase 6b: mesh corroboration is opt-in (default off).
+        assert!(!cfg.learning.mesh_suppression_corroboration);
     }
 
     #[test]
@@ -4674,6 +4687,14 @@ enabled = true
         let src = "[learning]\nneeds_review_notify = true\n";
         let cfg: AgentConfig = toml::from_str(src).expect("phase3 learning parses");
         assert!(cfg.learning.needs_review_notify);
+    }
+
+    #[test]
+    fn learning_section_parses_phase6_overrides() {
+        let src = "[learning]\nemit_labels = false\nmesh_suppression_corroboration = true\n";
+        let cfg: AgentConfig = toml::from_str(src).expect("phase6 learning parses");
+        assert!(!cfg.learning.emit_labels);
+        assert!(cfg.learning.mesh_suppression_corroboration);
     }
 
     #[test]
