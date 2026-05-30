@@ -1,0 +1,57 @@
+[Unit]
+Description=InnerWarden Supervisor (health-probe + smart restart for the agent)
+Documentation=https://github.com/InnerWarden/innerwarden/wiki/Operations
+After=network-online.target innerwarden-sensor.service
+Wants=network-online.target
+
+# This unit is the OPEN-SOURCE supervision layer. It replaces a plain
+# `Restart=on-failure` on the agent with: a periodic HTTP health probe
+# against the agent's /metrics endpoint, force-kill + respawn when the
+# agent is alive-but-unresponsive, a per-hour restart rate limit, and
+# Telegram alerts on every restart.
+#
+# IMPORTANT: the supervisor SPAWNS the agent as its own child. Do NOT run
+# innerwarden-agent.service at the same time, or two agents will fight over
+# the dashboard port and the data dir. When you enable this unit, disable
+# the agent unit:
+#
+#   sudo systemctl disable --now innerwarden-agent
+#   sudo systemctl enable  --now innerwarden-supervisor
+#
+# Anti-tamper (process stealth, SHA-256 integrity gating, refuse-to-respawn
+# on a swapped binary) lives in the separate proprietary watchdog, which
+# wraps this supervisor via its RestartHook. This OSS unit gives you the
+# resilience without the anti-tamper.
+
+[Service]
+Type=simple
+# Runs as the same unprivileged user the agent unit uses, so the agent it
+# spawns is identical to the standalone innerwarden-agent.service child
+# (same uid, same sudoers grants for block-ip). The agent's env file carries
+# API keys / dashboard creds / Telegram tokens and is shared here so the
+# spawned agent sees the same environment it would under its own unit.
+User=innerwarden
+Group=innerwarden
+EnvironmentFile=-/etc/innerwarden/agent.env
+ExecStart=/usr/local/bin/innerwarden-supervisor \
+  --agent-binary /usr/local/bin/innerwarden-agent \
+  --agent-arg --data-dir --agent-arg /var/lib/innerwarden \
+  --agent-arg --config --agent-arg /etc/innerwarden/agent.toml \
+  --agent-arg --dashboard \
+  --agent-api http://127.0.0.1:8787 \
+  --health-interval 30 \
+  --max-restarts-per-hour 10
+# Supervisor-level restart: if the supervisor process itself dies, systemd
+# brings it back, and it re-adopts/respawns the agent. The agent's own
+# crash recovery is the supervisor's job, not systemd's.
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=innerwarden-supervisor
+# The supervisor itself is tiny; the agent it spawns carries its own limits.
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

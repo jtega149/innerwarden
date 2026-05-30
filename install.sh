@@ -576,6 +576,11 @@ if [[ "${BUILD_FROM_SOURCE}" == "1" ]]; then
   IW_SENSOR_BIN="${ROOT_DIR}/target/release/innerwarden-sensor"
   IW_AGENT_BIN="${ROOT_DIR}/target/release/innerwarden-agent"
   IW_CTL_BIN="${ROOT_DIR}/target/release/innerwarden-ctl"
+  if [[ "${SUPERVISED}" == "true" ]]; then
+    log "building innerwarden-supervisor (release)..."
+    cargo build --release -p innerwarden-supervisor
+    IW_SUPERVISOR_BIN="${ROOT_DIR}/target/release/innerwarden-supervisor"
+  fi
 else
   # ── Download pre-built binaries from GitHub Releases (~10 s) ────────────
   if ! command -v curl >/dev/null 2>&1; then
@@ -1209,6 +1214,48 @@ WantedBy=multi-user.target
 EOF
 fi
 
+# Supervised mode (opt-in): write the supervisor unit. It runs as the same
+# unprivileged user as the agent unit and SPAWNS the agent as its child, so
+# the spawned agent is identical to the standalone agent unit's child. The
+# enable block below starts THIS unit and leaves innerwarden-agent.service
+# disabled so the two never fight over port 8787.
+SUPERVISOR_UNIT="/etc/systemd/system/innerwarden-supervisor.service"
+if [[ "${SUPERVISED}" == "true" ]] && { [[ ! -f "${SUPERVISOR_UNIT}" ]] || [[ "${FORCE}" -eq 1 ]]; }; then
+  log "writing supervisor unit: ${SUPERVISOR_UNIT}"
+  install_from_stdin "${SUPERVISOR_UNIT}" 644 root root <<EOF
+[Unit]
+Description=Inner Warden - Supervisor (health-probe + smart restart for the agent)
+After=network-online.target innerwarden-sensor.service
+Wants=network-online.target
+Requires=innerwarden-sensor.service
+Documentation=https://github.com/InnerWarden/innerwarden/wiki/Operations
+
+[Service]
+Type=simple
+User=innerwarden
+Group=innerwarden
+EnvironmentFile=/etc/innerwarden/agent.env
+ExecStart=/usr/local/bin/innerwarden-supervisor \\
+  --agent-binary /usr/local/bin/innerwarden-agent \\
+  --agent-arg --data-dir --agent-arg /var/lib/innerwarden \\
+  --agent-arg --config --agent-arg /etc/innerwarden/agent.toml \\
+  --agent-arg --dashboard \\
+  --agent-api http://127.0.0.1:8787 \\
+  --health-interval 30 \\
+  --max-restarts-per-hour 10
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=innerwarden-supervisor
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
 install_integrations() {
   echo
   log "=== Integration setup (--with-integrations) ==="
@@ -1239,16 +1286,28 @@ if [[ "$OS_TYPE" == "Darwin" ]]; then
 else
   log "reloading systemd and starting services..."
   run_root systemctl daemon-reload
-  run_root systemctl enable innerwarden-sensor innerwarden-agent >/dev/null
   run_root systemctl restart innerwarden-sensor
-  run_root systemctl restart innerwarden-agent
-
   if ! run_root systemctl is-active --quiet innerwarden-sensor; then
     fail "innerwarden-sensor failed to start. Check: sudo journalctl -u innerwarden-sensor -n 200"
   fi
 
-  if ! run_root systemctl is-active --quiet innerwarden-agent; then
-    fail "innerwarden-agent failed to start. Check: sudo journalctl -u innerwarden-agent -n 200"
+  if [[ "${SUPERVISED}" == "true" ]]; then
+    # The supervisor owns the agent lifecycle (spawns it as a child), so the
+    # standalone agent unit must NOT also run or both fight over port 8787.
+    run_root systemctl enable innerwarden-sensor innerwarden-supervisor >/dev/null
+    run_root systemctl disable innerwarden-agent >/dev/null 2>&1 || true
+    run_root systemctl stop innerwarden-agent >/dev/null 2>&1 || true
+    run_root systemctl restart innerwarden-supervisor
+    if ! run_root systemctl is-active --quiet innerwarden-supervisor; then
+      fail "innerwarden-supervisor failed to start. Check: sudo journalctl -u innerwarden-supervisor -n 200"
+    fi
+    log "supervised mode: agent runs under innerwarden-supervisor (innerwarden-agent.service left disabled)."
+  else
+    run_root systemctl enable innerwarden-sensor innerwarden-agent >/dev/null
+    run_root systemctl restart innerwarden-agent
+    if ! run_root systemctl is-active --quiet innerwarden-agent; then
+      fail "innerwarden-agent failed to start. Check: sudo journalctl -u innerwarden-agent -n 200"
+    fi
   fi
 
   if [[ "${WITH_INTEGRATIONS}" -eq 1 ]]; then

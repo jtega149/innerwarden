@@ -106,6 +106,14 @@ jobs:
           cargo zigbuild --release \
             --target x86_64-unknown-linux-gnu \
             -p innerwarden-ctl
+          # Supervisor — OSS process-supervision layer (health-probe + smart
+          # restart). No special features; the proprietary anti-tamper watchdog
+          # wraps it via RestartHook and is built separately. install.sh
+          # downloads this binary when INNERWARDEN_SUPERVISED=1, so it MUST
+          # ship in the release or supervised installs 404 on download.
+          cargo zigbuild --release \
+            --target x86_64-unknown-linux-gnu \
+            -p innerwarden-supervisor
 
       # ── Build aarch64 ──────────────────────────────────────────────────────
       - name: Build (aarch64-unknown-linux-gnu)
@@ -122,6 +130,10 @@ jobs:
           cargo zigbuild --release \
             --target aarch64-unknown-linux-gnu \
             -p innerwarden-ctl
+          # Supervisor — see x86_64 comment above.
+          cargo zigbuild --release \
+            --target aarch64-unknown-linux-gnu \
+            -p innerwarden-supervisor
 
       # ── Stage assets with SHA-256 sidecars ────────────────────────────────
       #
@@ -139,7 +151,7 @@ jobs:
             else
               target="aarch64-unknown-linux-gnu"
             fi
-            for binary in innerwarden-sensor innerwarden-agent innerwarden-ctl; do
+            for binary in innerwarden-sensor innerwarden-agent innerwarden-ctl innerwarden-supervisor; do
               src="target/$target/release/$binary"
               dest="dist/${binary}-linux-${arch}"
               cp "$src" "$dest"
@@ -306,9 +318,11 @@ jobs:
             innerwarden-sensor-linux-x86_64
             innerwarden-agent-linux-x86_64
             innerwarden-ctl-linux-x86_64
+            innerwarden-supervisor-linux-x86_64
             innerwarden-sensor-linux-aarch64
             innerwarden-agent-linux-aarch64
             innerwarden-ctl-linux-aarch64
+            innerwarden-supervisor-linux-aarch64
           )
           missing=0
           # Stable when the tag has no '-' suffix (e.g. v0.13.1 stable;
@@ -341,9 +355,9 @@ jobs:
             exit 1
           fi
           if [[ "$is_stable" -eq 1 ]]; then
-            echo "All 19 stable assets present (6 binaries + 6 SHA-256 + 6 .sig + install.sh)."
+            echo "All 25 stable assets present (8 binaries + 8 SHA-256 + 8 .sig + install.sh)."
           else
-            echo "All 13 prerelease assets present (6 binaries + 6 SHA-256 + install.sh; .sig optional)."
+            echo "All 17 prerelease assets present (8 binaries + 8 SHA-256 + install.sh; .sig optional)."
           fi
 
       # ── Spec 048: aggregate SHA256SUMS + GPG signature ────────────────────

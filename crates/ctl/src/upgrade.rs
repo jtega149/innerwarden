@@ -125,6 +125,14 @@ pub const TARGETS: &[UpgradeTarget] = &[
         binary: "innerwarden-ctl",
         install_as: &["innerwarden-ctl", "innerwarden"],
     },
+    UpgradeTarget {
+        // OSS supervision layer. Only present when the operator opted into
+        // supervised mode (install.sh INNERWARDEN_SUPERVISED=1); `update`
+        // skips targets not found on disk, so this is inert on default
+        // installs and upgrades the supervisor in lockstep when it IS used.
+        binary: "innerwarden-supervisor",
+        install_as: &["innerwarden-supervisor"],
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -490,7 +498,12 @@ mod tests {
     #[test]
     fn build_plan_finds_binaries() {
         let mut assets = vec![];
-        for name in &["innerwarden-sensor", "innerwarden-agent", "innerwarden-ctl"] {
+        for name in &[
+            "innerwarden-sensor",
+            "innerwarden-agent",
+            "innerwarden-ctl",
+            "innerwarden-supervisor",
+        ] {
             assets.push(GithubAsset {
                 name: format!("{name}-linux-x86_64"),
                 browser_download_url: format!("https://example.com/{name}"),
@@ -506,7 +519,7 @@ mod tests {
             assets,
         };
         let plan = build_plan(&release, "x86_64");
-        assert_eq!(plan.len(), 3);
+        assert_eq!(plan.len(), 4);
     }
 
     #[test]
@@ -534,11 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn targets_cover_all_three_binaries() {
+    fn targets_cover_all_binaries() {
         let names: Vec<_> = TARGETS.iter().map(|t| t.binary).collect();
         assert!(names.contains(&"innerwarden-sensor"));
         assert!(names.contains(&"innerwarden-agent"));
         assert!(names.contains(&"innerwarden-ctl"));
+        // OSS supervision layer; upgraded in lockstep when present on disk.
+        assert!(names.contains(&"innerwarden-supervisor"));
     }
 
     #[test]
