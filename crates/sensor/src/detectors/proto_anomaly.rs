@@ -156,13 +156,41 @@ impl ProtoAnomalyDetector {
 
         // SMB on non-standard port (lateral movement on non-445)
         if app_proto == "smb" && dst_port != 445 && dst_port != 139 {
-            if let Some(inc) = self.emit(
-                AnomalyType::SmbNonStandardPort,
-                &format!("SMB on port {dst_port}"),
-                &format!("SMB protocol detected on non-standard port {dst_port} ({src_ip} -> {dst_ip}). Possible lateral movement attempt on a non-default port to evade firewall rules."),
-                src_ip, dst_ip, dst_port, now,
-                Severity::High,
-            ) {
+            // FP guard (prod 2026-05-30): an EXTERNAL source "speaking SMB" to a
+            // public WEB port (80/443/8080/...) is almost never lateral movement
+            // — lateral movement is internal->internal or aimed at SMB ports.
+            // What actually happens is an internet scanner sends junk/HTTP-ish
+            // bytes to the web port and the protocol classifier mis-reads them
+            // as SMB. Observed repeatedly from Linode scanner 45.33.87.154 ->
+            // :80, firing "SMB lateral movement High" every visit. Downgrade
+            // that exact shape to a Low recon signal instead of a High lateral
+            // alert; keep the original High for genuine SMB-port-evasion cases
+            // (internal source, or a non-web destination port).
+            let external_smb_on_web_port = !super::is_internal_ip(dst_ip) // dst is a real host, not loopback
+                    && is_http_port(dst_port)
+                    && !super::is_internal_ip(src_ip);
+            let (atype, title, summary, sev) = if external_smb_on_web_port {
+                (
+                    AnomalyType::ProtocolMismatch,
+                    format!("SMB-like bytes on web port {dst_port}"),
+                    format!(
+                        "External source {src_ip} sent SMB-classified bytes to web port {dst_port} ({src_ip} -> {dst_ip}). \
+                         Almost certainly an internet scanner probing the web service (protocol classifier mismatch), \
+                         not SMB lateral movement (which is internal-to-internal or aimed at SMB ports)."
+                    ),
+                    Severity::Low,
+                )
+            } else {
+                (
+                    AnomalyType::SmbNonStandardPort,
+                    format!("SMB on port {dst_port}"),
+                    format!("SMB protocol detected on non-standard port {dst_port} ({src_ip} -> {dst_ip}). Possible lateral movement attempt on a non-default port to evade firewall rules."),
+                    Severity::High,
+                )
+            };
+            if let Some(inc) =
+                self.emit(atype, &title, &summary, src_ip, dst_ip, dst_port, now, sev)
+            {
                 incidents.push(inc);
             }
         }
@@ -468,6 +496,63 @@ mod tests {
         );
         let incidents = det.process(&ev);
         assert!(incidents.iter().any(|i| i.title.contains("SMB on port")));
+    }
+
+    #[test]
+    fn smb_like_bytes_from_external_to_public_web_port_is_downgraded_recon() {
+        // Prod FP (2026-05-30): Linode scanner 45.33.87.154 -> public web :80
+        // mis-classified as "SMB lateral movement High". External src + external
+        // dst + web port => downgrade to Low ProtocolMismatch recon, not High.
+        let mut det = ProtoAnomalyDetector::new("host1", 300);
+        let ev = make_stream_event(
+            "tcp_stream.smb",
+            serde_json::json!({
+                "app_proto": "smb",
+                "src_ip": "45.33.87.154",
+                "dst_ip": "8.8.4.4",
+                "dst_port": 80,
+                "signals": [],
+            }),
+        );
+        let incidents = det.process(&ev);
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            incidents[0].severity,
+            Severity::Low,
+            "external SMB-bytes on a public web port must be Low recon, not High lateral"
+        );
+        assert!(
+            incidents[0].incident_id.contains("ProtocolMismatch"),
+            "downgraded incident should be ProtocolMismatch, got: {}",
+            incidents[0].incident_id
+        );
+        assert!(
+            incidents[0].summary.contains("scanner")
+                || incidents[0].summary.contains("classifier mismatch"),
+            "summary should explain the scanner/classifier FP, got: {}",
+            incidents[0].summary
+        );
+    }
+
+    #[test]
+    fn smb_on_non_web_port_from_external_stays_high_lateral() {
+        // External src but a NON-web port (445-evasion on 4445): the genuine
+        // lateral-movement shape the rule exists for. Must stay High.
+        let mut det = ProtoAnomalyDetector::new("host1", 300);
+        let ev = make_stream_event(
+            "tcp_stream.smb",
+            serde_json::json!({
+                "app_proto": "smb",
+                "src_ip": "8.8.8.8",
+                "dst_ip": "8.8.4.4",
+                "dst_port": 4445,
+                "signals": [],
+            }),
+        );
+        let incidents = det.process(&ev);
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].severity, Severity::High);
+        assert!(incidents[0].title.contains("SMB on port"));
     }
 
     #[test]
