@@ -444,6 +444,212 @@ pub(crate) async fn handle_telegram_action_callback(
         return true;
     }
 
+    // Spec 062 Phase 3: needs_review operator decision via send_needs_review_request.
+    // sentinel: "__review__:{incident_id}". The operator tapped Block / Ignore /
+    // Dismiss on a needs_review notification. We resolve the incident from the
+    // store, run the chosen terminal action, and write a NEW decision row — that
+    // becomes the incident's most-recent decision so the Phase 2 timeout sweep
+    // (which keys off the latest decision being `needs_review`) stops treating it
+    // as pending.
+    if let Some(incident_id) = result.incident_id.strip_prefix("__review__:") {
+        let incident_id = incident_id.to_string();
+        let chosen = result.chosen_action.clone();
+        let operator = result.operator_name.clone();
+        info!(
+            incident_id = %incident_id,
+            operator = %operator,
+            action = %chosen,
+            "Telegram needs_review decision received"
+        );
+
+        let Some(incident) = state
+            .sqlite_store
+            .as_ref()
+            .and_then(|s| s.get_incident(&incident_id).ok().flatten())
+        else {
+            tg_reply(
+                state,
+                format!(
+                    "⏳ Couldn't find incident {incident_id} - it may have been pruned. Nothing to do."
+                ),
+            );
+            return true;
+        };
+
+        let host = incident.host.clone();
+        let ip = incident
+            .entities
+            .iter()
+            .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+            .map(|e| e.value.clone());
+        let provider_label = format!("telegram:{operator}");
+        let now = chrono::Utc::now();
+
+        // Resolve the terminal action. `block` runs the gated firewall skill;
+        // `ignore`/`dismiss` are bookkeeping-only. Each path yields the audit
+        // tuple (action_type, skill_id, target_ip, auto_executed, exec_result,
+        // reply) written once below.
+        #[allow(clippy::type_complexity)]
+        let (action_type, skill_id, target_ip, auto_executed, exec_result, reply): (
+            &str,
+            Option<String>,
+            Option<String>,
+            bool,
+            String,
+            String,
+        ) = match chosen.as_str() {
+            "block" => {
+                if let Some(ip) = ip.clone() {
+                    let skill_id = format!("block-ip-{}", cfg.responder.block_backend);
+                    let skill = state.skill_registry.get(&skill_id).or_else(|| {
+                        state
+                            .skill_registry
+                            .block_skill_for_backend(&cfg.responder.block_backend)
+                    });
+                    if let Some(skill) = skill {
+                        let ctx = skills::SkillContext {
+                            incident: incident.clone(),
+                            target_ip: Some(ip.clone()),
+                            target_user: None,
+                            target_container: None,
+                            duration_secs: None,
+                            host: host.clone(),
+                            data_dir: data_dir.to_path_buf(),
+                            honeypot: honeypot_runtime(cfg),
+                            ai_provider: state.ai_router.any_llm(),
+                        };
+                        // 2026-05-10 skill_gate: operator-driven needs_review
+                        // blocks route through the same allowlist / cloud-safelist
+                        // gate as every other block path. A wrong tap must not
+                        // firewall a trusted_ips IP or a CDN edge.
+                        let exec =
+                            match crate::skill_gate::gate_block_ip(&ip, &cfg.allowlist.trusted_ips)
+                            {
+                                Ok(gate) => {
+                                    crate::skill_gate::execute_block_skill_gated(
+                                        skill,
+                                        &ctx,
+                                        cfg.responder.dry_run,
+                                        &gate,
+                                    )
+                                    .await
+                                }
+                                Err(refusal) => {
+                                    warn!(
+                                        ip = %ip,
+                                        skill_id = %skill_id,
+                                        reason = %refusal,
+                                        "Telegram needs_review block refused by gate"
+                                    );
+                                    skills::SkillResult {
+                                        success: false,
+                                        message: format!("{refusal}"),
+                                    }
+                                }
+                            };
+                        if exec.success {
+                            state.blocklist.insert(ip.clone());
+                        }
+                        let reply = if cfg.responder.dry_run {
+                            format!("🧪 Dry run - {ip} would be blocked in the firewall.")
+                        } else if exec.success {
+                            format!("🛡 {ip} blocked. This review is closed.")
+                        } else {
+                            format!("❌ Failed to block {ip}: {}", exec.message)
+                        };
+                        (
+                            "block_ip",
+                            Some(skill_id),
+                            Some(ip.clone()),
+                            true,
+                            exec.message,
+                            reply,
+                        )
+                    } else {
+                        (
+                            "block_ip",
+                            None,
+                            Some(ip.clone()),
+                            false,
+                            "block skill not available".to_string(),
+                            format!("⚠️ Block skill not available for {ip}."),
+                        )
+                    }
+                } else {
+                    // No IP to block — degrade to dismiss rather than a no-op.
+                    (
+                        "dismiss",
+                        None,
+                        None,
+                        false,
+                        "no IP on incident; dismissed".to_string(),
+                        format!("⚠️ No IP on {incident_id} - can't block. Dismissed instead."),
+                    )
+                }
+            }
+            "ignore" => (
+                "ignore",
+                None,
+                ip.clone(),
+                false,
+                "ignored by operator".to_string(),
+                format!("🙈 {incident_id} ignored. Logged as a non-threat, keeping an eye out."),
+            ),
+            _ => (
+                "dismiss",
+                None,
+                ip.clone(),
+                false,
+                "dismissed by operator".to_string(),
+                format!("🗑 {incident_id} dismissed. Won't surface it again."),
+            ),
+        };
+
+        // Terminal decision row (JSONL + SQLite mirror). Being the most-recent
+        // decision is what excludes this incident from the Phase 2 sweep.
+        if let Some(writer) = state.decision_writer.as_mut() {
+            let entry = decisions::DecisionEntry {
+                ts: now,
+                incident_id: incident_id.clone(),
+                host: host.clone(),
+                ai_provider: provider_label,
+                action_type: action_type.to_string(),
+                target_ip: target_ip.clone(),
+                target_user: None,
+                skill_id,
+                confidence: 1.0,
+                auto_executed,
+                dry_run: cfg.responder.dry_run,
+                reason: format!("Telegram operator resolved needs_review via {action_type}"),
+                estimated_threat: "manual".to_string(),
+                execution_result: exec_result,
+                prev_hash: None,
+                decision_layer: Some("manual_operator".to_string()),
+            };
+            if let Err(e) = writer.write(&entry) {
+                warn!("failed to write needs_review decision entry: {e:#}");
+            }
+        }
+
+        // Label the in-memory graph in place so graph-derived dashboard views
+        // reflect the resolution without waiting for a rebuild.
+        {
+            let mut graph = state.knowledge_graph.write().unwrap();
+            graph.ingest_decision(
+                &incident_id,
+                action_type,
+                target_ip.as_deref(),
+                1.0,
+                &format!("operator {operator} resolved needs_review: {action_type}"),
+                auto_executed,
+                now,
+            );
+        }
+
+        tg_reply(state, reply);
+        return true;
+    }
+
     false
 }
 
@@ -690,6 +896,93 @@ mod tests {
 
         assert!(handled);
         assert!(!state.pending_honeypot_choices.contains_key("198.51.100.57"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec 062 Phase 3 — needs_review operator decision handler
+    // -----------------------------------------------------------------------
+
+    fn today_str() -> String {
+        chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn needs_review_dismiss_resolves_and_writes_decision() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let inc = crate::tests::test_incident("203.0.113.70");
+        crate::tests::insert_test_incident(&store, &inc);
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.sqlite_store = Some(store);
+        let cfg = config::AgentConfig::default();
+
+        let id = format!("__review__:{}", inc.incident_id);
+        let handled = handle_telegram_action_callback(
+            &approval(&id, "dismiss"),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+
+        assert!(handled);
+        // A terminal decision row was written — this is what excludes the
+        // incident from the Phase 2 needs_review timeout sweep.
+        assert!(
+            decisions::count_decisions_for_date(dir.path(), &today_str()) >= 1,
+            "dismiss must write a terminal decision row"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_review_unknown_incident_replies_without_decision() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.sqlite_store = Some(store);
+        let cfg = config::AgentConfig::default();
+
+        let handled = handle_telegram_action_callback(
+            &approval("__review__:does-not-exist", "dismiss"),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+
+        assert!(handled, "the sentinel is still consumed");
+        assert_eq!(
+            decisions::count_decisions_for_date(dir.path(), &today_str()),
+            0,
+            "no incident -> no decision row written"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_review_block_updates_blocklist() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let inc = crate::tests::test_incident("203.0.113.71");
+        crate::tests::insert_test_incident(&store, &inc);
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.sqlite_store = Some(store);
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.dry_run = true;
+        cfg.responder.block_backend = "ufw".to_string();
+
+        let id = format!("__review__:{}", inc.incident_id);
+        let handled =
+            handle_telegram_action_callback(&approval(&id, "block"), dir.path(), &cfg, &mut state)
+                .await;
+
+        assert!(handled);
+        assert!(
+            state.blocklist.contains("203.0.113.71"),
+            "operator block via needs_review must update the blocklist"
+        );
     }
 
     #[tokio::test]

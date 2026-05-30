@@ -961,6 +961,57 @@ mod tests {
         assert!(parse_callback("hpot:block:1.2.3.4", "Alice").is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // Spec 062 Phase 3 — needs_review operator-in-the-loop routing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_review_callback_routing() {
+        // The incident_id itself contains ':' (e.g. "kill_chain:1.2.3.4:test").
+        // splitn(2) must keep everything after the FIRST ':' as the id so it
+        // round-trips into the get_incident lookup in bot_actions.
+        let data = "review:block:kill_chain:1.2.3.4:test";
+        let rest = data
+            .strip_prefix("review:")
+            .expect("review prefix should be present");
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        assert_eq!(parts.len(), 2);
+        let action = parts[0];
+        let incident_id = parts[1];
+        assert_eq!(action, "block");
+        assert_eq!(incident_id, "kill_chain:1.2.3.4:test");
+
+        let result = ApprovalResult {
+            incident_id: format!("__review__:{incident_id}"),
+            approved: action != "ignore",
+            always: false,
+            operator_name: "Alice".to_string(),
+            chosen_action: action.to_string(),
+        };
+        assert_eq!(result.incident_id, "__review__:kill_chain:1.2.3.4:test");
+        assert!(result.approved);
+        assert_eq!(result.chosen_action, "block");
+
+        // ignore action produces approved=false
+        let data_ignore = "review:ignore:sigma:cron:99";
+        let rest_i = data_ignore.strip_prefix("review:").unwrap();
+        let parts_i: Vec<&str> = rest_i.splitn(2, ':').collect();
+        assert_eq!(parts_i[0], "ignore");
+        assert_eq!(parts_i[1], "sigma:cron:99");
+        let result_i = ApprovalResult {
+            incident_id: format!("__review__:{}", parts_i[1]),
+            approved: parts_i[0] != "ignore",
+            always: false,
+            operator_name: "Bob".to_string(),
+            chosen_action: parts_i[0].to_string(),
+        };
+        assert!(!result_i.approved);
+
+        // review: prefix must not be caught by parse_callback
+        assert!(parse_callback("review:block:inc-1", "Alice").is_none());
+        assert!(parse_callback("review:dismiss:inc-2", "Alice").is_none());
+    }
+
     #[test]
     fn test_send_honeypot_suggestion_format() {
         // Verify the message body would contain the key fields.

@@ -668,6 +668,102 @@ impl TelegramClient {
         Ok(msg_id)
     }
 
+    // -----------------------------------------------------------------------
+    // Spec 062 Phase 3 - needs_review operator-in-the-loop
+    // -----------------------------------------------------------------------
+
+    /// Send a `needs_review` notification with a 3-button choice keyboard.
+    ///
+    /// Sent when an ambiguous incident reaches `mark_needs_review` and no
+    /// automated layer confidently decided it (spec 062 Phase 1). The operator
+    /// resolves it directly from Telegram: Block / Ignore / Dismiss. The tap is
+    /// routed back through `bot_actions::handle_telegram_action_callback` via the
+    /// `__review__:{incident_id}` sentinel, which writes the terminal decision —
+    /// that makes it the incident's most-recent decision, so the Phase 2 timeout
+    /// sweep stops treating it as pending.
+    ///
+    /// Returns the Telegram `message_id`.
+    ///
+    /// callback_data carries the raw `incident_id`. Telegram caps callback_data
+    /// at 64 bytes; `review:dismiss:` is 15 bytes, leaving 49 for the id. In-tree
+    /// incident_ids fit comfortably; a pathologically long id would make the
+    /// sendMessage fail loudly (Result propagated), never silently mis-route.
+    pub async fn send_needs_review_request(&self, incident: &Incident) -> Result<i64> {
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": Self::needs_review_text(incident),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "reply_markup": {
+                "inline_keyboard": Self::needs_review_keyboard(&incident.incident_id),
+            }
+        });
+
+        let resp = self.post_json_with_response("sendMessage", &body).await?;
+        let msg_id = resp["result"]["message_id"]
+            .as_i64()
+            .context("Telegram sendMessage returned no message_id")?;
+        Ok(msg_id)
+    }
+
+    /// Pure: the HTML body of a needs_review notification. Extracted so the
+    /// IP/title/severity rendering is unit-testable without an HTTP round-trip.
+    fn needs_review_text(incident: &Incident) -> String {
+        let ip = incident
+            .entities
+            .iter()
+            .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+            .map(|e| e.value.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!(
+            "🔎 <b>Needs your review</b>\n\
+             \n\
+             <b>IP:</b> <code>{ip}</code>\n\
+             <b>Incident:</b> {title}\n\
+             <b>Severity:</b> {severity}\n\
+             \n\
+             The Warden could not confidently decide this one. What should it do?",
+            ip = escape_html(&ip),
+            title = escape_html(&incident.title),
+            severity = escape_html(&format!("{:?}", incident.severity)),
+        )
+    }
+
+    /// Pure: the 3-button inline keyboard (Block / Ignore / Dismiss). Extracted
+    /// so the `review:{action}:{incident_id}` callback_data construction — the
+    /// piece that must round-trip through `bot_actions` — is unit-testable.
+    fn needs_review_keyboard(incident_id: &str) -> serde_json::Value {
+        serde_json::json!([
+            [
+                { "text": "🚫 Block",   "callback_data": format!("review:block:{incident_id}")   },
+                { "text": "🙈 Ignore",  "callback_data": format!("review:ignore:{incident_id}")  }
+            ],
+            [
+                { "text": "🗑 Dismiss", "callback_data": format!("review:dismiss:{incident_id}") }
+            ]
+        ])
+    }
+
+    /// Pure: toast text shown when the operator taps a needs_review button.
+    fn review_action_toast(action: &str) -> String {
+        match action {
+            "block" => "🚫 Blocking the attacker at the firewall...".to_string(),
+            "ignore" => "🙈 Ignoring - logging as a non-threat.".to_string(),
+            "dismiss" => "🗑 Dismissing this one - won't bug you again.".to_string(),
+            _ => "👍 Logged.".to_string(),
+        }
+    }
+
+    /// Pure: reaction emoji for a needs_review button tap.
+    fn review_action_emoji(action: &str) -> &'static str {
+        match action {
+            "block" => "\u{1f6ab}",
+            "ignore" => "\u{1f648}",
+            "dismiss" => "\u{1f5d1}\u{fe0f}",
+            _ => "\u{1f44d}",
+        }
+    }
+
     /// Edit a confirmation message to show the final outcome (removes the keyboard).
     pub async fn resolve_confirmation(
         &self,
@@ -1225,6 +1321,34 @@ impl TelegramClient {
                                         }
                                         let result = ApprovalResult {
                                             incident_id: format!("__hpot__:{ip}"),
+                                            approved: action != "ignore",
+                                            always: false,
+                                            operator_name: operator.clone(),
+                                            chosen_action: action.to_string(),
+                                        };
+                                        if approval_tx.send(result).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                } else if let Some(rest) = data.strip_prefix("review:") {
+                                    // Spec 062 Phase 3: needs_review operator decision.
+                                    // format: "review:{action}:{incident_id}" where
+                                    // action ∈ {block, ignore, dismiss}. The incident_id
+                                    // itself can contain ':' (e.g. "kill_chain:1.2.3.4"),
+                                    // so split only on the FIRST ':' after the action.
+                                    let parts: Vec<&str> = rest.splitn(2, ':').collect();
+                                    if parts.len() == 2 {
+                                        let action = parts[0];
+                                        let incident_id = parts[1];
+                                        let toast = Self::review_action_toast(action);
+                                        let _ =
+                                            self.answer_callback_toast(&callback.id, &toast).await;
+                                        if cb_chat_id != 0 {
+                                            let emoji = Self::review_action_emoji(action);
+                                            self.react(cb_chat_id, cb_msg_id, emoji).await;
+                                        }
+                                        let result = ApprovalResult {
+                                            incident_id: format!("__review__:{incident_id}"),
                                             approved: action != "ignore",
                                             always: false,
                                             operator_name: operator.clone(),
@@ -2017,6 +2141,53 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn needs_review_text_renders_ip_title_and_severity() {
+        let inc = make_incident();
+        let text = TelegramClient::needs_review_text(&inc);
+        assert!(text.contains("198.51.100.10"), "must show the attacker IP");
+        assert!(
+            text.contains("SSH brute force burst"),
+            "must show the title"
+        );
+        assert!(text.contains("High"), "must show the severity");
+        assert!(text.contains("Needs your review"));
+    }
+
+    #[test]
+    fn needs_review_text_falls_back_to_unknown_without_ip_entity() {
+        let mut inc = make_incident();
+        inc.entities.clear();
+        let text = TelegramClient::needs_review_text(&inc);
+        assert!(text.contains("<code>unknown</code>"));
+    }
+
+    #[test]
+    fn needs_review_keyboard_callback_data_round_trips_colon_in_id() {
+        // incident_id contains ':' — the callback_data must keep it intact so
+        // bot_actions' splitn(2) reconstructs the same id for get_incident.
+        let id = "kill_chain:9.9.9.9:test";
+        let kb = TelegramClient::needs_review_keyboard(id);
+        let block_cb = kb[0][0]["callback_data"].as_str().unwrap();
+        let ignore_cb = kb[0][1]["callback_data"].as_str().unwrap();
+        let dismiss_cb = kb[1][0]["callback_data"].as_str().unwrap();
+        assert_eq!(block_cb, "review:block:kill_chain:9.9.9.9:test");
+        assert_eq!(ignore_cb, "review:ignore:kill_chain:9.9.9.9:test");
+        assert_eq!(dismiss_cb, "review:dismiss:kill_chain:9.9.9.9:test");
+    }
+
+    #[test]
+    fn review_action_toast_and_emoji_cover_all_actions() {
+        for action in ["block", "ignore", "dismiss", "wat"] {
+            assert!(!TelegramClient::review_action_toast(action).is_empty());
+            assert!(!TelegramClient::review_action_emoji(action).is_empty());
+        }
+        assert_ne!(
+            TelegramClient::review_action_emoji("block"),
+            TelegramClient::review_action_emoji("dismiss")
+        );
+    }
+
     #[tokio::test]
     async fn send_confirmation_request_uses_mock_response_message_id() -> anyhow::Result<()> {
         let (state, server, port, cert_dir) = start_mock_telegram_server(vec![]).await?;
@@ -2187,6 +2358,15 @@ mod tests {
                         "from": { "first_name": "Alice" },
                         "chat": { "id": 42 }
                     }
+                },
+                {
+                    "update_id": 12,
+                    "callback_query": {
+                        "id": "cb-12",
+                        "from": { "first_name": "Alice" },
+                        "data": "review:dismiss:kill_chain:9.9.9.9:test",
+                        "message": { "message_id": 1012, "chat": { "id": 42 } }
+                    }
                 }
             ]
         })];
@@ -2197,7 +2377,7 @@ mod tests {
 
         let mut task = tokio::spawn(client.run_polling(tx));
         let mut incident_ids = Vec::new();
-        for _ in 0..10usize {
+        for _ in 0..11usize {
             let result = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                 .await
                 .context("timed out waiting for approval result")?
@@ -2216,6 +2396,7 @@ mod tests {
             "__enable2fa__",
             "__status__",
             "__enable__:ai",
+            "__review__:kill_chain:9.9.9.9:test",
         ] {
             assert!(
                 incident_ids.iter().any(|id| id == expected),

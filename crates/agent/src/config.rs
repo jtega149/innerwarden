@@ -1948,6 +1948,15 @@ pub struct LearningConfig {
     /// honeypot / request_confirmation) are never gated. Default 0.75.
     #[serde(default = "default_llm_escalation_min_confidence")]
     pub llm_escalation_min_confidence: f32,
+
+    /// Spec 062 Phase 3 — when an ambiguous incident is parked as
+    /// `needs_review`, send the operator a Telegram notification with inline
+    /// Block / Ignore / Dismiss buttons so they can resolve it from chat.
+    /// Default `false`: spec 062 ships disabled-by-default (nothing
+    /// auto-enabled in prod). The operator flips this on after validating on
+    /// a lab host. With no Telegram client configured this is a no-op.
+    #[serde(default)]
+    pub needs_review_notify: bool,
 }
 
 fn default_learned_suppression_mode() -> String {
@@ -1969,6 +1978,7 @@ impl Default for LearningConfig {
             min_dismissals: default_learned_min_dismissals(),
             llm_escalation_enabled: default_true(),
             llm_escalation_min_confidence: default_llm_escalation_min_confidence(),
+            needs_review_notify: false,
         }
     }
 }
@@ -4643,6 +4653,15 @@ enabled = true
         // Spec 062 Phase 5 defaults: LLM escalation on, 0.75 confidence floor.
         assert!(cfg.learning.llm_escalation_enabled);
         assert!((cfg.learning.llm_escalation_min_confidence - 0.75).abs() < f32::EPSILON);
+        // Spec 062 Phase 3: needs_review Telegram notify is opt-in (default off).
+        assert!(!cfg.learning.needs_review_notify);
+    }
+
+    #[test]
+    fn learning_section_parses_needs_review_notify_override() {
+        let src = "[learning]\nneeds_review_notify = true\n";
+        let cfg: AgentConfig = toml::from_str(src).expect("phase3 learning parses");
+        assert!(cfg.learning.needs_review_notify);
     }
 
     #[test]

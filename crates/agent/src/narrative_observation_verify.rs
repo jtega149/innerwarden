@@ -855,7 +855,7 @@ pub(crate) async fn ai_verify_ambiguous(
         None
     };
     let Some(ai) = ai_opt else {
-        mark_needs_review(&items, state, "no AI verifier configured");
+        mark_needs_review(&items, cfg, state, "no AI verifier configured");
         return;
     };
 
@@ -968,7 +968,7 @@ pub(crate) async fn ai_verify_ambiguous(
     // left undecided to leak into orphan-recovery. Fall it to needs_review.
     let unresolved = partition_unresolved(items, &resolved);
     if !unresolved.is_empty() {
-        mark_needs_review(&unresolved, state, "AI verifier returned no verdict");
+        mark_needs_review(&unresolved, cfg, state, "AI verifier returned no verdict");
     }
 }
 
@@ -1035,7 +1035,12 @@ fn needs_review_entry(
 /// `needs_review` is terminal-pending: it carries `auto_executed = false`
 /// (no action was taken) and `execution_result = "awaiting_human"`. Phase 2
 /// adds the severity-gated timeout + notification clock on top of these rows.
-fn mark_needs_review(items: &[AmbiguousItem], state: &mut AgentState, why: &str) {
+fn mark_needs_review(
+    items: &[AmbiguousItem],
+    cfg: &crate::config::AgentConfig,
+    state: &mut AgentState,
+    why: &str,
+) {
     let now = chrono::Utc::now();
     for item in items {
         // Graph label so the dashboard's graph-derived views update in place.
@@ -1061,6 +1066,35 @@ fn mark_needs_review(items: &[AmbiguousItem], state: &mut AgentState, why: &str)
                     error = %e,
                     "needs_review: failed to write decision row"
                 );
+            }
+        }
+
+        // Spec 062 Phase 3: notify the operator on Telegram with inline
+        // Block / Ignore / Dismiss buttons (gated by [learning]
+        // needs_review_notify, default false — nothing auto-enabled in prod).
+        // The tap routes back via the `__review__:` sentinel in bot_actions.
+        // Fire-and-forget: a notify failure must not block the tick.
+        if cfg.learning.needs_review_notify {
+            if let (Some(tg), Some(store)) =
+                (state.telegram_client.clone(), state.sqlite_store.clone())
+            {
+                match store.get_incident(&item.incident_id) {
+                    Ok(Some(incident)) => {
+                        tokio::spawn(async move {
+                            if let Err(e) = tg.send_needs_review_request(&incident).await {
+                                warn!(error = %e, "needs_review: telegram notify failed");
+                            }
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            incident_id = %item.incident_id,
+                            error = %e,
+                            "needs_review: could not load incident for telegram notify"
+                        );
+                    }
+                }
             }
         }
     }
@@ -2424,5 +2458,35 @@ mod tests {
         };
         let e = needs_review_entry(&item, "why", chrono::Utc::now());
         assert!(e.target_ip.is_none());
+    }
+
+    #[test]
+    fn mark_needs_review_writes_decision_and_notify_is_safe_without_telegram() {
+        use crate::tests::triage_test_state;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = triage_test_state(tmp.path());
+        // Phase 3 notify ON, but no telegram client / sqlite store on the test
+        // state -> the notify branch must short-circuit, not panic.
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.learning.needs_review_notify = true;
+        assert!(state.telegram_client.is_none());
+
+        let items = vec![AmbiguousItem {
+            incident_id: "inc-mnr-1".into(),
+            score: 55,
+            evidence: serde_json::json!({"dst_ip": "203.0.113.80"}),
+            detector: "proto_anomaly".into(),
+            title: "ambiguous".into(),
+        }];
+        mark_needs_review(&items, &cfg, &mut state, "no AI verifier configured");
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(
+            crate::decisions::count_decisions_for_date(tmp.path(), &today) >= 1,
+            "mark_needs_review must still write the needs_review decision row"
+        );
     }
 }
