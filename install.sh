@@ -890,6 +890,30 @@ EOF
   fi
 fi
 
+# Detect the host firewall backend so block-ip works out of the box on
+# any distro: Rocky/RHEL/CentOS/Fedora ship firewalld (no ufw), so the
+# old hardcoded `block_backend = "ufw"` meant a fresh install there could
+# detect but never block. Order favours the distro-native, persistence-
+# capable tool. The responder still ships disabled + dry_run (monitor-only
+# default), so this only picks WHICH backend activates when the operator
+# turns response on.
+detect_block_backend() {
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    echo firewalld
+  elif command -v ufw >/dev/null 2>&1; then
+    echo ufw
+  elif command -v nft >/dev/null 2>&1; then
+    echo nftables
+  elif command -v iptables >/dev/null 2>&1; then
+    echo iptables
+  else
+    echo ufw  # nothing detected; keep the historical default
+  fi
+}
+BLOCK_BACKEND="$(detect_block_backend)"
+BLOCK_SKILL="block-ip-${BLOCK_BACKEND}"
+log "detected firewall backend for block-ip: ${BLOCK_BACKEND}"
+
 log "writing agent config: ${AGENT_CONFIG}"
 # Wave 8d (2026-05-04): agent.toml carries API keys (OpenAI / Anthropic /
 # Telegram bot tokens / AbuseIPDB) so it must NOT be group-readable on
@@ -982,8 +1006,8 @@ backend = "iptables"
 [responder]
 enabled = false
 dry_run = true
-block_backend = "ufw"
-allowed_skills = ["block-ip-ufw"]
+block_backend = "${BLOCK_BACKEND}"
+allowed_skills = ["${BLOCK_SKILL}"]
 EOF
 
 log "writing environment file: ${AGENT_ENV}"

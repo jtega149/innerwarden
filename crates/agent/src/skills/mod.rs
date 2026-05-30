@@ -311,6 +311,7 @@ impl SkillRegistry {
                 Box::new(BlockIpUfw),
                 Box::new(BlockIpIptables),
                 Box::new(BlockIpNftables),
+                Box::new(BlockIpFirewalld),
                 Box::new(BlockIpPf),
                 Box::new(BlockIpXdp),
                 Box::new(MonitorIp),
@@ -509,9 +510,10 @@ mod tests {
     fn registry_infos_are_serializable() {
         let reg = SkillRegistry::default_builtin();
         let infos = reg.infos();
-        assert_eq!(infos.len(), 12);
+        assert_eq!(infos.len(), 13); // +block-ip-firewalld (RHEL/Rocky backend)
         let json = serde_json::to_string(&infos).unwrap();
         assert!(json.contains("block-ip-ufw"));
+        assert!(json.contains("block-ip-firewalld"));
     }
 
     #[test]

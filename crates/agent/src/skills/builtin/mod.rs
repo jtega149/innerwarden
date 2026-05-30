@@ -1,4 +1,5 @@
 mod block_container;
+mod block_ip_firewalld;
 mod block_ip_iptables;
 mod block_ip_nftables;
 mod block_ip_pf;
@@ -13,6 +14,7 @@ mod rate_limit_nginx;
 mod suspend_user_sudo;
 
 pub use block_container::{cleanup_expired_container_blocks, BlockContainer};
+pub use block_ip_firewalld::BlockIpFirewalld;
 pub use block_ip_iptables::BlockIpIptables;
 pub use block_ip_nftables::BlockIpNftables;
 pub use block_ip_pf::BlockIpPf;

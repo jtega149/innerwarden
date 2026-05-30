@@ -14,7 +14,7 @@ use crate::systemd;
 
 pub struct BlockIpCapability;
 
-const BLOCK_IP_BACKENDS: &[&str] = &["ufw", "iptables", "nftables"];
+const BLOCK_IP_BACKENDS: &[&str] = &["ufw", "iptables", "nftables", "firewalld"];
 
 impl BlockIpCapability {
     fn backend<'a>(&self, opts: &'a ActivationOptions) -> &'a str {
@@ -43,7 +43,7 @@ impl Capability for BlockIpCapability {
     }
 
     fn description(&self) -> &'static str {
-        "Block attacking IPs via firewall (ufw / iptables / nftables)"
+        "Block attacking IPs via firewall (ufw / iptables / nftables / firewalld)"
     }
 
     fn preflights(&self, opts: &ActivationOptions) -> Vec<Box<dyn Preflight>> {
@@ -51,6 +51,7 @@ impl Capability for BlockIpCapability {
         let (display_name, path): (&'static str, &'static str) = match backend {
             "iptables" => ("iptables is installed", "/sbin/iptables"),
             "nftables" => ("nft is installed", "/usr/sbin/nft"),
+            "firewalld" => ("firewall-cmd is installed", "/usr/bin/firewall-cmd"),
             _ => ("ufw is installed", "/usr/sbin/ufw"),
         };
         vec![
@@ -93,10 +94,11 @@ impl Capability for BlockIpCapability {
     fn activate(&self, opts: &ActivationOptions) -> Result<ActivationReport> {
         let backend = self.backend(opts);
 
-        if !["ufw", "iptables", "nftables"].contains(&backend) {
+        if !BLOCK_IP_BACKENDS.contains(&backend) {
             anyhow::bail!(
-                "unsupported backend '{}' - use one of: ufw, iptables, nftables",
-                backend
+                "unsupported backend '{}' - use one of: {}",
+                backend,
+                BLOCK_IP_BACKENDS.join(", ")
             );
         }
 
@@ -274,6 +276,24 @@ mod tests {
         .unwrap();
         let opts = make_opts(&sensor, &agent);
         assert!(BlockIpCapability.is_enabled(&opts));
+    }
+
+    #[test]
+    fn firewalld_backend_is_accepted_and_builds_preflights() {
+        // Covers the firewalld arm of backend()/preflights() (RHEL/Rocky).
+        let sensor = NamedTempFile::new().unwrap();
+        let agent = NamedTempFile::new().unwrap();
+        let mut opts = make_opts(&sensor, &agent);
+        opts.params
+            .insert("backend".to_string(), "firewalld".to_string());
+        assert_eq!(BlockIpCapability.backend(&opts), "firewalld");
+        assert_eq!(
+            BlockIpCapability.skill_id("firewalld"),
+            "block-ip-firewalld"
+        );
+        // Building preflights exercises the firewalld match arm: firewall-cmd
+        // binary check + shared sudoers-dir + user checks.
+        assert_eq!(BlockIpCapability.preflights(&opts).len(), 3);
     }
 
     #[test]

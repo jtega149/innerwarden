@@ -144,6 +144,18 @@ pub fn block_ip_rule(backend: &str) -> Option<String> {
             /usr/sbin/nft delete element inet innerwarden-blocked blocked-ips *, \\\n  \
             /usr/sbin/nft list set inet innerwarden-blocked blocked-ips\n"
         }
+        "firewalld" => {
+            // RHEL/Rocky/CentOS/Fedora. `firewall-cmd` lives at
+            // /usr/bin/firewall-cmd on these distros, which is the path
+            // `sudo firewall-cmd` resolves to via secure_path, so the
+            // skill's bare invocation matches this grant (no path drift).
+            // Scoped to rich-rule add/remove + list only.
+            "\
+            innerwarden ALL=(ALL) NOPASSWD: \\\n  \
+            /usr/bin/firewall-cmd --add-rich-rule=*, \\\n  \
+            /usr/bin/firewall-cmd --remove-rich-rule=*, \\\n  \
+            /usr/bin/firewall-cmd --list-rich-rules\n"
+        }
         _ => return None,
     };
     Some(format!(
@@ -189,6 +201,7 @@ mod tests {
         assert!(block_ip_rule("ufw").is_some());
         assert!(block_ip_rule("iptables").is_some());
         assert!(block_ip_rule("nftables").is_some());
+        assert!(block_ip_rule("firewalld").is_some());
     }
 
     #[test]
@@ -255,6 +268,16 @@ mod tests {
         let nft = block_ip_rule("nftables").expect("nft rule");
         assert!(nft.contains("/usr/sbin/nft add element inet innerwarden-blocked"));
         assert!(nft.contains("/usr/sbin/nft list set inet innerwarden-blocked"));
+
+        // firewalld (RHEL/Rocky): scoped to rich-rule add/remove/list, and
+        // the granted path matches what `sudo firewall-cmd` resolves to on
+        // those distros (/usr/bin/firewall-cmd), so there is no path drift
+        // between the grant and the skill's invocation.
+        let fwd = block_ip_rule("firewalld").expect("firewalld rule");
+        assert!(fwd.contains("/usr/bin/firewall-cmd --add-rich-rule=*"));
+        assert!(fwd.contains("/usr/bin/firewall-cmd --remove-rich-rule=*"));
+        assert!(fwd.contains("/usr/bin/firewall-cmd --list-rich-rules"));
+        assert!(!fwd.contains("--reload"), "must not grant a broad reload");
     }
 
     #[test]
