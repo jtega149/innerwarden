@@ -185,6 +185,7 @@ mod trust_rules;
 mod trust_scoring;
 #[allow(dead_code)]
 mod two_factor;
+mod warden_labels;
 mod web_push;
 mod webhook;
 mod xdp_availability;

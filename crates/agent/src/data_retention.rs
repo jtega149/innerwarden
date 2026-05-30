@@ -20,6 +20,7 @@ fn warm_jsonl_patterns() -> &'static [(&'static str, &'static str)] {
         ("events-", ".jsonl"),
         ("incidents-", ".jsonl"),
         ("decisions-", ".jsonl"),
+        ("labels-", ".jsonl"),
         ("telemetry-", ".jsonl"),
         ("admin-actions-", ".jsonl"),
         ("agent-guard-events-", ".jsonl"),
@@ -70,6 +71,10 @@ pub fn cleanup(data_dir: &Path, cfg: &DataRetentionConfig) -> usize {
         ("incidents-", ".jsonl.gz", cfg.incidents_keep_days),
         ("decisions-", ".jsonl", cfg.decisions_keep_days),
         ("decisions-", ".jsonl.gz", cfg.decisions_keep_days),
+        // Spec 062 Phase 6a warden-label corpus — retained like decisions
+        // (low volume; only human decisions + learned suppressions land here).
+        ("labels-", ".jsonl", cfg.decisions_keep_days),
+        ("labels-", ".jsonl.gz", cfg.decisions_keep_days),
         ("telemetry-", ".jsonl", cfg.telemetry_keep_days),
         ("telemetry-", ".jsonl.gz", cfg.telemetry_keep_days),
         ("admin-actions-", ".jsonl", cfg.decisions_keep_days),

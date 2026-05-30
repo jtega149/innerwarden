@@ -1843,6 +1843,26 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             let today_key = format!("anomaly_train:{}", chrono::Utc::now().format("%Y-%m-%d"));
                             if !state.store.has_cooldown(state_store::CooldownTable::Decision, &today_key) {
                                 info!(trigger_hour, "autoencoder: triggering nightly training");
+                                // Spec 062 Phase 6a: report how full the warden
+                                // label corpus is. We do NOT consume it on-host
+                                // yet (the autoencoder stays unsupervised, the
+                                // warden ONNX is the shipped artifact) — this
+                                // log is the honest signal that the channel is
+                                // accumulating gold + weak labels for offline
+                                // re-distillation.
+                                {
+                                    let today = chrono::Utc::now()
+                                        .format("%Y-%m-%d")
+                                        .to_string();
+                                    let labels_today = crate::warden_labels::count_labels_for_date(
+                                        &cli.data_dir,
+                                        &today,
+                                    );
+                                    info!(
+                                        labels_today,
+                                        "warden_labels: human-label corpus size for today (offline re-distillation channel)"
+                                    );
+                                }
                                 // Open a dedicated `Store` for the training run instead
                                 // of borrowing `state.sqlite_store`. Training reads
                                 // tens of thousands of events synchronously and can

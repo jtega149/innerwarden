@@ -1043,6 +1043,28 @@ fn try_learned_suppression(
                     now,
                 );
             }
+            // Spec 062 Phase 6a: a learned-suppression auto-dismiss is weak
+            // supervision (a trivial repeated shape) — record it as a low-weight
+            // training label so the warden corpus sees what the agent considers
+            // routine noise, not just what the operator touched.
+            if cfg.learning.emit_labels {
+                let sample = crate::warden_labels::build_sample(
+                    now,
+                    &incident.host,
+                    &incident.incident_id,
+                    &detector,
+                    if ip.is_empty() {
+                        None
+                    } else {
+                        Some(ip.as_str())
+                    },
+                    &incident.severity,
+                    "suppress",
+                    crate::warden_labels::LabelSource::LearnedSuppression,
+                    &incident.summary,
+                );
+                crate::warden_labels::append_label(data_dir, &sample, now);
+            }
             true
         }
     }

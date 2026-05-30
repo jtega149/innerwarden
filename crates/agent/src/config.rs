@@ -1957,6 +1957,15 @@ pub struct LearningConfig {
     /// a lab host. With no Telegram client configured this is a no-op.
     #[serde(default)]
     pub needs_review_notify: bool,
+
+    /// Spec 062 Phase 6a — emit human-grade decisions (Telegram resolutions,
+    /// operator honeypot/block/ignore choices, learned-suppression dismisses)
+    /// to `labels-<date>.jsonl` as a warden re-distillation corpus. Default
+    /// `true`: the channel is purely additive (a low-volume append-only log
+    /// pruned alongside `decisions-*.jsonl`), introduces no behaviour change,
+    /// and is worthless if off. Set `false` to opt out of the corpus entirely.
+    #[serde(default = "default_true")]
+    pub emit_labels: bool,
 }
 
 fn default_learned_suppression_mode() -> String {
@@ -1979,6 +1988,7 @@ impl Default for LearningConfig {
             llm_escalation_enabled: default_true(),
             llm_escalation_min_confidence: default_llm_escalation_min_confidence(),
             needs_review_notify: false,
+            emit_labels: true,
         }
     }
 }
@@ -4655,6 +4665,8 @@ enabled = true
         assert!((cfg.learning.llm_escalation_min_confidence - 0.75).abs() < f32::EPSILON);
         // Spec 062 Phase 3: needs_review Telegram notify is opt-in (default off).
         assert!(!cfg.learning.needs_review_notify);
+        // Spec 062 Phase 6a: label channel is additive, on by default.
+        assert!(cfg.learning.emit_labels);
     }
 
     #[test]

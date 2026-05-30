@@ -441,6 +441,24 @@ pub(crate) async fn handle_telegram_action_callback(
                 );
             }
         }
+
+        // Spec 062 Phase 6a: the operator's honeypot/block/monitor/ignore
+        // choice is a gold training label.
+        if cfg.learning.emit_labels {
+            let sample = crate::warden_labels::build_sample(
+                chrono::Utc::now(),
+                &choice.incident.host,
+                &choice.incident_id,
+                crate::learned_suppression::detector_of(&choice.incident_id),
+                Some(ip.as_str()),
+                &choice.incident.severity,
+                label_verdict(chosen),
+                crate::warden_labels::LabelSource::TelegramHoneypot,
+                &choice.incident.summary,
+            );
+            crate::warden_labels::append_label(data_dir, &sample, chrono::Utc::now());
+        }
+
         return true;
     }
 
@@ -646,11 +664,38 @@ pub(crate) async fn handle_telegram_action_callback(
             );
         }
 
+        // Spec 062 Phase 6a: an operator resolving a needs_review from the
+        // phone is a gold training label. Persist it to the warden corpus.
+        if cfg.learning.emit_labels {
+            let sample = crate::warden_labels::build_sample(
+                now,
+                &host,
+                &incident_id,
+                crate::learned_suppression::detector_of(&incident_id),
+                target_ip.as_deref(),
+                &incident.severity,
+                label_verdict(action_type),
+                crate::warden_labels::LabelSource::TelegramReview,
+                &incident.summary,
+            );
+            crate::warden_labels::append_label(data_dir, &sample, now);
+        }
+
         tg_reply(state, reply);
         return true;
     }
 
     false
+}
+
+/// Map a decision `action_type` to the warden-corpus verdict vocabulary
+/// (`block` | `ignore` | `dismiss` | `monitor` | `honeypot` | `suppress`).
+/// `block_ip` collapses to `block`; everything else passes through.
+fn label_verdict(action_type: &str) -> &str {
+    match action_type {
+        "block_ip" => "block",
+        other => other,
+    }
 }
 
 /// Handle standard pending confirmations (approve/reject/always) that come from
