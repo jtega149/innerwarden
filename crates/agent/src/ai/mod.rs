@@ -122,6 +122,29 @@ impl AiAction {
             AiAction::Dismiss { .. } => "dismiss",
         }
     }
+
+    /// Spec 062 Phase 5: is this a high-impact enforcement action whose
+    /// blast radius warrants a human veto when the deciding model is not
+    /// confident? These cut real access — block traffic, suspend a user's
+    /// sudo, kill a user's processes, pause a container, or run the
+    /// kill-chain response (kill + block C2 + forensics). A wrong
+    /// autonomous call here is operator-visible and disruptive.
+    ///
+    /// Soft actions (`Monitor` / `Dismiss` / `Ignore` /
+    /// `RequestConfirmation`) and the low-blast `Honeypot` deception are
+    /// NOT high-impact — they pass through without the confidence gate.
+    /// Mirrors the "com peso, confirma" weight split that learned
+    /// suppression uses ([`crate::learned_suppression::ACTIONED_TYPES`]).
+    pub fn is_high_impact(&self) -> bool {
+        matches!(
+            self,
+            AiAction::BlockIp { .. }
+                | AiAction::SuspendUserSudo { .. }
+                | AiAction::KillProcess { .. }
+                | AiAction::BlockContainer { .. }
+                | AiAction::KillChainResponse { .. }
+        )
+    }
 }
 
 impl AiDecision {

@@ -297,6 +297,79 @@ fn find_process_comm_by_pid(graph: &KnowledgeGraph, pid: u32) -> Option<String> 
     None
 }
 
+/// Spec 062 Phase 5 — pure `needs_human` veto predicate for an LLM
+/// escalation decision. Returns true when the action is HIGH-IMPACT
+/// (block_ip / suspend_user / kill_process / block_container, per
+/// [`crate::ai::AiAction::is_high_impact`]) AND the model's confidence is
+/// below `min_conf`. Soft / low-blast actions never trip it, and a
+/// confident high-impact call passes through. Free of I/O so every branch
+/// (action class × confidence boundary) is unit-testable.
+fn llm_escalation_needs_human(
+    action: &crate::ai::AiAction,
+    confidence: f32,
+    min_conf: f32,
+) -> bool {
+    action.is_high_impact() && confidence < min_conf
+}
+
+/// Spec 062 Phase 5 — build the `needs_review` decision entry for a
+/// high-impact LLM escalation that fell below the confidence floor. Pure
+/// (no I/O). Mirrors [`needs_review_entry`] but carries the would-be
+/// action + the deciding LLM in the reason so the operator sees exactly
+/// what was deferred and why. `auto_executed = false`,
+/// `execution_result = "awaiting_human"`, `decision_layer =
+/// "observation_verifier"` — the same lifecycle Phase 1 / Phase 2 sweep
+/// and the dashboard already understand.
+fn escalation_needs_review_entry(
+    incident: &innerwarden_core::incident::Incident,
+    provider_name: &str,
+    decision: &crate::ai::AiDecision,
+    min_conf: f32,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::decisions::DecisionEntry {
+    // Prefer the action's own target IP (the IP the LLM wanted to act on);
+    // fall back to the incident's primary IP entity. AiDecision has no
+    // target accessor, so read it off the action variant directly.
+    let target_ip = match &decision.action {
+        crate::ai::AiAction::BlockIp { ip, .. }
+        | crate::ai::AiAction::Monitor { ip }
+        | crate::ai::AiAction::Honeypot { ip } => Some(ip.clone()),
+        _ => incident
+            .entities
+            .iter()
+            .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+            .map(|e| e.value.clone()),
+    };
+    crate::decisions::DecisionEntry {
+        ts: now,
+        incident_id: incident.incident_id.clone(),
+        host: incident.host.clone(),
+        ai_provider: "needs-review".to_string(),
+        action_type: "needs_review".to_string(),
+        target_ip,
+        target_user: None,
+        skill_id: None,
+        confidence: decision.confidence,
+        auto_executed: false,
+        dry_run: false,
+        reason: format!(
+            "High-impact action '{}' proposed by the escalation LLM ({}) at \
+             confidence {:.2}, below the {:.2} floor. Deferred to human review \
+             instead of auto-executing (Spec 062 Phase 5 needs_human veto). \
+             LLM rationale: {}",
+            decision.action.name(),
+            provider_name,
+            decision.confidence,
+            min_conf,
+            decision.reason,
+        ),
+        estimated_threat: decision.estimated_threat.clone(),
+        execution_result: "awaiting_human".to_string(),
+        prev_hash: None,
+        decision_layer: Some("observation_verifier".to_string()),
+    }
+}
+
 /// Promote an escalated incident into the Fase 4 decide() + execute path
 /// (spec 028-b full wiring). Called only when the
 /// `incident_flow.escalate_to_decide` feature flag is enabled.
@@ -328,7 +401,20 @@ async fn promote_escalated_to_decision(
     //
     // Spec 029 PR-C.2: this is the Decide role (the escalate-to-decide
     // wiring from 028-b), so route through the capability router.
-    let Some(provider) = state.ai_router.provider_for(crate::ai::Capability::Decide) else {
+    //
+    // Spec 062 Phase 5: this path runs ONLY on incidents the fast-path
+    // warden could not resolve (they were parked as `escalate`). Prefer
+    // the LLM for the second-opinion Decide via `escalation_decider()` —
+    // `provider_for(Decide)` would hand it back to the same warden, which
+    // is why the configured Azure LLM recorded zero decisions in prod.
+    // Gated by `[learning] llm_escalation_enabled` (default true) as a
+    // no-redeploy kill switch; when off, keep the legacy Decide routing.
+    let provider = if cfg.learning.llm_escalation_enabled {
+        state.ai_router.escalation_decider()
+    } else {
+        state.ai_router.provider_for(crate::ai::Capability::Decide)
+    };
+    let Some(provider) = provider else {
         tracing::debug!(
             incident_id,
             "028-b: no Decide provider configured, leaving escalated in graph"
@@ -411,6 +497,62 @@ async fn promote_escalated_to_decision(
     state
         .telemetry
         .observe_ai_decision(&decision.action, latency_ms);
+
+    // 3b. Spec 062 Phase 5 — needs_human veto. If the escalation LLM
+    //     chose a HIGH-IMPACT action (block_ip / suspend_user /
+    //     kill_process / block_container) but is below the configured
+    //     confidence floor, do NOT auto-execute: park it in `needs_review`
+    //     for the operator (Phase 1 lifecycle). "Com peso, confirma."
+    //     Soft / low-blast actions and confident calls fall through to the
+    //     normal execute path unchanged. Skipped entirely when the LLM
+    //     escalation routing is disabled (then there is no LLM second
+    //     opinion to second-guess).
+    if cfg.learning.llm_escalation_enabled
+        && llm_escalation_needs_human(
+            &decision.action,
+            decision.confidence,
+            cfg.learning.llm_escalation_min_confidence,
+        )
+    {
+        let now = chrono::Utc::now();
+        let entry = escalation_needs_review_entry(
+            &incident,
+            provider_name,
+            &decision,
+            cfg.learning.llm_escalation_min_confidence,
+            now,
+        );
+        if let Some(writer) = &mut state.decision_writer {
+            if let Err(e) = writer.write(&entry) {
+                tracing::warn!(
+                    incident_id,
+                    error = %e,
+                    "062-p5: failed to write needs_review veto decision"
+                );
+            }
+        }
+        {
+            let mut graph = state.knowledge_graph.write().unwrap();
+            graph.ingest_decision(
+                incident_id,
+                "needs_review",
+                entry.target_ip.as_deref(),
+                decision.confidence,
+                &entry.reason,
+                false,
+                now,
+            );
+        }
+        tracing::info!(
+            incident_id,
+            provider_name,
+            action = decision.action.name(),
+            confidence = decision.confidence,
+            "062-p5: high-impact LLM escalation below confidence floor — \
+             deferred to human (needs_review) instead of auto-executing"
+        );
+        return;
+    }
 
     // 4. Reuse the existing post-decision safeguards so that
     //    already-blocked IPs, below-threshold confidence, and other fast-
@@ -958,6 +1100,192 @@ use chrono::Timelike;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Spec 062 Phase 5: needs_human veto ──────────────────────────────
+
+    fn p5_decision(action: crate::ai::AiAction, confidence: f32) -> crate::ai::AiDecision {
+        crate::ai::AiDecision {
+            action,
+            confidence,
+            auto_execute: true,
+            reason: "test rationale".to_string(),
+            alternatives: vec![],
+            estimated_threat: "high".to_string(),
+        }
+    }
+
+    #[test]
+    fn needs_human_vetoes_low_confidence_high_impact() {
+        use crate::ai::AiAction;
+        assert!(llm_escalation_needs_human(
+            &AiAction::BlockIp {
+                ip: "203.0.113.7".into(),
+                skill_id: "block-ip-ufw".into(),
+            },
+            0.60,
+            0.75
+        ));
+        assert!(llm_escalation_needs_human(
+            &AiAction::KillProcess {
+                user: "mallory".into(),
+                duration_secs: 0,
+            },
+            0.0,
+            0.75
+        ));
+        assert!(llm_escalation_needs_human(
+            &AiAction::SuspendUserSudo {
+                user: "mallory".into(),
+                duration_secs: 3600,
+            },
+            0.74,
+            0.75
+        ));
+        assert!(llm_escalation_needs_human(
+            &AiAction::BlockContainer {
+                container_id: "abc".into(),
+                action: "pause".into(),
+            },
+            0.10,
+            0.75
+        ));
+        assert!(llm_escalation_needs_human(
+            &AiAction::KillChainResponse {
+                reason: "c2".into(),
+            },
+            0.50,
+            0.75
+        ));
+    }
+
+    #[test]
+    fn needs_human_passes_confident_high_impact() {
+        use crate::ai::AiAction;
+        assert!(!llm_escalation_needs_human(
+            &AiAction::BlockIp {
+                ip: "203.0.113.7".into(),
+                skill_id: "block-ip-ufw".into(),
+            },
+            0.75,
+            0.75
+        ));
+        assert!(!llm_escalation_needs_human(
+            &AiAction::BlockIp {
+                ip: "203.0.113.7".into(),
+                skill_id: "block-ip-ufw".into(),
+            },
+            0.99,
+            0.75
+        ));
+    }
+
+    #[test]
+    fn needs_human_never_vetoes_soft_or_low_blast_actions() {
+        use crate::ai::AiAction;
+        let soft = [
+            AiAction::Monitor {
+                ip: "203.0.113.7".into(),
+            },
+            AiAction::Dismiss {
+                reason: "noise".into(),
+            },
+            AiAction::Ignore {
+                reason: "noise".into(),
+            },
+            AiAction::Honeypot {
+                ip: "203.0.113.7".into(),
+            },
+            AiAction::RequestConfirmation {
+                summary: "?".into(),
+            },
+        ];
+        for action in soft {
+            assert!(
+                !llm_escalation_needs_human(&action, 0.0, 0.75),
+                "{} must never trip the needs_human veto",
+                action.name()
+            );
+        }
+    }
+
+    #[test]
+    fn escalation_needs_review_entry_has_lifecycle_fields() {
+        use crate::ai::AiAction;
+        use innerwarden_core::entities::EntityRef;
+        let inc = innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "host-1".into(),
+            incident_id: "imds_ssrf:203.0.113.7:now".into(),
+            severity: innerwarden_core::event::Severity::Medium,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::Value::Null,
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("203.0.113.7")],
+        };
+        let decision = p5_decision(
+            AiAction::BlockIp {
+                ip: "203.0.113.7".into(),
+                skill_id: "block-ip-ufw".into(),
+            },
+            0.60,
+        );
+        let entry = escalation_needs_review_entry(
+            &inc,
+            "azure_openai",
+            &decision,
+            0.75,
+            chrono::Utc::now(),
+        );
+        assert_eq!(entry.action_type, "needs_review");
+        assert_eq!(entry.ai_provider, "needs-review");
+        assert!(!entry.auto_executed);
+        assert_eq!(entry.execution_result, "awaiting_human");
+        assert_eq!(
+            entry.decision_layer.as_deref(),
+            Some("observation_verifier")
+        );
+        assert_eq!(entry.target_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(entry.host, "host-1");
+        assert!(entry.reason.contains("block_ip"));
+        assert!(entry.reason.contains("azure_openai"));
+        assert!(entry.reason.contains("0.75"));
+    }
+
+    #[test]
+    fn escalation_needs_review_entry_falls_back_to_incident_ip_for_non_ip_action() {
+        use crate::ai::AiAction;
+        use innerwarden_core::entities::EntityRef;
+        let inc = innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            incident_id: "x:1".into(),
+            severity: innerwarden_core::event::Severity::Medium,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::Value::Null,
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("198.51.100.5")],
+        };
+        let decision = p5_decision(
+            AiAction::KillProcess {
+                user: "mallory".into(),
+                duration_secs: 0,
+            },
+            0.40,
+        );
+        let entry = escalation_needs_review_entry(
+            &inc,
+            "azure_openai",
+            &decision,
+            0.75,
+            chrono::Utc::now(),
+        );
+        assert_eq!(entry.target_ip.as_deref(), Some("198.51.100.5"));
+        assert!(entry.reason.contains("kill_process"));
+    }
 
     #[test]
     fn ambiguous_item_captures_fields() {

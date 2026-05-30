@@ -1927,6 +1927,27 @@ pub struct LearningConfig {
     /// learned-suppression dismissals are excluded from the count.
     #[serde(default = "default_learned_min_dismissals")]
     pub min_dismissals: u64,
+
+    /// Spec 062 Phase 5 — route escalated (warden-unresolved) incidents to
+    /// the LLM for a second-opinion Decide. Default `true`: when an
+    /// `[ai.llm]` provider is configured it now decides the ambiguous
+    /// escalations the local warden parked, instead of the warden being
+    /// asked twice (the production bug where the configured Azure LLM
+    /// recorded zero decisions). With no LLM configured this is a no-op —
+    /// the escalation falls back to whatever Decide provider exists, exactly
+    /// as before. Set `false` as a kill switch without a redeploy.
+    #[serde(default = "default_true")]
+    pub llm_escalation_enabled: bool,
+
+    /// Spec 062 Phase 5 — confidence floor below which a HIGH-IMPACT LLM
+    /// escalation action (block_ip / suspend_user_sudo / kill_process /
+    /// block_container / kill_chain_response) is NOT auto-executed but
+    /// deferred to a human via `needs_review`. "Com peso, confirma" applied
+    /// to the LLM: a confident high-impact call executes; an unsure one
+    /// waits for the operator. Soft actions (monitor / dismiss / ignore /
+    /// honeypot / request_confirmation) are never gated. Default 0.75.
+    #[serde(default = "default_llm_escalation_min_confidence")]
+    pub llm_escalation_min_confidence: f32,
 }
 
 fn default_learned_suppression_mode() -> String {
@@ -1937,11 +1958,17 @@ fn default_learned_min_dismissals() -> u64 {
     5
 }
 
+fn default_llm_escalation_min_confidence() -> f32 {
+    0.75
+}
+
 impl Default for LearningConfig {
     fn default() -> Self {
         Self {
             suppression_mode: default_learned_suppression_mode(),
             min_dismissals: default_learned_min_dismissals(),
+            llm_escalation_enabled: default_true(),
+            llm_escalation_min_confidence: default_llm_escalation_min_confidence(),
         }
     }
 }
@@ -4613,6 +4640,9 @@ enabled = true
         let cfg: AgentConfig = toml::from_str("").expect("empty config is valid");
         assert_eq!(cfg.learning.suppression_mode, "shadow");
         assert_eq!(cfg.learning.min_dismissals, 5);
+        // Spec 062 Phase 5 defaults: LLM escalation on, 0.75 confidence floor.
+        assert!(cfg.learning.llm_escalation_enabled);
+        assert!((cfg.learning.llm_escalation_min_confidence - 0.75).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -4621,6 +4651,18 @@ enabled = true
         let cfg: AgentConfig = toml::from_str(src).expect("learning section parses");
         assert_eq!(cfg.learning.suppression_mode, "enforce");
         assert_eq!(cfg.learning.min_dismissals, 10);
+        // Phase 5 fields keep their defaults when omitted.
+        assert!(cfg.learning.llm_escalation_enabled);
+    }
+
+    #[test]
+    fn learning_section_parses_phase5_overrides() {
+        let src = "[learning]\nllm_escalation_enabled = false\n\
+                   llm_escalation_min_confidence = 0.9\n";
+        let cfg: AgentConfig = toml::from_str(src).expect("phase5 learning parses");
+        assert!(!cfg.learning.llm_escalation_enabled);
+        assert!((cfg.learning.llm_escalation_min_confidence - 0.9).abs() < f32::EPSILON);
+        assert_eq!(cfg.learning.suppression_mode, "shadow");
     }
 
     #[test]

@@ -157,6 +157,39 @@ impl AiRouter {
         self.provider_for(Capability::Decide)
     }
 
+    /// Spec 062 Phase 5: provider for an *escalated* Decide.
+    ///
+    /// The escalation path (`promote_escalated_to_decision`) runs ONLY on
+    /// incidents the fast-path Decide provider (typically the local warden
+    /// classifier) could not resolve — they were parked as `escalate`. A
+    /// second opinion from the heavier LLM is exactly what is wanted, so
+    /// this PREFERS the llm slot for Decide, falling back to the
+    /// classifier slot, then `None`. Contrast [`provider_for`] with
+    /// `Capability::Decide`, which prefers the classifier (the cheap
+    /// hot-path) and is why a configured-but-secondary LLM recorded zero
+    /// decisions in production (the warden always won the Decide role).
+    ///
+    /// Back-compat: a legacy single-`[ai]` config puts the same provider
+    /// in both slots, so this returns that provider — identical to the
+    /// pre-Phase-5 path. Behaviour changes only when the operator runs
+    /// distinct warden + llm providers (the production shape), where
+    /// escalations now reach the LLM.
+    ///
+    /// [`provider_for`]: Self::provider_for
+    pub fn escalation_decider(&self) -> Option<Arc<dyn AiProvider>> {
+        if let Some(l) = &self.llm {
+            if l.capabilities().has(Capability::Decide) {
+                return Some(Arc::clone(l));
+            }
+        }
+        if let Some(c) = &self.classifier {
+            if c.capabilities().has(Capability::Decide) {
+                return Some(Arc::clone(c));
+            }
+        }
+        None
+    }
+
     /// Convenience: provider for any of the free-form text roles.
     /// Returns the first populated among Generate, Explain,
     /// SimulateShell. Useful for telemetry and health checks.
@@ -510,6 +543,68 @@ mod tests {
         );
         let r = AiRouter::new(Some(c), None).unwrap();
         assert!(r.provider_for(Capability::Generate).is_none());
+    }
+
+    // ── escalation_decider (spec 062 Phase 5) ───────────────────────────
+
+    #[test]
+    fn escalation_decider_prefers_llm_over_classifier() {
+        // Production shape: warden in classifier slot, azure in llm slot,
+        // both declare Decide. The hot path (provider_for Decide) gives
+        // the warden; escalation must give the LLM (the second opinion).
+        let warden = arc(
+            "warden",
+            AiCapabilities::from_slice(&[Capability::Decide, Capability::Classify]),
+        );
+        let azure = arc("azure", AiCapabilities::ALL);
+        let r = AiRouter::new(Some(warden), Some(azure)).unwrap();
+        assert_eq!(
+            r.provider_for(Capability::Decide).unwrap().name(),
+            "warden",
+            "hot path stays on the cheap classifier"
+        );
+        assert_eq!(
+            r.escalation_decider().unwrap().name(),
+            "azure",
+            "escalation must reach the LLM, fixing the azure-0-decisions bug"
+        );
+    }
+
+    #[test]
+    fn escalation_decider_falls_back_to_classifier_when_no_llm() {
+        let warden = arc(
+            "warden",
+            AiCapabilities::from_slice(&[Capability::Decide, Capability::Classify]),
+        );
+        let r = AiRouter::new(Some(warden), None).unwrap();
+        assert_eq!(r.escalation_decider().unwrap().name(), "warden");
+    }
+
+    #[test]
+    fn escalation_decider_back_compat_same_provider_both_slots() {
+        // Legacy single-[ai] config → same provider in both slots → no
+        // behaviour change vs pre-Phase-5.
+        let single = arc("legacy", AiCapabilities::ALL);
+        let r = AiRouter::new(Some(Arc::clone(&single)), Some(single)).unwrap();
+        assert_eq!(r.escalation_decider().unwrap().name(), "legacy");
+    }
+
+    #[test]
+    fn escalation_decider_none_when_disabled() {
+        assert!(AiRouter::disabled().escalation_decider().is_none());
+    }
+
+    #[test]
+    fn escalation_decider_skips_llm_that_lacks_decide() {
+        // An llm slot that somehow does not declare Decide must not be
+        // chosen; fall through to the classifier.
+        let llm_no_decide = arc(
+            "gen-only",
+            AiCapabilities::from_slice(&[Capability::Generate]),
+        );
+        let warden = arc("warden", AiCapabilities::from_slice(&[Capability::Decide]));
+        let r = AiRouter::new(Some(warden), Some(llm_no_decide)).unwrap();
+        assert_eq!(r.escalation_decider().unwrap().name(), "warden");
     }
 
     #[test]
