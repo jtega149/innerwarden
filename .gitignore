@@ -46,3 +46,7 @@ specs/
 
 # graphify knowledge graph (local-only, regenerable)
 graphify-out/
+
+# Local-only security audit workspace (not for public repo)
+security-audit/
+sandcat.go-linux

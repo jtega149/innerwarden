@@ -25,6 +25,11 @@ pub struct AgentConfig {
     pub honeypot: HoneypotConfig,
     #[serde(default)]
     pub responder: ResponderConfig,
+    /// Spec 062: decision review + learned suppression. Absent `[learning]`
+    /// section deserializes to safe defaults (shadow mode), so existing
+    /// agent.toml files upgrade with no edits.
+    #[serde(default)]
+    pub learning: LearningConfig,
     /// Spec 056: SOC response playbooks. Default disabled so existing
     /// installs keep their current behaviour (playbooks load + list via CTL
     /// but the agent does not execute them on incidents) until the operator
@@ -1890,6 +1895,53 @@ impl Default for ResponderConfig {
             trusted_processes: default_trusted_processes(),
             max_blocks_per_hour: default_max_blocks_per_hour(),
             circuit_breaker_mode: default_circuit_breaker_mode(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Learning (spec 062 — decision review + learned suppression)
+// ---------------------------------------------------------------------------
+
+/// Spec 062 Phase 4 — learned-suppression knobs. An absent `[learning]`
+/// section deserializes to these defaults (shadow mode, N = 5) so existing
+/// agent.toml files upgrade cleanly with no edits — the spec's hard
+/// "no breakage" migration rule.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningConfig {
+    /// Learned-suppression mode: `"off"` | `"shadow"` | `"enforce"`.
+    /// Default `"shadow"`: the gate logs what it WOULD suppress to
+    /// `learned_suppression_shadow_<DATE>.jsonl` and changes nothing,
+    /// until the operator validates the numbers and promotes to
+    /// `"enforce"`. Unknown values collapse to `"shadow"` (see
+    /// `learned_suppression::parse_mode`), never silently to `"off"`.
+    #[serde(default = "default_learned_suppression_mode")]
+    pub suppression_mode: String,
+
+    /// Minimum GENUINE repeated dismissals of a `(detector | ip)` shape
+    /// before it becomes eligible for auto-suppression. Default 5 — above
+    /// the autofp *suggestion* threshold of 3 because this acts SILENTLY;
+    /// prod's top repeated shapes dwarf it (1105 / 456 / 82 dismissals),
+    /// so 5 catches all real noise with margin. orphan-recovery and prior
+    /// learned-suppression dismissals are excluded from the count.
+    #[serde(default = "default_learned_min_dismissals")]
+    pub min_dismissals: u64,
+}
+
+fn default_learned_suppression_mode() -> String {
+    "shadow".to_string()
+}
+
+fn default_learned_min_dismissals() -> u64 {
+    5
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            suppression_mode: default_learned_suppression_mode(),
+            min_dismissals: default_learned_min_dismissals(),
         }
     }
 }
@@ -4550,6 +4602,25 @@ enabled = true
             cfg.data.filestore_max_size_mb,
             default_data_filestore_max_size_mb()
         );
+    }
+
+    #[test]
+    fn learning_section_absent_uses_safe_defaults() {
+        // Spec 062 migration rule: an existing agent.toml with NO
+        // [learning] section must upgrade cleanly to shadow mode (no
+        // behaviour change) and N = 5 — never silently disabled, never
+        // enforcing by default. Repeats the [observation]-absent gap fix.
+        let cfg: AgentConfig = toml::from_str("").expect("empty config is valid");
+        assert_eq!(cfg.learning.suppression_mode, "shadow");
+        assert_eq!(cfg.learning.min_dismissals, 5);
+    }
+
+    #[test]
+    fn learning_section_parses_enforce_override() {
+        let src = "[learning]\nsuppression_mode = \"enforce\"\nmin_dismissals = 10\n";
+        let cfg: AgentConfig = toml::from_str(src).expect("learning section parses");
+        assert_eq!(cfg.learning.suppression_mode, "enforce");
+        assert_eq!(cfg.learning.min_dismissals, 10);
     }
 
     #[test]

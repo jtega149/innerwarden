@@ -82,6 +82,20 @@ pub struct DecisionRow {
     pub data: String,
 }
 
+/// Spec 062 Phase 4 — aggregate dismissal stats for a learned-suppression
+/// shape `(detector | target_ip)`. Returned by
+/// [`Store::shape_dismissal_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShapeDismissalStats {
+    /// `dismiss` decisions on this shape whose `ai_provider` is NOT in the
+    /// caller's exclusion list (orphan-recovery + learned-suppression).
+    pub genuine_dismissals: u64,
+    /// Decisions on this shape whose `action_type` is one of the caller's
+    /// "weighty" action types (block_ip / monitor / kill / ...). Any > 0
+    /// means the shape must never be auto-suppressed.
+    pub actioned: u64,
+}
+
 impl Store {
     /// Insert a decision with automatic hash chaining.
     ///
@@ -139,6 +153,81 @@ impl Store {
         let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Spec 062 Phase 4 — count repeated-dismissal stats for a
+    /// learned-suppression shape `(detector | target_ip)`.
+    ///
+    /// `detector_prefix` is matched against `incident_id` as
+    /// `"<detector_prefix>:%"` (incident ids are `detector:...`).
+    ///
+    /// - `genuine_dismissals`: `dismiss` decisions on this shape whose
+    ///   `ai_provider` is NOT in `excluded_providers`. The exclusion list
+    ///   removes the orphan-recovery silent-leak (counting it would
+    ///   launder the bug spec 062 fixes into "learning") and
+    ///   learned-suppression's own output (anti-loop). `ai_provider` lives
+    ///   inside the JSON `data` blob, not a column, so it is excluded via
+    ///   `data NOT LIKE '%"ai_provider":"<p>"%'`.
+    /// - `actioned`: decisions on this shape whose `action_type` is in
+    ///   `actioned_types` (block_ip / monitor / kill / ...). Any > 0 means
+    ///   the shape is "weighty" and must never auto-suppress.
+    ///
+    /// Both are indexed `COUNT(*)` queries scoped by `target_ip`
+    /// (`idx_decisions` on target via the action index + the small
+    /// per-IP candidate set keep them cheap even for the hottest shapes).
+    pub fn shape_dismissal_stats(
+        &self,
+        detector_prefix: &str,
+        target_ip: &str,
+        excluded_providers: &[&str],
+        actioned_types: &[&str],
+    ) -> Result<ShapeDismissalStats> {
+        let conn = self.conn()?;
+        let detector_like = format!("{detector_prefix}:%");
+
+        // ── genuine dismissals ──────────────────────────────────────────
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM decisions \
+             WHERE target_ip = ?1 AND incident_id LIKE ?2 AND action_type = 'dismiss'",
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(target_ip.to_string()),
+            Box::new(detector_like.clone()),
+        ];
+        for (i, p) in excluded_providers.iter().enumerate() {
+            sql.push_str(&format!(" AND data NOT LIKE ?{}", i + 3));
+            binds.push(Box::new(format!("%\"ai_provider\":\"{p}\"%")));
+        }
+        let genuine_dismissals: u64 = {
+            let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+            conn.query_row(&sql, refs.as_slice(), |r| r.get::<_, i64>(0))? as u64
+        };
+
+        // ── weighty (actioned) history ──────────────────────────────────
+        let actioned: u64 = if actioned_types.is_empty() {
+            0
+        } else {
+            let placeholders: Vec<String> = (0..actioned_types.len())
+                .map(|i| format!("?{}", i + 3))
+                .collect();
+            let sql2 = format!(
+                "SELECT COUNT(*) FROM decisions \
+                 WHERE target_ip = ?1 AND incident_id LIKE ?2 AND action_type IN ({})",
+                placeholders.join(", ")
+            );
+            let mut binds2: Vec<Box<dyn rusqlite::ToSql>> =
+                vec![Box::new(target_ip.to_string()), Box::new(detector_like)];
+            for t in actioned_types {
+                binds2.push(Box::new(t.to_string()));
+            }
+            let refs: Vec<&dyn rusqlite::ToSql> = binds2.iter().map(|b| b.as_ref()).collect();
+            conn.query_row(&sql2, refs.as_slice(), |r| r.get::<_, i64>(0))? as u64
+        };
+
+        Ok(ShapeDismissalStats {
+            genuine_dismissals,
+            actioned,
+        })
     }
 
     /// Get the hash of the last decision in the chain (None if empty).
@@ -1142,5 +1231,122 @@ mod tests {
             "hash chain must remain intact across concurrent IMMEDIATE inserts; broken_at = {:?}",
             result.broken_at
         );
+    }
+
+    // ── shape_dismissal_stats (spec 062 Phase 4) ────────────────────────
+
+    fn seed_shape(store: &Store, incident_id: &str, ip: &str, action: &str, provider: &str) {
+        let data = serde_json::json!({ "ai_provider": provider }).to_string();
+        store
+            .insert_decision(&DecisionRow {
+                ts: "2026-05-30T00:00:00Z".to_string(),
+                incident_id: incident_id.to_string(),
+                action_type: action.to_string(),
+                target_ip: Some(ip.to_string()),
+                target_user: None,
+                confidence: 1.0,
+                auto_executed: true,
+                reason: None,
+                data,
+            })
+            .unwrap();
+    }
+
+    const EXCL: &[&str] = &["orphan-recovery", "learned-suppression"];
+    const ACTED: &[&str] = &["block_ip", "monitor", "kill_process"];
+
+    #[test]
+    fn shape_dismissal_stats_counts_genuine_dismissals() {
+        let store = Store::open_memory().unwrap();
+        let ip = "169.254.169.254";
+        for i in 0..7 {
+            seed_shape(
+                &store,
+                &format!("imds_ssrf:{ip}:{i}"),
+                ip,
+                "dismiss",
+                "noise-gate",
+            );
+        }
+        let s = store
+            .shape_dismissal_stats("imds_ssrf", ip, EXCL, ACTED)
+            .unwrap();
+        assert_eq!(s.genuine_dismissals, 7);
+        assert_eq!(s.actioned, 0);
+    }
+
+    #[test]
+    fn shape_dismissal_stats_excludes_orphan_recovery_and_self() {
+        let store = Store::open_memory().unwrap();
+        let ip = "169.254.169.254";
+        seed_shape(&store, "imds_ssrf:x:1", ip, "dismiss", "noise-gate");
+        seed_shape(&store, "imds_ssrf:x:2", ip, "dismiss", "orphan-recovery");
+        seed_shape(
+            &store,
+            "imds_ssrf:x:3",
+            ip,
+            "dismiss",
+            "learned-suppression",
+        );
+        let s = store
+            .shape_dismissal_stats("imds_ssrf", ip, EXCL, ACTED)
+            .unwrap();
+        // Only the noise-gate dismissal counts; leak + own output excluded.
+        assert_eq!(s.genuine_dismissals, 1);
+    }
+
+    #[test]
+    fn shape_dismissal_stats_counts_actioned_history() {
+        let store = Store::open_memory().unwrap();
+        let ip = "203.0.113.5";
+        seed_shape(&store, "port_scan:x:1", ip, "dismiss", "noise-gate");
+        seed_shape(&store, "port_scan:x:2", ip, "block_ip", "manual");
+        seed_shape(&store, "port_scan:x:3", ip, "monitor", "manual");
+        let s = store
+            .shape_dismissal_stats("port_scan", ip, EXCL, ACTED)
+            .unwrap();
+        assert_eq!(s.genuine_dismissals, 1);
+        assert_eq!(s.actioned, 2);
+    }
+
+    #[test]
+    fn shape_dismissal_stats_scopes_by_detector_and_ip() {
+        let store = Store::open_memory().unwrap();
+        let ip = "169.254.169.254";
+        seed_shape(&store, "imds_ssrf:x:1", ip, "dismiss", "noise-gate");
+        // Same IP, different detector — must NOT count for imds_ssrf.
+        seed_shape(&store, "reverse_shell:x:1", ip, "dismiss", "noise-gate");
+        // Same detector, different IP — must NOT count.
+        seed_shape(&store, "imds_ssrf:y:1", "8.8.8.8", "dismiss", "noise-gate");
+        let s = store
+            .shape_dismissal_stats("imds_ssrf", ip, EXCL, ACTED)
+            .unwrap();
+        assert_eq!(s.genuine_dismissals, 1);
+    }
+
+    #[test]
+    fn shape_dismissal_stats_empty_actioned_list_returns_zero_actioned() {
+        let store = Store::open_memory().unwrap();
+        let ip = "203.0.113.9";
+        seed_shape(&store, "port_scan:x:1", ip, "block_ip", "manual");
+        let s = store
+            .shape_dismissal_stats("port_scan", ip, EXCL, &[])
+            .unwrap();
+        assert_eq!(
+            s.actioned, 0,
+            "empty actioned_types must short-circuit to 0"
+        );
+    }
+
+    #[test]
+    fn shape_dismissal_stats_no_exclusions_counts_everything() {
+        let store = Store::open_memory().unwrap();
+        let ip = "169.254.169.254";
+        seed_shape(&store, "imds_ssrf:x:1", ip, "dismiss", "orphan-recovery");
+        seed_shape(&store, "imds_ssrf:x:2", ip, "dismiss", "noise-gate");
+        let s = store
+            .shape_dismissal_stats("imds_ssrf", ip, &[], ACTED)
+            .unwrap();
+        assert_eq!(s.genuine_dismissals, 2);
     }
 }

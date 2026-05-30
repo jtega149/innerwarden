@@ -377,6 +377,18 @@ pub(crate) async fn process_incidents(
             continue;
         }
 
+        // Spec 062 Phase 4 — learned suppression (weight-aware,
+        // LLM-optional). Runs after the targeted FP helpers + kg-fp so the
+        // genuine-dismissal count reflects everything they resolved. Only
+        // Low/Medium shapes with N+ genuine dismissals and zero weighty
+        // history are auto-dismissed; orphan-recovery + own output are
+        // excluded from the count (anti-laundering). Default shadow:
+        // logs would-suppress, changes nothing until operator promotes.
+        if try_learned_suppression(incident, cfg, state, data_dir) {
+            handled += 1;
+            continue;
+        }
+
         // VirusTotal enrichment: when YARA scanner detects a binary, check its
         // SHA-256 hash against VT. Result logged for operator context.
         if incident.incident_id.starts_with("yara_scan:") {
@@ -931,6 +943,111 @@ async fn drain_playbook_commands(
 /// `enforce` mode). Returns `false` for shadow / off / pass-through.
 /// Critical floor is enforced inside `kg_fp_suppression::classify`
 /// — Critical incidents NEVER reach the suppress branch.
+/// Spec 062 Phase 4 — learned suppression (weight-aware, LLM-optional).
+/// Mirrors `try_kg_fp_suppression`'s shadow/enforce wiring. Runs AFTER the
+/// targeted FP helpers + kg-fp so its genuine-dismissal count reflects
+/// everything those paths resolved. Full policy + anti-laundering rules
+/// live in `crate::learned_suppression`.
+fn try_learned_suppression(
+    incident: &innerwarden_core::incident::Incident,
+    cfg: &crate::config::AgentConfig,
+    state: &mut crate::AgentState,
+    data_dir: &Path,
+) -> bool {
+    use crate::learned_suppression::{
+        detector_of, evaluate, parse_mode, primary_ip, severity_label, suppression_reason,
+        write_shadow_log, LearnedVerdict, ShadowLogRecord, SuppressionMode,
+        SUPPRESSION_AI_PROVIDER,
+    };
+
+    let mode = parse_mode(&cfg.learning.suppression_mode);
+    if matches!(mode, SuppressionMode::Off) {
+        return false;
+    }
+    // Clone the Arc so the read-only store borrow does not conflict with
+    // the `&mut state` writes in the enforce branch below.
+    let Some(store) = state.sqlite_store.clone() else {
+        return false;
+    };
+    let verdict = evaluate(&store, incident, cfg.learning.min_dismissals);
+    let LearnedVerdict::Suppress { dismissals } = verdict else {
+        return false;
+    };
+
+    let now = chrono::Utc::now();
+    let detector = detector_of(&incident.incident_id).to_string();
+    let ip = primary_ip(incident).unwrap_or_default();
+
+    match mode {
+        // Unreachable (handled above) but keeps the match exhaustive.
+        SuppressionMode::Off => false,
+        SuppressionMode::Shadow => {
+            let record = ShadowLogRecord {
+                ts: now.to_rfc3339(),
+                incident_id: incident.incident_id.clone(),
+                detector,
+                target_ip: ip,
+                severity: severity_label(&incident.severity).to_string(),
+                genuine_dismissals: dismissals,
+                threshold: cfg.learning.min_dismissals,
+                would_suppress: true,
+            };
+            write_shadow_log(data_dir, &record, now);
+            tracing::info!(
+                incident_id = %incident.incident_id,
+                dismissals,
+                "learned-suppression: shadow — would have suppressed"
+            );
+            false
+        }
+        SuppressionMode::Enforce => {
+            let reason =
+                suppression_reason(&detector, &ip, dismissals, cfg.learning.min_dismissals);
+            let entry = crate::decisions::DecisionEntry {
+                ts: now,
+                incident_id: incident.incident_id.clone(),
+                host: incident.host.clone(),
+                ai_provider: SUPPRESSION_AI_PROVIDER.to_string(),
+                action_type: "dismiss".to_string(),
+                target_ip: if ip.is_empty() {
+                    None
+                } else {
+                    Some(ip.clone())
+                },
+                target_user: None,
+                skill_id: None,
+                confidence: 1.0,
+                auto_executed: true,
+                dry_run: false,
+                reason: reason.clone(),
+                estimated_threat: "none".to_string(),
+                execution_result: "dismissed".to_string(),
+                prev_hash: None,
+                decision_layer: Some("auto_rule".to_string()),
+            };
+            if let Some(writer) = &mut state.decision_writer {
+                if let Err(e) = writer.write(&entry) {
+                    tracing::warn!("failed to write learned-suppression dismiss: {e:#}");
+                    return false;
+                }
+            }
+            {
+                let mut graph = state.knowledge_graph.write().unwrap();
+                graph.ingest_decision(
+                    &incident.incident_id,
+                    "dismiss",
+                    None,
+                    1.0,
+                    &reason,
+                    true,
+                    now,
+                );
+            }
+            true
+        }
+    }
+}
+
 fn try_kg_fp_suppression(
     incident: &innerwarden_core::incident::Incident,
     cfg: &crate::config::AgentConfig,
@@ -1524,5 +1641,126 @@ mod tests {
             !handled,
             "enforce mode must NOT suppress when likelihood is below threshold"
         );
+    }
+
+    // ── try_learned_suppression wiring (spec 062 Phase 4) ───────────────
+
+    fn ls_seed_dismiss(store: &innerwarden_store::Store, id: &str, ip: &str, provider: &str) {
+        let data = serde_json::json!({ "ai_provider": provider }).to_string();
+        store
+            .insert_decision(&innerwarden_store::decisions::DecisionRow {
+                ts: chrono::Utc::now().to_rfc3339(),
+                incident_id: id.to_string(),
+                action_type: "dismiss".to_string(),
+                target_ip: Some(ip.to_string()),
+                target_user: None,
+                confidence: 1.0,
+                auto_executed: true,
+                reason: None,
+                data,
+            })
+            .unwrap();
+    }
+
+    fn ls_low_incident(detector: &str, ip: &str) -> innerwarden_core::incident::Incident {
+        use innerwarden_core::entities::EntityRef;
+        innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "h".to_string(),
+            incident_id: format!("{detector}:{ip}:now"),
+            severity: innerwarden_core::event::Severity::Low,
+            title: "t".to_string(),
+            summary: "s".to_string(),
+            evidence: serde_json::json!([]),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip(ip)],
+        }
+    }
+
+    #[test]
+    fn try_learned_suppression_off_mode_is_noop() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let ip = "169.254.169.254";
+        for i in 0..10 {
+            ls_seed_dismiss(&store, &format!("imds_ssrf:{ip}:{i}"), ip, "noise-gate");
+        }
+        state.sqlite_store = Some(store);
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.learning.suppression_mode = "off".to_string();
+        let inc = ls_low_incident("imds_ssrf", ip);
+        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
+    }
+
+    #[test]
+    fn try_learned_suppression_shadow_logs_but_passes_through() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let ip = "169.254.169.254";
+        for i in 0..6 {
+            ls_seed_dismiss(&store, &format!("imds_ssrf:{ip}:{i}"), ip, "noise-gate");
+        }
+        state.sqlite_store = Some(store);
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.learning.suppression_mode = "shadow".to_string();
+        cfg.learning.min_dismissals = 5;
+        let inc = ls_low_incident("imds_ssrf", ip);
+        // Shadow never handles (returns false) but MUST write a shadow log.
+        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
+        let logged = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("learned_suppression_shadow_")
+            });
+        assert!(logged, "shadow mode must write a shadow log file");
+    }
+
+    #[test]
+    fn try_learned_suppression_enforce_writes_dismiss() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let ip = "169.254.169.254";
+        for i in 0..6 {
+            ls_seed_dismiss(&store, &format!("imds_ssrf:{ip}:{i}"), ip, "noise-gate");
+        }
+        state.sqlite_store = Some(store);
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.learning.suppression_mode = "enforce".to_string();
+        cfg.learning.min_dismissals = 5;
+        let inc = ls_low_incident("imds_ssrf", ip);
+        assert!(try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
+    }
+
+    #[test]
+    fn try_learned_suppression_enforce_passes_through_below_threshold() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let ip = "169.254.169.254";
+        ls_seed_dismiss(&store, "imds_ssrf:x:1", ip, "noise-gate");
+        state.sqlite_store = Some(store);
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.learning.suppression_mode = "enforce".to_string();
+        cfg.learning.min_dismissals = 5;
+        let inc = ls_low_incident("imds_ssrf", ip);
+        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
+    }
+
+    #[test]
+    fn try_learned_suppression_no_store_returns_false() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.sqlite_store = None;
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.learning.suppression_mode = "enforce".to_string();
+        let inc = ls_low_incident("imds_ssrf", "169.254.169.254");
+        assert!(!try_learned_suppression(&inc, &cfg, &mut state, dir.path()));
     }
 }

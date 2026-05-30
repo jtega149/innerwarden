@@ -127,6 +127,7 @@ mod kg_decide_features;
 mod kg_fp_suppression;
 mod killchain_inline;
 mod knowledge_graph;
+mod learned_suppression;
 mod loops;
 mod lsm_policy;
 mod mesh;
