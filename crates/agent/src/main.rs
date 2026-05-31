@@ -307,6 +307,19 @@ struct Cli {
     #[arg(long)]
     retrain_anomaly: bool,
 
+    /// Offline backtest: train the autoencoder on events BEFORE
+    /// `--backtest-cutoff`, score the held-out events after it, and report
+    /// whether the host-anomaly score separates incidents the agent acted on
+    /// (real) from ones it dismissed (false positive). Measures if the
+    /// autoencoder would help if it acted — no training leakage. Then exits.
+    #[arg(long)]
+    backtest_anomaly: bool,
+
+    /// Cutoff date (YYYY-MM-DD) for `--backtest-anomaly`: events before it
+    /// train the model, events on/after it are the held-out scoring period.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    backtest_cutoff: Option<String>,
+
     /// Parse `--config <path>` against the strict AgentConfig schema, print a
     /// short OK summary on success or the parse error on failure, then exit
     /// without booting the agent. Used by `innerwarden config validate` and

@@ -161,6 +161,161 @@ pub(crate) fn run_retrain_anomaly(cli: &crate::Cli) -> Result<()> {
     Ok(())
 }
 
+/// Offline autoencoder backtest (`innerwarden-agent --backtest-anomaly`).
+/// Reads events + decisions from the data dir, splits at the cutoff, and prints
+/// whether the host-anomaly score separates real (acted) incidents from
+/// dismissed (FP) ones. See `neural_lifecycle::run_anomaly_backtest`.
+pub(crate) fn run_backtest_anomaly(cli: &crate::Cli) -> Result<()> {
+    let store = innerwarden_store::Store::open(&cli.data_dir)
+        .map_err(|e| anyhow::anyhow!("open store: {e:#}"))?;
+
+    // Events → BacktestEvent (ts, kind, identity tokens for novelty detection).
+    let rows = store
+        .events_since(0, 5_000_000)
+        .map_err(|e| anyhow::anyhow!("read events: {e:#}"))?;
+    let mut events: Vec<neural_lifecycle::BacktestEvent> = rows
+        .into_iter()
+        .map(|(_, e)| {
+            let mut tokens = Vec::new();
+            let d = &e.details;
+            let comm = d.get("comm").and_then(|v| v.as_str());
+            if let Some(c) = comm {
+                tokens.push(format!("comm:{c}"));
+            }
+            if let Some(dst) = d
+                .get("dst_ip")
+                .or_else(|| d.get("src_ip"))
+                .and_then(|v| v.as_str())
+            {
+                tokens.push(format!("dst:{dst}"));
+            }
+            if let (Some(pc), Some(c)) = (d.get("parent_comm").and_then(|v| v.as_str()), comm) {
+                tokens.push(format!("lin:{pc}>{c}"));
+            }
+            neural_lifecycle::BacktestEvent::new(e.ts, &e.kind, tokens)
+        })
+        .collect();
+    events.sort_by_key(|e| e.ts);
+    if events.len() < 200 {
+        anyhow::bail!("only {} events in store — need more history", events.len());
+    }
+
+    // Decisions: (ts, action_type) from every decisions-*.jsonl.
+    let mut decisions: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&cli.data_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("decisions-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            for line in content.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let (Some(ts), Some(action)) = (
+                    v.get("ts").and_then(|x| x.as_str()),
+                    v.get("action_type").and_then(|x| x.as_str()),
+                ) else {
+                    continue;
+                };
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                    decisions.push((dt.with_timezone(&chrono::Utc), action.to_string()));
+                }
+            }
+        }
+    }
+
+    // Cutoff: explicit `--backtest-cutoff YYYY-MM-DD`, else 70% of the event
+    // time-span (70% train / 30% held-out scoring).
+    let (min_ts, max_ts) = (events.first().unwrap().ts, events.last().unwrap().ts);
+    let cutoff = match cli.backtest_cutoff.as_deref() {
+        Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .map_err(|e| anyhow::anyhow!("bad --backtest-cutoff: {e}"))?
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc(),
+        None => min_ts + (max_ts - min_ts) * 7 / 10,
+    };
+
+    println!("=== autoencoder backtest ===");
+    println!(
+        "  events           : {} ({}  ..  {})",
+        events.len(),
+        min_ts.format("%Y-%m-%d %H:%M"),
+        max_ts.format("%Y-%m-%d %H:%M")
+    );
+    println!("  cutoff           : {}", cutoff.to_rfc3339());
+
+    // Run BOTH variants so the novelty feature's effect is directly comparable.
+    for use_novelty in [false, true] {
+        let report =
+            neural_lifecycle::run_anomaly_backtest(&events, &decisions, cutoff, use_novelty)
+                .map_err(|e| anyhow::anyhow!("backtest: {e}"))?;
+        let label = if use_novelty {
+            "WITH novelty features"
+        } else {
+            "plain (event-kind only)"
+        };
+        println!("\n  --- {label} ---");
+        println!(
+            "  train/scored windows : {} / {}",
+            report.train_windows, report.scored_windows
+        );
+        let sep = report.real_mean_score - report.fp_mean_score;
+        println!(
+            "  decision sep         : real {:.3} vs FP {:.3}  = {sep:+.3} ({})",
+            report.real_mean_score,
+            report.fp_mean_score,
+            if sep.abs() <= 0.03 {
+                "flat"
+            } else if sep > 0.0 {
+                "real higher"
+            } else {
+                "inverted"
+            }
+        );
+        // The guard-dog metric: do the LOUDEST barks point at genuine novelty?
+        let nov_sep = report.novelty_mean_score - report.seen_mean_score;
+        println!(
+            "  novelty windows      : {} of {} scored ({:.1}%)",
+            report.novelty_windows,
+            report.scored_windows,
+            100.0 * report.novelty_windows as f64 / report.scored_windows.max(1) as f64
+        );
+        println!(
+            "  novelty vs seen score: novel {:.3} vs seen {:.3} = {nov_sep:+.3} ({})",
+            report.novelty_mean_score,
+            report.seen_mean_score,
+            if nov_sep > 0.05 {
+                "BARKS LOUDER on novelty — guard-dog signal"
+            } else if nov_sep.abs() <= 0.05 {
+                "flat — novelty doesn't bark louder"
+            } else {
+                "inverted"
+            }
+        );
+        let base_rate = 100.0 * report.novelty_windows as f64 / report.scored_windows.max(1) as f64;
+        let top_rate =
+            100.0 * report.top1pct_on_novelty as f64 / report.top1pct_count.max(1) as f64;
+        println!(
+            "  top-1% loudest barks : {} of {} are on novel windows ({:.1}% vs {:.1}% base rate — {})",
+            report.top1pct_on_novelty,
+            report.top1pct_count,
+            top_rate,
+            base_rate,
+            if top_rate > base_rate * 1.5 {
+                "concentrated on novelty ✓"
+            } else {
+                "no better than chance"
+            }
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn cleanup_015_backup_path(snapshot_path: &Path, stamp: &str) -> PathBuf {
     snapshot_path.with_extension(format!("json.bak-015-{stamp}"))
 }
@@ -364,6 +519,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
     if cli.retrain_anomaly {
         return run_retrain_anomaly(&cli);
+    }
+
+    if cli.backtest_anomaly {
+        return run_backtest_anomaly(&cli);
     }
 
     if cli.report {
@@ -2780,6 +2939,8 @@ mod tests {
             cleanup_015_graph_signal_quality: false,
             backfill_015_research_only: false,
             retrain_anomaly: false,
+            backtest_anomaly: false,
+            backtest_cutoff: None,
             validate_config_only: false,
         }
     }
@@ -4091,6 +4252,8 @@ mod heap_budget {
             cleanup_015_graph_signal_quality: false,
             backfill_015_research_only: false,
             retrain_anomaly: false,
+            backtest_anomaly: false,
+            backtest_cutoff: None,
         }
     }
 

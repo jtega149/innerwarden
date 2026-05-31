@@ -769,6 +769,294 @@ pub(crate) fn percentile_score(mse: f32, anchors: &[f32]) -> Option<f32> {
     Some(0.99 + 0.01 * ((mse - max) / scale).tanh())
 }
 
+/// Offline backtest: would the autoencoder have helped?
+///
+/// Trains a FRESH model on events BEFORE `cutoff`, then scores the held-out
+/// events AFTER it (the model never saw them — no training leakage, the one
+/// thing that makes a naive replay lie). The autoencoder scores the HOST's
+/// event stream (is the host behaving anomalously right now?), not a single
+/// attacker, so each scored window is joined to the operator-facing decisions
+/// by TIME: the host-anomaly score around incidents the agent ACTED on
+/// (block/monitor/… = treated as real) vs ones it DISMISSED (dismiss/ignore =
+/// false positive). If real-incident times score materially higher than FP
+/// times, the autoencoder carries signal worth acting on; if they overlap, it
+/// does not on this host's traffic and acting on it would mostly add false
+/// blocks.
+#[derive(Debug, Clone)]
+pub struct AnomalyBacktestReport {
+    pub cutoff: String,
+    pub use_novelty: bool,
+    pub train_windows: usize,
+    pub scored_windows: usize,
+    // Decision-separation (does the bark line up with real-vs-FP?).
+    pub real_decisions: usize,
+    pub fp_decisions: usize,
+    pub real_mean_score: f64,
+    pub fp_mean_score: f64,
+    pub sweep: Vec<(f64, usize, usize)>,
+    // Guard-dog metric (does the LOUD bark point at genuine novelty?).
+    pub novelty_windows: usize,
+    pub novelty_mean_score: f64,
+    pub seen_mean_score: f64,
+    pub top1pct_count: usize,
+    pub top1pct_on_novelty: usize,
+}
+
+/// One backtest event: timestamp, event-kind index, and the identity tokens
+/// (`comm:`, `dst:`, `lin:`) used for first-ever novelty detection.
+pub struct BacktestEvent {
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub kind: Option<usize>,
+    pub tokens: Vec<String>,
+}
+
+impl BacktestEvent {
+    /// Build from a raw event kind string + identity tokens (`comm:`/`dst:`/`lin:`).
+    pub fn new(ts: chrono::DateTime<chrono::Utc>, kind: &str, tokens: Vec<String>) -> Self {
+        Self {
+            ts,
+            kind: kind_index(kind),
+            tokens,
+        }
+    }
+}
+
+/// Action types that mean the agent treated the incident as a real threat.
+const BACKTEST_REAL_ACTIONS: &[&str] = &[
+    "block_ip",
+    "monitor",
+    "honeypot",
+    "kill_process",
+    "suspend_user_sudo",
+    "block_container",
+];
+
+/// Number of novelty features appended when `use_novelty` is on:
+/// fraction of events in the window whose comm / dst / lineage was never seen
+/// in the training period. Zero in training (everything's been seen), spikes
+/// on first-ever behavior at inference — so the autoencoder fires on the
+/// genuinely NEW, not on a burst of known events.
+const NOVELTY_FEATURES: usize = 3;
+
+fn novelty_window_features(
+    window: &[&BacktestEvent],
+    seen_comm: &std::collections::HashSet<String>,
+    seen_dst: &std::collections::HashSet<String>,
+    seen_lin: &std::collections::HashSet<String>,
+) -> (f32, f32, f32) {
+    let n = window.len().max(1) as f32;
+    let mut nc = 0.0;
+    let mut nd = 0.0;
+    let mut nl = 0.0;
+    for ev in window {
+        let mut has_new_c = false;
+        let mut has_new_d = false;
+        let mut has_new_l = false;
+        for t in &ev.tokens {
+            if let Some(v) = t.strip_prefix("comm:") {
+                if !seen_comm.contains(v) {
+                    has_new_c = true;
+                }
+            } else if let Some(v) = t.strip_prefix("dst:") {
+                if !seen_dst.contains(v) {
+                    has_new_d = true;
+                }
+            } else if let Some(v) = t.strip_prefix("lin:") {
+                if !seen_lin.contains(v) {
+                    has_new_l = true;
+                }
+            }
+        }
+        if has_new_c {
+            nc += 1.0;
+        }
+        if has_new_d {
+            nd += 1.0;
+        }
+        if has_new_l {
+            nl += 1.0;
+        }
+    }
+    (nc / n, nd / n, nl / n)
+}
+
+pub fn run_anomaly_backtest(
+    bt_events: &[BacktestEvent],
+    decisions: &[(chrono::DateTime<chrono::Utc>, String)],
+    cutoff: chrono::DateTime<chrono::Utc>,
+    use_novelty: bool,
+) -> Result<AnomalyBacktestReport, String> {
+    use std::collections::HashSet;
+
+    let extra = if use_novelty { NOVELTY_FEATURES } else { 0 };
+    let feat_len = NUM_FEATURES + extra;
+
+    // Training seen-sets of identity tokens (only from events before cutoff).
+    let mut seen_comm: HashSet<String> = HashSet::new();
+    let mut seen_dst: HashSet<String> = HashSet::new();
+    let mut seen_lin: HashSet<String> = HashSet::new();
+    for ev in bt_events.iter().filter(|e| e.ts < cutoff) {
+        for t in &ev.tokens {
+            if let Some(v) = t.strip_prefix("comm:") {
+                seen_comm.insert(v.to_string());
+            } else if let Some(v) = t.strip_prefix("dst:") {
+                seen_dst.insert(v.to_string());
+            } else if let Some(v) = t.strip_prefix("lin:") {
+                seen_lin.insert(v.to_string());
+            }
+        }
+    }
+
+    // Build a feature vector for a window of events.
+    let build_feat = |win: &[&BacktestEvent]| -> Vec<f32> {
+        let kinds: Vec<Option<usize>> = win.iter().map(|e| e.kind).collect();
+        let mut f = window_features(&kinds);
+        if use_novelty {
+            let (nc, nd, nl) = novelty_window_features(win, &seen_comm, &seen_dst, &seen_lin);
+            f.push(nc);
+            f.push(nd);
+            f.push(nl);
+        }
+        f
+    };
+
+    // --- TRAIN windows (events before cutoff). ---
+    let train_ev: Vec<&BacktestEvent> = bt_events.iter().filter(|e| e.ts < cutoff).collect();
+    let mut train_features: Vec<Vec<f32>> = Vec::new();
+    {
+        let mut i = 0;
+        while i + WINDOW_SIZE <= train_ev.len() {
+            train_features.push(build_feat(&train_ev[i..i + WINDOW_SIZE]));
+            i += 5;
+        }
+    }
+    if train_features.len() < 100 {
+        return Err(format!(
+            "not enough train windows: {} (need 100+)",
+            train_features.len()
+        ));
+    }
+
+    let split = TrainTestSplit::from_fraction(train_features.len(), 0.2);
+    let (train_idx, holdout_idx) = split.indices();
+    let base_idx: &[usize] = if holdout_idx.is_empty() {
+        &train_idx
+    } else {
+        &holdout_idx
+    };
+
+    let mut net = AutoencoderNet::new(&[feat_len, 16, 8, 16, feat_len], 0.001);
+    for _ in 0..50 {
+        for &i in &train_idx {
+            net.train_reconstruction(&train_features[i]);
+        }
+    }
+    let (_mse, _std, anchors) = compute_baseline(&net, &train_features, base_idx);
+    if !anchors.iter().any(|&a| a > 0.0) {
+        return Err("degenerate baseline".into());
+    }
+
+    // --- Score HELD-OUT windows (events on/after cutoff). ---
+    let hold_ev: Vec<&BacktestEvent> = bt_events.iter().filter(|e| e.ts >= cutoff).collect();
+    // (ts, score, contains_first_ever_entity)
+    let mut scored: Vec<(chrono::DateTime<chrono::Utc>, f64, bool)> = Vec::new();
+    {
+        let mut i = 0;
+        while i + WINDOW_SIZE <= hold_ev.len() {
+            let win = &hold_ev[i..i + WINDOW_SIZE];
+            let f = build_feat(win);
+            let mse = net.reconstruction_error(&f);
+            let score = percentile_score(mse, &anchors).unwrap_or(0.0) as f64;
+            let novel = win.iter().any(|e| {
+                e.tokens.iter().any(|t| {
+                    if let Some(v) = t.strip_prefix("comm:") {
+                        !seen_comm.contains(v)
+                    } else if let Some(v) = t.strip_prefix("dst:") {
+                        !seen_dst.contains(v)
+                    } else if let Some(v) = t.strip_prefix("lin:") {
+                        !seen_lin.contains(v)
+                    } else {
+                        false
+                    }
+                })
+            });
+            let end_ts = win.last().map(|e| e.ts).unwrap_or(cutoff);
+            scored.push((end_ts, score, novel));
+            i += 1;
+        }
+    }
+    if scored.is_empty() {
+        return Err("no held-out windows scored".into());
+    }
+
+    // --- Decision separation. ---
+    let nearest = |ts: chrono::DateTime<chrono::Utc>| -> Option<f64> {
+        scored
+            .iter()
+            .min_by_key(|(t, _, _)| (*t - ts).num_seconds().abs())
+            .map(|(_, s, _)| *s)
+    };
+    let mut real: Vec<f64> = Vec::new();
+    let mut fp: Vec<f64> = Vec::new();
+    for (ts, action) in decisions.iter().filter(|(t, _)| *t >= cutoff) {
+        let Some(score) = nearest(*ts) else { continue };
+        if BACKTEST_REAL_ACTIONS.contains(&action.as_str()) {
+            real.push(score);
+        } else if action == "dismiss" || action == "ignore" {
+            fp.push(score);
+        }
+    }
+    let mean = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
+    let mut sweep = Vec::new();
+    for t in [0.5_f64, 0.6, 0.7, 0.75, 0.8, 0.9] {
+        sweep.push((
+            t,
+            real.iter().filter(|&&s| s >= t).count(),
+            fp.iter().filter(|&&s| s >= t).count(),
+        ));
+    }
+
+    // --- Guard-dog novelty metric. ---
+    let novelty_scores: Vec<f64> = scored
+        .iter()
+        .filter(|(_, _, n)| *n)
+        .map(|(_, s, _)| *s)
+        .collect();
+    let seen_scores: Vec<f64> = scored
+        .iter()
+        .filter(|(_, _, n)| !*n)
+        .map(|(_, s, _)| *s)
+        .collect();
+    // Top 1% loudest barks → how many are on a genuinely novel window?
+    let mut by_score: Vec<&(chrono::DateTime<chrono::Utc>, f64, bool)> = scored.iter().collect();
+    by_score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top_n = (scored.len() / 100).max(1);
+    let top1pct_on_novelty = by_score.iter().take(top_n).filter(|(_, _, n)| *n).count();
+
+    Ok(AnomalyBacktestReport {
+        cutoff: cutoff.to_rfc3339(),
+        use_novelty,
+        train_windows: train_features.len(),
+        scored_windows: scored.len(),
+        real_decisions: real.len(),
+        fp_decisions: fp.len(),
+        real_mean_score: mean(&real),
+        fp_mean_score: mean(&fp),
+        sweep,
+        novelty_windows: novelty_scores.len(),
+        novelty_mean_score: mean(&novelty_scores),
+        seen_mean_score: mean(&seen_scores),
+        top1pct_count: top_n,
+        top1pct_on_novelty,
+    })
+}
+
 impl Default for AnomalyConfig {
     fn default() -> Self {
         Self {
@@ -2000,6 +2288,105 @@ mod tests {
             "clamp must preserve at least half for training"
         );
         assert!(!holdout.is_empty());
+    }
+
+    fn bt_ev(secs: i64, kind: &str, tokens: &[&str]) -> BacktestEvent {
+        let ts = chrono::DateTime::from_timestamp(secs, 0).expect("valid ts");
+        BacktestEvent::new(ts, kind, tokens.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn novelty_window_features_counts_first_ever_fraction() {
+        use std::collections::HashSet;
+        let seen_comm: HashSet<String> = ["nginx".to_string()].into_iter().collect();
+        let seen_dst: HashSet<String> = HashSet::new();
+        let seen_lin: HashSet<String> = HashSet::new();
+        let evs = vec![
+            bt_ev(0, "shell.command_exec", &["comm:nginx"]), // known comm
+            bt_ev(1, "shell.command_exec", &["comm:evil"]),  // first-ever comm
+            bt_ev(2, "network.outbound_connect", &["dst:1.2.3.4"]), // first-ever dst
+            bt_ev(3, "process.clone", &["lin:nginx>sh"]),    // first-ever lineage
+        ];
+        let win: Vec<&BacktestEvent> = evs.iter().collect();
+        let (nc, nd, nl) = novelty_window_features(&win, &seen_comm, &seen_dst, &seen_lin);
+        // 1 of 4 events has a novel comm, 1 of 4 a novel dst, 1 of 4 a novel lineage.
+        assert!((nc - 0.25).abs() < 1e-6, "novel comm fraction: {nc}");
+        assert!((nd - 0.25).abs() < 1e-6, "novel dst fraction: {nd}");
+        assert!((nl - 0.25).abs() < 1e-6, "novel lineage fraction: {nl}");
+    }
+
+    #[test]
+    fn run_anomaly_backtest_detects_held_out_novelty() {
+        // 700 known-comm events before cutoff (enough for 100+ train windows),
+        // then 300 after cutoff where half introduce a first-ever comm. The
+        // backtest must train cleanly and flag the held-out novelty windows.
+        let kinds = [
+            "shell.command_exec",
+            "network.outbound_connect",
+            "file.read_access",
+            "process.clone",
+        ];
+        let mut evs = Vec::new();
+        for i in 0..700i64 {
+            let k = kinds[(i % 4) as usize];
+            evs.push(bt_ev(
+                i,
+                k,
+                &["comm:nginx", "dst:10.0.0.1", "lin:systemd>nginx"],
+            ));
+        }
+        for i in 0..300i64 {
+            let k = kinds[(i % 4) as usize];
+            if i % 2 == 0 {
+                // first-ever comm only appears after the cutoff → genuine novelty
+                evs.push(bt_ev(1000 + i, k, &["comm:cryptominer", "dst:10.0.0.1"]));
+            } else {
+                evs.push(bt_ev(1000 + i, k, &["comm:nginx", "dst:10.0.0.1"]));
+            }
+        }
+        let cutoff = chrono::DateTime::from_timestamp(700, 0).unwrap();
+        let decisions = vec![
+            (
+                chrono::DateTime::from_timestamp(1100, 0).unwrap(),
+                "block_ip".to_string(),
+            ),
+            (
+                chrono::DateTime::from_timestamp(1150, 0).unwrap(),
+                "dismiss".to_string(),
+            ),
+        ];
+
+        let r = run_anomaly_backtest(&evs, &decisions, cutoff, true).expect("backtest runs");
+        assert!(r.use_novelty);
+        assert!(r.train_windows >= 100, "train windows: {}", r.train_windows);
+        assert!(r.scored_windows > 0, "scored windows: {}", r.scored_windows);
+        assert!(
+            r.novelty_windows > 0,
+            "held-out novelty must be detected, got {}",
+            r.novelty_windows
+        );
+        assert_eq!(r.top1pct_count, (r.scored_windows / 100).max(1));
+        // Decision joining wired up: at least the block_ip mapped to a real score.
+        assert!(
+            r.real_decisions >= 1,
+            "real decisions: {}",
+            r.real_decisions
+        );
+
+        // Without novelty features the report still runs (smaller feature vector).
+        let r0 = run_anomaly_backtest(&evs, &decisions, cutoff, false).expect("no-novelty runs");
+        assert!(!r0.use_novelty);
+        assert!(r0.scored_windows > 0);
+    }
+
+    #[test]
+    fn run_anomaly_backtest_errors_when_too_few_train_windows() {
+        let evs: Vec<BacktestEvent> = (0..50i64)
+            .map(|i| bt_ev(i, "shell.command_exec", &["comm:nginx"]))
+            .collect();
+        let cutoff = chrono::DateTime::from_timestamp(40, 0).unwrap();
+        let err = run_anomaly_backtest(&evs, &[], cutoff, true).expect_err("too few windows");
+        assert!(err.contains("not enough train windows"), "err: {err}");
     }
 
     #[test]
