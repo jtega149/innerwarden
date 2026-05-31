@@ -2418,6 +2418,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         ) {
                             // Backfill enrichment for profiles missing GeoIP/AbuseIPDB
                             incident_enrichment::backfill_enrichment(&mut state).await;
+                            // DShield (ISC) community reputation — opt-in, read-only.
+                            incident_enrichment::dshield_backfill(
+                                &mut state,
+                                cfg.dshield.enabled,
+                            )
+                            .await;
                             // Scan honeypot sessions for known attacker IPs
                             scan_honeypot_for_profiles(
                                 &cli.data_dir,

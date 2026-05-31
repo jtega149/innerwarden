@@ -59,6 +59,8 @@ pub struct AgentConfig {
     pub crowdsec: CrowdSecConfig,
     #[serde(default)]
     pub abuseipdb: AbuseIpDbConfig,
+    #[serde(default)]
+    pub dshield: DshieldConfig,
     /// Deprecated 2026-05-07: the agent's fail2ban sync was removed
     /// (see PR #486). The field is preserved here so existing
     /// operator `agent.toml` files with a `[fail2ban]` section
@@ -3108,6 +3110,21 @@ impl Default for AbuseIpDbConfig {
             report_daily_cap: default_abuseipdb_report_daily_cap(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DShield (SANS Internet Storm Center) — read-only community enrichment
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DshieldConfig {
+    /// Enable DShield (ISC) IP reputation enrichment (default: false).
+    /// Keyless, read-only — attacker IPs get the community's global attack
+    /// history + threat-feed membership alongside AbuseIPDB / CrowdSec.
+    /// Opt-in like every other external-call enrichment.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 fn default_abuseipdb_max_age_days() -> u32 {

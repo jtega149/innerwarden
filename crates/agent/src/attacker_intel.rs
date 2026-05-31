@@ -38,6 +38,11 @@ pub struct AttackerProfile {
     pub abuseipdb_score: Option<u8>,
     pub crowdsec_listed: bool,
     pub is_tor: bool,
+    /// DShield (SANS ISC) community reputation, when `[dshield] enabled`.
+    /// `#[serde(default)]` so profiles persisted before this field upgrade
+    /// cleanly (deserialize to `None`).
+    #[serde(default)]
+    pub dshield: Option<crate::dshield::DshieldReputation>,
 
     // ── Timeline / Recurrence ──
     pub first_seen: DateTime<Utc>,
@@ -157,6 +162,7 @@ pub fn new_profile(ip: &str, ts: DateTime<Utc>) -> AttackerProfile {
         abuseipdb_score: None,
         crowdsec_listed: false,
         is_tor: false,
+        dshield: None,
         first_seen: ts,
         last_seen: ts,
         visit_count: 0,

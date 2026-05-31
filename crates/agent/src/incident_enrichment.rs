@@ -8,6 +8,8 @@ const GEOIP_CACHE_NS: &str = "geoip_cache";
 const ABUSEIPDB_CACHE_NS: &str = "abuseipdb_cache";
 /// Namespace for daily API call counters.
 const ABUSEIPDB_LIMITS_NS: &str = "abuseipdb_limits";
+/// Namespace for cached DShield (ISC) reputation results.
+const DSHIELD_CACHE_NS: &str = "dshield_cache";
 /// Max API calls per day (free tier = 1000; reserve 200 for ad-hoc checks).
 const ABUSEIPDB_DAILY_LIMIT: u32 = 800;
 /// Cache TTL: 24 hours.
@@ -304,6 +306,75 @@ pub(crate) async fn backfill_enrichment(state: &mut AgentState) {
     );
 }
 
+/// DShield (SANS ISC) community enrichment pass — read-only, keyless.
+///
+/// Isolated from the AbuseIPDB-coupled `backfill_enrichment`: DShield needs no
+/// API key and is generous on rate, so this just batches a few attacker
+/// profiles that have no DShield data yet, looks them up cache-first, and
+/// attaches the community attack history + threat-feed membership. Gated by
+/// `[dshield] enabled` (opt-in like every external-call enrichment). A failed
+/// lookup leaves the profile untouched — never blocks anything.
+pub(crate) async fn dshield_backfill(state: &mut AgentState, enabled: bool) {
+    const BATCH_SIZE: usize = 5;
+    if !enabled {
+        return;
+    }
+
+    let candidates: Vec<String> = state
+        .attacker_profiles
+        .iter()
+        .filter(|(ip, p)| p.dshield.is_none() && is_ip_eligible_for_external_enrichment(ip))
+        .map(|(ip, _)| ip.clone())
+        .take(BATCH_SIZE)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+
+    let client = crate::dshield::DshieldClient::new();
+    for ip in candidates {
+        // Cache-first (survives restarts).
+        let cached: Option<crate::dshield::DshieldReputation> = state
+            .sqlite_store
+            .as_ref()
+            .and_then(|sq| sq.kv_get_str(DSHIELD_CACHE_NS, &ip).ok().flatten())
+            .and_then(|j| serde_json::from_str(&j).ok());
+
+        let rep = match cached {
+            Some(c) => {
+                debug!(ip = %ip, "dshield: using cached reputation");
+                c
+            }
+            None => match client.lookup(&ip).await {
+                Some(r) => {
+                    if let Some(sq) = state.sqlite_store.as_ref() {
+                        let expiry = (chrono::Utc::now()
+                            + chrono::Duration::hours(CACHE_TTL_HOURS))
+                        .to_rfc3339();
+                        if let Ok(j) = serde_json::to_string(&r) {
+                            let _ = sq.kv_set_with_expiry(
+                                DSHIELD_CACHE_NS,
+                                &ip,
+                                j.as_bytes(),
+                                Some(&expiry),
+                            );
+                        }
+                    }
+                    r
+                }
+                None => continue,
+            },
+        };
+
+        if rep.is_known_attacker() {
+            info!(ip = %ip, "{}", rep.as_context_line());
+        }
+        if let Some(p) = state.attacker_profiles.get_mut(&ip) {
+            p.dshield = Some(rep);
+        }
+    }
+}
+
 // Extracted pure logic for testing
 pub(crate) fn is_ip_eligible_for_external_enrichment(ip: &str) -> bool {
     match ip.parse::<std::net::IpAddr>() {
@@ -515,6 +586,89 @@ mod tests {
         let profile = state.attacker_profiles.get(ip).expect("profile preserved");
         assert!(profile.geo.is_none(), "no client must skip enrichment");
         assert!(profile.abuseipdb_score.is_none());
+    }
+
+    #[tokio::test]
+    async fn dshield_backfill_is_noop_when_disabled() {
+        // Opt-in: with [dshield] enabled=false the pass touches nothing and
+        // makes no external call.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let ip = "8.8.8.8";
+        state.attacker_profiles.insert(
+            ip.to_string(),
+            attacker_intel::new_profile(ip, chrono::Utc::now()),
+        );
+
+        dshield_backfill(&mut state, false).await;
+
+        assert!(
+            state.attacker_profiles.get(ip).unwrap().dshield.is_none(),
+            "disabled DShield must not enrich"
+        );
+    }
+
+    #[tokio::test]
+    async fn dshield_backfill_applies_cached_reputation_without_network() {
+        // Cache-hit path: a DShield reputation already in SQLite is applied to
+        // the profile with NO external call. Exercises the dominant runtime
+        // branch (cache, deserialize, set profile, context line).
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let ip = "45.33.32.156";
+        let rep = crate::dshield::DshieldReputation {
+            reports: 999,
+            targets: 42,
+            last_seen: Some("2026-05-30".to_string()),
+            as_number: Some("4134".to_string()),
+            as_name: Some("CHINANET".to_string()),
+            as_country: Some("CN".to_string()),
+            network: Some("45.33.32.0/24".to_string()),
+            threatfeeds: vec!["sansoc".to_string()],
+        };
+        let expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        store
+            .kv_set_with_expiry(
+                DSHIELD_CACHE_NS,
+                ip,
+                serde_json::to_string(&rep).unwrap().as_bytes(),
+                Some(&expiry),
+            )
+            .unwrap();
+        state.sqlite_store = Some(store);
+        state.attacker_profiles.insert(
+            ip.to_string(),
+            attacker_intel::new_profile(ip, chrono::Utc::now()),
+        );
+
+        dshield_backfill(&mut state, true).await;
+
+        let got = state.attacker_profiles.get(ip).unwrap().dshield.as_ref();
+        assert_eq!(got, Some(&rep), "cached DShield reputation must be applied");
+    }
+
+    #[tokio::test]
+    async fn dshield_backfill_skips_private_ips() {
+        // Even enabled, a private/loopback IP is never sent to ISC — the
+        // candidate filter drops it before any network call.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        for ip in ["10.0.0.5", "127.0.0.1", "192.168.1.9"] {
+            state.attacker_profiles.insert(
+                ip.to_string(),
+                attacker_intel::new_profile(ip, chrono::Utc::now()),
+            );
+        }
+
+        dshield_backfill(&mut state, true).await;
+
+        for ip in ["10.0.0.5", "127.0.0.1", "192.168.1.9"] {
+            assert!(
+                state.attacker_profiles.get(ip).unwrap().dshield.is_none(),
+                "private IP must be skipped"
+            );
+        }
     }
 
     #[tokio::test]

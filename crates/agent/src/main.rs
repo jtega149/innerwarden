@@ -89,6 +89,7 @@ mod decision_honeypot;
 mod decision_skill_actions;
 mod decisions;
 mod dna_inline;
+mod dshield;
 mod environment_profile;
 mod firmware_tick;
 mod fleet;

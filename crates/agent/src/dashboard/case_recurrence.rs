@@ -182,6 +182,7 @@ mod tests {
             abuseipdb_score: None,
             crowdsec_listed: false,
             is_tor: false,
+            dshield: None,
             first_seen: Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
             last_seen: Utc.with_ymd_and_hms(2026, 5, 12, 0, 0, 0).unwrap(),
             visit_count,
