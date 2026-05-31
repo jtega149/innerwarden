@@ -16,6 +16,15 @@ const STANDARD_RESOLVERS: &[&str] = &[
 /// Cloud/infrastructure domains that should NOT trigger DNS tunneling alerts.
 /// These generate high volume legitimate queries from servers.
 const DNS_ALLOWED_DOMAINS: &[&str] = &[
+    // Cloud-provider INTERNAL/VCN DNS suffixes. These resolve the host's own
+    // infra (instance hostnames, metadata, VM-to-VM). The provider controls
+    // the zone, so an attacker cannot tunnel data through it. Verified on prod
+    // 2026-05-31: `oraclevcn.com` was the #2 false-positive source (144/day).
+    "oraclevcn.com",         // Oracle Cloud VCN internal DNS
+    "ec2.internal",          // AWS EC2 internal
+    "compute.internal",      // AWS VPC internal
+    "internal.cloudapp.net", // Azure internal
+    "google.internal",       // GCP internal
     "oraclecloud.com",
     "oracle.com",
     "amazonaws.com",
@@ -57,6 +66,13 @@ const DNS_ALLOWED_COMMS: &[&str] = &[
     "dnsmasq",      // DNS forwarder
     "snapd",        // Snap daemon — resolves snap store and update servers
 ];
+
+/// True if `domain` is exactly `base` or a true subdomain of it (`*.base`).
+/// Avoids the bare-`ends_with` trap where `evil-oraclevcn.com` would match
+/// `oraclevcn.com`. `domain` is expected already lowercased.
+fn domain_matches_suffix(domain: &str, base: &str) -> bool {
+    domain == base || domain.ends_with(&format!(".{base}"))
+}
 
 /// Detects DNS tunneling patterns from native DNS query capture and eBPF connect events.
 ///
@@ -148,11 +164,14 @@ impl DnsTunnelingDetector {
     /// Process dns.query events from dns_capture collector.
     /// Same analysis as the DNS capture path: entropy, volume, length.
     fn process_dns_query(&mut self, event: &Event, domain: &str, src_ip: &str) -> Option<Incident> {
-        // Skip cloud/infrastructure domains
+        // Skip cloud/infrastructure domains. Match on a DOT boundary so a
+        // look-alike registrable domain like `evil-oraclevcn.com` does NOT get
+        // allowlisted by a bare suffix match — only the exact domain or a true
+        // subdomain (`*.oraclevcn.com`) is trusted.
         let lower_domain = domain.to_lowercase();
         if DNS_ALLOWED_DOMAINS
             .iter()
-            .any(|d| lower_domain.ends_with(d))
+            .any(|d| domain_matches_suffix(&lower_domain, d))
         {
             return None;
         }
@@ -611,6 +630,50 @@ mod tests {
         // Normal subdomain: low entropy
         let inc = det.process(&dns_event("10.0.0.5", "www.example.com", now));
         assert!(inc.is_none());
+    }
+
+    #[test]
+    fn cloud_internal_vcn_dns_is_silent() {
+        // The prod 2026-05-31 #2 FP: high-entropy queries to *.oraclevcn.com.
+        // That zone is Oracle-controlled (the host resolving its own VCN
+        // infra), not tunneling — must be silent despite high entropy.
+        let mut det = DnsTunnelingDetector::new("test", 4.0, 15, 100, 60);
+        let now = Utc::now();
+        let inc = det.process(&dns_event(
+            "10.0.0.5",
+            "a1b2c3d4e5f6g7h8i9j0k1.subnet07.oraclevcn.com",
+            now,
+        ));
+        assert!(inc.is_none(), "*.oraclevcn.com is the host's own cloud DNS");
+    }
+
+    #[test]
+    fn lookalike_cloud_domain_still_fires() {
+        // SECURITY: a registrable look-alike `evil-oraclevcn.com` must NOT be
+        // allowlisted by the suffix — the dot-boundary match rejects it, so
+        // real tunneling through a spoof domain is still caught.
+        let mut det = DnsTunnelingDetector::new("test", 4.0, 15, 100, 60);
+        let now = Utc::now();
+        let inc = det.process(&dns_event(
+            "10.0.0.5",
+            "a1b2c3d4e5f6g7h8i9j0k1.evil-oraclevcn.com",
+            now,
+        ));
+        assert!(inc.is_some(), "look-alike domain must not be trusted");
+    }
+
+    #[test]
+    fn domain_matches_suffix_requires_dot_boundary() {
+        assert!(domain_matches_suffix("oraclevcn.com", "oraclevcn.com"));
+        assert!(domain_matches_suffix(
+            "x.subnet.oraclevcn.com",
+            "oraclevcn.com"
+        ));
+        assert!(!domain_matches_suffix(
+            "evil-oraclevcn.com",
+            "oraclevcn.com"
+        ));
+        assert!(!domain_matches_suffix("notoraclevcn.com", "oraclevcn.com"));
     }
 
     #[test]
