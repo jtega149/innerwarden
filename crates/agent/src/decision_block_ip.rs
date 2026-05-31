@@ -165,6 +165,28 @@ pub(crate) async fn execute_block_ip_decision(
         return (reason, false);
     }
 
+    // Redundant re-block guard. If this IP already has a live (TTL-valid)
+    // firewall block, the rule is already in effect — re-running the block
+    // path re-adds an existing ufw/XDP rule every time a correlation rule
+    // (multi-technique), repeat-offender loop, or re-fired detector targets
+    // the same IP. Field evidence (oneroom Hetzner 2026-05-31): one already-
+    // blocked threat-feed IP was re-blocked 9× in a day from these non-
+    // incident-flow sources. Skip the redundant firewall write but report it
+    // as handled (the block IS active), so the caller records a terminal
+    // decision rather than a "skipped" no-op that would re-orphan. This runs
+    // AFTER the safety gates (allowlist/safelist/circuit-breaker) so it can
+    // never widen what gets blocked — it only suppresses a duplicate.
+    if state.response_lifecycle.is_ip_actively_blocked(ip, now_utc) {
+        info!(
+            ip,
+            "already actively blocked (live firewall rule) — skipping redundant re-block"
+        );
+        return (
+            "already blocked: live firewall rule already active for this IP".to_string(),
+            true,
+        );
+    }
+
     state.recent_blocks.push_back(now_utc);
     // Spec 037 I-07 slice 2: persist for warm-cache on next boot so a
     // restart does not let a `MAX_BLOCKS_PER_MINUTE` burst land in the

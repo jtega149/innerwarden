@@ -1487,6 +1487,28 @@ impl ResponseLifecycle {
             .any(|r| r.target == target && &r.backend == backend)
     }
 
+    /// True if `ip` has a live `BlockIp` response right now: an entry that is
+    /// still `Active` and whose TTL has not expired. This is the
+    /// **TTL-accurate** "currently blocked" view — unlike `state.blocklist`
+    /// (a `HashSet` that is NOT pruned when a block's TTL expires; the XDP
+    /// cleanup loop only prunes `xdp_block_times`). Callers use this to skip
+    /// redundant work for an already-blocked IP without the risk of treating
+    /// an expired block as still active.
+    ///
+    /// Field evidence (oneroom Hetzner, 2026-05-31): a single threat-feed IP
+    /// that was already firewall-blocked re-fired `threat_intel` every cycle;
+    /// each re-fire re-ran the block (re-adding a live ufw rule) and leaked the
+    /// fresh incident to the orphan-recovery sweep — 9 re-blocks + 68 dismisses
+    /// for one IP in a day. Gating that churn on this check stops it.
+    pub fn is_ip_actively_blocked(&self, ip: &str, now: DateTime<Utc>) -> bool {
+        self.active.iter().any(|r| {
+            r.response_type == ResponseType::BlockIp
+                && r.target == ip
+                && r.state == LifecycleState::Active
+                && r.expires_at > now
+        })
+    }
+
     /// Generate Prometheus metrics lines.
     #[allow(dead_code)] // exposed by /metrics endpoint in spec 016
     pub fn to_prometheus_lines(&self) -> String {
@@ -1972,6 +1994,36 @@ mod tests {
             ttl,
             None,
         )
+    }
+
+    #[test]
+    fn is_ip_actively_blocked_true_for_live_block_false_for_expired_or_other() {
+        let mut lc = ResponseLifecycle::new();
+        let now = Utc::now();
+
+        // Live block (1h TTL): expires_at well in the future → actively blocked.
+        reg(&mut lc, "1.2.3.4", 3600);
+        assert!(lc.is_ip_actively_blocked("1.2.3.4", now));
+
+        // A different IP is not blocked.
+        assert!(!lc.is_ip_actively_blocked("9.9.9.9", now));
+
+        // An expired block (negative TTL → expires_at in the past) is NOT
+        // active, even though `state.blocklist` would still contain the IP.
+        reg(&mut lc, "5.6.7.8", -10);
+        assert!(!lc.is_ip_actively_blocked("5.6.7.8", now));
+
+        // A non-BlockIp response on an IP-shaped target must not count as a
+        // block (e.g. an nginx rate-limit on the same address).
+        lc.register(
+            ResponseType::RateLimitNginx,
+            ResponseBackend::Nginx,
+            "10.0.0.1",
+            "inc-test",
+            3600,
+            None,
+        );
+        assert!(!lc.is_ip_actively_blocked("10.0.0.1", now));
     }
 
     #[test]

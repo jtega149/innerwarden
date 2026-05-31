@@ -26,6 +26,10 @@ pub(super) enum PreAiGuardDecision {
     SkipPrivateOrBlocked,
     SkipDecisionCooldown,
     SkipAiCallBudget,
+    /// Primary IP already has a live (TTL-valid) firewall block. The incident
+    /// is recorded as a terminal "already blocked" dismiss without an AI call
+    /// or a redundant re-block, so it never reaches the orphan-recovery sweep.
+    SkipAlreadyBlocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +50,12 @@ pub(super) struct PreAiGuardInputs {
     /// decide(). Allowlist and per-tick budget still apply because
     /// those are safety, not noise.
     pub skip_fase3: bool,
+    /// The incident's primary IP already has a live (TTL-valid) firewall
+    /// block (see `response_lifecycle::is_ip_actively_blocked`). This guard
+    /// runs BEFORE the skip-fase3 bypass: a high-signal detector re-firing on
+    /// an already-blocked IP is pure churn (re-block + orphan), so it is
+    /// short-circuited regardless of the skip list.
+    pub already_actively_blocked: bool,
 }
 
 /// Spec 028-b skip-fase3: return true when the incident_id is either
@@ -64,6 +74,37 @@ pub(super) fn matches_skip_fase3(incident_id: &str, skip_list: &[String]) -> boo
     })
 }
 
+/// Detectors whose signal is FULLY mitigated by an active IP firewall block:
+/// recon, protocol anomalies, and auth-brute attempts all require the IP to
+/// reach the host, which the block prevents. Re-alerting on these for an
+/// already-blocked IP is pure churn. Active-harm / host-side detectors
+/// (`data_exfil`, `c2_*`, `reverse_shell`, `kill_chain`, `ransomware`,
+/// `fileless`, `privesc`, `rootkit`, …) are deliberately EXCLUDED: if a block
+/// were ever bypassed (e.g. XDP unavailable + a ufw race) those still describe
+/// real harm and must surface even when the IP is nominally blocked.
+const BLOCK_MITIGATED_DETECTORS: &[&str] = &[
+    "threat_intel",
+    "proto_anomaly",
+    "port_scan",
+    "web_scan",
+    "scanner_ua",
+    "user_agent_scanner",
+    "nmap_scan",
+    "wordlist_scan",
+    "ssh_bruteforce",
+    "distributed_ssh",
+    "credential_stuffing",
+];
+
+/// True when `incident_id`'s detector is one a firewall block fully mitigates,
+/// so an already-blocked IP can be short-circuited. Strips the graph
+/// detectors' `graph_` prefix so `graph_threat_intel` matches `threat_intel`.
+pub(super) fn is_block_mitigated_detector(incident_id: &str) -> bool {
+    let detector = incident_id.split(':').next().unwrap_or("");
+    let base = detector.strip_prefix("graph_").unwrap_or(detector);
+    BLOCK_MITIGATED_DETECTORS.contains(&base)
+}
+
 pub(super) fn decide_pre_ai_guard(inputs: PreAiGuardInputs) -> PreAiGuardDecision {
     if inputs.is_pipeline_test {
         return PreAiGuardDecision::PipelineTestHandled;
@@ -80,6 +121,19 @@ pub(super) fn decide_pre_ai_guard(inputs: PreAiGuardInputs) -> PreAiGuardDecisio
 
     if inputs.is_allowlisted {
         return PreAiGuardDecision::SkipAllowlisted;
+    }
+
+    // Already-blocked guard. Runs BEFORE the skip-fase3 bypass because it is
+    // SAFETY/dedup, not a noise gate: an IP that already has a live firewall
+    // block must not be re-decided. Re-deciding re-runs the block (re-adding a
+    // live ufw rule) and, when the decide path can't keep up, leaks the fresh
+    // incident to the orphan-recovery sweep ~1h later. Field evidence (oneroom
+    // Hetzner 2026-05-31): a single already-blocked threat-feed IP produced 9
+    // re-blocks + 68 orphan dismisses in one day because `threat_intel` (a
+    // skip-fase3 detector) bypassed the existing in-`should_invoke_ai` blocked
+    // gate. Gating here, ahead of skip-fase3, closes that hole.
+    if inputs.already_actively_blocked {
+        return PreAiGuardDecision::SkipAlreadyBlocked;
     }
 
     // Spec 028-b skip-fase3: high-signal detectors bypass the
@@ -156,6 +210,25 @@ pub(crate) fn evaluate_pre_ai_flow(
         &incident.incident_id,
         &cfg.incident_flow.detectors_skip_fase3,
     );
+    // Churn guard: short-circuit only when (a) the detector is fully mitigated
+    // by a firewall block AND (b) this incident's primary IP already has a live
+    // (TTL-valid) block. Active-harm detectors are excluded by (a) so a real
+    // exfil/C2 still surfaces even against a nominally-blocked IP. The block
+    // check uses the lifecycle's TTL-accurate view, NOT `state.blocklist`
+    // (which is not pruned on TTL expiry).
+    let already_actively_blocked = is_block_mitigated_detector(&incident.incident_id) && {
+        use innerwarden_core::entities::EntityType;
+        let now = chrono::Utc::now();
+        incident
+            .entities
+            .iter()
+            .find(|e| e.r#type == EntityType::Ip)
+            .is_some_and(|e| {
+                state
+                    .response_lifecycle
+                    .is_ip_actively_blocked(&e.value, now)
+            })
+    };
     let mut guard_inputs = PreAiGuardInputs {
         is_pipeline_test: incident.tags.iter().any(|tag| tag == "pipeline-test"),
         is_advisory_detector: detector == "neural_anomaly" || detector == "host_drift",
@@ -167,6 +240,7 @@ pub(crate) fn evaluate_pre_ai_flow(
         ai_calls_this_tick,
         max_ai_calls_per_tick: cfg.ai.max_ai_calls_per_tick,
         skip_fase3,
+        already_actively_blocked,
     };
 
     if ai_enabled {
@@ -282,6 +356,22 @@ pub(crate) fn evaluate_pre_ai_flow(
             );
             PreAiFlowDecision::SkipHandled
         }
+        PreAiGuardDecision::SkipAlreadyBlocked => {
+            // The primary IP already has a live firewall block. Skip the AI
+            // call AND the (redundant) re-block — the firewall rule is already
+            // in effect. This closes the skip_fase3 hole: high-signal detectors
+            // (threat_intel, …) re-firing on an already-blocked IP no longer
+            // reach decide()/block. Recording an immediate terminal decision +
+            // resolving the incident group is deferred to spec 066 Phase 2
+            // (sensor-side suppression), so this stays a pure skip with no
+            // decision write — matching the existing SkipPrivateOrBlocked
+            // behaviour and the same-IP-same-tick dedup contract.
+            info!(
+                incident_id = %incident.incident_id,
+                "AI gate: skipping (IP already actively blocked at firewall) — no re-decide / no re-block"
+            );
+            PreAiFlowDecision::SkipHandled
+        }
         PreAiGuardDecision::SkipDecisionCooldown => {
             info!(
                 incident_id = %incident.incident_id,
@@ -320,7 +410,66 @@ mod tests {
             ai_calls_this_tick: 0,
             max_ai_calls_per_tick: 10,
             skip_fase3: false,
+            already_actively_blocked: false,
         }
+    }
+
+    #[test]
+    fn is_block_mitigated_detector_covers_recon_excludes_active_harm() {
+        // Recon / protocol / auth-brute: a firewall block fully mitigates → suppressible.
+        assert!(is_block_mitigated_detector(
+            "threat_intel:threat_ip:1.2.3.4:2026-05-31T14:05Z"
+        ));
+        assert!(is_block_mitigated_detector(
+            "proto_anomaly:SshVersionAnomaly:1.2.3.4:2026-05-31T16Z"
+        ));
+        assert!(is_block_mitigated_detector("ssh_bruteforce:1.2.3.4"));
+        // Graph-prefixed variant strips to the same base.
+        assert!(is_block_mitigated_detector("graph_threat_intel:1.2.3.4:1"));
+        // Active-harm / host-side: must STILL surface even if the IP is blocked.
+        assert!(!is_block_mitigated_detector("data_exfil_ebpf:1.2.3.4"));
+        assert!(!is_block_mitigated_detector("c2_callback:1.2.3.4"));
+        assert!(!is_block_mitigated_detector(
+            "kill_chain:DATA_EXFIL:1.2.3.4"
+        ));
+        assert!(!is_block_mitigated_detector("reverse_shell:1.2.3.4"));
+        assert!(!is_block_mitigated_detector("ransomware:host"));
+    }
+
+    #[test]
+    fn decide_pre_ai_guard_already_blocked_short_circuits_even_skip_fase3() {
+        // The churn fix: an IP that is already actively blocked must not be
+        // re-decided, even for a high-signal skip-fase3 detector (which
+        // otherwise bypasses the noise gates and reaches decide()).
+        let mut inputs = default_guard_inputs();
+        inputs.already_actively_blocked = true;
+        inputs.skip_fase3 = true;
+        inputs.passes_ai_gate = true;
+        assert_eq!(
+            decide_pre_ai_guard(inputs),
+            PreAiGuardDecision::SkipAlreadyBlocked
+        );
+    }
+
+    #[test]
+    fn decide_pre_ai_guard_allowlist_takes_precedence_over_already_blocked() {
+        // Allowlist is the operator's explicit "never touch" contract and is
+        // checked first; an allowlisted IP never reaches the already-blocked
+        // branch (it would not be blocked in the first place).
+        let mut inputs = default_guard_inputs();
+        inputs.is_allowlisted = true;
+        inputs.already_actively_blocked = true;
+        assert_eq!(
+            decide_pre_ai_guard(inputs),
+            PreAiGuardDecision::SkipAllowlisted
+        );
+    }
+
+    #[test]
+    fn decide_pre_ai_guard_not_blocked_still_proceeds() {
+        // Regression guard: the new branch must not change the happy path.
+        let inputs = default_guard_inputs();
+        assert_eq!(decide_pre_ai_guard(inputs), PreAiGuardDecision::Proceed);
     }
 
     #[test]
