@@ -121,6 +121,13 @@ const IMDS_LEGITIMATE_EXE_PREFIXES: &[&str] = &[
     "/usr/bin/containerd",
     "/var/lib/rancher/",
     "/snap/microk8s/",
+    // Base-OS system daemons that touch the metadata IP for non-cred reasons
+    // (e.g. systemd-resolved forwards DNS to the cloud resolver, which on many
+    // clouds shares 169.254.169.254). Root-owned system binaries that take no
+    // untrusted URL input, so they are not an SSRF vector. Verified on prod
+    // 2026-05-31. Both the merged (/usr/lib) and Debian (/lib) unit paths.
+    "/usr/lib/systemd/systemd-resolved",
+    "/lib/systemd/systemd-resolved",
 ];
 
 /// Comms whose IMDS access is treated as the canonical SSRF signature
@@ -489,6 +496,22 @@ mod tests {
             inc.is_none(),
             "Oracle Cloud Agent from /snap must be silent"
         );
+    }
+
+    #[test]
+    fn systemd_resolved_from_system_path_is_silent() {
+        // systemd-resolved forwards DNS to the cloud resolver, which on many
+        // clouds shares 169.254.169.254. Root-owned system binary, not an SSRF
+        // vector. Verified on prod 2026-05-31.
+        let mut det = ImdsSsrfDetector::new("test", vec![], DEFAULT_COOLDOWN_SECONDS);
+        let inc = det.process(&imds_connect_exe(
+            793,
+            "systemd-resolve",
+            Some("/usr/lib/systemd/systemd-resolved"),
+            IMDS_IPV4,
+            Utc::now(),
+        ));
+        assert!(inc.is_none(), "systemd-resolved must be silent");
     }
 
     #[test]
