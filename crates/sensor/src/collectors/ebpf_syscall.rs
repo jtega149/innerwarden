@@ -303,6 +303,7 @@ fn connect_to_event(
     dst_ip: Ipv4Addr,
     dst_port: u16,
     host: &str,
+    exe_path: Option<&str>,
 ) -> Event {
     let mut details = serde_json::json!({
         "pid": pid,
@@ -315,6 +316,16 @@ fn connect_to_event(
     });
     if let Some(cid) = container_id {
         details["container_id"] = serde_json::Value::String(cid.to_string());
+    }
+    // Spec: non-forgeable process identity for downstream detectors (e.g.
+    // imds_ssrf). `exe_path` is the binary captured at execve (from the
+    // ExecveCtx cache), NOT the forgeable `comm`. An attacker who renames
+    // their process `cloud-init` cannot also be running from a root-owned
+    // vendor path. Absent when the connecting pid was not seen execve
+    // (e.g. a daemon that started before the sensor) — the detector then
+    // falls back to a best-effort /proc/<pid>/exe read.
+    if let Some(exe) = exe_path {
+        details["exe_path"] = serde_json::Value::String(exe.to_string());
     }
 
     let mut tags = vec!["ebpf".to_string(), "network".to_string()];
@@ -1817,6 +1828,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let container_id = resolve_container_id(pid);
 
+                    let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
                     Some(connect_to_event(
                         pid,
                         uid,
@@ -1827,6 +1839,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         ip,
                         port,
                         &host,
+                        exe_path.as_deref(),
                     ))
                 }
                 // FileOpenEvent layout (#[repr(C)]):
@@ -3048,11 +3061,33 @@ mod tests {
     #[test]
     fn connect_event_high_severity_for_reverse_shell_ports() {
         let ip = Ipv4Addr::new(1, 2, 3, 4);
-        let event = connect_to_event(5678, 1000, 1, 0, None, "nc", ip, 4444, "test-host");
+        let event = connect_to_event(5678, 1000, 1, 0, None, "nc", ip, 4444, "test-host", None);
         assert_eq!(event.severity, Severity::High);
 
-        let event_normal = connect_to_event(5678, 1000, 1, 0, None, "curl", ip, 443, "test-host");
+        let event_normal =
+            connect_to_event(5678, 1000, 1, 0, None, "curl", ip, 443, "test-host", None);
         assert_eq!(event_normal.severity, Severity::Info);
+    }
+
+    #[test]
+    fn connect_event_carries_exe_path_when_present() {
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let event = connect_to_event(
+            5678,
+            1000,
+            1,
+            0,
+            None,
+            "unifiedmonitori",
+            ip,
+            443,
+            "test-host",
+            Some("/snap/oracle-cloud-agent/95/plugins/unifiedmonitoring/unifiedmonitoring"),
+        );
+        assert_eq!(
+            event.details["exe_path"],
+            "/snap/oracle-cloud-agent/95/plugins/unifiedmonitoring/unifiedmonitoring"
+        );
     }
 
     #[test]
@@ -3068,6 +3103,7 @@ mod tests {
             ip,
             4444,
             "test-host",
+            None,
         );
         assert_eq!(event.details["container_id"], "container123");
         assert!(event.tags.contains(&"container".to_string()));

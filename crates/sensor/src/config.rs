@@ -454,11 +454,21 @@ pub struct ImdsSsrfConfig {
     pub enabled: bool,
     #[serde(default = "default_imds_ssrf_cooldown_seconds")]
     pub cooldown_seconds: u64,
-    /// Operator-extended allowlist on top of the built-in cloud-tool
-    /// list. Matched with `starts_with` so the truncated 15-char
-    /// `TASK_COMM_LEN` form is what should appear here.
+    /// DEPRECATED (2026-05-31): comm is forgeable (`prctl(PR_SET_NAME)` /
+    /// `argv[0]`), so a comm allowlist is a detector BYPASS — an attacker
+    /// names their tool `cloud-init` and IMDS cred-theft is ignored. This
+    /// field is accepted for config back-compat but **no longer gates**
+    /// legitimacy. Use `allowlist_exe_prefixes` instead.
     #[serde(default)]
     pub allowlist_comms: Vec<String>,
+    /// Operator-extended legitimacy allowlist, matched against the accessing
+    /// process's real executable path (`exe_path`, captured at execve / read
+    /// from `/proc/<pid>/exe`) with `starts_with`. Non-forgeable: an attacker
+    /// cannot run from a root-owned vendor path without already being root.
+    /// Use directory prefixes with a trailing `/` (e.g.
+    /// `"/snap/my-cloud-agent/"`) to avoid sibling-directory spoofing.
+    #[serde(default)]
+    pub allowlist_exe_prefixes: Vec<String>,
 }
 
 impl Default for ImdsSsrfConfig {
@@ -467,6 +477,7 @@ impl Default for ImdsSsrfConfig {
             enabled: true,
             cooldown_seconds: default_imds_ssrf_cooldown_seconds(),
             allowlist_comms: Vec::new(),
+            allowlist_exe_prefixes: Vec::new(),
         }
     }
 }

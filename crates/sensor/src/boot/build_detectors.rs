@@ -524,14 +524,19 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
             detectors::data_exfil_ebpf::DataExfilEbpfDetector::new(&cfg.agent.host_id, 60, 600)
         }),
         imds_ssrf: if cfg.detectors.imds_ssrf.enabled {
+            if !cfg.detectors.imds_ssrf.allowlist_comms.is_empty() {
+                info!(
+                    "imds_ssrf: [detectors.imds_ssrf] allowlist_comms is DEPRECATED and no longer gates (comm is forgeable). Migrate to allowlist_exe_prefixes."
+                );
+            }
             info!(
-                "imds_ssrf detector enabled (cloud-metadata SSRF; cooldown {}s, operator allowlist={} entries)",
+                "imds_ssrf detector enabled (cloud-metadata SSRF; cooldown {}s, exe-prefix allowlist={} entries)",
                 cfg.detectors.imds_ssrf.cooldown_seconds,
-                cfg.detectors.imds_ssrf.allowlist_comms.len(),
+                cfg.detectors.imds_ssrf.allowlist_exe_prefixes.len(),
             );
             Some(detectors::imds_ssrf::ImdsSsrfDetector::new(
                 &cfg.agent.host_id,
-                cfg.detectors.imds_ssrf.allowlist_comms.clone(),
+                cfg.detectors.imds_ssrf.allowlist_exe_prefixes.clone(),
                 cfg.detectors.imds_ssrf.cooldown_seconds,
             ))
         } else {

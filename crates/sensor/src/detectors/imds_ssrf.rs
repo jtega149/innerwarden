@@ -28,35 +28,34 @@
 //! exception: it specifically watches IMDS and fires when the
 //! accessing process is NOT in the legitimate-tool allowlist.
 //!
-//! ## FP defences
+//! ## FP defences — keyed on the NON-FORGEABLE executable path
 //!
-//! Three layers, applied in order:
+//! 2026-05-31 redesign. The earlier version allowlisted by `comm`, which is
+//! **forgeable** (`prctl(PR_SET_NAME)`, `argv[0]`, renaming the binary). That
+//! turned the allowlist into a BYPASS: an attacker who named their SSRF tool
+//! `cloud-init` had their IMDS cred-theft silently ignored on every host that
+//! ships InnerWarden. Comm is no longer a legitimacy gate.
 //!
-//! 1. `is_innerwarden_process(uid, comm)` — sensor / agent processes
-//!    are skipped even if some future code path queries IMDS (none
-//!    today; defensive symmetry with `data_exfil_ebpf`).
-//! 2. `IMDS_LEGITIMATE_PROCESSES` — hard-coded list of cloud bootstrap
-//!    and agent comms (cloud-init, amazon-ssm-agen, aws, gcloud, az,
-//!    walinuxagent, kubelet, dockerd, containerd, …) that legitimately
-//!    poll IMDS. Each entry uses the truncated 15-char form that
-//!    Linux's `TASK_COMM_LEN` produces, so the actual comm seen in
-//!    eBPF events matches.
-//! 3. `allowlist_comms` (config) — operator extension for app-specific
-//!    runtimes that legitimately use IAM (e.g. a Python service that
-//!    calls boto3 against IMDS). Adding `python3` here silences the
-//!    HIGH-tier alert for that comm only.
+//! Legitimacy is now decided by the accessing process's real **executable
+//! path** (`exe_path`), captured at execve by the collector (non-forgeable, no
+//! race) or read from `/proc/<pid>/exe` (canonical) as a fallback:
 //!
-//! After the three skips, the detector tiers severity:
+//! 1. `is_innerwarden_process(uid, comm)` — our own processes, skipped.
+//! 2. `IMDS_LEGITIMATE_EXE_PREFIXES` — built-in trusted vendor exe-path
+//!    prefixes, all in **root-owned** dirs (`/usr`, `/snap`, `/opt`,
+//!    `/var/lib`). An attacker who can run from there already has root, so the
+//!    cred-theft threat model is moot. Covers AWS / GCP / Azure / Oracle Cloud
+//!    / k8s agents.
+//! 3. `allowlist_exe_prefixes` (config) — operator extension, also path-based.
 //!
-//! - `WEBSERVER_RUNTIME_PREFIXES` (`nginx`, `apache2`, `php-fpm`,
-//!   `uwsgi`, `gunicorn`, `puma`, …) hitting IMDS = **Critical**. That
-//!   shape IS the SSRF signature — webserver workers do not call IAM
-//!   in normal life.
-//! - Any other non-allowlisted comm = **High**. Suspicious but worth
-//!   investigating before allowlisting.
+//! `comm` survives only to ESCALATE: a `WEBSERVER_RUNTIME_PREFIXES` comm
+//! (`nginx`, `php-fpm`, …) hitting IMDS = **Critical** (the SSRF signature).
+//! Forging comm to look like nginx only makes you MORE suspicious, so this
+//! direction is safe. Everything else not from a trusted exe = **High**. When
+//! the exe cannot be resolved at all, the detector does NOT skip — it alerts
+//! (fail toward detection).
 //!
-//! A per-(comm) cooldown of 10 minutes prevents alert floods when an
-//! SSRF loop pokes IMDS continuously.
+//! A per-(comm) cooldown of 10 minutes prevents alert floods.
 
 use std::collections::HashMap;
 
@@ -75,56 +74,53 @@ const IMDS_IPV6: &str = "fd00:ec2::254";
 /// one is enough to wake the operator.
 pub const DEFAULT_COOLDOWN_SECONDS: u64 = 600;
 
-/// Comms that legitimately query IMDS. Entries are matched with
-/// `starts_with`, so the Linux 15-char truncation (`TASK_COMM_LEN`) is
-/// covered: `amazon-ssm-agent` becomes `amazon-ssm-agen` in eBPF
-/// events, `ec2-instance-connect` becomes `ec2-instance-c`, etc.
+/// Built-in legitimacy allowlist keyed on the accessing process's real
+/// **executable path** (`exe_path`), NOT its `comm`.
 ///
-/// Coverage rationale:
+/// Why path, not comm (2026-05-31 redesign): `comm` is forgeable
+/// (`prctl(PR_SET_NAME)`, `argv[0]`, renaming the binary). A comm allowlist
+/// was therefore a BYPASS — an attacker who renamed their SSRF tool
+/// `cloud-init` had IMDS access silently ignored. The executable path is
+/// non-forgeable in the way that matters: every entry below lives in a
+/// **root-owned** directory (`/usr`, `/snap`, `/opt`, `/var/lib`). An
+/// attacker who can place a binary there already has root — at which point
+/// the IMDS-cred-theft threat model is moot (they own the host).
 ///
-/// - AWS: cloud-init (first-boot configuration), amazon-ssm-agent
-///   (Systems Manager), amazon-cloudwatch-agent, ec2-instance-connect,
-///   awscli / aws (CLI), the various aws-c2c / aws-c2v helper daemons.
-/// - GCP: cloud-init (yes, same binary on GCP), gcloud (CLI),
-///   gke-metadata-server, google-osconfig-agent, google-fluentd,
-///   google_oslogin_*, google-startup-scripts. All known to poll IMDS
-///   on a schedule.
-/// - Azure: az / azure-cli, walinuxagent + WaAppAgent (the Azure
-///   provisioning daemons), omsagent (Log Analytics).
-/// - Kubernetes / container runtimes: kubelet, dockerd, containerd,
-///   runc, kube-proxy, cilium-agent. All call IMDS to discover the
-///   node's IAM role for pulling private images, mounting EBS, etc.
-const IMDS_LEGITIMATE_PROCESSES: &[&str] = &[
+/// Directory entries carry a trailing `/` so `/snap/oracle-cloud-agent-evil/`
+/// does NOT match `/snap/oracle-cloud-agent/`. File entries are exact program
+/// paths in root-owned `bin` dirs.
+///
+/// Coverage (Oracle paths verified on prod 2026-05-31):
+const IMDS_LEGITIMATE_EXE_PREFIXES: &[&str] = &[
     // AWS
-    "cloud-init",
-    "cloud-init-l",
-    "cloud-config",
-    "cloud-final",
-    "amazon-ssm-agen",
-    "amazon-cloudwat",
-    "aws",
-    "awscli",
-    "ec2-instance-c",
+    "/usr/bin/cloud-init",
+    "/usr/local/bin/cloud-init",
+    "/usr/lib/python3/dist-packages/cloudinit/",
+    "/snap/amazon-ssm-agent/",
+    "/usr/bin/amazon-ssm-agent",
+    "/opt/aws/",
+    "/opt/amazon/",
     // GCP
-    "gcloud",
-    "gke-metadata-",
-    "google-fluentd",
-    "google-osconfig",
-    "google_oslogin_",
-    "google-startup-",
+    "/usr/bin/google_",
+    "/usr/bin/gke-metadata-server",
+    "/snap/google-cloud-cli/",
+    "/usr/lib/python3/dist-packages/google/",
     // Azure
-    "az",
-    "azure-cli",
-    "walinuxagent",
-    "WaAppAgent",
-    "omsagent",
+    "/usr/sbin/waagent",
+    "/var/lib/waagent/",
+    "/opt/microsoft/",
+    // Oracle Cloud (OCI) — verified on prod
+    "/snap/oracle-cloud-agent/",
+    "/usr/libexec/oracle-cloud-agent/",
+    "/var/lib/oracle-cloud-agent/",
+    "/opt/unified-monitoring-agent/",
     // Kubernetes / container runtimes
-    "kubelet",
-    "dockerd",
-    "containerd",
-    "runc",
-    "kube-proxy",
-    "cilium-agent",
+    "/usr/bin/kubelet",
+    "/usr/local/bin/kubelet",
+    "/usr/bin/dockerd",
+    "/usr/bin/containerd",
+    "/var/lib/rancher/",
+    "/snap/microk8s/",
 ];
 
 /// Comms whose IMDS access is treated as the canonical SSRF signature
@@ -155,8 +151,10 @@ const WEBSERVER_RUNTIME_PREFIXES: &[&str] = &[
 
 pub struct ImdsSsrfDetector {
     host: String,
-    /// Operator-extended allowlist on top of `IMDS_LEGITIMATE_PROCESSES`.
-    allowlist_comms: Vec<String>,
+    /// Operator-extended legitimacy allowlist of trusted executable-path
+    /// prefixes, on top of `IMDS_LEGITIMATE_EXE_PREFIXES`. Non-forgeable
+    /// (unlike the deprecated comm allowlist).
+    allowlist_exe_prefixes: Vec<String>,
     /// Cooldown gate: per-(comm) timestamp of last emitted incident.
     alerted: HashMap<String, DateTime<Utc>>,
     cooldown: Duration,
@@ -165,15 +163,51 @@ pub struct ImdsSsrfDetector {
 impl ImdsSsrfDetector {
     pub fn new(
         host: impl Into<String>,
-        allowlist_comms: Vec<String>,
+        allowlist_exe_prefixes: Vec<String>,
         cooldown_seconds: u64,
     ) -> Self {
         Self {
             host: host.into(),
-            allowlist_comms,
+            allowlist_exe_prefixes,
             alerted: HashMap::new(),
             cooldown: Duration::seconds(cooldown_seconds as i64),
         }
+    }
+
+    /// Resolve the accessing process's real executable path. Prefers the
+    /// `exe_path` the collector captured at execve (non-forgeable, no race);
+    /// falls back to a best-effort `/proc/<pid>/exe` realpath for a long-lived
+    /// daemon that started before the sensor (alive at connect time, so the
+    /// read is reliable). Returns `None` only when both are unavailable
+    /// (e.g. a transient pid already reaped) — the caller then fails toward
+    /// alerting.
+    fn resolve_exe_path(event: &Event, pid: u32) -> Option<String> {
+        if let Some(e) = event.details.get("exe_path").and_then(|v| v.as_str()) {
+            if !e.is_empty() {
+                return Some(e.to_string());
+            }
+        }
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+    }
+
+    /// True if `exe` is a legitimate IMDS caller by executable path. Rejects
+    /// non-absolute paths and any `..` traversal (a raw execve filename could
+    /// carry `/usr/bin/../../tmp/evil` — `/proc/<pid>/exe` is already
+    /// canonical, but the cached filename may not be). Matching is prefix
+    /// based against the built-in + operator lists.
+    fn is_trusted_exe(&self, exe: &str) -> bool {
+        if !exe.starts_with('/') || exe.contains("/../") || exe.ends_with("/..") {
+            return false;
+        }
+        IMDS_LEGITIMATE_EXE_PREFIXES
+            .iter()
+            .any(|p| exe.starts_with(p))
+            || self
+                .allowlist_exe_prefixes
+                .iter()
+                .any(|p| exe.starts_with(p.as_str()))
     }
 
     pub fn process(&mut self, event: &Event) -> Option<Incident> {
@@ -204,18 +238,18 @@ impl ImdsSsrfDetector {
         if super::allowlists::is_innerwarden_process(uid, comm) {
             return None;
         }
-        if IMDS_LEGITIMATE_PROCESSES
-            .iter()
-            .any(|p| comm.starts_with(p))
-        {
-            return None;
-        }
-        if self
-            .allowlist_comms
-            .iter()
-            .any(|p| comm.starts_with(p.as_str()))
-        {
-            return None;
+
+        // Legitimacy is decided by the NON-FORGEABLE executable path, never by
+        // `comm`. A process reaching IMDS is benign only when it runs from a
+        // trusted root-owned vendor path (cloud-init / SSM / Oracle Cloud Agent
+        // / kubelet / …). An attacker who renames their tool `cloud-init` but
+        // runs from `/tmp` is NOT skipped — that bypass is closed. When the exe
+        // cannot be resolved at all, we do NOT skip (fail toward detection).
+        let exe_path = Self::resolve_exe_path(event, pid);
+        if let Some(ref exe) = exe_path {
+            if self.is_trusted_exe(exe) {
+                return None;
+            }
         }
 
         let now = event.ts;
@@ -235,6 +269,9 @@ impl ImdsSsrfDetector {
             self.alerted.retain(|_, ts| *ts > cutoff);
         }
 
+        // `comm` is used ONLY to ESCALATE (webserver -> Critical), never to
+        // allowlist. Forging comm to look like nginx is self-incriminating, so
+        // this direction is safe.
         let is_webserver = WEBSERVER_RUNTIME_PREFIXES
             .iter()
             .any(|p| comm.starts_with(p));
@@ -243,17 +280,19 @@ impl ImdsSsrfDetector {
         } else {
             Severity::High
         };
+        let exe_display = exe_path.as_deref().unwrap_or("<unresolved>");
+        let exe_unverified = exe_path.is_none();
 
         let title = if is_webserver {
             format!("Cloud metadata SSRF: webserver process {comm} (pid={pid}) reached IMDS at {dst_ip}")
         } else {
-            format!("Cloud metadata access by unexpected process: {comm} (pid={pid}) reached IMDS at {dst_ip}")
+            format!("Cloud metadata access by unexpected process: {comm} (pid={pid}, exe={exe_display}) reached IMDS at {dst_ip}")
         };
 
         let summary = format!(
-            "{comm} (pid={pid}) made an outbound connection to the cloud \
-             metadata endpoint {dst_ip}. IMDS hands out short-lived IAM / \
-             service-account credentials valid for this host. {}",
+            "{comm} (pid={pid}, exe={exe_display}) made an outbound connection to \
+             the cloud metadata endpoint {dst_ip}. IMDS hands out short-lived \
+             IAM / service-account credentials valid for this host. {}",
             if is_webserver {
                 "Webserver runtimes (nginx / apache / php-fpm / uwsgi / \
                  gunicorn) don't call IAM in normal operation, so this \
@@ -261,12 +300,14 @@ impl ImdsSsrfDetector {
                  Treat as a likely SSRF exploit against the webapp; check \
                  request logs for the URL that triggered the IMDS request \
                  and rotate any IAM credentials the metadata server returned."
+            } else if exe_unverified {
+                "The executable path could not be verified (transient process), \
+                 so legitimacy could not be confirmed — alerting to be safe."
             } else {
-                "This process is not in the built-in cloud-tool allowlist \
-                 (cloud-init / SSM-agent / kubelet / aws / gcloud / az / …). \
-                 Investigate whether it should be allowlisted in \
-                 `[detectors.imds_ssrf] allowlist_comms` or whether it \
-                 indicates an attacker tool."
+                "This executable is not under a built-in trusted cloud-agent \
+                 path. Investigate whether it is a legitimate vendor agent (then \
+                 allowlist via `[detectors.imds_ssrf] allowlist_exe_prefixes`) \
+                 or an attacker tool stealing IAM credentials."
             }
         );
 
@@ -281,6 +322,8 @@ impl ImdsSsrfDetector {
                 "kind": "imds_ssrf",
                 "detection": "metadata_endpoint_access",
                 "comm": comm,
+                "exe_path": exe_path,
+                "exe_unverified": exe_unverified,
                 "pid": pid,
                 "dst_ip": dst_ip,
                 "is_webserver_runtime": is_webserver,
@@ -292,7 +335,7 @@ impl ImdsSsrfDetector {
                 "Rotate any IAM / service-account credentials that may have been returned".to_string(),
                 "Patch SSRF in the application — typically a request-forwarding or webhook feature".to_string(),
                 format!(
-                    "If legitimate, allowlist via `[detectors.imds_ssrf] allowlist_comms = [\"{comm}\"]`"
+                    "If {exe_display} is a legitimate vendor agent, allowlist via `[detectors.imds_ssrf] allowlist_exe_prefixes = [\"<dir prefix>/\"]`"
                 ),
             ],
             tags: vec![
@@ -318,7 +361,23 @@ impl ImdsSsrfDetector {
 mod tests {
     use super::*;
 
-    fn imds_connect(pid: u32, comm: &str, dst_ip: &str, ts: DateTime<Utc>) -> Event {
+    fn imds_connect_exe(
+        pid: u32,
+        comm: &str,
+        exe: Option<&str>,
+        dst_ip: &str,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        let mut details = serde_json::json!({
+            "pid": pid,
+            "uid": 33, // www-data
+            "comm": comm,
+            "dst_ip": dst_ip,
+            "dst_port": 80,
+        });
+        if let Some(e) = exe {
+            details["exe_path"] = serde_json::Value::String(e.to_string());
+        }
         Event {
             ts,
             host: "test".into(),
@@ -326,16 +385,17 @@ mod tests {
             kind: "network.outbound_connect".into(),
             severity: Severity::Info,
             summary: format!("connect {dst_ip}:80"),
-            details: serde_json::json!({
-                "pid": pid,
-                "uid": 33, // www-data
-                "comm": comm,
-                "dst_ip": dst_ip,
-                "dst_port": 80,
-            }),
+            details,
             tags: vec!["ebpf".into()],
             entities: vec![EntityRef::ip(dst_ip)],
         }
+    }
+
+    // Backstop: an unresolvable exe (no exe_path field + a pid that does not
+    // exist, so the /proc fallback misses) — used by the webserver-escalation
+    // tests where comm alone decides Critical.
+    fn imds_connect(pid: u32, comm: &str, dst_ip: &str, ts: DateTime<Utc>) -> Event {
+        imds_connect_exe(pid, comm, None, dst_ip, ts)
     }
 
     #[test]
@@ -367,69 +427,120 @@ mod tests {
     }
 
     #[test]
-    fn unknown_runtime_to_imds_fires_high_not_critical() {
-        // A non-allowlisted, non-webserver comm hitting IMDS is
-        // suspicious but ambiguous — could be an attacker tool or a
-        // legitimate app using boto3 from a worker daemon. Fire HIGH
-        // (one human look) instead of Critical (page on-call).
+    fn unknown_exe_to_imds_fires_high_not_critical() {
+        // A non-webserver process from an untrusted path hitting IMDS is
+        // suspicious — attacker tool or a legit app using boto3. Fire HIGH.
         let mut det = ImdsSsrfDetector::new("test", vec![], DEFAULT_COOLDOWN_SECONDS);
         let inc = det
-            .process(&imds_connect(9102, "python3", IMDS_IPV4, Utc::now()))
-            .expect("unknown comm → IMDS must fire");
+            .process(&imds_connect_exe(
+                9102,
+                "python3",
+                Some("/usr/bin/python3"),
+                IMDS_IPV4,
+                Utc::now(),
+            ))
+            .expect("unknown exe → IMDS must fire");
         assert_eq!(inc.severity, Severity::High);
         assert!(inc.tags.contains(&"unexpected_process".to_string()));
     }
 
     #[test]
-    fn cloud_init_to_imds_is_silent() {
-        // cloud-init queries IMDS at every boot to pull the user-data
-        // and instance identity document. Firing here would page
-        // on-call for every reboot.
+    fn cloud_init_from_trusted_exe_is_silent() {
+        // cloud-init queries IMDS every boot. Silent ONLY because it runs
+        // from a root-owned vendor path — not because of its comm.
         let mut det = ImdsSsrfDetector::new("test", vec![], DEFAULT_COOLDOWN_SECONDS);
-        let inc = det.process(&imds_connect(9103, "cloud-init", IMDS_IPV4, Utc::now()));
-        assert!(inc.is_none(), "cloud-init must be allowlisted");
+        let inc = det.process(&imds_connect_exe(
+            9103,
+            "cloud-init",
+            Some("/usr/bin/cloud-init"),
+            IMDS_IPV4,
+            Utc::now(),
+        ));
+        assert!(inc.is_none(), "cloud-init from /usr/bin must be silent");
     }
 
     #[test]
-    fn ssm_agent_truncated_comm_is_silent() {
-        // Linux TASK_COMM_LEN truncates `amazon-ssm-agent` to
-        // `amazon-ssm-agen`. Anchor pins that the allowlist entry
-        // covers the truncated form — the form eBPF actually emits.
+    fn ssm_agent_from_snap_path_is_silent() {
         let mut det = ImdsSsrfDetector::new("test", vec![], DEFAULT_COOLDOWN_SECONDS);
-        let inc = det.process(&imds_connect(
+        let inc = det.process(&imds_connect_exe(
             9104,
             "amazon-ssm-agen",
+            Some("/snap/amazon-ssm-agent/7993/amazon-ssm-agent"),
+            IMDS_IPV4,
+            Utc::now(),
+        ));
+        assert!(inc.is_none(), "ssm-agent from /snap must be silent");
+    }
+
+    #[test]
+    fn oracle_cloud_agent_from_snap_path_is_silent() {
+        // The exact prod 2026-05-31 false positive: the Oracle Cloud Agent's
+        // unified-monitoring plugin polling IMDS. comm `unifiedmonitori` is
+        // NOT in any list — silence comes from the verified vendor exe path.
+        let mut det = ImdsSsrfDetector::new("test", vec![], DEFAULT_COOLDOWN_SECONDS);
+        let inc = det.process(&imds_connect_exe(
+            1569,
+            "unifiedmonitori",
+            Some("/snap/oracle-cloud-agent/95/plugins/unifiedmonitoring/unifiedmonitoring"),
             IMDS_IPV4,
             Utc::now(),
         ));
         assert!(
             inc.is_none(),
-            "amazon-ssm-agen (truncated 15-char comm) must be allowlisted"
+            "Oracle Cloud Agent from /snap must be silent"
         );
     }
 
     #[test]
-    fn kubelet_to_imds_is_silent() {
-        // kubelet queries IMDS on every node startup to discover the
-        // IAM role for pulling private images and mounting EBS.
+    fn spoofed_comm_from_untrusted_path_still_fires() {
+        // THE BYPASS THIS REDESIGN CLOSES: an attacker names their SSRF tool
+        // `cloud-init` (forging comm) but runs it from /tmp. The old comm
+        // allowlist would have ignored it; the exe-path gate does NOT.
         let mut det = ImdsSsrfDetector::new("test", vec![], DEFAULT_COOLDOWN_SECONDS);
-        let inc = det.process(&imds_connect(9105, "kubelet", IMDS_IPV4, Utc::now()));
-        assert!(inc.is_none(), "kubelet must be allowlisted");
+        let inc = det
+            .process(&imds_connect_exe(
+                9200,
+                "cloud-init", // forged comm
+                Some("/tmp/cloud-init"),
+                IMDS_IPV4,
+                Utc::now(),
+            ))
+            .expect("forged comm from /tmp must STILL fire — bypass closed");
+        assert_eq!(inc.severity, Severity::High);
     }
 
     #[test]
-    fn operator_allowlist_silences_otherwise_flagged_comm() {
-        // Operator runs a Python service that legitimately uses
-        // boto3 against IMDS. Default behaviour fires HIGH; adding
-        // `python3` to the operator's `allowlist_comms` config
-        // silences it.
+    fn path_traversal_in_exe_is_not_trusted() {
+        // `/snap/oracle-cloud-agent/../../tmp/evil` lexically starts with a
+        // trusted prefix but resolves outside it. Reject `..` paths.
+        let mut det = ImdsSsrfDetector::new("test", vec![], DEFAULT_COOLDOWN_SECONDS);
+        let inc = det.process(&imds_connect_exe(
+            9201,
+            "x",
+            Some("/snap/oracle-cloud-agent/../../tmp/evil"),
+            IMDS_IPV4,
+            Utc::now(),
+        ));
+        assert!(inc.is_some(), "path-traversal exe must not be trusted");
+    }
+
+    #[test]
+    fn operator_allowlist_exe_prefix_silences() {
+        // Operator runs a legit boto3 worker from /opt/myapp; allowlist its
+        // vendor dir by EXE PREFIX (non-forgeable), not comm.
         let mut det = ImdsSsrfDetector::new(
             "test",
-            vec!["python3".to_string()],
+            vec!["/opt/myapp/".to_string()],
             DEFAULT_COOLDOWN_SECONDS,
         );
-        let inc = det.process(&imds_connect(9106, "python3", IMDS_IPV4, Utc::now()));
-        assert!(inc.is_none(), "operator-allowlisted comm must be silenced");
+        let inc = det.process(&imds_connect_exe(
+            9106,
+            "python3",
+            Some("/opt/myapp/worker"),
+            IMDS_IPV4,
+            Utc::now(),
+        ));
+        assert!(inc.is_none(), "operator exe-prefix allowlist must silence");
     }
 
     #[test]
