@@ -398,13 +398,14 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
     let playbook_section = crate::ai::playbook_prompt_section(&ctx.playbook_outcome);
     let dshield_section = crate::ai::dshield_prompt_section(&ctx.ip_dshield);
     let posture_section = crate::ai::posture_prompt_section(&ctx.host_posture);
+    let prior_section = crate::ai::prior_decisions_prompt_section(&ctx.prior_decisions);
 
     format!(
         r#"Analyze this security incident and decide on a response.
 
 INCIDENT:
 {incident_json}
-{graph_section}{playbook_section}{dshield_section}{posture_section}
+{graph_section}{playbook_section}{dshield_section}{posture_section}{prior_section}
 RECENT EVENTS FROM THE SAME ENTITY (last {count}):
 {events_json}
 
@@ -423,6 +424,7 @@ Select the best skill and return a JSON decision."#,
         playbook_section = playbook_section,
         dshield_section = dshield_section,
         posture_section = posture_section,
+        prior_section = prior_section,
         events_json = events_json,
         count = ctx.recent_events.len(),
         related_json = related_json,
@@ -543,6 +545,7 @@ mod tests {
             ip_geo: None,
             ip_dshield: None,
             host_posture: None,
+            prior_decisions: None,
             graph_context,
             graph_subgraph,
             playbook_outcome: None,

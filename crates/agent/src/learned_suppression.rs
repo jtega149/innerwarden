@@ -228,6 +228,37 @@ pub(crate) fn evaluate(
     )
 }
 
+/// Compact prior-decision context for the AI decide() prompt (spec 067 Phase
+/// 2c): how this exact `(detector | ip)` shape has been handled before. Lets
+/// the LLM stop re-surfacing settled noise (a shape dismissed many times with
+/// nothing changed) and respect a shape that was previously actioned. Reuses
+/// the same `shape_dismissal_stats` query and exclusion lists as the learned-
+/// suppression gate so the counts agree. `None` when there is no IP, no
+/// detector, the query fails, or the shape has no prior history.
+pub(crate) fn prior_decisions_context(
+    store: &innerwarden_store::Store,
+    incident: &Incident,
+) -> Option<String> {
+    let ip = primary_ip(incident)?;
+    let detector = detector_of(&incident.incident_id);
+    if detector.is_empty() {
+        return None;
+    }
+    let stats = store
+        .shape_dismissal_stats(detector, &ip, EXCLUDED_DISMISS_PROVIDERS, ACTIONED_TYPES)
+        .ok()?;
+    if stats.genuine_dismissals == 0 && stats.actioned == 0 {
+        return None;
+    }
+    Some(format!(
+        "this exact ({detector} | {ip}) shape has prior decisions: \
+         {} genuine dismissal(s) as noise, {} weighty action(s) (block/monitor/kill). \
+         If dismissals dominate and nothing material changed, it is likely settled \
+         noise; if it was actioned before, treat as a recurring threat.",
+        stats.genuine_dismissals, stats.actioned
+    ))
+}
+
 /// Build the human/audit reason for a learned-suppression dismiss.
 pub(crate) fn suppression_reason(detector: &str, ip: &str, dismissals: u64, n: u64) -> String {
     format!(
@@ -573,6 +604,29 @@ mod tests {
             evaluate(&store, &inc, 5, 0),
             LearnedVerdict::Suppress { dismissals: 6 }
         );
+    }
+
+    #[test]
+    fn prior_decisions_context_summarizes_dismissal_history() {
+        // Spec 067 Phase 2c: the decide() prompt learns this shape's history.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(&tmp);
+        let ip = "169.254.169.254";
+        for i in 0..3 {
+            seed_dismiss(&store, &format!("imds_ssrf:{ip}:{i}"), ip, "noise-gate");
+        }
+        let inc = low_incident("imds_ssrf", ip);
+        let line = prior_decisions_context(&store, &inc).expect("should summarize prior history");
+        assert!(line.contains("imds_ssrf"));
+        assert!(line.contains("3 genuine dismissal"));
+    }
+
+    #[test]
+    fn prior_decisions_context_none_when_no_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(&tmp);
+        let inc = low_incident("imds_ssrf", "169.254.169.254");
+        assert!(prior_decisions_context(&store, &inc).is_none());
     }
 
     #[test]

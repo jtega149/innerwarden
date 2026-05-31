@@ -312,6 +312,7 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
 
     let dshield_line = crate::ai::dshield_prompt_section(&ctx.ip_dshield);
     let posture_line = crate::ai::posture_prompt_section(&ctx.host_posture);
+    let prior_line = crate::ai::prior_decisions_prompt_section(&ctx.prior_decisions);
 
     // Spec 025: prefer the structured JSON subgraph when available —
     // qwen2.5:3b gained +20 pp action accuracy on the ai-grounding
@@ -336,7 +337,7 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
 
 INCIDENT:
 {incident_json}
-{reputation_line}{geo_line}{dshield_line}{posture_line}
+{reputation_line}{geo_line}{dshield_line}{posture_line}{prior_line}
 {graph_section}{playbook_section}RECENT EVENTS FROM THE SAME ENTITY (last {count}):
 {events_json}
 
@@ -355,6 +356,7 @@ Select the best skill and return a JSON decision."#,
         geo_line = geo_line,
         dshield_line = dshield_line,
         posture_line = posture_line,
+        prior_line = prior_line,
         graph_section = graph_section,
         playbook_section = playbook_section,
         events_json = events_json,
@@ -742,6 +744,7 @@ mod tests {
             ip_geo: None,
             ip_dshield: None,
             host_posture: None,
+            prior_decisions: None,
             graph_context,
             graph_subgraph,
             playbook_outcome: None,
@@ -856,5 +859,31 @@ mod tests {
         let ctx = spec025_ctx(&inc, None, None); // host_posture None
         let prompt = build_prompt(&ctx);
         assert!(!prompt.contains("HOST POSTURE"));
+    }
+
+    #[test]
+    fn build_prompt_includes_prior_decisions_when_present() {
+        // Spec 067 Phase 2c: prior-decision history reaches the LLM prompt.
+        let inc = spec025_incident();
+        let mut ctx = spec025_ctx(&inc, None, None);
+        ctx.prior_decisions = Some(
+            "this exact (ssh_bruteforce | 1.2.3.4) shape has prior decisions: 5 genuine \
+             dismissal(s) as noise, 0 weighty action(s)"
+                .to_string(),
+        );
+        let prompt = build_prompt(&ctx);
+        assert!(
+            prompt.contains("PRIOR DECISIONS FOR THIS PATTERN"),
+            "prior-decisions header missing"
+        );
+        assert!(prompt.contains("5 genuine dismissal"));
+    }
+
+    #[test]
+    fn build_prompt_omits_prior_decisions_when_absent() {
+        let inc = spec025_incident();
+        let ctx = spec025_ctx(&inc, None, None); // prior_decisions None
+        let prompt = build_prompt(&ctx);
+        assert!(!prompt.contains("PRIOR DECISIONS FOR THIS PATTERN"));
     }
 }

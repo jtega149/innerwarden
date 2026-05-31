@@ -703,6 +703,10 @@ pub(crate) async fn process_incidents(
             ip_geo: ip_geo_early.clone(),
             ip_dshield,
             host_posture: crate::posture::ai_context_line(&state.host_posture),
+            prior_decisions: state
+                .sqlite_store
+                .as_ref()
+                .and_then(|sq| crate::learned_suppression::prior_decisions_context(sq, incident)),
             graph_context,
             graph_subgraph,
             playbook_outcome: playbook_ai_context,

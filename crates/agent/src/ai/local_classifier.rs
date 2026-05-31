@@ -617,6 +617,7 @@ mod tests {
             ip_geo,
             ip_dshield: None,
             host_posture: None,
+            prior_decisions: None,
             graph_context: None,
             graph_subgraph: None,
             playbook_outcome: None,
