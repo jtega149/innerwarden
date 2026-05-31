@@ -715,18 +715,72 @@ impl TelegramClient {
             .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
             .map(|e| e.value.clone())
             .unwrap_or_else(|| "unknown".to_string());
-        format!(
+
+        // Spec 067 Phase 1: the operator was gating a real action (Block /
+        // Ignore / Dismiss) with only title + IP + severity. Surface the
+        // detector, what happened, what to check, and MITRE tags — everything
+        // already on the incident — so the decision can be made from the alert
+        // instead of opening the dashboard.
+        let detector = incident
+            .incident_id
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .strip_prefix("graph_")
+            .or(incident.incident_id.split(':').next())
+            .unwrap_or("");
+
+        let mut out = format!(
             "🔎 <b>Needs your review</b>\n\
              \n\
              <b>IP:</b> <code>{ip}</code>\n\
+             <b>Detector:</b> {detector}\n\
              <b>Incident:</b> {title}\n\
-             <b>Severity:</b> {severity}\n\
-             \n\
-             The Warden could not confidently decide this one. What should it do?",
+             <b>Severity:</b> {severity}\n",
             ip = escape_html(&ip),
+            detector = escape_html(detector),
             title = escape_html(&incident.title),
             severity = escape_html(&format!("{:?}", incident.severity)),
-        )
+        );
+
+        let summary = incident.summary.trim();
+        if !summary.is_empty() && summary != incident.title.trim() {
+            let s = if summary.chars().count() > 300 {
+                let cut: String = summary.chars().take(300).collect();
+                format!("{cut}…")
+            } else {
+                summary.to_string()
+            };
+            out.push_str(&format!("\n<b>What happened:</b> {}\n", escape_html(&s)));
+        }
+
+        let checks: Vec<&String> = incident.recommended_checks.iter().take(3).collect();
+        if !checks.is_empty() {
+            out.push_str("\n<b>Check:</b>\n");
+            for c in checks {
+                out.push_str(&format!("• {}\n", escape_html(c)));
+            }
+        }
+
+        let mitre: Vec<&String> = incident
+            .tags
+            .iter()
+            .filter(|t| {
+                t.starts_with('T') && t[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+            })
+            .take(6)
+            .collect();
+        if !mitre.is_empty() {
+            let joined = mitre
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("\n<b>MITRE:</b> {}\n", escape_html(&joined)));
+        }
+
+        out.push_str("\nThe Warden could not confidently decide this one. What should it do?");
+        out
     }
 
     /// Pure: the 3-button inline keyboard (Block / Ignore / Dismiss). Extracted
@@ -896,9 +950,14 @@ impl TelegramClient {
         let mut keyboard_rows: Vec<Vec<serde_json::Value>> = vec![];
 
         if !auto_blocked {
+            // Spec 067 Phase 1 fix: the debrief is sent AFTER the honeypot
+            // session ends, so there is no live `pending_honeypot_choices`
+            // entry — the old `hpot:block:` callback always hit "that choice
+            // expired". Route the post-session block through the gated
+            // quick-block path instead, which needs no pending entry.
             keyboard_rows.push(vec![serde_json::json!({
                 "text": "🚫 Block now",
-                "callback_data": format!("hpot:block:{ip}")
+                "callback_data": format!("quick:block:{ip}")
             })]);
         }
 
@@ -1160,6 +1219,25 @@ impl TelegramClient {
     ///
     /// Uses long-polling (timeout=25s) so this blocks for up to 25s between updates.
     /// Any errors are logged and the loop continues.
+    /// Inbound authorization (spec 067 Phase 1): only the configured operator
+    /// chat may drive the bot. Before this gate the poll loop processed ANY
+    /// sender's commands, `/ask` (LLM access + graph-context disclosure),
+    /// `/enable` / `/disable` (CLI subprocess), and approval callbacks — there
+    /// was no inbound check on who sent the update.
+    ///
+    /// Telegram chat ids are always `i64`. When the configured `chat_id` is a
+    /// numeric id (every real deployment) the sender's chat id MUST equal it or
+    /// the update is dropped. A non-numeric configured id only occurs on a
+    /// non-functional / misconfigured bot (Telegram rejects non-numeric ids for
+    /// outbound `sendMessage` too), and cannot be matched against an `i64`
+    /// sender, so it is not enforced rather than silently dropping every update.
+    fn inbound_authorized(&self, chat_id: i64) -> bool {
+        match self.chat_id.parse::<i64>() {
+            Ok(allowed) => allowed == chat_id,
+            Err(_) => true,
+        }
+    }
+
     pub async fn run_polling(
         self: std::sync::Arc<Self>,
         approval_tx: mpsc::Sender<ApprovalResult>,
@@ -1195,6 +1273,17 @@ impl TelegramClient {
                                 .unwrap_or(0);
                             let cb_msg_id =
                                 callback.message.as_ref().map(|m| m.message_id).unwrap_or(0);
+
+                            // Spec 067 Phase 1: drop callbacks from any chat that
+                            // is not the configured operator chat.
+                            if !self.inbound_authorized(cb_chat_id) {
+                                warn!(
+                                    chat_id = cb_chat_id,
+                                    operator = %operator,
+                                    "Telegram: dropping callback from unauthorized chat"
+                                );
+                                continue;
+                            }
 
                             if let Some(data) = &callback.data {
                                 if let Some(incident_id) = data.strip_prefix("fp:check:") {
@@ -1504,8 +1593,20 @@ impl TelegramClient {
                                     .unwrap_or_default();
                                 info!(text = %text, operator = %operator, "Telegram: text message received");
 
-                                // Visual feedback: react with 👀 and show typing
+                                // Spec 067 Phase 1: drop messages from any chat
+                                // that is not the configured operator chat,
+                                // before any reaction, AI call, or command runs.
                                 let chat_id = msg.chat.as_ref().map(|c| c.id).unwrap_or(0);
+                                if !self.inbound_authorized(chat_id) {
+                                    warn!(
+                                        chat_id,
+                                        operator = %operator,
+                                        "Telegram: dropping message from unauthorized sender"
+                                    );
+                                    continue;
+                                }
+
+                                // Visual feedback: react with 👀 and show typing
                                 if chat_id != 0 {
                                     self.react_eyes(chat_id, msg.message_id).await;
                                 }
@@ -2142,6 +2243,23 @@ mod tests {
     }
 
     #[test]
+    fn inbound_authorized_enforces_numeric_chat_id() {
+        // Numeric operator chat_id (every real deployment): only that chat passes.
+        let c = TelegramClient::new("tok", "88", None).expect("client");
+        assert!(c.inbound_authorized(88), "configured chat must pass");
+        assert!(!c.inbound_authorized(99), "other chat must be dropped");
+        assert!(
+            !c.inbound_authorized(0),
+            "missing/zero chat must be dropped"
+        );
+
+        // Non-numeric configured id (misconfigured/test bot, can't send outbound
+        // either) is not enforced rather than dropping every update.
+        let c2 = TelegramClient::new("tok", "chat-123", None).expect("client");
+        assert!(c2.inbound_authorized(42));
+    }
+
+    #[test]
     fn needs_review_text_renders_ip_title_and_severity() {
         let inc = make_incident();
         let text = TelegramClient::needs_review_text(&inc);
@@ -2152,6 +2270,13 @@ mod tests {
         );
         assert!(text.contains("High"), "must show the severity");
         assert!(text.contains("Needs your review"));
+        // Spec 067 Phase 1: enriched card carries detector + what-happened so
+        // the operator can decide from the alert.
+        assert!(text.contains("ssh_bruteforce"), "must show the detector");
+        assert!(
+            text.contains("20 failed attempts in 60s"),
+            "must show the summary (what happened)"
+        );
     }
 
     #[test]
