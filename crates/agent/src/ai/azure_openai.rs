@@ -284,6 +284,7 @@ mod tests {
             available_skills: vec![],
             ip_reputation: None,
             ip_geo: None,
+            ip_dshield: None,
             graph_context: None,
             graph_subgraph: None,
             playbook_outcome: None,

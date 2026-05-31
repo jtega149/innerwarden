@@ -676,6 +676,17 @@ pub(crate) async fn process_incidents(
             }
         };
 
+        // Spec 067 Phase 2: DShield context for the primary IP, read from the
+        // cached attacker profile (populated by the slow-loop backfill) so the
+        // decide path makes NO extra network call. Gives the LLM the IP's
+        // global attack telemetry, which AbuseIPDB does not carry.
+        let ip_dshield = crate::learned_suppression::primary_ip(incident).and_then(|ip| {
+            state
+                .attacker_profiles
+                .get(&ip)
+                .and_then(|p| p.dshield.as_ref().map(|d| d.as_context_line()))
+        });
+
         let ctx = ai::DecisionContext {
             incident,
             recent_events: ai_context_inputs.recent_events,
@@ -690,6 +701,7 @@ pub(crate) async fn process_incidents(
                 .collect(),
             ip_reputation: ip_reputation.clone(),
             ip_geo: ip_geo_early.clone(),
+            ip_dshield,
             graph_context,
             graph_subgraph,
             playbook_outcome: playbook_ai_context,

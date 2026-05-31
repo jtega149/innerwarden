@@ -464,6 +464,7 @@ async fn promote_escalated_to_decision(
         available_skills,
         ip_reputation: None,
         ip_geo: None,
+        ip_dshield: None,
         graph_context: None,
         graph_subgraph,
         // Narrative-verification Decide path runs outside the incident

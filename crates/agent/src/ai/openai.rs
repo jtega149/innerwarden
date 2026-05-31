@@ -310,6 +310,8 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
         .map(|g| format!("\nIP GEOLOCATION:\n{}", g.as_context_line()))
         .unwrap_or_default();
 
+    let dshield_line = crate::ai::dshield_prompt_section(&ctx.ip_dshield);
+
     // Spec 025: prefer the structured JSON subgraph when available —
     // qwen2.5:3b gained +20 pp action accuracy on the ai-grounding
     // benchmark when the prompt carried `{nodes, edges}` JSON instead of
@@ -333,7 +335,7 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
 
 INCIDENT:
 {incident_json}
-{reputation_line}{geo_line}
+{reputation_line}{geo_line}{dshield_line}
 {graph_section}{playbook_section}RECENT EVENTS FROM THE SAME ENTITY (last {count}):
 {events_json}
 
@@ -350,6 +352,7 @@ Select the best skill and return a JSON decision."#,
         incident_json = incident_json,
         reputation_line = reputation_line,
         geo_line = geo_line,
+        dshield_line = dshield_line,
         graph_section = graph_section,
         playbook_section = playbook_section,
         events_json = events_json,
@@ -735,6 +738,7 @@ mod tests {
             available_skills: vec![],
             ip_reputation: None,
             ip_geo: None,
+            ip_dshield: None,
             graph_context,
             graph_subgraph,
             playbook_outcome: None,
@@ -807,5 +811,27 @@ mod tests {
         let ctx = spec025_ctx(&inc, None, None); // playbook_outcome None
         let prompt = build_prompt(&ctx);
         assert!(!prompt.contains("DETERMINISTIC PLAYBOOK"));
+    }
+
+    #[test]
+    fn build_prompt_includes_dshield_when_present() {
+        // Spec 067 Phase 2: DShield context reaches the LLM prompt.
+        let inc = spec025_incident();
+        let mut ctx = spec025_ctx(&inc, None, None);
+        ctx.ip_dshield = Some("DShield(ISC): 397 targets attacked, feeds=blocklist".to_string());
+        let prompt = build_prompt(&ctx);
+        assert!(
+            prompt.contains("DSHIELD (SANS ISC global attack telemetry)"),
+            "DShield section header missing"
+        );
+        assert!(prompt.contains("397 targets attacked"));
+    }
+
+    #[test]
+    fn build_prompt_omits_dshield_when_absent() {
+        let inc = spec025_incident();
+        let ctx = spec025_ctx(&inc, None, None); // ip_dshield None
+        let prompt = build_prompt(&ctx);
+        assert!(!prompt.contains("DSHIELD"));
     }
 }
