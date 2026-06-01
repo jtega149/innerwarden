@@ -9,6 +9,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-06-01
+
+**Headline:** Spec 067 — AI context completeness. The two AI surfaces are now fully grounded. The autonomous `decide()` brain reasons over DShield (SANS ISC) telemetry, host posture, and the operator's prior decisions for the same incident shape (so it stops re-surfacing settled noise and stops over-reacting to attacks the host config already refuses). The operator-facing chat answers like the warden that lives on the box: "why did you block 1.2.3.4?" pulls that IP's incident + decision + the real reason; "how's my server?" returns a live pulse (posture + top attackers + what is unusual versus baseline) with an answer-style guide that forbids vague filler. Plus a security fix: the Telegram bot now drops inbound commands from any chat that is not the configured operator.
+
+### Added — Spec 067 decide() context
+
+- **DShield (SANS ISC) into the decide prompt** (#908). The cached attacker-profile DShield line (global attacked-target count + threat-feed membership) reaches the LLM with no extra network call on the hot path.
+- **Host posture into the decide prompt** (#909). The LLM sees the same defensive facts the severity-downgrade engine uses (PasswordAuthentication / PermitRootLogin / MaxAuthTries), so its reasoning matches the assigned severity.
+- **Prior operator decisions into the decide prompt** (#910). A compact summary of how this exact `(detector | ip)` shape was decided before (genuine dismissals vs weighty actions), reusing the learned-suppression query. The biggest "stop re-surfacing settled noise" lever.
+
+### Added — Spec 067 operator chat
+
+- **`/ask` + free-text decision deep-dive** (#911). Naming an IP ("why did you block 1.2.3.4?") surfaces that IP's incident + decision + the stored `decision_reason`, not just subgraph edges. Free-text questions share the `/ask` handler, so no slash is required.
+- **Live server pulse** (#912, #913). The chat context carries the host's real posture, the top attackers tracked right now (by risk), and what is unusual versus this host's baseline (training maturity + recent anomalies).
+- **Answer-style guide** (#914). A resident-voice directive prepended to the chat persona: cite the real data by name, justify "quiet" instead of shrugging, never answer with vague filler like "just the usual scanners."
+
+### Fixed — Spec 067 Phase 1
+
+- **Inbound Telegram authorization (security)** (#907). The poll loop now drops commands, `/ask`, `/enable` / `/disable`, and approval callbacks from any chat that is not the configured operator chat. Previously there was no inbound sender check.
+- **Richer `needs_review` card** (#907). The Block / Ignore / Dismiss card now carries the detector, what happened (summary), recommended checks, and MITRE tags, so the operator can decide from the alert.
+- **Honeypot debrief "Block now" button** (#907). Routed through the gated quick-block path; it previously always hit "that choice expired" because the post-session debrief never registered a pending entry.
+
 ## [0.15.0] - 2026-05-31
 
 **Headline:** Operator-in-the-loop, end to end. Spec 056 ships the **SOC playbook engine** (declarative response sequences, virtual skills, shadow mode, dashboard API, `innerwarden playbook test`, bundled Log4Shell playbook). Spec 062 closes the real **Autonomy Gap**: ambiguous incidents now route to an explicit `needs_review` floor with severity-gated honest timeouts, Telegram inline Block/Ignore/Dismiss buttons, learned suppression, an optional LLM second opinion, and a warden retrain label channel + mesh corroboration — every path has a deterministic fallback when no LLM is present. Spec 066 stops already-blocked IPs from churning the decide/re-block/orphan loop. Plus: the OSS `innerwarden-supervisor` now ships in the install path, a `firewalld` block backend for RHEL/Rocky/Fedora, DShield (SANS ISC) read-only IP reputation enrichment, `[agent]` host asset tags (spec 058), Local Warden auto-provisioning on install, and two offline harnesses (`--playbook-replay`, `--backtest-anomaly`).
