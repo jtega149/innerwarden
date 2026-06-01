@@ -654,12 +654,13 @@ pub(crate) async fn handle_telegram_bot_command(
                 }
             };
             let deep_ctx = bot_helpers::ask_context_deep(&state.knowledge_graph, &question, 8000);
-            let system_prompt = crate::agent_context::compose_system_prompt(
-                &cfg.telegram.bot.personality,
-                &agent_ctx,
-                &deep_ctx,
-                "",
-            );
+            // Spec 067 Phase 5: prepend the answer-style guide so the model
+            // replies like the warden that lives on the box (specific, cites
+            // the live pulse + cases) instead of bland "just the usual
+            // scanners" filler.
+            let persona = crate::agent_context::chat_persona(&cfg.telegram.bot.personality);
+            let system_prompt =
+                crate::agent_context::compose_system_prompt(&persona, &agent_ctx, &deep_ctx, "");
 
             // Spec 029 PR-C.2: `/ask` is operator-facing free-form
             // chat → Generate capability.

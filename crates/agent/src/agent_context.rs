@@ -181,6 +181,27 @@ pub(crate) fn live_server_context(
     }
 }
 
+/// Answer-style guide prepended to the persona for operator chat (spec 067
+/// Phase 5). The chat context already carries the live pulse + cases, but even
+/// a capable model (gpt-5.x) answered "just the usual scanners" because nothing
+/// told it HOW to answer. This makes it reply like the warden that lives on the
+/// box: specific, evidence-led, never vague filler.
+pub(crate) const CHAT_ANSWER_GUIDE: &str = "You are the Inner Warden security agent that lives on this server. Answer the operator like the resident who watches this exact box, not a generic assistant.\n\
+- Be specific and concrete: cite the real data below by name. When asked how the server is, name the actual top attacker IPs and their risk scores, state the host's real posture, and call out anything unusual versus this host's baseline.\n\
+- If it is quiet, say WHY it is quiet (for example: the scanners are low-risk SSH probes the host's PasswordAuthentication=no already refuses; nothing touched a real service; baseline normal). Quiet is a conclusion you justify, not a shrug.\n\
+- Never answer with vague filler like \"just the usual scanners\" without the specifics behind it. Lead with the bottom line, then the evidence.\n\
+- Be confident and brief.";
+
+/// Build the chat persona: the answer-style guide, plus the operator's
+/// configured personality when one is set.
+pub(crate) fn chat_persona(personality: &str) -> String {
+    if personality.trim().is_empty() {
+        CHAT_ANSWER_GUIDE.to_string()
+    } else {
+        format!("{CHAT_ANSWER_GUIDE}\n\n{}", personality.trim())
+    }
+}
+
 /// Merge a persona string, the runtime snapshot, recent incidents, and recent
 /// decisions into one system prompt. Empty-string inputs are skipped so the
 /// prompt never carries dangling "RECENT INCIDENTS:" headers with no body.
@@ -467,6 +488,26 @@ mod tests {
         assert!(
             ctx.contains("unusual for this host lately: nginx spawned a shell"),
             "baseline anomaly must surface; got:\n{ctx}"
+        );
+    }
+
+    #[test]
+    fn chat_persona_uses_guide_alone_when_personality_empty() {
+        let p = chat_persona("   ");
+        assert!(p.contains("lives on this server"), "guide must be present");
+        assert!(
+            p.contains("just the usual scanners"),
+            "guide must forbid vague filler"
+        );
+    }
+
+    #[test]
+    fn chat_persona_combines_guide_and_personality() {
+        let p = chat_persona("Speak like a laconic ops engineer.");
+        assert!(p.contains("lives on this server"), "guide must be present");
+        assert!(
+            p.contains("laconic ops engineer"),
+            "configured personality must be kept"
         );
     }
 }
