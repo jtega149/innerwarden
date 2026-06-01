@@ -645,6 +645,7 @@ pub(crate) async fn handle_telegram_bot_command(
                 let pulse = crate::agent_context::live_server_context(
                     &state.host_posture,
                     &state.attacker_profiles,
+                    &state.baseline,
                 );
                 if pulse.is_empty() {
                     base

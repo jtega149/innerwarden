@@ -117,6 +117,7 @@ pub(crate) fn build_agent_context(
 pub(crate) fn live_server_context(
     posture: &crate::posture::HostPosture,
     attacker_profiles: &std::collections::HashMap<String, crate::attacker_intel::AttackerProfile>,
+    baseline: &crate::baseline::BaselineStore,
 ) -> String {
     let mut body = String::new();
     if let Some(p) = crate::posture::ai_context_line(posture) {
@@ -139,6 +140,40 @@ pub(crate) fn live_server_context(
             top.join(", ")
         ));
     }
+
+    // Baseline: what is normal for THIS host, and what stood out lately. The
+    // resident's "this is unusual for us" sense. Skipped on a brand-new store
+    // with nothing learned and no anomalies, so the pulse stays empty until
+    // there is something real to report.
+    if baseline.is_mature()
+        || baseline.total_observations() > 0
+        || !baseline.recent_anomalies.is_empty()
+    {
+        let maturity = if baseline.is_mature() {
+            "trained".to_string()
+        } else {
+            format!("learning (day {})", baseline.training_days())
+        };
+        body.push_str(&format!(
+            "Baseline: {maturity}, {} events learned",
+            baseline.total_observations()
+        ));
+        let unusual: Vec<String> = baseline
+            .recent_anomalies
+            .iter()
+            .rev()
+            .take(3)
+            .map(|a| a.description.clone())
+            .collect();
+        if !unusual.is_empty() {
+            body.push_str(&format!(
+                "; unusual for this host lately: {}",
+                unusual.join("; ")
+            ));
+        }
+        body.push('\n');
+    }
+
     if body.is_empty() {
         String::new()
     } else {
@@ -389,7 +424,7 @@ mod tests {
         lo.risk_score = 50;
         profiles.insert("1.2.3.4".to_string(), lo);
 
-        let ctx = live_server_context(&p, &profiles);
+        let ctx = live_server_context(&p, &profiles, &crate::baseline::BaselineStore::new());
         assert!(ctx.contains("LIVE SERVER PULSE"));
         assert!(
             ctx.contains("PasswordAuthentication=No"),
@@ -403,9 +438,35 @@ mod tests {
 
     #[test]
     fn live_server_context_empty_when_nothing_live() {
-        // Default posture probe is Pending and no attackers tracked.
+        // Default posture (Pending probe), no attackers, fresh baseline.
         let p = crate::posture::HostPosture::default();
         let profiles = std::collections::HashMap::new();
-        assert!(live_server_context(&p, &profiles).is_empty());
+        let baseline = crate::baseline::BaselineStore::new();
+        assert!(live_server_context(&p, &profiles, &baseline).is_empty());
+    }
+
+    #[test]
+    fn live_server_context_surfaces_baseline_anomalies() {
+        // Spec 067 Phase 4b: the pulse carries "what is unusual for THIS host".
+        let p = crate::posture::HostPosture::default();
+        let profiles = std::collections::HashMap::new();
+        let mut baseline = crate::baseline::BaselineStore::new();
+        let report = crate::baseline::AnomalyReport {
+            anomaly_type: crate::baseline::AnomalyType::ProcessLineage,
+            description: "nginx spawned a shell (never seen before)".to_string(),
+            expected: "nginx -> worker".to_string(),
+            observed: "nginx -> sh".to_string(),
+            confidence: 0.9,
+            severity: innerwarden_core::event::Severity::High,
+        };
+        baseline.record_anomaly(&report, None);
+
+        let ctx = live_server_context(&p, &profiles, &baseline);
+        assert!(ctx.contains("LIVE SERVER PULSE"));
+        assert!(ctx.contains("Baseline:"), "baseline line missing");
+        assert!(
+            ctx.contains("unusual for this host lately: nginx spawned a shell"),
+            "baseline anomaly must surface; got:\n{ctx}"
+        );
     }
 }
