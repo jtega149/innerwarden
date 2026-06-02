@@ -62,8 +62,14 @@ pub(crate) struct SensorContext {
     state: State,
     sqlite_writer: SqliteWriter,
     syslog_writer: Option<sinks::syslog_cef::SyslogCefWriter>,
-    tx: mpsc::Sender<Event>,
-    rx: mpsc::Receiver<Event>,
+    // Spec 069 follow-up #1: three-lane channels (Option C). `bulk_tx` is
+    // the plain bulk Sender handed to the low-rate file collectors; `ebpf_tx`
+    // is the non-blocking multi-lane handle for the eBPF ring reader (the
+    // flood source); `event_rx` is the biased prio→emergency→bulk drain.
+    ebpf_tx: crate::event_channels::EbpfTx,
+    bulk_tx: mpsc::Sender<Event>,
+    event_rx: crate::event_channels::EventRx,
+    drop_counters: std::sync::Arc<crate::event_channels::DropCounters>,
     cursors: SharedCursors,
     detectors: DetectorSet,
     threat_datasets: Datasets,
@@ -127,7 +133,12 @@ pub(crate) async fn boot_init(cfg: Config) -> Result<SensorContext> {
             ))
         }
     };
-    let (tx, rx) = mpsc::channel(1024);
+    // Spec 069 follow-up #1: three-lane channels replace the single
+    // mpsc(1024). The eBPF ring reader emits non-blocking through `ebpf_tx`
+    // (prio/emergency/bulk); the low-rate file collectors keep their plain
+    // blocking `Sender` on the bulk lane via `bulk_tx`.
+    let (ebpf_tx, event_rx, drop_counters) = crate::event_channels::channels();
+    let bulk_tx = ebpf_tx.bulk_sender();
 
     // Shared state - updated by collectors, read on shutdown for persistence.
     // Bundled into SharedCursors in PR-F1 (#810); adopted here in PR-F2.
@@ -254,8 +265,10 @@ pub(crate) async fn boot_init(cfg: Config) -> Result<SensorContext> {
         state,
         sqlite_writer,
         syslog_writer,
-        tx,
-        rx,
+        ebpf_tx,
+        bulk_tx,
+        event_rx,
+        drop_counters,
         cursors,
         detectors,
         threat_datasets,
@@ -283,8 +296,10 @@ pub(crate) async fn run_loop(ctx: SensorContext) -> Result<()> {
         mut state,
         sqlite_writer,
         mut syslog_writer,
-        tx,
-        rx,
+        ebpf_tx,
+        bulk_tx,
+        event_rx,
+        drop_counters,
         cursors,
         mut detectors,
         mut threat_datasets,
@@ -298,7 +313,7 @@ pub(crate) async fn run_loop(ctx: SensorContext) -> Result<()> {
     // dropped — only the per-collector clones hold the sender side,
     // so when every collector task exits the consumer's `rx.recv()`
     // returns `None` and the event loop shuts down cleanly.
-    boot::spawn_collectors::spawn_collectors(&cfg, &data_dir, &state, tx, &cursors);
+    boot::spawn_collectors::spawn_collectors(&cfg, &data_dir, &state, bulk_tx, ebpf_tx, &cursors);
 
     // Apply seccomp profile if configured (Active Defence feature).
     // MUST be after all eBPF programs are loaded and sockets are opened,
@@ -323,7 +338,8 @@ pub(crate) async fn run_loop(ctx: SensorContext) -> Result<()> {
     // signal fires, then snapshots every shared-cursor Arc into the
     // State and writes it to disk.
     boot::event_loop::run_event_loop(
-        rx,
+        event_rx,
+        drop_counters,
         &sqlite_writer,
         &mut detectors,
         &mut syslog_writer,

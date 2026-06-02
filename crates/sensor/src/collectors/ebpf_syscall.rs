@@ -12,7 +12,6 @@
 use innerwarden_core::entities::EntityRef;
 use innerwarden_core::event::{Event, Severity};
 use std::net::Ipv4Addr;
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 /// Embedded eBPF bytecode (compiled into the sensor binary).
@@ -1357,7 +1356,7 @@ fn attach_tp(bpf: &mut aya::Ebpf, name: &str, category: &str, tp_name: &str) -> 
 }
 
 #[cfg(feature = "ebpf")]
-pub async fn run(tx: mpsc::Sender<Event>, host: String) {
+pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
     use aya::maps::RingBuf;
     use aya::programs::TracePoint;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -3025,11 +3024,18 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
             };
 
             if let Some(ev) = event {
-                if tx.send(ev).await.is_err() {
-                    warn!("eBPF collector: channel closed, stopping");
-                    return;
-                }
+                // Spec 069 follow-up #1 (Option C): non-blocking emit. The
+                // drain loop MUST NOT block — emit classifies into prio /
+                // emergency / bulk and drops (counted) rather than awaiting,
+                // so the kernel ring never overflows behind us.
+                let _ = tx.emit(ev);
             }
+        }
+
+        // Consumer gone (shutdown) → every lane closed → stop draining.
+        if tx.is_closed() {
+            info!("eBPF collector: all channels closed, stopping");
+            return;
         }
 
         // Wait for ring buffer readability via epoll, or fall back to 100ms poll
@@ -3052,7 +3058,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
 
 /// Fallback when ebpf feature is not enabled.
 #[cfg(not(feature = "ebpf"))]
-pub async fn run(_tx: mpsc::Sender<Event>, _host: String) {
+pub async fn run(_tx: crate::event_channels::EbpfTx, _host: String) {
     if is_ebpf_available() {
         info!("eBPF is available but the sensor was compiled without --features ebpf");
         info!("Rebuild with: cargo build --features ebpf -p innerwarden-sensor");

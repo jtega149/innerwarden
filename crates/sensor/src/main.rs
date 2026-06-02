@@ -4,6 +4,7 @@ mod collectors;
 mod config;
 mod detector_set;
 mod detectors;
+mod event_channels;
 mod event_dispatch;
 mod event_pipeline;
 mod incident_builders;

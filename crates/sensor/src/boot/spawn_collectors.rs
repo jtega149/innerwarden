@@ -64,6 +64,7 @@ pub(crate) fn spawn_collectors(
     _data_dir: &Path, // reserved for future per-collector data-dir routing
     state: &State,
     tx: mpsc::Sender<Event>,
+    ebpf_tx: crate::event_channels::EbpfTx,
     cursors: &SharedCursors,
 ) {
     let SharedCursors {
@@ -288,13 +289,19 @@ pub(crate) fn spawn_collectors(
         });
     }
 
-    // Spawn eBPF collector (optional - requires Linux 5.8+, CAP_BPF)
+    // Spawn eBPF collector (optional - requires Linux 5.8+, CAP_BPF).
+    // The ring reader is the flood source, so it gets the non-blocking
+    // multi-lane `ebpf_tx` (spec 069 follow-up #1, Option C) rather than the
+    // plain bulk Sender. When disabled, `ebpf_tx` simply drops here, closing
+    // the prio/emergency lanes while the bulk lane stays open for file
+    // collectors.
     if cfg.collectors.ebpf_syscall.enabled {
-        let tx_ebpf = tx.clone();
         let host_id = cfg.agent.host_id.clone();
         tokio::spawn(async move {
-            collectors::ebpf_syscall::run(tx_ebpf, host_id).await;
+            collectors::ebpf_syscall::run(ebpf_tx, host_id).await;
         });
+    } else {
+        drop(ebpf_tx);
     }
 
     // Spawn firmware integrity collector (monitors ESP, UEFI vars, ACPI, DMI, tainted)
@@ -511,8 +518,9 @@ mod tests {
         let state = State::default();
         let cursors = SharedCursors::new();
         let (tx, mut rx) = mpsc::channel(1);
+        let (ebpf_tx, _erx, _ctr) = crate::event_channels::channels();
 
-        spawn_collectors(&cfg, tmp.path(), &state, tx, &cursors);
+        spawn_collectors(&cfg, tmp.path(), &state, tx, ebpf_tx, &cursors);
 
         assert!(
             rx.recv().await.is_none(),
@@ -575,8 +583,9 @@ mod tests {
 
         let cursors = SharedCursors::new();
         let (tx, _rx) = mpsc::channel(32);
+        let (ebpf_tx, _erx, _ctr) = crate::event_channels::channels();
 
-        spawn_collectors(&cfg, tmp.path(), &state, tx, &cursors);
+        spawn_collectors(&cfg, tmp.path(), &state, tx, ebpf_tx, &cursors);
 
         assert_eq!(cursors.auth_offset.load(Ordering::Relaxed), 17);
         assert_eq!(cursors.exec_audit_offset.load(Ordering::Relaxed), 23);

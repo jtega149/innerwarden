@@ -27,15 +27,16 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use innerwarden_core::event::Event;
-use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::boot::cursors::SharedCursors;
 use crate::detector_set::DetectorSet;
 use crate::detectors::datasets::Datasets;
+use crate::event_channels::{Drained, DropCounters, EventRx};
 use crate::event_dispatch;
 use crate::sinks;
 use crate::sinks::sqlite::SqliteWriter;
@@ -58,7 +59,8 @@ use crate::WriteStats;
 /// the allow finally drops.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_event_loop(
-    mut rx: mpsc::Receiver<Event>,
+    mut rx: EventRx,
+    drop_counters: Arc<DropCounters>,
     sqlite_writer: &SqliteWriter,
     detectors: &mut DetectorSet,
     syslog_writer: &mut Option<sinks::syslog_cef::SyslogCefWriter>,
@@ -86,11 +88,18 @@ pub(crate) async fn run_event_loop(
     // within a 10-second window. Only the highest severity is kept.
     let mut dedup_cache: HashMap<u32, (chrono::DateTime<chrono::Utc>, u8)> = HashMap::new();
 
+    // Spec 069 follow-up #1: periodically surface channel-saturation drops.
+    // Today the sensor loses events 100% silently; this makes brownout /
+    // emergency-lane / drop activity visible to operators.
+    let mut last_counter_log = Instant::now();
+    const COUNTER_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
     'main: loop {
-        // Receive next event or signal
+        // Receive next item or signal. `EventRx::recv` drains
+        // prio → emergency → bulk (biased).
         #[cfg(unix)]
         let received = tokio::select! {
-            event = rx.recv() => event,
+            item = rx.recv() => item,
             _ = tokio::signal::ctrl_c() => {
                 info!("SIGINT received - shutting down");
                 break 'main;
@@ -103,14 +112,14 @@ pub(crate) async fn run_event_loop(
 
         #[cfg(not(unix))]
         let received = tokio::select! {
-            event = rx.recv() => event,
+            item = rx.recv() => item,
             _ = tokio::signal::ctrl_c() => {
                 info!("SIGINT received - shutting down");
                 break 'main;
             }
         };
 
-        let Some(ev) = received else {
+        let Some(drained) = received else {
             info!("all collectors stopped");
             break 'main;
         };
@@ -118,22 +127,58 @@ pub(crate) async fn run_event_loop(
         // Periodic dataset reload (every hour)
         threat_datasets.maybe_reload();
 
-        event_dispatch::process_event(
-            ev,
-            sqlite_writer,
-            detectors,
-            &mut stats,
-            syslog_writer,
-            &mut dedup_cache,
-            threat_datasets,
-        );
+        match drained {
+            Drained::Event(ev) => {
+                event_dispatch::process_event(
+                    ev,
+                    sqlite_writer,
+                    detectors,
+                    &mut stats,
+                    syslog_writer,
+                    &mut dedup_cache,
+                    threat_datasets,
+                );
+            }
+            // Compact security signal that spilled to the emergency lane
+            // while the prio channel was saturated. Raise the saturation
+            // incident directly so the response path still fires even though
+            // the full event payload was dropped to keep the ring draining.
+            Drained::Security(sig) => {
+                event_dispatch::process_security_signal(
+                    sig,
+                    sqlite_writer,
+                    &mut stats,
+                    syslog_writer,
+                    &mut dedup_cache,
+                );
+            }
+        }
+
+        if last_counter_log.elapsed() >= COUNTER_LOG_INTERVAL {
+            last_counter_log = Instant::now();
+            let (prio_dropped, bulk_dropped, emergency_used, brownouts) = drop_counters.snapshot();
+            if prio_dropped > 0 || bulk_dropped > 0 || emergency_used > 0 || brownouts > 0 {
+                warn!(
+                    prio_dropped,
+                    bulk_dropped,
+                    emergency_used,
+                    brownout_activations = brownouts,
+                    "event channel saturation (cumulative) — sensor shed load to protect the kernel ring"
+                );
+            }
+        }
     }
 
+    let (prio_dropped, bulk_dropped, emergency_used, brownouts) = drop_counters.snapshot();
     info!(
         events_written = stats.events_written,
         events_dropped = stats.events_dropped,
         incidents_written = stats.incidents_written,
         pipeline_rules = detectors.event_pipeline.rule_count(),
+        prio_dropped,
+        bulk_dropped,
+        emergency_used,
+        brownout_activations = brownouts,
         "sensor stopped"
     );
 

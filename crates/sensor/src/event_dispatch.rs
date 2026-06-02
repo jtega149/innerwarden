@@ -49,6 +49,7 @@ use tracing::info;
 
 use crate::detector_set::DetectorSet;
 use crate::detectors;
+use crate::event_channels::SecuritySignal;
 use crate::incident_builders::{
     devnode_exposed_incident, page_cache_mismatch_incident, passthrough_incident,
 };
@@ -921,6 +922,30 @@ pub(crate) fn process_event(
 // + page_cache_mismatch_incident moved to crates/sensor/src/incident_builders.rs
 // as part of the 2026-05-25 main.rs decomposition PR4.
 
+/// Spec 069 follow-up #1 (Option C): handle a compact [`SecuritySignal`]
+/// that spilled to the emergency lane while the prio channel was saturated.
+/// The full event payload was dropped to keep the kernel ring draining, so
+/// we raise the saturation incident directly — the response/notification
+/// path still fires off the preserved compact signal. The detector fan-out
+/// is intentionally skipped (we have no full event to feed it); the incident
+/// itself carries the security signal.
+pub(crate) fn process_security_signal(
+    sig: SecuritySignal,
+    sqlite: &SqliteWriter,
+    stats: &mut WriteStats,
+    syslog: &mut Option<sinks::syslog_cef::SyslogCefWriter>,
+    dedup_cache: &mut HashMap<u32, (chrono::DateTime<chrono::Utc>, u8)>,
+) {
+    let incident = sig.to_incident();
+    info!(
+        kind = %sig.kind,
+        pid = sig.pid,
+        seq = sig.seq,
+        "emergency-lane security signal (prio saturated)"
+    );
+    write_incident(sqlite, stats, incident, syslog, dedup_cache);
+}
+
 fn write_incident(
     sqlite: &SqliteWriter,
     stats: &mut WriteStats,
@@ -1193,5 +1218,153 @@ mod tests {
             "process_event must NOT short-circuit on blocked IPs — see the 2026-05-23 incident comment in the function body. \
              If you intentionally re-added the early-return, delete THIS test with a comment explaining why."
         );
+    }
+
+    // Spec 069 follow-up #1: a compact security signal from the emergency
+    // lane must still raise a saturation incident (response path fires even
+    // though the full event payload was dropped under load).
+    #[test]
+    fn process_security_signal_writes_saturation_incident() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sqlite = SqliteWriter::new(tmp.path(), true).expect("sqlite");
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+
+        let sig = crate::event_channels::SecuritySignal {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            kind: "process.signal".into(),
+            severity: innerwarden_core::event::Severity::High,
+            pid: 4242,
+            ppid: 7,
+            uid: 0,
+            comm: "perl".into(),
+            target_pid: 91919,
+            exe: "/usr/bin/perl".into(),
+            container: String::new(),
+            seq: 1,
+        };
+        process_security_signal(sig, &sqlite, &mut stats, &mut syslog, &mut dedup_cache);
+
+        assert_eq!(
+            stats.incidents_written, 1,
+            "emergency-lane signal must raise a saturation incident"
+        );
+        assert!(
+            dedup_cache.contains_key(&4242),
+            "incident pid should seed the cross-detector dedup cache"
+        );
+    }
+
+    // ── Throughput smoke + micro-bench (spec 069 follow-up #1 baseline) ──
+    // Runs the full default detector fanout + real SQLite writes through
+    // `process_event` and reports the single-consumer ceiling (events/sec).
+    // Doubles as a correctness smoke (every event persists, no panic). Runs
+    // a small N by default so it stays fast in CI; override for a real
+    // measurement:
+    //   BENCH_N=200000 cargo test --release -p innerwarden-sensor process_event_throughput_bench -- --nocapture
+    #[test]
+    fn process_event_throughput_bench() {
+        use innerwarden_core::event::{Event, Severity};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sqlite = SqliteWriter::new(tmp.path(), true).expect("sqlite");
+        let cfg = crate::config::Config::test_default();
+        crate::boot::build_detectors::init_global_static_state_for_production(tmp.path());
+        let mut detectors = crate::boot::build_detectors::build_detector_set(&cfg, tmp.path());
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+        let datasets = seed_datasets(tmp.path());
+
+        let mk = |kind: &str, sev: Severity, det: serde_json::Value| Event {
+            ts: chrono::Utc::now(),
+            host: "bench".into(),
+            source: "ebpf".into(),
+            kind: kind.into(),
+            severity: sev,
+            summary: "bench".into(),
+            details: det,
+            tags: vec!["ebpf".into()],
+            entities: vec![],
+        };
+        let templates = vec![
+            mk(
+                "process.exit",
+                Severity::Info,
+                serde_json::json!({"pid":1234,"comm":"bash"}),
+            ),
+            mk(
+                "file.read_access",
+                Severity::Medium,
+                serde_json::json!({"pid":1234,"comm":"cat","path":"/etc/passwd"}),
+            ),
+            mk(
+                "network.outbound_connect",
+                Severity::Medium,
+                serde_json::json!({"pid":1234,"comm":"curl","ip":"203.0.113.9","dst_port":443}),
+            ),
+            mk(
+                "process.signal",
+                Severity::High,
+                serde_json::json!({"pid":1234,"comm":"perl","target_pid":4321,"signal":15}),
+            ),
+            mk(
+                "shell.command_exec",
+                Severity::Low,
+                serde_json::json!({"pid":1234,"comm":"bash","cmd":"ls -la"}),
+            ),
+            mk(
+                "process.prctl",
+                Severity::Low,
+                serde_json::json!({"pid":1234,"comm":"app","option":15}),
+            ),
+        ];
+
+        let n: usize = std::env::var("BENCH_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2_000);
+        let warmup = 200usize;
+        for i in 0..warmup {
+            let mut e = templates[i % templates.len()].clone();
+            e.details["pid"] = serde_json::json!(10_000 + i);
+            process_event(
+                e,
+                &sqlite,
+                &mut detectors,
+                &mut stats,
+                &mut syslog,
+                &mut dedup_cache,
+                &datasets,
+            );
+        }
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            let mut e = templates[i % templates.len()].clone();
+            e.details["pid"] = serde_json::json!(100_000 + i);
+            process_event(
+                e,
+                &sqlite,
+                &mut detectors,
+                &mut stats,
+                &mut syslog,
+                &mut dedup_cache,
+                &datasets,
+            );
+        }
+        let el = start.elapsed();
+        let eps = n as f64 / el.as_secs_f64();
+        println!(
+            "BENCH process_event: n={n} elapsed={el:?} -> {eps:.0} events/sec ({:.2} us/event); written={} dropped={} incidents={}",
+            el.as_secs_f64() * 1e6 / n as f64,
+            stats.events_written,
+            stats.events_dropped,
+            stats.incidents_written
+        );
+        // Correctness smoke: every event (warmup + bench) was persisted and
+        // the walk produced a positive throughput.
+        assert_eq!(stats.events_written, (warmup + n) as u64);
+        assert!(eps > 0.0);
     }
 }
