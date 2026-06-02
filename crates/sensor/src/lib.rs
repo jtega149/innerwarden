@@ -1,6 +1,7 @@
 // Library re-exports for integration/property tests and for the
 // cargo-fuzz harnesses in fuzz/.
 
+pub mod btf_offsets;
 pub mod collector_health;
 pub mod collectors;
 pub mod detectors;

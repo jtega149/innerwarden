@@ -1,4 +1,5 @@
 mod boot;
+mod btf_offsets;
 mod collector_health;
 mod collectors;
 mod config;

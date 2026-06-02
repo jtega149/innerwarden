@@ -1365,6 +1365,12 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
     use aya::programs::TracePoint;
     use std::os::fd::{AsRawFd, FromRawFd};
 
+    // Spec 069 #6: validate the hardcoded pt_regs syscall-arg offsets against
+    // the running kernel's BTF and warn loudly on mismatch (a future kernel
+    // that reorders pt_regs would otherwise make every arg read garbage
+    // silently). Fail-open.
+    crate::btf_offsets::verify_pt_regs_offsets();
+
     if !is_ebpf_available() {
         warn!("eBPF not available - falling back to audit-based collection");
         return;
