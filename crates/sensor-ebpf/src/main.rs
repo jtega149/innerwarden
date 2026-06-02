@@ -34,12 +34,9 @@ use aya_ebpf::{
     programs::{LsmContext, ProbeContext, RetProbeContext, TracePointContext, XdpContext},
 };
 
-// Spec 069: raw_tracepoint + RawTracePointContext are now used by always-on
-// non-syscall handlers (e.g. sched_process_exit), not just the dispatcher path,
-// so they must be imported unconditionally. ProgramArray stays dispatcher-only.
+// raw_tracepoint + RawTracePointContext are used by the always-on
+// `sched_process_exit` handler (spec 069 Phase 1).
 use aya_ebpf::{macros::raw_tracepoint, programs::RawTracePointContext};
-#[cfg(feature = "dispatcher")]
-use aya_ebpf::maps::ProgramArray;
 use aya_log_ebpf::info;
 use innerwarden_ebpf_types::{
     AcceptEvent, AcpiEvalEvent, BpfLoadEvent, CloneEvent, ConnectEvent, DupEvent, ExecveEvent,
@@ -248,78 +245,14 @@ fn is_rate_limited(pid: u32) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------------
-// Tail Call Dispatcher (feature = "dispatcher")
-// ---------------------------------------------------------------------------
-//
-// Single raw_tracepoint/sys_enter entry point that reads the syscall number
-// and tail-calls to the appropriate handler via ProgramArray.
-//
-// This replaces the 16 individual typed tracepoints with 1 attach point.
-// The handlers become tail call targets - same program type (raw_tracepoint),
-// each extracting args from pt_regs instead of typed tracepoint context.
-//
-// On aarch64: syscall args in pt_regs->regs[0..5] (offset 0, each 8 bytes)
-// On x86_64: pt_regs->di, si, dx, r10, r8, r9 (offsets 112, 104, 96, 56, 72, 64)
-
-#[cfg(feature = "dispatcher")]
-#[map]
-static SYSCALL_DISPATCH: ProgramArray = ProgramArray::with_max_entries(512, 0);
-
-/// Per-syscall enable flag - checked before tail call.
-/// Key: syscall number. Value: 1 = enabled, 0 = disabled.
-#[cfg(feature = "dispatcher")]
-#[map]
-static SYSCALL_ENABLED: HashMap<u32, u32> = HashMap::with_max_entries(512, 0);
-
-/// Read a raw tracepoint argument.
-/// For raw_tracepoint/sys_enter: args[0] = pt_regs*, args[1] = syscall_nr.
-/// Spec 069: only the optional `dispatcher` tail-call program reads raw args
-/// now. The per-syscall handlers became kprobes on the architecture syscall
-/// wrappers (see the `syscall_arg!` macro), so this is gated to that feature.
-#[cfg(feature = "dispatcher")]
-#[inline(always)]
-unsafe fn raw_arg(ctx: &RawTracePointContext, n: usize) -> u64 {
-    // bpf_raw_tracepoint_args { __u64 args[]; }
-    let args_ptr = ctx.as_ptr() as *const u64;
-    core::ptr::read_volatile(args_ptr.add(n))
-}
-
-/// Read a syscall argument from `pt_regs` for a `raw_tracepoint/sys_enter`
-/// program. `arg_idx`: 0-5 for the 6 syscall arguments.
-///
-/// Spec 069: reads via aya's `PtRegs`, whose `arg::<T>` is specialized per
-/// `bpf_target_arch` (x86_64 uses di/si/dx/r10/r8/r9, aarch64 uses
-/// regs[0..5], etc.). Because the eBPF object is built on the deploy host,
-/// `bpf_target_arch` matches the host and the offsets are correct on both
-/// Oracle (aarch64) and Hetzner (x86_64). The previous hand-rolled
-/// `arg_idx * 8` math was only correct for aarch64 and was a latent x86_64
-/// bug (never hit because the dispatcher path was disabled).
-/// pt_regs byte offset of syscall argument `arg_idx` (0-5), per architecture.
-/// Returned via a `match` (not a `.rodata` array indexed at runtime) so it
-/// constant-folds in the BPF program — a runtime index into a rodata array was
-/// observed to mis-read for arg_idx >= 1 on the BPF target.
-#[cfg(iw_arch_x86_64)]
-const fn syscall_arg_offset(arg_idx: usize) -> usize {
-    // rdi, rsi, rdx, r10, r8, r9
-    match arg_idx {
-        0 => 112,
-        1 => 104,
-        2 => 96,
-        3 => 56,
-        4 => 72,
-        _ => 64,
-    }
-}
-#[cfg(iw_arch_aarch64)]
-const fn syscall_arg_offset(arg_idx: usize) -> usize {
-    // x0..x5
-    if arg_idx > 5 {
-        5 * 8
-    } else {
-        arg_idx * 8
-    }
-}
+// Spec 069 #5: the spec-053 tail-call dispatcher (a single `sys_enter`
+// raw_tracepoint that read the syscall number and `bpf_tail_call`ed into
+// per-syscall handlers via a `ProgramArray`) was removed. It was gated behind
+// a `dispatcher` cargo feature that is not declared in any manifest, so it
+// never compiled — and the approach was abandoned because aya 0.13's
+// `bpf_tail_call` silently no-ops on this loader. The live path is per-syscall
+// kprobes on the architecture wrapper reading args via the `syscall_arg!`
+// macro below. The old `raw_arg` / `syscall_arg_offset` helpers went with it.
 
 // Spec 069: read syscall arguments from a kprobe on the architecture syscall
 // wrapper (`__x64_sys_<name>` / `__arm64_sys_<name>`), which takes a single
@@ -387,31 +320,6 @@ macro_rules! __sc_off {
     (3) => { 24 };
     (4) => { 32 };
     (5) => { 40 };
-}
-
-/// Main dispatcher - fires on every syscall entry.
-#[cfg(feature = "dispatcher")]
-#[raw_tracepoint(tracepoint = "sys_enter")]
-pub fn innerwarden_dispatcher(ctx: RawTracePointContext) -> u32 {
-    // args[1] = syscall number
-    let syscall_nr: u64 = unsafe { raw_arg(&ctx, 1) };
-    let nr = syscall_nr as u32;
-
-    // Check if this syscall is enabled
-    if let Some(&enabled) = unsafe { SYSCALL_ENABLED.get(&nr) } {
-        if enabled == 0 {
-            return 0;
-        }
-    } else {
-        return 0; // not in map = not monitored
-    }
-
-    // Tail call to handler - silently returns if no handler installed
-    unsafe {
-        let _ = SYSCALL_DISPATCH.tail_call(&ctx, nr);
-    }
-
-    0
 }
 
 // ---------------------------------------------------------------------------

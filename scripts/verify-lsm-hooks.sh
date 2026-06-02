@@ -34,7 +34,7 @@ EBPF_OBJ="${EBPF_OBJ:-crates/sensor-ebpf/target/bpfel-unknown-none/release/inner
 
 if [ ! -f "$EBPF_OBJ" ]; then
     echo "skip: eBPF object not built at $EBPF_OBJ" >&2
-    echo "      (build with: cd crates/sensor-ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release --features dispatcher)" >&2
+    echo "      (build with: cd crates/sensor-ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release)" >&2
     exit 2
 fi
 
