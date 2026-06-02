@@ -8,6 +8,7 @@ mod event_channels;
 mod event_dispatch;
 mod event_pipeline;
 mod incident_builders;
+mod kernel_promote;
 mod main_helpers;
 mod seccomp;
 mod sensor;

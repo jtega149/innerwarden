@@ -247,6 +247,22 @@ pub(crate) fn process_event(
         return;
     }
 
+    // Spec 069 follow-up #2: promote orphan high-signal kernel syscall events
+    // (ptrace inject / RWX mprotect / fileless memfd / in-container mount) to
+    // incidents — they previously landed in the DB + knowledge graph but never
+    // became incidents, so AI triage and response never ran. Detect WIDE; FP is
+    // contained by layers: the default + per-server allowlist inside
+    // `kernel_syscall_incident`, then the per-kind incident suppression here,
+    // then the agent's baseline + AI `decide()` downstream.
+    if let Some(incident) =
+        crate::kernel_promote::kernel_syscall_incident(&ev, &detectors.dynamic_allowlist)
+    {
+        let name = crate::kernel_promote::suppression_name(&ev.kind);
+        if !detectors.is_incident_suppressed(&incident, name) {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
     if let Some(ref mut det) = detectors.ssh {
         if let Some(incident) = det.process(&ev) {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
@@ -1254,6 +1270,66 @@ mod tests {
         assert!(
             dedup_cache.contains_key(&4242),
             "incident pid should seed the cross-detector dedup cache"
+        );
+    }
+
+    // Spec 069 follow-up #2: an invasive ptrace into another process by a
+    // non-debugger comm must be promoted to an incident through process_event
+    // (covers the kernel_promote wiring), while a debugger is contained.
+    #[test]
+    fn process_event_promotes_kernel_ptrace_injection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sqlite = SqliteWriter::new(tmp.path(), true).expect("sqlite");
+        let mut detectors = quiet_detector_set(tmp.path());
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+        let datasets = seed_datasets(tmp.path());
+
+        let mk = |comm: &str| innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "test-host".into(),
+            source: "ebpf".into(),
+            kind: "process.ptrace_attach".into(),
+            severity: innerwarden_core::event::Severity::Critical,
+            summary: "ptrace".into(),
+            details: serde_json::json!({
+                "pid": 1000, "target_pid": 2000, "request": 16,
+                "request_name": "PTRACE_ATTACH", "comm": comm,
+            }),
+            tags: vec![],
+            entities: vec![],
+        };
+
+        // Attacker comm → promoted.
+        process_event(
+            mk("evilinject"),
+            &sqlite,
+            &mut detectors,
+            &mut stats,
+            &mut syslog,
+            &mut dedup_cache,
+            &datasets,
+        );
+        assert!(
+            stats.incidents_written >= 1,
+            "invasive ptrace by a non-debugger must promote to an incident"
+        );
+
+        // Debugger comm → contained at the default-allowlist layer (no new incident).
+        let before = stats.incidents_written;
+        process_event(
+            mk("gdb"),
+            &sqlite,
+            &mut detectors,
+            &mut stats,
+            &mut syslog,
+            &mut dedup_cache,
+            &datasets,
+        );
+        assert_eq!(
+            stats.incidents_written, before,
+            "a debugger ptrace must be contained, not alerted"
         );
     }
 
