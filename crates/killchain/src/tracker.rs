@@ -11,6 +11,51 @@ use crate::bridge;
 use crate::patterns::*;
 use crate::types::{ChainEvent, PidChainState};
 
+/// True when a read path is a genuine credential/secret whose exfiltration
+/// matters, for the DATA_EXFIL chain (`sensitive_read + socket`).
+///
+/// Deliberately tight. The previous list included `/etc/passwd` and the whole
+/// `.ssh/` directory, which made every download tool trip DATA_EXFIL:
+/// `/etc/passwd` is world-readable, holds no secrets since `/etc/shadow`
+/// exists, and is read by virtually every process via glibc nss
+/// (`getpwuid`/`getpwnam`); `.ssh/known_hosts` and `.ssh/config` are read by
+/// git/ssh on every connection. Combined with any outbound connect (e.g. apt,
+/// snap, curl, rustup fetching from a CDN/mirror) that produced a flood of
+/// false-positive DATA_EXFIL incidents. The real exfil signal is the shadow
+/// hashes, private keys, and cloud/app credentials kept here; reading
+/// `/etc/passwd` alone is account *discovery* (T1087), handled elsewhere, not
+/// exfil.
+pub(crate) fn is_sensitive_read_path(path: &str) -> bool {
+    path.contains("/etc/shadow") // also matches /etc/shadow-
+        || path.contains("/etc/gshadow")
+        || path.contains("/etc/sudoers")
+        || path.contains(".ssh/id_") // private keys (id_rsa/id_ed25519/...)
+        || path.contains(".ssh/authorized_keys")
+        || path.contains("/.env") // dotenv secrets; "/.env" excludes *.env files
+        || path.contains(".gnupg/")
+        || path.contains(".netrc")
+        // Cloud / cluster credentials — explicit files, not the bare
+        // "credentials" substring (which matched benign credentials-cache
+        // dirs). Each is the canonical secret for its provider.
+        || path.contains(".aws/credentials")
+        || path.contains(".docker/config.json")
+        || path.contains("gcloud/application_default_credentials.json")
+        || path.contains(".azure/accessTokens.json")
+        || path.contains(".kube/config")
+        || path.contains("/var/run/secrets/kubernetes.io/serviceaccount/token")
+    // KNOWN LIMITATIONS (out of scope for substring matching — do not try to
+    // close them here):
+    //   - copy/hardlink/symlink-to-tmp: `cp /etc/shadow /tmp/x` then read
+    //     `/tmp/x` evades any path match. Needs inode-identity tracking in the
+    //     eBPF file_open hook, not this list.
+    //   - fd re-open / `/proc/self/fd/N` / `/proc/self/root/...` aliases.
+    //   - This is the userspace kill-chain trigger ONLY. The sensor's eBPF
+    //     openat emits `file.read_access` for the much broader `/etc`,`/root`,
+    //     `/home` set (rate-limited telemetry) and sets its own in-kernel
+    //     CHAIN_SENSITIVE_READ; that broader bit is a separate code path with
+    //     a separate FP profile and is NOT changed here.
+}
+
 // ---------------------------------------------------------------------------
 // PidTracker
 // ---------------------------------------------------------------------------
@@ -176,22 +221,14 @@ impl PidTracker {
                 }
                 CHAIN_MPROTECT
             }
-            // Sensitive file access (openat on /etc/shadow, .ssh/, credentials)
+            // Sensitive file access (openat on /etc/shadow, private keys, creds).
             "file.open" | "file.read_access" => {
                 let path = details
                     .get("filename")
                     .or_else(|| details.get("path"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let is_sensitive = path.contains("/etc/shadow")
-                    || path.contains("/etc/passwd")
-                    || path.contains("/etc/sudoers")
-                    || path.contains(".ssh/")
-                    || path.contains(".aws/")
-                    || path.contains(".env")
-                    || path.contains(".gnupg/")
-                    || path.contains("credentials");
-                if !is_sensitive {
+                if !is_sensitive_read_path(path) {
                     return vec![];
                 }
                 CHAIN_SENSITIVE_READ
@@ -923,6 +960,130 @@ mod tests {
             !fulls.is_empty(),
             "attacker DATA_EXFIL must still fire when a different comm is excluded"
         );
+    }
+
+    #[test]
+    fn is_sensitive_read_path_is_tight() {
+        // Real secrets whose exfiltration matters.
+        for p in [
+            "/etc/shadow",
+            "/etc/shadow-",
+            "/etc/gshadow",
+            "/etc/sudoers",
+            "/home/u/.ssh/id_rsa",
+            "/home/u/.ssh/id_ed25519",
+            "/root/.ssh/authorized_keys",
+            "/app/.env",
+            "/app/.env.production",
+            "/home/u/.gnupg/secring.gpg",
+            "/home/u/.netrc",
+            "/home/u/.aws/credentials",
+            "/root/.docker/config.json",
+            "/home/u/.config/gcloud/application_default_credentials.json",
+            "/home/u/.azure/accessTokens.json",
+            "/home/u/.kube/config",
+            "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        ] {
+            assert!(is_sensitive_read_path(p), "{p} must be sensitive");
+        }
+        // Benign reads that previously produced false-positive DATA_EXFIL:
+        // world-readable / nss / TLS-trust / ssh-bookkeeping / config files
+        // that download tools and cloud CLIs touch on every run.
+        for p in [
+            "/etc/passwd",
+            "/etc/resolv.conf",
+            "/etc/hosts",
+            "/etc/nsswitch.conf",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/ld.so.cache",
+            "/home/u/.ssh/known_hosts",
+            "/home/u/.ssh/config",
+            "/home/u/.aws/config",              // aws cli reads this every call
+            "/app/config.env",                  // *.env extension, not a .env dotfile
+            "/var/cache/app/credentials-cache", // bare "credentials" no longer matches
+        ] {
+            assert!(!is_sensitive_read_path(p), "{p} must NOT be sensitive");
+        }
+    }
+
+    #[test]
+    fn data_exfil_does_not_fire_on_etc_passwd() {
+        // The Oracle false positive: curl reads /etc/passwd via nss and
+        // connects to a CDN (54.230.x = CloudFront). Must NOT trip DATA_EXFIL.
+        let mut tracker = PidTracker::new();
+        tracker.process_event(&make_event_with_comm(
+            "file.read_access",
+            5000,
+            "curl",
+            json!({"filename": "/etc/passwd"}),
+        ));
+        let incidents = tracker.process_event(&make_event_with_comm(
+            "network.outbound_connect",
+            5000,
+            "curl",
+            json!({"dst_ip": "54.230.201.25", "dst_port": 443}),
+        ));
+        assert!(
+            incidents.iter().all(|i| i["severity"] != "critical"),
+            "/etc/passwd read + connect must not produce a critical DATA_EXFIL incident"
+        );
+    }
+
+    #[test]
+    fn data_exfil_still_fires_on_etc_shadow() {
+        // Regression guard: tightening the list must NOT weaken real exfil.
+        let mut tracker = PidTracker::new();
+        tracker.process_event(&make_event_with_comm(
+            "network.outbound_connect",
+            6000,
+            "attacker",
+            json!({"dst_ip": "185.234.1.1", "dst_port": 9999}),
+        ));
+        let incidents = tracker.process_event(&make_event_with_comm(
+            "file.read_access",
+            6000,
+            "attacker",
+            json!({"filename": "/etc/shadow"}),
+        ));
+        assert!(
+            incidents.iter().any(|i| i["severity"] == "critical"),
+            "shadow read + connect must still fire DATA_EXFIL"
+        );
+    }
+
+    #[test]
+    fn data_exfil_fires_on_ssh_private_key_not_known_hosts() {
+        // Private key + connect = real exfil.
+        let mut t1 = PidTracker::new();
+        t1.process_event(&make_event_with_comm(
+            "file.read_access",
+            7000,
+            "attacker",
+            json!({"filename": "/home/u/.ssh/id_ed25519"}),
+        ));
+        let fires = t1.process_event(&make_event_with_comm(
+            "network.outbound_connect",
+            7000,
+            "attacker",
+            json!({"dst_ip": "185.234.1.1", "dst_port": 9999}),
+        ));
+        assert!(fires.iter().any(|i| i["severity"] == "critical"));
+
+        // known_hosts (git/ssh bookkeeping) + connect = benign, no fire.
+        let mut t2 = PidTracker::new();
+        t2.process_event(&make_event_with_comm(
+            "file.read_access",
+            7001,
+            "git",
+            json!({"filename": "/home/u/.ssh/known_hosts"}),
+        ));
+        let benign = t2.process_event(&make_event_with_comm(
+            "network.outbound_connect",
+            7001,
+            "git",
+            json!({"dst_ip": "140.82.112.3", "dst_port": 443}),
+        ));
+        assert!(benign.iter().all(|i| i["severity"] != "critical"));
     }
 
     #[test]
