@@ -746,18 +746,47 @@ impl ResponseLifecycle {
     /// the row source (SQLite vs JSONL), so the duplication is
     /// intentional rather than premature abstraction.
     fn hydrate_from_decisions_sqlite(lifecycle: &mut Self, store: &innerwarden_store::Store) {
-        let now = Utc::now();
-        let today = chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
-        let rows = match store.block_ip_decisions_for_date(&today) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "block_ip_decisions_for_date failed during hydration");
-                return;
+        Self::hydrate_from_decisions_sqlite_at(lifecycle, store, Utc::now());
+    }
+
+    /// Clock-injectable core of `hydrate_from_decisions_sqlite`. Splitting
+    /// `now` out keeps the midnight-window behaviour deterministically
+    /// testable without touching the global clock.
+    fn hydrate_from_decisions_sqlite_at(
+        lifecycle: &mut Self,
+        store: &innerwarden_store::Store,
+        now: DateTime<Utc>,
+    ) {
+        // Query yesterday and today (UTC). A block's TTL is at most one
+        // hour, so a still-active block recorded shortly before midnight
+        // lives under yesterday's date partition (`ts LIKE 'date%'`).
+        // Querying only `today` silently dropped such blocks on any
+        // restart in the first hour after UTC midnight, and made these
+        // hydration tests flaky when they ran in the first 60s after
+        // midnight (the seeded `now - 60s` row landed under yesterday).
+        // The `expires_at <= now` filter below discards anything genuinely
+        // past its TTL, so widening the query window cannot resurrect
+        // stale blocks.
+        let today = now.date_naive();
+        let date_strings = [
+            (today - chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string(),
+            today.format("%Y-%m-%d").to_string(),
+        ];
+        let mut rows = Vec::new();
+        for date in &date_strings {
+            match store.block_ip_decisions_for_date(date) {
+                Ok(r) => rows.extend(r),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        date = %date,
+                        "block_ip_decisions_for_date failed during hydration"
+                    );
+                }
             }
-        };
+        }
         let tracked_targets: std::collections::HashSet<String> =
             lifecycle.active.iter().map(|r| r.target.clone()).collect();
         let mut added = 0usize;
@@ -3218,6 +3247,80 @@ mod tests {
             lifecycle.active.len(),
             0,
             "expired blocks must not be re-surfaced as active"
+        );
+    }
+
+    #[test]
+    fn hydrate_from_decisions_sqlite_at_includes_pre_midnight_block() {
+        // Regression: a block recorded shortly before UTC midnight stays
+        // active for up to an hour, but lives under *yesterday's* date
+        // partition. A restart in the first hour of the next day must
+        // still hydrate it. Before the yesterday+today query window this
+        // was silently dropped, and the `now - 60s` seed in the sibling
+        // tests made them flake in the first 60s after midnight. Inject a
+        // fixed `now` just after midnight so the case is deterministic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+
+        let now = "2026-01-02T00:00:30Z"
+            .parse::<DateTime<Utc>>()
+            .expect("parse now");
+        // 60s earlier => 2026-01-01T23:59:30Z (yesterday's partition);
+        // expires at 2026-01-02T00:59:30Z, still after `now`.
+        let pre_midnight = now - chrono::Duration::seconds(60);
+        assert_eq!(
+            pre_midnight.date_naive(),
+            now.date_naive() - chrono::Duration::days(1),
+            "fixture must straddle the UTC day boundary"
+        );
+        insert_block_ip_decision(
+            &store,
+            &pre_midnight.to_rfc3339(),
+            "203.0.113.40",
+            "ssh:bf:midnight",
+            Some("block-ip-ufw"),
+        );
+
+        let mut lifecycle = ResponseLifecycle::new();
+        ResponseLifecycle::hydrate_from_decisions_sqlite_at(&mut lifecycle, &store, now);
+
+        assert_eq!(
+            lifecycle.active.len(),
+            1,
+            "a pre-midnight block still within TTL must hydrate after midnight"
+        );
+        assert_eq!(lifecycle.active[0].target, "203.0.113.40");
+    }
+
+    #[test]
+    fn hydrate_from_decisions_sqlite_at_skips_expired_pre_midnight_block() {
+        // The widened yesterday+today window must not resurrect a
+        // yesterday block whose 1h TTL already lapsed by `now`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+
+        let now = "2026-01-02T02:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("parse now");
+        // 23:00 yesterday + 1h TTL => expired at 00:00, well before now.
+        let stale = "2026-01-01T23:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("parse stale");
+        insert_block_ip_decision(
+            &store,
+            &stale.to_rfc3339(),
+            "203.0.113.41",
+            "ssh:bf:midnight-stale",
+            None,
+        );
+
+        let mut lifecycle = ResponseLifecycle::new();
+        ResponseLifecycle::hydrate_from_decisions_sqlite_at(&mut lifecycle, &store, now);
+
+        assert_eq!(
+            lifecycle.active.len(),
+            0,
+            "expired yesterday block must not resurrect via the widened window"
         );
     }
 
