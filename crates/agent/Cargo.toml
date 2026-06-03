@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "network-programming"]
 # is required for `MALLOC_CONF` and the `malloc_conf` weak symbol to
 # be picked up by the runtime. See docs/heap-profile.md for the
 # on-demand workflow.
-tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 
 # Wave 9f (AUDIT-009 root): journald sink wired in main.rs when the
 # binary runs under systemd (detected via `JOURNAL_STREAM` env var). The

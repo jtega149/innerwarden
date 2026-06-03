@@ -24,7 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 notify = { version = "8", default-features = false, features = ["macos_kqueue"], optional = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
 
 [features]
 default = []

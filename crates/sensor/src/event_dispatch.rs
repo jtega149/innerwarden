@@ -45,7 +45,7 @@
 
 use std::collections::HashMap;
 
-use tracing::info;
+use tracing::{info, trace};
 
 use crate::detector_set::DetectorSet;
 use crate::detectors;
@@ -73,7 +73,11 @@ pub(crate) fn process_event(
     let mut ev = ev;
     let persist = detectors.event_pipeline.should_persist(&mut ev);
 
-    info!(kind = %ev.kind, summary = %ev.summary, "event");
+    // Per-event diagnostic at trace level: at prod's default INFO this logged
+    // one line for *every* event (~27/s on a busy host => ~2.3M journald lines
+    // /day), drowning real logs and bloating the journal. Keep it available
+    // under `RUST_LOG=trace` for debugging.
+    trace!(kind = %ev.kind, summary = %ev.summary, "event");
     if persist {
         sqlite.write_event(&ev);
         stats.events_written += 1;
