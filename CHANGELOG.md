@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.7] - 2026-06-04
+
 ### Fixed
 - **setns events from `call_usermodehelper` kernel helpers are no longer dropped.**
   `dispatch_setns` shared the comm/cgroup suppression gate with the other syscall
