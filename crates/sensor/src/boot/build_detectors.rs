@@ -173,6 +173,28 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
         );
         IntegrityAlertDetector::new(&cfg.agent.host_id, d.cooldown_seconds)
     });
+    let setns_owner_detector = cfg.detectors.setns_owner.enabled.then(|| {
+        let d = &cfg.detectors.setns_owner;
+        info!(
+            cooldown_seconds = d.cooldown_seconds,
+            "setns_owner detector enabled (untrusted namespace pivot — Spec 070)"
+        );
+        crate::detectors::setns_owner::SetnsOwnerDetector::new(
+            &cfg.agent.host_id,
+            d.cooldown_seconds,
+        )
+    });
+    let untrusted_root_exec_detector = cfg.detectors.untrusted_root_exec.enabled.then(|| {
+        let d = &cfg.detectors.untrusted_root_exec;
+        info!(
+            cooldown_seconds = d.cooldown_seconds,
+            "untrusted_root_exec detector enabled (root exec from writable path — Spec 070)"
+        );
+        crate::detectors::untrusted_root_exec::UntrustedRootExecDetector::new(
+            &cfg.agent.host_id,
+            d.cooldown_seconds,
+        )
+    });
     let log_tampering_detector = cfg.detectors.log_tampering.enabled.then(|| {
         let d = &cfg.detectors.log_tampering;
         info!(
@@ -251,6 +273,8 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
         execution_guard: execution_guard_detector,
         docker_anomaly: docker_anomaly_detector,
         integrity_alert: integrity_alert_detector,
+        setns_owner: setns_owner_detector,
+        untrusted_root_exec: untrusted_root_exec_detector,
         log_tampering: log_tampering_detector,
         distributed_ssh: distributed_ssh_detector,
         suspicious_login: cfg.detectors.ssh_bruteforce.enabled.then(|| {

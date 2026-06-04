@@ -1095,8 +1095,9 @@ mod tests {
     fn engine_starts_empty() {
         let engine = CorrelationEngine::new();
         // 47 original (CL-001 → CL-047) + 20 spec 050-PR7 (CL-051 → CL-070)
-        // + CL-071 (kernel devnode exposure chain — this PR).
-        assert_eq!(engine.rule_count(), 68);
+        // + CL-071 (kernel devnode exposure chain)
+        // + CL-072 (Spec 070 privilege-provenance → goal-action chain).
+        assert_eq!(engine.rule_count(), 69);
         assert_eq!(engine.pending_count(), 0);
     }
 
@@ -1961,6 +1962,48 @@ mod tests {
         ));
         engine.observe(make_event(Layer::Userspace, "lateral_egress_scp_rsync", ip));
         assert_chain_fires(&mut engine, "CL-069");
+    }
+
+    #[test]
+    fn cl_072_provenance_to_goal_action() {
+        // Spec 070: illegitimate privilege provenance (root joined a non-root-
+        // owned user namespace) followed by a goal action (write /etc/sudoers)
+        // chains into one Critical incident — the technique-independent
+        // "exploit caught" signal.
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.72";
+        engine.observe(make_event(
+            Layer::Userspace,
+            "namespace.setns_unpriv_owner",
+            ip,
+        ));
+        engine.observe(make_event(Layer::Userspace, "sensitive_write", ip));
+        assert_chain_fires(&mut engine, "CL-072");
+    }
+
+    #[test]
+    fn cl_072_untrusted_root_exec_to_persistence() {
+        // Untrusted root execution -> persistence is the same invariant via a
+        // different provenance signal and goal action.
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.73";
+        engine.observe(make_event(Layer::Userspace, "execution.untrusted_root", ip));
+        engine.observe(make_event(Layer::Userspace, "crontab_persistence", ip));
+        assert_chain_fires(&mut engine, "CL-072");
+    }
+
+    #[test]
+    fn cl_072_privesc_alone_does_not_fire() {
+        // A provenance signal with no goal action must NOT chain (no false
+        // "exploit" on a bare escalation).
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.74";
+        engine.observe(make_event(Layer::Userspace, "privesc", ip));
+        let chains = engine.drain_completed();
+        assert!(
+            !chains.iter().any(|c| c.rule_id == "CL-072"),
+            "CL-072 must not fire on a provenance signal alone"
+        );
     }
 
     #[test]

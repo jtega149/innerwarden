@@ -47,10 +47,29 @@ impl PrivescDetector {
             .map(|s| s.to_string());
 
         // Skip known legitimate privilege escalation processes from the shared allowlist.
-        // Handles kernel task parentheses: (install) -> install via comm_in_allowlist.
-        // Exploits from python, bash, etc. still fire Critical.
-        if super::allowlists::is_innerwarden_process(old_uid as u64, &comm)
-            || super::allowlists::comm_in_allowlist(&comm, super::allowlists::PRIVESC_ALLOWED)
+        // InnerWarden's own processes never alarm.
+        if super::allowlists::is_innerwarden_process(old_uid as u64, &comm) {
+            return None;
+        }
+
+        // Spec 070: decide legitimacy by NON-FORGEABLE provenance (the exe path
+        // of self/parent), not the forgeable comm. A real sudo/su/login or a
+        // container escalation is Trusted and suppressed; a payload that renamed
+        // itself `sudo` from /tmp is Illegitimate and still fires Critical —
+        // closing the comm-spoof bypass the old `PRIVESC_ALLOWED` comm gate fell
+        // for (a renamed binary or `prctl(PR_SET_NAME)` defeated it).
+        let ppid = resolve_ppid_status(pid);
+        let prov = super::provenance::resolve(pid, ppid);
+        let verdict = prov.escalation_verdict();
+        if verdict == super::provenance::Provenance::Trusted {
+            return None;
+        }
+        // The comm allowlist survives ONLY as a weak secondary hint: when
+        // provenance is merely Unknown (a /proc read raced, or a kernel task) and
+        // the comm is a known escalator, stay quiet to avoid FP churn.
+        // Illegitimate provenance is NEVER silenced by comm.
+        if verdict != super::provenance::Provenance::Illegitimate
+            && super::allowlists::comm_in_allowlist(&comm, super::allowlists::PRIVESC_ALLOWED)
         {
             return None;
         }
@@ -71,6 +90,7 @@ impl PrivescDetector {
             "ebpf".to_string(),
             "kprobe".to_string(),
             "privesc".to_string(),
+            verdict.tag().to_string(),
         ];
         let mut entities = vec![];
         if let Some(ref cid) = container_id {
@@ -108,6 +128,9 @@ impl PrivescDetector {
                 "old_uid": old_uid,
                 "new_uid": new_uid,
                 "container_id": container_id,
+                "exe": prov.exe,
+                "parent_exe": prov.parent_exe,
+                "provenance": verdict.tag(),
             }]),
             recommended_checks: vec![
                 format!("Investigate process {comm} (pid={pid}) - how did it gain root?"),
@@ -119,6 +142,18 @@ impl PrivescDetector {
             entities,
         })
     }
+}
+
+/// PPid from `/proc/<pid>/status` (0 if the process already exited / kernel task).
+fn resolve_ppid_status(pid: u32) -> u32 {
+    if let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in content.lines() {
+            if let Some(val) = line.strip_prefix("PPid:\t") {
+                return val.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------

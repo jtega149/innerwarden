@@ -48,11 +48,13 @@ use crate::detectors::ransomware::RansomwareDetector;
 use crate::detectors::reverse_shell::ReverseShellDetector;
 use crate::detectors::rootkit::RootkitDetector;
 use crate::detectors::search_abuse::SearchAbuseDetector;
+use crate::detectors::setns_owner::SetnsOwnerDetector;
 use crate::detectors::ssh_bruteforce::SshBruteforceDetector;
 use crate::detectors::ssh_key_injection::SshKeyInjectionDetector;
 use crate::detectors::sudo_abuse::SudoAbuseDetector;
 use crate::detectors::suspicious_login::SuspiciousLoginDetector;
 use crate::detectors::systemd_persistence::SystemdPersistenceDetector;
+use crate::detectors::untrusted_root_exec::UntrustedRootExecDetector;
 use crate::detectors::user_agent_scanner::UserAgentScannerDetector;
 use crate::detectors::user_creation::UserCreationDetector;
 use crate::detectors::web_scan::WebScanDetector;
@@ -90,6 +92,8 @@ pub(crate) struct DetectorSet {
     pub(crate) execution_guard: Option<ExecutionGuardDetector>,
     pub(crate) docker_anomaly: Option<DockerAnomalyDetector>,
     pub(crate) integrity_alert: Option<IntegrityAlertDetector>,
+    pub(crate) setns_owner: Option<SetnsOwnerDetector>,
+    pub(crate) untrusted_root_exec: Option<UntrustedRootExecDetector>,
     pub(crate) log_tampering: Option<LogTamperingDetector>,
     pub(crate) distributed_ssh: Option<DistributedSshDetector>,
     pub(crate) suspicious_login: Option<SuspiciousLoginDetector>,

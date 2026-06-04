@@ -281,9 +281,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_yaml_parses_to_68_rules() {
+    fn builtin_yaml_parses_to_69_rules() {
         let rules = load_builtin().unwrap();
-        assert_eq!(rules.len(), 68, "expected 68 rules, got {}", rules.len());
+        assert_eq!(rules.len(), 69, "expected 69 rules, got {}", rules.len());
     }
 
     #[test]

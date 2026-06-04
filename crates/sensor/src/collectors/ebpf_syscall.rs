@@ -142,6 +142,35 @@ fn find_ebpf_obj() -> Option<String> {
 }
 
 /// Resolve parent PID from /proc/<pid>/status. Best-effort (returns 0 on failure).
+/// Decode a `setns(2)` nstype mask into a short human label (Spec 070).
+/// nstype 0 means "any namespace type, determined by the fd".
+fn setns_nstype_name(nstype: u32) -> String {
+    if nstype == 0 {
+        return "by-fd".to_string();
+    }
+    const FLAGS: &[(u32, &str)] = &[
+        (0x1000_0000, "user"),   // CLONE_NEWUSER
+        (0x0002_0000, "mnt"),    // CLONE_NEWNS
+        (0x4000_0000, "net"),    // CLONE_NEWNET
+        (0x2000_0000, "pid"),    // CLONE_NEWPID
+        (0x0400_0000, "uts"),    // CLONE_NEWUTS
+        (0x0800_0000, "ipc"),    // CLONE_NEWIPC
+        (0x0200_0000, "cgroup"), // CLONE_NEWCGROUP
+        (0x0000_0080, "time"),   // CLONE_NEWTIME
+    ];
+    let mut parts = Vec::new();
+    for (bit, name) in FLAGS {
+        if nstype & bit != 0 {
+            parts.push(*name);
+        }
+    }
+    if parts.is_empty() {
+        format!("0x{nstype:x}")
+    } else {
+        parts.join("+")
+    }
+}
+
 fn resolve_ppid(pid: u32) -> u32 {
     let path = format!("/proc/{pid}/status");
     if let Ok(content) = std::fs::read_to_string(&path) {
@@ -1489,6 +1518,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
         attach_syscall_kprobe(&mut bpf, "dispatch_listen", &["listen"]);
         attach_syscall_kprobe(&mut bpf, "dispatch_mprotect", &["mprotect"]);
         attach_syscall_kprobe(&mut bpf, "dispatch_clone", &["clone"]);
+        // Spec 070: setns(2) — privilege-provenance pivot (emit-only).
+        attach_syscall_kprobe(&mut bpf, "dispatch_setns", &["setns"]);
         attach_syscall_kprobe(&mut bpf, "dispatch_unlink", &["unlinkat"]);
         attach_syscall_kprobe(&mut bpf, "dispatch_rename", &["renameat2"]);
         attach_syscall_kprobe(&mut bpf, "dispatch_kill", &["kill"]);
@@ -2560,6 +2591,40 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         summary: format!("{comm} (PID {pid}) clone(flags=0x{clone_flags:x})"),
                         details: serde_json::json!({"pid": pid, "uid": uid, "clone_flags": format!("0x{clone_flags:x}"), "comm": comm}),
                         tags: vec!["ebpf".to_string()],
+                        entities: vec![],
+                    })
+                }
+                // SetnsEvent (Spec 070): kind(4) pid(4) tgid(4) uid(4) fd(4,i32)
+                //   nstype(4) cgroup_id(8) comm(64) ts_ns(8) — total 104.
+                // Emit-only; the `setns_owner` detector resolves the target
+                // namespace owner uid in userspace from /proc/<pid>/fd/<fd>.
+                36 if data.len() >= 104 => {
+                    let pid = read_u32!(data, 4..8);
+                    let uid = read_u32!(data, 12..16);
+                    let fd = read_u32!(data, 16..20) as i32;
+                    let nstype = read_u32!(data, 20..24);
+                    let cgroup_id = read_u64!(data, 24..32);
+                    let comm = bytes_to_string(&data[32..96]);
+                    let nstype_name = setns_nstype_name(nstype);
+                    Some(Event {
+                        ts: chrono::Utc::now(),
+                        host: host.to_string(),
+                        source: "ebpf".to_string(),
+                        kind: "namespace.setns".to_string(),
+                        severity: Severity::Debug,
+                        summary: format!(
+                            "{comm} (PID {pid}, uid {uid}) setns(fd={fd}, {nstype_name})"
+                        ),
+                        details: serde_json::json!({
+                            "pid": pid,
+                            "uid": uid,
+                            "fd": fd,
+                            "nstype": nstype,
+                            "nstype_name": nstype_name,
+                            "cgroup_id": cgroup_id,
+                            "comm": comm,
+                        }),
+                        tags: vec!["ebpf".to_string(), "namespace".to_string()],
                         entities: vec![],
                     })
                 }

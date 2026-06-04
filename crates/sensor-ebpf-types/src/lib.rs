@@ -133,6 +133,15 @@ pub enum SyscallKind {
     /// the larger `ExecveEvent` shape — this kind always carries a
     /// fixed-shape `LsmDecisionEvent` (24 bytes).
     LsmDecision = 35,
+
+    // ── Spec 070: privilege provenance ────────────────────────────────
+    /// `setns(2)` entry (kprobe on `__x64_sys_setns` / `__arm64_sys_setns`).
+    /// Emit-only: carries fd + nstype + caller uid; the target namespace
+    /// OWNER uid is resolved in userspace (`setns_owner` detector) because
+    /// reading it in BPF needs a fragile nested-struct walk. A root process
+    /// joining a namespace owned by a non-root uid is the technique-independent
+    /// pivot primitive behind container-escape / userns-based LPE.
+    Setns = 36,
 }
 
 /// Identifies which kernel function a timing probe measured.
@@ -540,6 +549,31 @@ pub struct CloneEvent {
     pub ts_ns: u64,
 }
 
+/// Event emitted by the `setns(2)` kprobe (Spec 070 — privilege provenance).
+///
+/// Emit-only: the kernel side carries just the caller identity + `fd` + `nstype`.
+/// The TARGET namespace owner uid is resolved in userspace (`setns_owner`
+/// detector) via `/proc/<pid>/fd/<fd>` because walking `file->private_data ->
+/// ns -> owner -> uid` in BPF is the fragile nested-offset class (spec 069).
+/// Field order chosen so `cgroup_id` (u64) lands on an 8-byte boundary with no
+/// implicit padding: kind@0 pid@4 tgid@8 uid@12 fd@16 nstype@20 cgroup_id@24
+/// comm@32..96 ts_ns@96 (total 104 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SetnsEvent {
+    pub kind: u32,
+    pub pid: u32,
+    pub tgid: u32,
+    pub uid: u32,
+    /// The fd argument to setns(2) — points at an nsfs file in the caller.
+    pub fd: i32,
+    /// nstype mask (CLONE_NEWUSER/NEWNS/NEWNET/... or 0 = "any, from fd").
+    pub nstype: u32,
+    pub cgroup_id: u64,
+    pub comm: [u8; MAX_COMM_LEN],
+    pub ts_ns: u64,
+}
+
 /// Event emitted by `unlink`/`unlinkat` - file deletion.
 /// Filtered: only sensitive paths (/var/log, /etc, evidence files).
 #[repr(C)]
@@ -880,6 +914,8 @@ mod tests {
         assert_eq!(SyscallKind::FileOpen as u32, 3);
         assert_eq!(SyscallKind::FileWrite as u32, 4);
         assert_eq!(SyscallKind::Truncate as u32, 34);
+        assert_eq!(SyscallKind::LsmDecision as u32, 35);
+        assert_eq!(SyscallKind::Setns as u32, 36);
     }
 
     #[test]

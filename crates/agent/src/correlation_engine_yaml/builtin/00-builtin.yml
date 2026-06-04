@@ -1,4 +1,4 @@
-# Total rules exported: 68
+# Total rules exported: 69
 version: 1
 metadata:
   description: >-
@@ -38,6 +38,26 @@ lists:
     - c2_protocol_tunneling
     - c2_non_standard_port
     - dns_c2
+  # Spec 070 — technique-independent privilege-escalation provenance signals.
+  # Any of these means a process acquired or is using privilege through an
+  # illegitimate path, regardless of the underlying exploit.
+  privesc_provenance_kinds:
+    - privesc                          # uid->0 from illegitimate lineage
+    - execution.untrusted_root         # uid-0 exec of attacker-plantable code
+    - namespace.setns_unpriv_owner     # root joined a non-root-owned user namespace
+  # The finite set of high-value actions a successful local exploit takes once
+  # it has the primitive. Chaining "illegitimate provenance" -> any of these
+  # catches the whole "escalate then act" class.
+  root_goal_action_kinds:
+    - sensitive_write                  # /etc/sudoers, /etc/shadow, /etc/passwd, PAM
+    - ssh_key_injection
+    - systemd_persistence
+    - crontab_persistence
+    - kernel_module                    # insmod/init_module as root
+    - setuid_exploit_pattern
+    - pam_module_change
+    - selinux_apparmor_disable
+    - auditd_disable
 
 rules:
   - id: "CL-001"
@@ -1227,4 +1247,27 @@ rules:
           - "privilege.escalation"
           - "kill_chain_detected"
           - "credential_harvest"
+        entity_must_match: false
+
+  # Spec 070 — the technique-independent "exploit caught" chain. ANY illegitimate
+  # privilege-provenance signal followed by ANY high-value root action on the
+  # same host inside a tight window becomes ONE Critical incident. The escalation
+  # mechanism is irrelevant (CIFSwitch, Dirty Pipe, nf_tables, io_uring, ...);
+  # what is invariant is "gained privilege illegitimately, then used it".
+  - id: "CL-072"
+    name: "Illegitimate Privilege Provenance to Goal Action"
+    severity: critical
+    window_secs: 120
+    min_confidence: 0.8
+    stages:
+      # layer: null (any) — these incident kinds classify to Userspace via
+      # classify_layer (they are not "privilege.*"/"lsm.*"), so pinning a layer
+      # would prevent the match. Kind + tight window carry the precision.
+      - layer: null
+        kind_patterns:
+          - "$privesc_provenance_kinds"
+        entity_must_match: false
+      - layer: null
+        kind_patterns:
+          - "$root_goal_action_kinds"
         entity_must_match: false

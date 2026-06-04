@@ -42,7 +42,8 @@ use innerwarden_ebpf_types::{
     AcceptEvent, AcpiEvalEvent, BpfLoadEvent, CloneEvent, ConnectEvent, DupEvent, ExecveEvent,
     IopermEvent, IoplEvent, KillEvent, ListenEvent, LsmDecisionEvent, MemfdCreateEvent,
     ModuleLoadEvent, MountEvent, MprotectEvent, MsrWriteEvent, PrctlEvent, PrivEscEvent,
-    ProcessExitEvent, PtraceEvent, RenameEvent, SetUidEvent, SocketBindEvent, SyscallKind,
+    ProcessExitEvent, PtraceEvent, RenameEvent, SetUidEvent, SetnsEvent, SocketBindEvent,
+    SyscallKind,
     TimingProbeEvent, TimingTarget, TruncateEvent, UnlinkEvent, UtimensatEvent, MAX_COMM_LEN,
     MAX_FILENAME_LEN,
 };
@@ -87,7 +88,8 @@ static ALLOWLIST_V6: HashMap<[u8; 16], u32> = HashMap::with_max_entries(1_000, 0
 /// Comm allowlist - processes that should never trigger alerts.
 /// Key: first 16 bytes of comm name (zero-padded).
 /// Value: bitmask of handlers to skip (bit 0=execve, 1=connect, 2=openat,
-///   3=ptrace, 4=setuid, 5=bind, 6=mount, 7=memfd, 8=init_module).
+///   3=ptrace, 4=setuid, 5=bind, 6=mount, 7=memfd, 8=init_module, ...,
+///   18=setns).
 /// Populated by agent on boot from config (e.g., cargo, rustc, apt, systemd).
 #[map]
 static COMM_ALLOWLIST: HashMap<[u8; 16], u32> = HashMap::with_max_entries(256, 0);
@@ -2024,6 +2026,51 @@ pub fn dispatch_listen(ctx: ProbeContext) -> u32 {
         event.pid = pid;
         event.uid = uid;
         event.backlog = backlog;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+// Spec 070: setns(2) entry — privilege-provenance pivot primitive.
+// Emit-only. A root task joining a namespace owned by a non-root uid is the
+// technique-independent signature of container-escape / userns-based LPE; the
+// owner-uid check is done in userspace (`setns_owner` detector) since walking
+// the nsfs file -> ns -> owner -> uid chain in BPF is the fragile nested-offset
+// class. Comm handler bit 18; rate-limited like its siblings so runc /
+// containerd setns floods cannot starve the ring.
+#[kprobe]
+pub fn dispatch_setns(ctx: ProbeContext) -> u32 {
+    if is_comm_allowed(18) || is_cgroup_allowed() {
+        return 0;
+    }
+    // setns(fd, nstype): fd=arg0, nstype=arg1
+    let fd = unsafe { syscall_arg!(ctx, 0).unwrap_or(u64::MAX) } as i32;
+    let nstype = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) } as u32;
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = pid_tgid as u32;
+    // NOTE: deliberately NOT rate-limited. `is_rate_limited` is per-PID and
+    // SHARED across handlers; a process does execve (which stamps the limiter)
+    // then setns within the same 100ms window, so a per-PID limit would drop
+    // every real setns. setns is a low-volume, high-value syscall — container
+    // runtimes are filtered by comm bit 18 / cgroup and in the userspace
+    // `setns_owner` detector instead.
+    let tgid = (pid_tgid >> 32) as u32;
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<SetnsEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Setns as u32;
+        event.pid = pid;
+        event.tgid = tgid;
+        event.uid = uid;
+        event.fd = fd;
+        event.nstype = nstype;
         event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
         event.ts_ns = ts;
         if let Ok(comm) = bpf_get_current_comm() {

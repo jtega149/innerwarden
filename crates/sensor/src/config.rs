@@ -298,6 +298,10 @@ pub struct DetectorsConfig {
     #[serde(default)]
     pub integrity_alert: IntegrityAlertConfig,
     #[serde(default)]
+    pub setns_owner: SetnsOwnerConfig,
+    #[serde(default)]
+    pub untrusted_root_exec: UntrustedRootExecConfig,
+    #[serde(default)]
     pub log_tampering: LogTamperingConfig,
     #[serde(default)]
     pub dns_tunneling: DnsTunnelingConfig,
@@ -657,6 +661,46 @@ pub struct IntegrityAlertConfig {
     pub enabled: bool,
     #[serde(default = "default_integrity_alert_cooldown_seconds")]
     pub cooldown_seconds: u64,
+}
+
+/// Spec 070 — untrusted namespace-pivot detector. Default ON: it is a
+/// low-noise, technique-independent privilege-escalation signal (root joining a
+/// user namespace outside any container runtime context).
+#[derive(Debug, Deserialize)]
+pub struct SetnsOwnerConfig {
+    #[serde(default = "default_setns_owner_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_setns_owner_cooldown_seconds")]
+    pub cooldown_seconds: u64,
+}
+
+impl Default for SetnsOwnerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_setns_owner_enabled(),
+            cooldown_seconds: default_setns_owner_cooldown_seconds(),
+        }
+    }
+}
+
+/// Spec 070 — untrusted-root-execution detector. Default ON: uid-0 execution of
+/// a binary from an unprivileged-writable path (outside any container) is the
+/// most technique-independent post-exploit signal there is.
+#[derive(Debug, Deserialize)]
+pub struct UntrustedRootExecConfig {
+    #[serde(default = "default_untrusted_root_exec_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_untrusted_root_exec_cooldown_seconds")]
+    pub cooldown_seconds: u64,
+}
+
+impl Default for UntrustedRootExecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_untrusted_root_exec_enabled(),
+            cooldown_seconds: default_untrusted_root_exec_cooldown_seconds(),
+        }
+    }
 }
 
 impl Default for IntegrityAlertConfig {
@@ -1463,6 +1507,22 @@ fn default_docker_anomaly_window_seconds() -> u64 {
 
 fn default_integrity_alert_cooldown_seconds() -> u64 {
     3600
+}
+
+fn default_setns_owner_enabled() -> bool {
+    true
+}
+
+fn default_setns_owner_cooldown_seconds() -> u64 {
+    300
+}
+
+fn default_untrusted_root_exec_enabled() -> bool {
+    true
+}
+
+fn default_untrusted_root_exec_cooldown_seconds() -> u64 {
+    300
 }
 
 fn default_log_tampering_cooldown_seconds() -> u64 {

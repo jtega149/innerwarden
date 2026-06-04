@@ -339,6 +339,27 @@ pub(crate) fn process_event(
         }
     }
 
+    // Spec 070: untrusted namespace pivot (root setns into a non-root-owned
+    // user namespace outside any container runtime context).
+    let setns_owner_incident = detectors.setns_owner.as_mut().and_then(|d| d.process(&ev));
+    if let Some(incident) = setns_owner_incident {
+        if !detectors.is_incident_suppressed(&incident, "setns_owner") {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // Spec 070: untrusted root execution (uid-0 exec of a binary from an
+    // unprivileged-writable path outside any container runtime context).
+    let untrusted_root_exec_incident = detectors
+        .untrusted_root_exec
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = untrusted_root_exec_incident {
+        if !detectors.is_incident_suppressed(&incident, "untrusted_root_exec") {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
     // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
     // + systemd_persistence + mitre_hunt from PR #647). The detector body
     // does not thread `dynamic_allowlist` through, so we extract the

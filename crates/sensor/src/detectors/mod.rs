@@ -286,6 +286,11 @@ pub mod data_destruction_pattern;
 pub mod symlink_hijack;
 pub mod system_user_interactive;
 
+// Spec 070 — privilege provenance / untrusted-root-execution
+pub mod provenance;
+pub mod setns_owner;
+pub mod untrusted_root_exec;
+
 #[cfg(test)]
 mod tests {
     use super::*;

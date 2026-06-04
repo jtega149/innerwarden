@@ -1259,12 +1259,12 @@ ignored = 9, 67
     // ===== correlation (spec 055 Phase 3) =====
 
     #[test]
-    fn correlation_builtin_yaml_parses_to_68_rules() {
+    fn correlation_builtin_yaml_parses_to_69_rules() {
         let rules = parse_correlation_rules_from_yaml(CORRELATION_BUILTIN_YAML, "builtin").unwrap();
         assert_eq!(
             rules.len(),
-            68,
-            "CTL parser must see the same 68 built-in rules as agent::correlation_engine_yaml; \
+            69,
+            "CTL parser must see the same 69 built-in rules as agent::correlation_engine_yaml; \
              schema drift in the agent parser will surface here"
         );
     }
@@ -1340,7 +1340,7 @@ rules:
     fn correlation_loader_includes_builtin_when_dir_missing() {
         let nonexistent = PathBuf::from("/tmp/innerwarden-correlation-doesnt-exist-xyz");
         let (rules, errors) = load_all_correlation_rules(&nonexistent);
-        assert_eq!(rules.len(), 68);
+        assert_eq!(rules.len(), 69);
         assert!(errors.is_empty());
     }
 
@@ -1367,7 +1367,7 @@ rules:
         assert_eq!(cl001.severity, "low");
         assert_eq!(cl001.source_file, "10-override.yml");
         // total stays the same (one ID swapped)
-        assert_eq!(rules.len(), 68);
+        assert_eq!(rules.len(), 69);
     }
 
     #[test]
@@ -1387,7 +1387,7 @@ rules:
 "#;
         std::fs::write(dir.path().join("20-custom.yml"), new_yaml).unwrap();
         let (rules, _) = load_all_correlation_rules(dir.path());
-        assert_eq!(rules.len(), 69);
+        assert_eq!(rules.len(), 70);
         assert!(rules.iter().any(|r| r.id == "CL-999"));
     }
 
