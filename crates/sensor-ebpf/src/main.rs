@@ -2046,9 +2046,16 @@ pub fn dispatch_listen(ctx: ProbeContext) -> u32 {
 // containerd setns floods cannot starve the ring.
 #[kprobe]
 pub fn dispatch_setns(ctx: ProbeContext) -> u32 {
-    if is_comm_allowed(18) || is_cgroup_allowed() {
-        return 0;
-    }
+    // Emit-only: NO in-kernel comm/cgroup suppression gate. The shared
+    // `is_comm_allowed(18) || is_cgroup_allowed()` gate used by the other
+    // handlers swallowed `call_usermodehelper` kernel helpers (e.g.
+    // `cifs.upcall`): in that task context the kprobe fires (run_cnt advances)
+    // but the gate bails before `EVENTS.reserve`, even though the allowlist maps
+    // hold no matching entry — so the CIFSwitch (CVE-2026-46243) pivot, a root
+    // task joining a non-root-owned user namespace, never reached the ring.
+    // setns is a low-volume, high-value syscall, so we always emit here and let
+    // the userspace `setns_owner` detector filter container runtimes by
+    // non-forgeable exe path + owner-uid. [A2: kernel-helper blind spot]
     // setns(fd, nstype): fd=arg0, nstype=arg1
     let fd = unsafe { syscall_arg!(ctx, 0).unwrap_or(u64::MAX) } as i32;
     let nstype = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) } as u32;

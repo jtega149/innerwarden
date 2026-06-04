@@ -9,6 +9,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **setns events from `call_usermodehelper` kernel helpers are no longer dropped.**
+  `dispatch_setns` shared the comm/cgroup suppression gate with the other syscall
+  handlers. For a kernel-helper process spawned via `call_usermodehelper` (e.g.
+  `cifs.upcall`) that gate bailed before `EVENTS.reserve` even with empty
+  allowlist maps — the kprobe fired but no `namespace.setns` event reached the
+  ring, so the spec-070 `setns_owner` detector never saw a root task joining a
+  non-root-owned user namespace. `dispatch_setns` now emits unconditionally and
+  the userspace `setns_owner` detector does the container-runtime filtering by
+  non-forgeable exe path + owner-uid. Closes the blind spot for any
+  `call_usermodehelper` abuse (CIFS/NFS/quota upcalls), incl. CVE-2026-46243;
+  validated live against the real PoC on kernel 6.8.
+
 ## [0.15.6] - 2026-06-04
 
 ### Added
