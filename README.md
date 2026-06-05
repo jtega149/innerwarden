@@ -495,6 +495,19 @@ curl -s "http://localhost:8787/api/agent/check-ip?ip=203.0.113.10"
 
 Your agent calls `check-command` before executing. If the recommendation is `deny`, it stops. No changes to the agent runtime needed, just an HTTP call.
 
+**MCP inspecting proxy.** For agents that talk to MCP servers, wrap the server so every tool call and result is inspected inline — no agent changes needed:
+
+```bash
+# Advisory (default): transparent pipe that alerts on threats
+innerwarden agent proxy -- npx -y some-mcp-server
+
+# Guard: block a dangerous tool call (credential leak, injection, ATR rule)
+# with an isError denial; the call never reaches the server
+innerwarden agent proxy --mode guard -- npx -y some-mcp-server
+```
+
+It parses the JSON-RPC stdio stream and screens `tools/call` arguments, `tools/list` descriptions (tool poisoning), and tool results (injected responses). `kill` mode also terminates a server that issues a disallowed call.
+
 See [AI Agent Protection docs](modules/openclaw-protection/docs/README.md) for the full integration guide.
 
 ---

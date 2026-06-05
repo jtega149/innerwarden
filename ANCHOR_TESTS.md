@@ -1339,6 +1339,15 @@ Operator: "ninguem se acha nesse tipo de paginacao load more, coloca uma paginac
 - `crates/agent/src/dashboard/mod.rs::tests::pr_h_pagination_css_is_shared_across_intel_and_audit` — `.pagination-bar` / `.pagination-status` / `.pagination-pagesize` / `.pagination-nav` / `.pagination-btn` (+ `-active` / `-disabled`) / `.pagination-ellipsis` defined in app.css. Single CSS surface backs both views — a fork that styles them separately fails this anchor.
 - `crates/agent/src/dashboard/mod.rs::tests::pr_h_no_spec_leaks_in_operator_facing_strings` — operator-facing strings must not surface internal spec numbers. `· spec 024 ·` (Metrics Drift subtitle) and `(spec 016)` (SQLite Operational Health tooltip) stay deleted.
 
+### MCP inspecting proxy (2026-06-05)
+
+The proxy wraps a real MCP server and inspects JSON-RPC traffic. These anchors pin the load-bearing safety + correctness invariants: the default must never block (enabling the proxy can't break existing MCP flows), a blocked call must reply with the original id (no client hang), and the JSON-RPC id must round-trip losslessly.
+
+- `crates/agent-guard/src/mcp_proxy/enforce.rs::tests::advisory_and_warn_modes_never_block` — the DEFAULT (`advisory`) and `warn` modes forward+alert a blocking verdict but NEVER block/kill. This is the no-regression contract: turning the proxy on at its default changes no observable MCP behavior. A future refactor that lets advisory block fails here.
+- `crates/agent-guard/src/mcp_proxy/enforce.rs::tests::guard_blocks_a_disallowed_tool_call` — `guard` mode synthesizes a denial for a disallowed `tools/call`, echoing the original request id as an `isError` result (the call is not forwarded). A blocked request is never silently dropped (which would hang the client).
+- `crates/agent-guard/src/mcp_proxy/jsonrpc.rs::tests::large_integer_id_round_trips_losslessly` — a request id is preserved verbatim through parse→serialize (no `1` vs `1.0` / big-int precision loss), so a synthesized denial correlates to the right request.
+- `crates/agent-guard/src/mcp_proxy/transport.rs::tests::guard_blocks_and_replies_with_denial` — end-to-end: in `guard` mode a credential-laden `tools/call` never reaches the wrapped server and the client receives the denial; the clean call passes through.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

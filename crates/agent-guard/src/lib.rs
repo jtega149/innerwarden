@@ -1,15 +1,20 @@
 //! InnerWarden Agent Guard — AI agent protection module.
 //!
 //! Detects AI agents/tools/runtimes on the host and screens their activity:
-//! - Tool-call / argument / response scanning for prompt injection,
-//!   credential leaks, dangerous commands, and ATR rule matches. This is
-//!   pattern/regex scanning over the serialized call — NOT MCP-protocol-aware
-//!   parsing, and there is no inline MCP proxy yet.
+//! - Command/argument/response scanning for prompt injection, credential
+//!   leaks, dangerous commands, and ATR rule matches (pattern/regex over the
+//!   serialized payload). Exposed live via `/api/agent/check-command`.
+//! - An inline **MCP inspecting proxy** ([`mcp_proxy`]): a stdio
+//!   man-in-the-middle that wraps a real MCP server, parses each JSON-RPC
+//!   message, and inspects `tools/call` arguments + `tools/list` / tool
+//!   results. Modes: advisory (alert only, default), guard (block a disallowed
+//!   `tools/call` with a denial), kill (block + terminate the server). Run it
+//!   with `innerwarden agent proxy -- <server> [args]`.
 //! - Session tracking (rate limiting, sensitive-file access, exfil chains).
 //! - Process discovery via `/proc` scanning + MCP config-file discovery.
 //!
-//! Detection is advisory: matches surface as alerts ("snitch" mode) rather
-//! than inline enforcement.
+//! The `check-command` API is advisory ("snitch"). The MCP proxy is advisory by
+//! default but can enforce inline (guard/kill) when an operator opts in.
 //!
 //! Recognized agents/tools/runtimes (see [`signatures`]): Claude Code, Cursor,
 //! Aider, Goose, OpenClaw, Codex CLI, Gemini CLI, Cline, Ollama, and more.

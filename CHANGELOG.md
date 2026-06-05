@@ -10,6 +10,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **MCP inspecting proxy (`innerwarden agent proxy`).** A stdio
+  man-in-the-middle that wraps a real MCP server and inspects the JSON-RPC
+  traffic in both directions: `tools/call` arguments (prompt injection,
+  credential leaks, dangerous commands, ATR rules), `tools/list` descriptions
+  (tool poisoning), and tool results (injection in responses). Three modes:
+  `advisory` (default — a transparent, alerting pipe, no behavior change),
+  `guard` (a disallowed `tools/call` is not forwarded; the client gets an
+  `isError` denial keyed to the request id), and `kill` (block + terminate the
+  server). Usage: `innerwarden agent proxy --mode guard -- npx -y <server>`.
+  The decision logic is pure and unit-tested; the transport is a single-task
+  `select!` loop (one client writer, no shared lock). Pass-through preserves
+  original bytes; stdout carries only MCP traffic. New `crates/agent-guard/src/
+  mcp_proxy/` (jsonrpc, router, enforce, transport) + CTL subcommand. Operator
+  snitch (Telegram/Slack) + per-agent policy belong to the registry-aware
+  in-agent mode (a later epic); this ships the standalone CLI.
 - **`innerwarden_agent_guard_atr_rules_loaded` Prometheus gauge.** The
   `/metrics` endpoint now exports the number of ATR rules loaded in the
   agent-guard engine. `0` means the engine is degraded (rules failed to load
