@@ -1218,7 +1218,7 @@ pub(crate) async fn process_narrative_tick(
     // decrease across ticks — the operator sees a cleanup pass
     // running, not a number that vanishes mysteriously.
     if state.last_orphan_recovery.elapsed().as_secs() >= 600 {
-        let written = crate::orphan_recovery::run_sweep(state, data_dir);
+        let written = crate::orphan_recovery::run_sweep(state, data_dir).await;
         if written > 0 {
             tracing::info!(
                 written,

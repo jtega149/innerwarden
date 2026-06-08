@@ -116,6 +116,12 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/sensor/src/detectors/rootkit.rs::tests::timing_skips_tcp_stream_protocol_kinds` — `tcp_stream.http` / `.ssh` / `.smb` are excluded from the timing-anomaly pipeline (alongside the already-skipped `tcp_stream.flow` and `network.*`): their inter-event delta measures traffic idleness, not syscall-hook latency, so they are never tracked or flagged. Pinned the 2026-06-08 test001 FP where an 895-second gap between two HTTP streams (baseline ~4.8s) fired a critical `rootkit:timing` "getdents64 hook" incident that flooded `needs_review`.
 - `crates/sensor/src/detectors/rootkit.rs::tests::timing_still_tracks_file_read_access_after_tcp_stream_skip` — anti-regression: extending the skip list did NOT disable the real latency-tracked kinds; `file.read_access` still trains and remains eligible for timing detection (a getdents64 hook adds µs and is the detector's actual purpose).
 
+### Orphan-recovery retry (spec 071 Part C)
+
+- `crates/agent/src/orphan_recovery.rs::tests::is_passive_resolution_accepts_only_pure_verdicts` — only `dismiss`/`ignore` resolve a retried orphan; `monitor` / `block_ip` (and any active verdict) fall through to `needs_review` so the human still adjudicates a stale action. Pins the invariant that the retry never executes a stale enforcement action.
+- `crates/agent/src/orphan_recovery.rs::tests::retry_decide_resolves_high_crit_orphan_with_dismiss` — a High/Critical orphan whose re-decide returns a pure-verdict close is resolved with a real decision instead of being parked for a human (closes the "AI never ran → needs_review" inflation from transient restarts).
+- `crates/agent/src/orphan_recovery.rs::tests::retry_decide_returns_none_on_unparseable_incident` — a bad incident JSON yields `None` so the sweep safely falls back to `needs_review` (never panics, never loses the orphan).
+
 ### Warden Context Gate — no forgeable-comm dismiss of a real threat (spec 071 Part A)
 
 These pin the 2026-06-08 adversarial red-team must-fixes. `comm` is attacker-forgeable, so the gate must NEVER auto-dismiss a High/Critical incident on it. A failure here means a real attack can be silenced by a process rename.

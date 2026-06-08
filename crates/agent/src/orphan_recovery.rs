@@ -24,10 +24,12 @@
 //! 2. For each, write a decision with `ai_provider="orphan-recovery"` and a
 //!    clear reason. **Severity-gated (Spec 062 invariant):** Low/Medium/Info
 //!    orphans are `dismiss`ed (safe noise cleanup); **High/Critical orphans
-//!    are routed to `needs_review`, never silently dismissed** — they stay
-//!    visible/audited and the needs_review timeout sweep leaves High/Critical
-//!    in needs_review forever. The hash chain stays intact (the standard
-//!    `decisions::append_chained` is used) and the audit trail is honest.
+//!    are RETRIED through the decider once (spec 071 Part C) — a pure-verdict
+//!    close resolves them, otherwise they are routed to `needs_review`, never
+//!    silently dismissed** — they stay visible/audited and the needs_review
+//!    timeout sweep leaves High/Critical in needs_review forever. The hash chain
+//!    stays intact (the standard `decisions::append_chained` is used) and the
+//!    audit trail is honest.
 //! 3. The Stuck bucket on the next dashboard tick reflects only NEW
 //!    >1h-old orphans (which themselves get swept within 10 minutes).
 //!
@@ -40,11 +42,55 @@
 //! - Skips allowlisted incidents (those already have their own group).
 //! - Skips incidents that already have a decision (idempotent).
 
+use crate::ai::{AiAction, AiDecision, DecisionContext, SkillInfo};
 use crate::decisions::DecisionEntry;
 use crate::AgentState;
 use chrono::Utc;
+use innerwarden_core::incident::Incident;
 use std::path::Path;
 use tracing::{info, warn};
+
+/// Spec 071 Part C: a High/Critical orphan is often not "undecidable" — it
+/// merely missed `decide()` because the agent restarted or the provider had a
+/// transient skip. Before routing it to `needs_review`, retry the decision once
+/// here. We ACCEPT only a pure-verdict close (`dismiss`/`ignore`): those resolve
+/// the orphan with nothing left to execute. Anything that implies an action —
+/// `monitor`, block/kill/suspend/honeypot, or a needs-human surface
+/// (`RequestConfirmation`, e.g. when the Context Gate surfaces a low-confidence
+/// high/crit) — falls through to the existing `needs_review` fallback so the
+/// human still adjudicates a stale action on an old incident.
+fn is_passive_resolution(action: &AiAction) -> bool {
+    matches!(action, AiAction::Dismiss { .. } | AiAction::Ignore { .. })
+}
+
+/// Re-run the decider on an orphan reconstructed from its stored incident JSON.
+/// Returns the decision only if it deserialized and the provider succeeded.
+/// Best-effort: any failure (bad JSON, provider error) yields `None` and the
+/// caller falls back to `needs_review`.
+async fn retry_decide(
+    provider: &dyn crate::ai::AiProvider,
+    incident_data_json: &str,
+    available_skills: &[SkillInfo],
+    already_blocked: &[String],
+) -> Option<AiDecision> {
+    let incident: Incident = serde_json::from_str(incident_data_json).ok()?;
+    let ctx = DecisionContext {
+        incident: &incident,
+        recent_events: Vec::new(),
+        related_incidents: Vec::new(),
+        already_blocked: already_blocked.to_vec(),
+        available_skills: available_skills.to_vec(),
+        ip_reputation: None,
+        ip_geo: None,
+        ip_dshield: None,
+        host_posture: None,
+        prior_decisions: None,
+        graph_context: None,
+        graph_subgraph: None,
+        playbook_outcome: None,
+    };
+    provider.decide(&ctx).await.ok()
+}
 
 /// Best-effort machine hostname for the decision row's `host` field.
 /// Mirrors the helper in `dashboard::actions::hostname` so the
@@ -80,7 +126,22 @@ pub(crate) const ORPHAN_AI_PROVIDER: &str = "orphan-recovery";
 /// Run one orphan-recovery sweep. Returns the number of decisions
 /// written. Best-effort: SQL or store errors are logged at `warn!` and
 /// do not propagate.
-pub(crate) fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize {
+pub(crate) async fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize {
+    // Part C: gather owned handles up front so the retry's `.await` never holds
+    // a borrow of `state`. `escalation_decider` returns an owned Arc; skills and
+    // the blocklist are cloned into owned Vecs.
+    let decider = state.ai_router.escalation_decider();
+    let available_skills: Vec<SkillInfo> = state
+        .skill_registry
+        .infos()
+        .into_iter()
+        .map(|s| SkillInfo {
+            id: s.id.clone(),
+            applicable_to: s.applicable_to.clone(),
+        })
+        .collect();
+    let already_blocked = state.blocklist.as_vec();
+
     let Some(store) = state.sqlite_store.as_ref() else {
         return 0;
     };
@@ -124,6 +185,64 @@ pub(crate) fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize {
             severity.trim().to_ascii_lowercase().as_str(),
             "high" | "critical"
         );
+
+        // Spec 071 Part C: before routing a High/Critical orphan to
+        // needs_review, retry the decision once. A pure-verdict close
+        // (dismiss/ignore) resolves the orphan with a real decision; anything
+        // else falls through to the needs_review fallback below.
+        if high_impact {
+            if let Some(provider) = decider.as_deref() {
+                if let Some(decision) = retry_decide(
+                    provider,
+                    &incident_data_json,
+                    &available_skills,
+                    &already_blocked,
+                )
+                .await
+                {
+                    if is_passive_resolution(&decision.action) {
+                        let entry = DecisionEntry {
+                            ts: now,
+                            incident_id: incident_id.clone(),
+                            host: hostname(),
+                            ai_provider: provider.name().to_string(),
+                            action_type: decision.action.name().to_string(),
+                            target_ip: target_ip.clone(),
+                            target_user: None,
+                            skill_id: None,
+                            confidence: decision.confidence,
+                            // The recovery sweep records the verdict; it does not
+                            // run response skills (a dismiss/ignore has none).
+                            auto_executed: false,
+                            dry_run: false,
+                            reason: format!(
+                                "Orphan-recovery retry: re-decided a {severity}-severity \
+                                 incident that missed its decision ({age_human} old). \
+                                 {} returned {} (conf {:.2}) — a pure-verdict close, so the \
+                                 orphan is resolved instead of parked for a human.",
+                                provider.name(),
+                                decision.action.name(),
+                                decision.confidence
+                            ),
+                            estimated_threat: decision.estimated_threat.clone(),
+                            execution_result: "redecided".to_string(),
+                            prev_hash: None,
+                            decision_layer: Some("orphan_redecide".to_string()),
+                        };
+                        match crate::decisions::append_chained(data_dir, &entry, Some(store)) {
+                            Ok(()) => written += 1,
+                            Err(e) => warn!(
+                                incident_id = %incident_id,
+                                error = %e,
+                                "orphan_recovery: failed to write retry decision"
+                            ),
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
         let (action_type, execution_result, estimated_threat, reason): (
             &str,
             &str,
@@ -367,8 +486,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn run_sweep_returns_zero_when_sqlite_store_is_none() {
+    #[tokio::test]
+    async fn run_sweep_returns_zero_when_sqlite_store_is_none() {
         // Before the agent's slow_loop has finished its boot it can
         // tick run_sweep with `state.sqlite_store == None` (e.g. the
         // sqlite-reopen retry path). The function MUST early-return 0
@@ -376,7 +495,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = crate::tests::triage_test_state(tmp.path());
         assert!(state.sqlite_store.is_none());
-        let written = run_sweep(&mut state, tmp.path());
+        let written = run_sweep(&mut state, tmp.path()).await;
         assert_eq!(written, 0, "no store → no decisions written");
         // The triage_test_state DecisionWriter already creates an
         // empty decisions-*.jsonl on construction; the early-return
@@ -397,8 +516,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn run_sweep_returns_zero_when_store_has_no_orphans() {
+    #[tokio::test]
+    async fn run_sweep_returns_zero_when_store_has_no_orphans() {
         // Empty store → the inner `find_orphan_incidents` returns an
         // empty vec → run_sweep early-returns 0 BEFORE the loop body
         // and skips the info! log. Pins the empty-bucket fast path so
@@ -406,7 +525,7 @@ mod tests {
         // shows up as a coverage regression here.
         let tmp = tempfile::tempdir().unwrap();
         let (mut state, store) = build_state_with_store(&tmp);
-        let written = run_sweep(&mut state, tmp.path());
+        let written = run_sweep(&mut state, tmp.path()).await;
         assert_eq!(written, 0);
         assert_eq!(
             store.decisions_count().unwrap(),
@@ -415,8 +534,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_sweep_writes_dismiss_decision_for_old_orphan() {
+    #[tokio::test]
+    async fn run_sweep_writes_dismiss_decision_for_old_orphan() {
         // End-to-end happy path:
         // (1) old orphan inserted, no decision row;
         // (2) run_sweep returns 1;
@@ -432,7 +551,7 @@ mod tests {
             .insert_incident(&make_orphan("old:orphan-1", two_hours_ago))
             .unwrap();
 
-        let written = run_sweep(&mut state, tmp.path());
+        let written = run_sweep(&mut state, tmp.path()).await;
 
         assert_eq!(written, 1, "exactly one orphan should have been swept");
         assert_eq!(store.decisions_count().unwrap(), 1);
@@ -470,8 +589,8 @@ mod tests {
         assert!(jsonl.exists(), "decisions JSONL must be written");
     }
 
-    #[test]
-    fn run_sweep_high_severity_orphan_routes_to_needs_review() {
+    #[tokio::test]
+    async fn run_sweep_high_severity_orphan_routes_to_needs_review() {
         // Spec 062 invariant: a High/Critical orphan must NOT be silently
         // dismissed — it routes to needs_review (visible, audited, never
         // auto-closed by the needs_review timeout sweep).
@@ -486,7 +605,7 @@ mod tests {
             ))
             .unwrap();
 
-        let written = run_sweep(&mut state, tmp.path());
+        let written = run_sweep(&mut state, tmp.path()).await;
         assert_eq!(written, 1);
 
         let rows = store.decisions_for_incident("old:critical-orphan").unwrap();
@@ -507,8 +626,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_sweep_low_severity_orphan_is_dismissed() {
+    #[tokio::test]
+    async fn run_sweep_low_severity_orphan_is_dismissed() {
         // The complement: Low/Medium orphans stay on the dismiss path — that
         // is what the cleanup sweep is for.
         let tmp = tempfile::tempdir().unwrap();
@@ -522,7 +641,7 @@ mod tests {
             ))
             .unwrap();
 
-        run_sweep(&mut state, tmp.path());
+        run_sweep(&mut state, tmp.path()).await;
         let rows = store.decisions_for_incident("old:low-orphan").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
         assert_eq!(
@@ -532,8 +651,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_sweep_extracts_target_ip_from_incident_data() {
+    #[tokio::test]
+    async fn run_sweep_extracts_target_ip_from_incident_data() {
         // The dismiss decision should carry the first IP entity of
         // the orphan's stored JSON as `target_ip` so attacker-IP
         // dashboards correctly attribute the auto-dismissed row.
@@ -546,7 +665,7 @@ mod tests {
             .insert_incident(&make_orphan("old:orphan-with-ip", two_hours_ago))
             .unwrap();
 
-        let written = run_sweep(&mut state, tmp.path());
+        let written = run_sweep(&mut state, tmp.path()).await;
         assert_eq!(written, 1);
 
         let rows = store.decisions_for_incident("old:orphan-with-ip").unwrap();
@@ -558,8 +677,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_sweep_skips_fresh_and_decided_and_allowlisted_incidents() {
+    #[tokio::test]
+    async fn run_sweep_skips_fresh_and_decided_and_allowlisted_incidents() {
         // Mirrors the SoT contract on `find_orphan_incidents` from one
         // layer up: run_sweep must NOT touch incidents that are
         // (a) fresh, (b) already have a decision, or (c) flagged
@@ -605,7 +724,7 @@ mod tests {
             .insert_incident(&make_orphan("old:real-orphan", two_hours_ago))
             .unwrap();
 
-        let written = run_sweep(&mut state, tmp.path());
+        let written = run_sweep(&mut state, tmp.path()).await;
         assert_eq!(
             written, 1,
             "only the (d) row qualifies; sweep wrote {written} decision(s)"
@@ -639,6 +758,138 @@ mod tests {
                 .unwrap()
                 .len(),
             1,
+        );
+    }
+
+    // Spec 071 Part C: the retry-before-needs_review path.
+    struct DismissStub;
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for DismissStub {
+        fn name(&self) -> &'static str {
+            "dismiss-stub"
+        }
+        fn capabilities(&self) -> crate::ai::AiCapabilities {
+            crate::ai::AiCapabilities::from_slice(&[crate::ai::Capability::Decide])
+        }
+        async fn decide(&self, _ctx: &DecisionContext<'_>) -> anyhow::Result<AiDecision> {
+            Ok(AiDecision {
+                action: AiAction::Dismiss {
+                    reason: "stub".into(),
+                },
+                confidence: 0.92,
+                auto_execute: true,
+                reason: "stub".into(),
+                alternatives: vec![],
+                estimated_threat: "low".into(),
+            })
+        }
+        async fn chat(&self, _: &str, _: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn is_passive_resolution_accepts_only_pure_verdicts() {
+        assert!(is_passive_resolution(&AiAction::Dismiss {
+            reason: "x".into()
+        }));
+        assert!(is_passive_resolution(&AiAction::Ignore {
+            reason: "x".into()
+        }));
+        // Monitor implies an action to execute; an orphan retry must NOT treat
+        // it as a resolution (it falls through to needs_review).
+        assert!(!is_passive_resolution(&AiAction::Monitor {
+            ip: "1.1.1.1".into()
+        }));
+        assert!(!is_passive_resolution(&AiAction::BlockIp {
+            ip: "1.1.1.1".into(),
+            skill_id: "s".into()
+        }));
+    }
+
+    #[tokio::test]
+    async fn retry_decide_resolves_high_crit_orphan_with_dismiss() {
+        let inc = make_orphan_sev(
+            "privesc:x:1:t",
+            chrono::Utc::now(),
+            innerwarden_core::event::Severity::Critical,
+        );
+        let json = serde_json::to_string(&inc).unwrap();
+        let decision = retry_decide(&DismissStub, &json, &[], &[])
+            .await
+            .expect("stub provider returns a decision");
+        assert!(
+            is_passive_resolution(&decision.action),
+            "a dismiss verdict must resolve the orphan instead of routing to needs_review"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_decide_returns_none_on_unparseable_incident() {
+        // Bad JSON must yield None so the caller safely falls back to needs_review.
+        assert!(retry_decide(&DismissStub, "{not valid", &[], &[])
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn run_sweep_retries_high_crit_orphan_and_resolves_instead_of_needs_review() {
+        // End-to-end Part C: with a decider present, a High/Critical orphan is
+        // re-decided; a pure-verdict dismiss resolves it (NOT needs_review).
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        // Inject a decider that returns a dismiss into the LLM (escalation) slot.
+        state.ai_router =
+            crate::ai::AiRouter::new(None, Some(std::sync::Arc::new(DismissStub))).unwrap();
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan_sev(
+                "privesc:rogue:1:t",
+                two_hours_ago,
+                innerwarden_core::event::Severity::Critical,
+            ))
+            .unwrap();
+
+        let written = run_sweep(&mut state, tmp.path()).await;
+        assert_eq!(written, 1, "the orphan should be resolved by the retry");
+
+        let rows = store.decisions_for_incident("privesc:rogue:1:t").unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        // Resolved by the retry, NOT parked: needs_review would carry
+        // ai_provider="orphan-recovery" + action_type="needs_review".
+        assert_eq!(
+            parsed.get("action_type").and_then(|v| v.as_str()),
+            Some("dismiss"),
+            "a passive retry verdict must resolve the orphan"
+        );
+        assert_eq!(
+            parsed.get("ai_provider").and_then(|v| v.as_str()),
+            Some("dismiss-stub"),
+            "the audit row must attribute the verdict to the retry decider, not orphan-recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sweep_keeps_needs_review_when_retry_unavailable() {
+        // No decider (escalation_decider == None) → retry skipped → the
+        // High/Critical orphan still routes to needs_review (Spec 062 invariant).
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan_sev(
+                "privesc:rogue:2:t",
+                two_hours_ago,
+                innerwarden_core::event::Severity::Critical,
+            ))
+            .unwrap();
+        let _ = run_sweep(&mut state, tmp.path()).await;
+        let rows = store.decisions_for_incident("privesc:rogue:2:t").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(
+            parsed.get("action_type").and_then(|v| v.as_str()),
+            Some("needs_review")
         );
     }
 
