@@ -183,11 +183,10 @@ fn agent_guard_alert_payload(alert: &crate::dashboard::AgentGuardAlert) -> serde
         "medium" => "🟠",
         _ => "🟡",
     };
-    let cmd_preview = if alert.command.len() > 120 {
-        format!("{}…", &alert.command[..120])
-    } else {
-        alert.command.clone()
-    };
+    // `&alert.command[..120]` panicked on a multi-byte UTF-8 boundary;
+    // command_preview backs up to a char boundary and adds an ellipsis only
+    // when it actually truncates.
+    let cmd_preview = crate::text_util::command_preview(&alert.command, 120);
     let signals_str = alert.signals.join(", ");
     let atr_line = if alert.atr_rule_ids.is_empty() {
         String::new()
@@ -204,7 +203,7 @@ fn agent_guard_alert_payload(alert: &crate::dashboard::AgentGuardAlert) -> serde
                     "text": {
                         "type": "mrkdwn",
                         "text": format!(
-                            "🤖 *Agent Guard Alert*\n{sev_emoji} {} — {}\n\n*Agent:* {}\n*Command:* `{}`\n*Risk:* {}/100\n*Signals:* {}{}",
+                            "🤖 *Agent Guard Alert*\n{sev_emoji} {} — {}\n\n*Agent:* {}\n*Command:* `{}`\n*Risk score:* {}\n*Signals:* {}{}",
                             alert.severity.to_uppercase(),
                             alert.recommendation.to_uppercase(),
                             alert.agent_name,
@@ -368,6 +367,22 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(text.contains("ATR: ATR-7"));
+        assert!(text.contains('…'));
+        // Risk is an unbounded weighted sum, not a percentage: render it as a
+        // bare score, never the misleading "/100" (prod showed "270/100").
+        assert!(text.contains("Risk score:"));
+        assert!(text.contains("91"));
+        assert!(!text.contains("/100"));
+    }
+
+    #[test]
+    fn agent_guard_payload_truncates_multibyte_command_without_panic() {
+        // 140 multibyte chars: byte index 120 is NOT a char boundary, so a
+        // naive `&cmd[..120]` would panic. safe_truncate must back up cleanly.
+        let payload = agent_guard_alert_payload(&test_guard_alert("✓".repeat(140), "high"));
+        let text = payload["attachments"][0]["blocks"][0]["text"]["text"]
+            .as_str()
+            .unwrap();
         assert!(text.contains('…'));
     }
 

@@ -426,11 +426,10 @@ impl TelegramClient {
             "review" => "REVIEW",
             _ => &alert.recommendation,
         };
-        let cmd_preview = if alert.command.len() > 120 {
-            format!("{}…", &alert.command[..120])
-        } else {
-            alert.command.clone()
-        };
+        // `&alert.command[..120]` panicked on a multi-byte UTF-8 boundary;
+        // command_preview backs up to a char boundary and adds an ellipsis
+        // only when it actually truncates.
+        let cmd_preview = crate::text_util::command_preview(&alert.command, 120);
         let signals_str = if alert.signals.is_empty() {
             "—".to_string()
         } else {
@@ -447,7 +446,7 @@ impl TelegramClient {
              {sev_emoji} <b>{}</b> — {rec_label}\n\n\
              <b>Agent:</b> {}\n\
              <b>Command:</b> <code>{}</code>\n\
-             <b>Risk:</b> {}/100\n\
+             <b>Risk score:</b> {}\n\
              <b>Signals:</b> {}{}\n\n\
              InnerWarden flagged this action by your AI agent.",
             alert.severity.to_uppercase(),
@@ -2675,7 +2674,10 @@ mod tests {
         let guard_alert = crate::dashboard::AgentGuardAlert {
             ts: chrono::Utc::now(),
             agent_name: "CodexRunner".to_string(),
-            command: "rm -rf /tmp/malicious".to_string(),
+            // Long multi-byte command: byte index 120 falls mid-codepoint, so
+            // a naive `&command[..120]` would panic. Exercises the safe
+            // truncation branch in send_agent_guard_alert.
+            command: format!("rm -rf /tmp/{}", "✓".repeat(140)),
             risk_score: 91,
             severity: "high".to_string(),
             recommendation: "deny".to_string(),
