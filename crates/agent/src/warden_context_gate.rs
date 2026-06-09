@@ -172,6 +172,19 @@ fn is_high_severity(sev: &Severity) -> bool {
     matches!(sev, Severity::High | Severity::Critical)
 }
 
+/// True if any evidence object carries the spec-070 NON-forgeable provenance tag
+/// `provenance:illegitimate` (the sensor proved an untrusted exe-path lineage).
+fn evidence_provenance_is_illegitimate(ctx: &DecisionContext<'_>) -> bool {
+    let is_illegit = |v: &serde_json::Value| {
+        v.get("provenance").and_then(|p| p.as_str()) == Some("provenance:illegitimate")
+    };
+    let ev = &ctx.incident.evidence;
+    match ev.as_array() {
+        Some(arr) => arr.iter().any(is_illegit),
+        None => is_illegit(ev),
+    }
+}
+
 fn primary_ip(ctx: &DecisionContext<'_>) -> Option<String> {
     ctx.incident
         .entities
@@ -204,6 +217,26 @@ pub(crate) fn apply(ctx: &DecisionContext<'_>, decision: AiDecision) -> AiDecisi
     let detector = detector_class(ctx);
     let provenance = classify_provenance(ctx);
     let high_sev = is_high_severity(&ctx.incident.severity);
+
+    // Spec 072 Phase 2: a detector's NON-forgeable provenance verdict overrides
+    // the text-only classifier. If the sensor proved illegitimate lineage
+    // (spec-070 exe-path provenance, recorded in `evidence.provenance`) but the
+    // classifier wants to close the incident, refuse it — surface regardless of
+    // the classifier's confidence. Symmetric to the comm rule: a forgeable comm
+    // can never DISMISS High/Critical; a non-forgeable `illegitimate` verdict can
+    // never BE dismissed.
+    if is_passive_close(&decision.action) && evidence_provenance_is_illegitimate(ctx) {
+        return surface(
+            ctx,
+            format!(
+                "context gate: a detector proved illegitimate provenance (non-forgeable \
+                 exe-path lineage); refusing the classifier's {} ({:.2}) and surfacing it.",
+                decision.action.name(),
+                decision.confidence
+            ),
+            "high".to_string(),
+        );
+    }
 
     let provenance_benign = match provenance {
         ActorProvenance::SelfComponent => SELF_NOISY_DETECTORS.contains(&detector),
@@ -650,5 +683,59 @@ mod tests {
             classify_provenance(&ctx(&i, vec![])),
             ActorProvenance::Unknown
         );
+    }
+
+    // --- Phase 2: non-forgeable `provenance:illegitimate` overrides the classifier ---
+
+    fn inc_illegit(id: &str, sev: Severity) -> Incident {
+        let mut i = inc(id, sev, "comm=sudo", &[]);
+        i.evidence = serde_json::json!([{ "provenance": "provenance:illegitimate" }]);
+        i
+    }
+
+    #[test]
+    fn illegitimate_provenance_refuses_even_high_confidence_dismiss() {
+        // The sensor proved illegitimate exe-path lineage; the text-only
+        // classifier's confident dismiss must NOT close it — surface instead.
+        let i = inc_illegit("privesc:sudo:x", Severity::Critical);
+        let out = apply(&ctx(&i, vec![]), dismiss(0.97));
+        assert!(
+            !is_dismiss(&out),
+            "illegitimate provenance must never be dismissed: {:?}",
+            out.action
+        );
+        assert!(matches!(out.action, AiAction::RequestConfirmation { .. }));
+    }
+
+    #[test]
+    fn illegitimate_provenance_does_not_touch_enforcement() {
+        // The guard only refuses passive closes; a block stands.
+        let i = inc_illegit("privesc:sudo:x", Severity::Critical);
+        let out = apply(&ctx(&i, vec![]), block(0.9));
+        assert!(matches!(out.action, AiAction::BlockIp { .. }));
+    }
+
+    #[test]
+    fn non_illegitimate_provenance_unaffected_by_guard() {
+        // A trusted/absent provenance tag does not trigger the guard; a
+        // high-confidence dismiss on a Low-severity incident still stands.
+        let mut i = inc("discovery_anomaly:bash:x", Severity::Low, "comm=bash", &[]);
+        i.evidence = serde_json::json!([{ "provenance": "provenance:trusted" }]);
+        let out = apply(&ctx(&i, vec![]), dismiss(0.9));
+        assert!(is_dismiss(&out));
+        assert_eq!(out.reason, "orig");
+    }
+
+    #[test]
+    fn evidence_provenance_is_illegitimate_parses_array_and_object() {
+        let mut arr = inc("x:y:z", Severity::High, "", &[]);
+        arr.evidence = serde_json::json!([{ "provenance": "provenance:illegitimate" }]);
+        assert!(evidence_provenance_is_illegitimate(&ctx(&arr, vec![])));
+        let mut obj = inc("x:y:z", Severity::High, "", &[]);
+        obj.evidence = serde_json::json!({ "provenance": "provenance:illegitimate" });
+        assert!(evidence_provenance_is_illegitimate(&ctx(&obj, vec![])));
+        let mut trusted = inc("x:y:z", Severity::High, "", &[]);
+        trusted.evidence = serde_json::json!([{ "provenance": "provenance:trusted" }]);
+        assert!(!evidence_provenance_is_illegitimate(&ctx(&trusted, vec![])));
     }
 }

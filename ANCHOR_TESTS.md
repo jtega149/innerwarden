@@ -140,6 +140,15 @@ The model/config install (`tar -xzf … -C /var/lib/innerwarden/models`) is an E
 - `crates/sensor/src/detectors/host_drift.rs::tests::allowlisted_comm_from_nonstaging_path_still_skipped` — a non-staging path with an allowlisted comm still skips (the gate only revokes the allowlist for staging dirs).
 - `crates/sensor/src/detectors/host_drift.rs::tests::path_in_untrusted_staging_classifies_dirs` — staging-dir classifier.
 
+### Warden Context Gate — non-forgeable `provenance:illegitimate` overrides the classifier (spec 072 Phase 2)
+
+The mirror of the comm rule: a forgeable comm can never DISMISS a real threat; symmetrically, a detector's non-forgeable `evidence.provenance:illegitimate` (spec-070 exe-path lineage) can never BE dismissed by the text-only classifier — even at high confidence.
+
+- `crates/agent/src/warden_context_gate.rs::tests::illegitimate_provenance_refuses_even_high_confidence_dismiss` — a classifier dismiss at conf 0.97 on a `provenance:illegitimate` incident is refused and surfaced.
+- `crates/agent/src/warden_context_gate.rs::tests::illegitimate_provenance_does_not_touch_enforcement` — the guard only refuses passive closes; a `block_ip` stands.
+- `crates/agent/src/warden_context_gate.rs::tests::non_illegitimate_provenance_unaffected_by_guard` — a trusted/absent tag does not trigger the guard.
+- `crates/agent/src/warden_context_gate.rs::tests::evidence_provenance_is_illegitimate_parses_array_and_object` — evidence parser handles both the array and single-object shapes.
+
 ### Warden Context Gate — no forgeable-comm dismiss of a real threat (spec 071 Part A)
 
 These pin the 2026-06-08 adversarial red-team must-fixes. `comm` is attacker-forgeable, so the gate must NEVER auto-dismiss a High/Critical incident on it. A failure here means a real attack can be silenced by a process rename.
