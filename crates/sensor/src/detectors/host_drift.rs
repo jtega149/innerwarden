@@ -33,6 +33,8 @@ const DEVELOPMENT_PATHS: &[&str] = &[
     "/tmp/rustc",        // rustc temp files
     "/tmp/npm-",         // npm temp files
     "/tmp/pip-",         // pip temp files
+    "/tmp/dpkg-",        // dpkg install temp (e.g. /tmp/dpkg-tmp.*)
+    "/tmp/apt-",         // apt install temp
     "/var/cache/",       // package manager caches
     "/usr/lib/rustlib/", // Rust toolchain
     "/usr/share/cargo/", // cargo shared
@@ -186,8 +188,11 @@ impl HostDriftDetector {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        // Skip allowlisted processes
-        if is_allowed_process(comm) {
+        // Skip allowlisted processes — but ONLY when the binary is not in an
+        // untrusted staging dir. `comm` is forgeable (argv0 / prctl), so a
+        // payload renamed `cargo` from /tmp must not escape via the comm
+        // allowlist; the exe path is non-forgeable (spec 072 Part D-sensor).
+        if is_allowed_process(comm) && !path_in_untrusted_staging(filename) {
             return None;
         }
 
@@ -246,6 +251,8 @@ impl HostDriftDetector {
                 "comm": comm,
                 "pid": pid,
                 "uid": uid,
+                // Spec 072 Part D-sensor: non-forgeable staging classification.
+                "exe_untrusted_staging": path_in_untrusted_staging(filename),
             }]),
             recommended_checks: vec![
                 format!("Inspect binary: file {filename} && sha256sum {filename}"),
@@ -280,9 +287,16 @@ fn is_allowed_process(comm: &str) -> bool {
     })
 }
 
+/// Untrusted staging directories — a binary here is malware staging, never a
+/// real allowlisted tool. Spec 072 Part D-sensor: the exe path (`filename`) is
+/// captured at execve and is non-forgeable, unlike `comm`.
+fn path_in_untrusted_staging(path: &str) -> bool {
+    path.starts_with("/tmp/") || path.starts_with("/dev/shm/") || path.starts_with("/var/tmp/")
+}
+
 fn classify_path_severity(path: &str) -> Severity {
     // High-risk temp directories (malware staging)
-    if path.starts_with("/tmp/") || path.starts_with("/dev/shm/") || path.starts_with("/var/tmp/") {
+    if path_in_untrusted_staging(path) {
         return Severity::Critical;
     }
     // World-writable or unusual locations
@@ -329,6 +343,50 @@ mod tests {
         let inc = det.process(&ev);
         assert!(inc.is_some());
         assert_eq!(inc.unwrap().severity, Severity::Critical);
+    }
+
+    // Spec 072 Part D-sensor: the comm allowlist is gated on the non-forgeable
+    // exe path so a renamed payload in a staging dir cannot escape via it.
+    #[test]
+    fn allowlisted_comm_from_raw_staging_fires() {
+        // comm spoofed to `cargo` but the binary is a raw /tmp payload → FIRE.
+        let mut det = HostDriftDetector::new("test", 300);
+        let inc = det.process(&exec_event("cargo", "/tmp/payload"));
+        assert!(
+            inc.is_some(),
+            "an allowlisted comm running from a raw staging path must not be skipped"
+        );
+        assert_eq!(inc.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn allowlisted_comm_from_cargo_build_temp_still_skipped() {
+        // Regression: real cargo build temp files (/tmp/cargo-*) are a
+        // development path and stay suppressed — the staging gate did not
+        // break legitimate builds.
+        let mut det = HostDriftDetector::new("test", 300);
+        assert!(det
+            .process(&exec_event("cargo", "/tmp/cargo-abc123/build-script-build"))
+            .is_none());
+    }
+
+    #[test]
+    fn allowlisted_comm_from_nonstaging_path_still_skipped() {
+        // A non-staging, non-trusted path with an allowlisted comm still skips
+        // via the comm allowlist (the gate only revokes it for staging dirs).
+        let mut det = HostDriftDetector::new("test", 300);
+        assert!(det
+            .process(&exec_event("cargo", "/srv/build/cargo"))
+            .is_none());
+    }
+
+    #[test]
+    fn path_in_untrusted_staging_classifies_dirs() {
+        assert!(path_in_untrusted_staging("/tmp/x"));
+        assert!(path_in_untrusted_staging("/var/tmp/x"));
+        assert!(path_in_untrusted_staging("/dev/shm/x"));
+        assert!(!path_in_untrusted_staging("/usr/bin/cargo"));
+        assert!(!path_in_untrusted_staging("/srv/build/cargo"));
     }
 
     #[test]

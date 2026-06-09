@@ -122,6 +122,15 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/orphan_recovery.rs::tests::retry_decide_resolves_high_crit_orphan_with_dismiss` — a High/Critical orphan whose re-decide returns a pure-verdict close is resolved with a real decision instead of being parked for a human (closes the "AI never ran → needs_review" inflation from transient restarts).
 - `crates/agent/src/orphan_recovery.rs::tests::retry_decide_returns_none_on_unparseable_incident` — a bad incident JSON yields `None` so the sweep safely falls back to `needs_review` (never panics, never loses the orphan).
 
+### host_drift comm allowlist gated on the non-forgeable exe path (spec 072 Part D-sensor)
+
+`host_drift` skipped on the forgeable `comm` allowlist BEFORE checking the path, so `/tmp/payload` with `comm=cargo` was a comm-spoof bypass inside the detector. The allowlist is now revoked for binaries in an untrusted staging dir.
+
+- `crates/sensor/src/detectors/host_drift.rs::tests::allowlisted_comm_from_raw_staging_fires` — `comm=cargo` running from a raw `/tmp/payload` MUST fire Critical (the allowlist no longer shields a staging exe).
+- `crates/sensor/src/detectors/host_drift.rs::tests::allowlisted_comm_from_cargo_build_temp_still_skipped` — regression: real cargo build temp (`/tmp/cargo-*`) stays suppressed via the development-path allowlist (the staging gate did not break builds).
+- `crates/sensor/src/detectors/host_drift.rs::tests::allowlisted_comm_from_nonstaging_path_still_skipped` — a non-staging path with an allowlisted comm still skips (the gate only revokes the allowlist for staging dirs).
+- `crates/sensor/src/detectors/host_drift.rs::tests::path_in_untrusted_staging_classifies_dirs` — staging-dir classifier.
+
 ### Warden Context Gate — no forgeable-comm dismiss of a real threat (spec 071 Part A)
 
 These pin the 2026-06-08 adversarial red-team must-fixes. `comm` is attacker-forgeable, so the gate must NEVER auto-dismiss a High/Critical incident on it. A failure here means a real attack can be silenced by a process rename.
