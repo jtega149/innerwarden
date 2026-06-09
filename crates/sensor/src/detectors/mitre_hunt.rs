@@ -1230,6 +1230,16 @@ impl MitreHuntDetector {
             return None;
         }
 
+        // Spec 072 Part D-sensor: InnerWarden EXTRACTING its own model/config
+        // tarball into its data dir is the install flow, not exfil staging
+        // (the `/var/lib/` match is the `-C /var/lib/innerwarden/...` target).
+        // Requiring an extraction op is what makes this safe: an attacker
+        // staging exfil CREATES an archive of sensitive data, so appending
+        // `/var/lib/innerwarden` to a `tar -c …` cannot launder it past this.
+        if is_innerwarden_self_unpack(argv0_base, argv_joined) {
+            return None;
+        }
+
         self.emit(
             "suspicious_archive",
             Severity::Medium,
@@ -1366,6 +1376,30 @@ impl MitreHuntDetector {
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
+
+/// Spec 072 Part D-sensor: is this an archive EXTRACTION (unpack) into the
+/// InnerWarden data dir? That is the model/config install flow, not exfil
+/// staging. Gated on extraction (not creation) so a `tar -c` of sensitive data
+/// that merely mentions `/var/lib/innerwarden` is NOT suppressed.
+fn is_innerwarden_self_unpack(argv0_base: &str, argv_joined: &str) -> bool {
+    if !argv_joined.contains("/var/lib/innerwarden") {
+        return false;
+    }
+    match argv0_base {
+        "unzip" | "unrar" => true,
+        "7z" | "7za" => argv_joined.contains(" x") || argv_joined.contains(" e"),
+        // A tar mode-flag bundle contains 'x' for extract (e.g. `xzf`/`xf`/
+        // `xvf`), 'c' for create. Match the extract mode, not create.
+        "tar" => {
+            argv_joined.split_whitespace().any(|tok| {
+                let f = tok.trim_start_matches('-');
+                f.starts_with('x')
+            }) || argv_joined.contains("--extract")
+                || argv_joined.contains("--get")
+        }
+        _ => false,
+    }
+}
 
 fn extract_argv(event: &Event) -> Vec<String> {
     // Try argv array first (exec_audit events)
@@ -1791,6 +1825,79 @@ mod tests {
             d.process(&ev).is_none(),
             "second within cooldown should be suppressed"
         );
+    }
+
+    // ── suspicious_archive: InnerWarden self-unpack suppression (spec 072) ──
+
+    #[test]
+    fn suspicious_archive_suppresses_innerwarden_model_unpack() {
+        // The model/config install flow: extract our tarball into our data dir.
+        let mut d = det();
+        let ev = make_event(
+            "tar -xzf innerwarden-classifier.tar.gz -C /var/lib/innerwarden/models/classifier",
+            &[
+                "tar",
+                "-xzf",
+                "innerwarden-classifier.tar.gz",
+                "-C",
+                "/var/lib/innerwarden/models/classifier",
+            ],
+        );
+        assert!(
+            d.process(&ev).is_none(),
+            "extracting our own tarball into /var/lib/innerwarden is the install flow, not exfil"
+        );
+    }
+
+    #[test]
+    fn suspicious_archive_still_fires_on_create_of_sensitive_into_iw_dir() {
+        // Anti-bypass: a CREATE (tar -c) of /etc/shadow that merely outputs into
+        // our data dir is still exfil staging — the extraction gate must not
+        // launder it.
+        let mut d = det();
+        let ev = make_event(
+            "tar -czf /var/lib/innerwarden/loot.tar /etc/shadow",
+            &[
+                "tar",
+                "-czf",
+                "/var/lib/innerwarden/loot.tar",
+                "/etc/shadow",
+            ],
+        );
+        assert!(d.process(&ev).is_some());
+    }
+
+    #[test]
+    fn suspicious_archive_still_fires_on_real_exfil() {
+        // Regression: a genuine tar -c of sensitive dirs to /tmp still fires.
+        let mut d = det();
+        let ev = make_event(
+            "tar -czf /tmp/loot.tar /etc/shadow /root/.ssh",
+            &["tar", "-czf", "/tmp/loot.tar", "/etc/shadow", "/root/.ssh"],
+        );
+        assert!(d.process(&ev).is_some());
+    }
+
+    #[test]
+    fn is_innerwarden_self_unpack_logic() {
+        assert!(is_innerwarden_self_unpack(
+            "tar",
+            "tar -xzf x.tgz -C /var/lib/innerwarden/models"
+        ));
+        // create into our dir is NOT a self-unpack (must still fire)
+        assert!(!is_innerwarden_self_unpack(
+            "tar",
+            "tar -czf /var/lib/innerwarden/loot.tar /etc/shadow"
+        ));
+        // extract into a non-InnerWarden dir is out of scope here
+        assert!(!is_innerwarden_self_unpack(
+            "tar",
+            "tar -xzf x.tgz -C /home/user"
+        ));
+        assert!(is_innerwarden_self_unpack(
+            "unzip",
+            "unzip /tmp/x.zip -d /var/lib/innerwarden/m"
+        ));
     }
 
     // ── Event type filtering ───────────────────────────────────────────

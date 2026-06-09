@@ -122,6 +122,15 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/orphan_recovery.rs::tests::retry_decide_resolves_high_crit_orphan_with_dismiss` — a High/Critical orphan whose re-decide returns a pure-verdict close is resolved with a real decision instead of being parked for a human (closes the "AI never ran → needs_review" inflation from transient restarts).
 - `crates/agent/src/orphan_recovery.rs::tests::retry_decide_returns_none_on_unparseable_incident` — a bad incident JSON yields `None` so the sweep safely falls back to `needs_review` (never panics, never loses the orphan).
 
+### suspicious_archive suppresses InnerWarden self-unpack (spec 072 Part D-sensor)
+
+The model/config install (`tar -xzf … -C /var/lib/innerwarden/models`) is an EXTRACTION into our own data dir, not exfil staging. Gated on extraction (not create) so an attacker cannot launder a `tar -c` of sensitive data by appending `/var/lib/innerwarden`.
+
+- `crates/sensor/src/detectors/mitre_hunt.rs::tests::suspicious_archive_suppresses_innerwarden_model_unpack` — extracting our tarball into `/var/lib/innerwarden` does NOT fire.
+- `crates/sensor/src/detectors/mitre_hunt.rs::tests::suspicious_archive_still_fires_on_create_of_sensitive_into_iw_dir` — anti-bypass: a `tar -c` of `/etc/shadow` outputting into our dir STILL fires (create ≠ extraction).
+- `crates/sensor/src/detectors/mitre_hunt.rs::tests::suspicious_archive_still_fires_on_real_exfil` — regression: a genuine `tar -c` of sensitive dirs to `/tmp` still fires.
+- `crates/sensor/src/detectors/mitre_hunt.rs::tests::is_innerwarden_self_unpack_logic` — extraction-vs-create + our-dir-vs-other classifier.
+
 ### host_drift comm allowlist gated on the non-forgeable exe path (spec 072 Part D-sensor)
 
 `host_drift` skipped on the forgeable `comm` allowlist BEFORE checking the path, so `/tmp/payload` with `comm=cargo` was a comm-spoof bypass inside the detector. The allowlist is now revoked for binaries in an untrusted staging dir.
