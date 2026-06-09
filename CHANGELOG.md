@@ -9,7 +9,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.8] - 2026-06-09
+
 ### Added
+- **Warden Context Gate — deterministic guardrail around the on-device decider (spec 071).**
+  A pre/post gate around the Local Warden ONNX classifier: it surfaces under-rated
+  High/Critical threats (escalates when the model's confidence is below the floor)
+  and NEVER dismisses a High/Critical incident on a forgeable signal (`comm` /
+  argv0 / prctl). Red-teamed: an attacker renaming a payload to a trusted process
+  name can no longer talk the gate into a silent dismiss. Closes the false-positive
+  source where the decider acted on a context-starved input, without weakening
+  real detection.
 - **MCP inspecting proxy (`innerwarden agent proxy`).** A stdio
   man-in-the-middle that wraps a real MCP server and inspects the JSON-RPC
   traffic in both directions: `tools/call` arguments (prompt injection,
@@ -47,8 +57,33 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   patterns = 24 — the previously marketed "29" was false; dangerous commands = 14;
   API-key patterns = 7; AI agent/tool/runtime signatures = 20, not "25+"), so a
   doc/code drift fails CI.
+- **Orphan-recovery retries the decider for High/Critical orphans before queueing (spec 071 Part C).**
+  A High/Critical incident left without an AI decision (e.g. a provider skip during
+  an agent restart) is now re-run through the decider before being routed to the
+  `needs_review` queue, instead of leaking straight there. Fewer ambiguous incidents
+  reach the human queue; the queue stays the rung of last resort.
+- **The decider gate refuses to dismiss `provenance:illegitimate` incidents (spec 072 Phase 2).**
+  An incident whose evidence carries a non-forgeable illegitimate-provenance tag is
+  never auto-dismissed — it is always surfaced, regardless of the model's verdict.
 
 ### Fixed
+- **False-positive suppression via non-forgeable exe-path provenance (specs 071/072).**
+  Several FP-prone detectors now gate their benign-self / toolchain skips on the
+  non-forgeable `/proc/<pid>/exe` path instead of the forgeable `comm`:
+  `data_exfiltration` excludes the zig / build-script toolchain and only skips a
+  build tool when its exe path is itself trusted (not a renamed binary in `/tmp`);
+  `host_drift`'s comm allowlist is gated on the exe path; `rootkit` timing no longer
+  flags `tcp_stream.{http,ssh,smb}`; `suspicious_archive` suppresses InnerWarden's
+  own self-unpack into `/var/lib/innerwarden`. These clear the operator- and
+  self-traffic false positives that were piling in `needs_review`, without weakening
+  real detection.
+- **`innerwarden get` reads the unified SQLite store, not legacy JSONL (#969).** The
+  CLI under-reported decisions/incidents by reading the old jsonl files instead of
+  `innerwarden.db`; it now reads the unified store (with a jsonl fallback).
+- **De-flaked the `privesc` provenance tests (#976).** The tests read real `/proc`,
+  so a live PID matching a hardcoded test pid made provenance resolve to a real
+  trusted process intermittently in CI; they now use guaranteed-dead pids (above
+  `pid_max`) so provenance resolves deterministically to Unknown.
 - **ATR community rules now actually load in production (agent-guard).** The
   `check-command` snitch path advertised "71 ATR community rules", but the agent
   loaded them from `/etc/innerwarden/rules` while `deploy-prod.sh` only ever
