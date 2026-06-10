@@ -641,6 +641,9 @@ struct AgentState {
     last_orphan_recovery: std::time::Instant,
     /// Spec 062 Phase 2 — last needs_review-timeout sweep tick.
     last_needs_review_timeout: std::time::Instant,
+    /// Spec 076 phase 2 — last block-enforcement reconcile tick (re-applies
+    /// firewall rules that silently dropped while their record stayed Active).
+    last_block_enforcement_reconcile: std::time::Instant,
     /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
     /// Hot-reloaded every 60s. Merged with static config allowlist at check time.
     dynamic_trusted_ips: Vec<String>,

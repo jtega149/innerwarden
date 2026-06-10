@@ -68,6 +68,12 @@ fn read_v2_snapshot_or_warn(path: &std::path::Path) -> Option<String> {
 /// and an alert is raised.
 const MAX_REVERT_ATTEMPTS: u32 = 3;
 
+/// Spec 076 phase 2: an enforcement is considered "verified live" only if the
+/// reconciler confirmed it within this window. Longer than the reconcile
+/// interval (~5 min) so one missed tick does not flip the dashboard to
+/// unverified; short enough that a truly dropped rule shows as stale quickly.
+const ENFORCEMENT_VERIFY_STALE_SECS: i64 = 900;
+
 /// Backend that applied the response (determines how to revert).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -277,6 +283,11 @@ pub struct ResponseLifecycle {
     /// Entries given up on after exhausting retries. These are the ones that
     /// require operator attention.
     total_orphaned: u64,
+    /// Spec 076 phase 2: target -> when its block was last CONFIRMED live against
+    /// the real firewall by the slow-loop reconciler. A side table (not a field
+    /// on every ActiveResponse) so it does not touch every construction site;
+    /// the dashboard joins it so "enforced" reflects the live rule, not the TTL.
+    verified_live: std::collections::HashMap<String, DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,7 +314,28 @@ impl ResponseLifecycle {
             total_revert_failures: 0,
             total_already_absent: 0,
             total_orphaned: 0,
+            verified_live: std::collections::HashMap::new(),
         }
+    }
+
+    /// Record that `target`'s block was just confirmed live against the real
+    /// firewall (or re-applied) at `now`. Spec 076 phase 2.
+    pub fn mark_verified_live(&mut self, target: &str, now: DateTime<Utc>) {
+        self.verified_live.insert(target.to_string(), now);
+    }
+
+    /// Active, TTL-valid BlockIp targets + their backend — the set the
+    /// reconciler checks against the live firewall.
+    pub fn active_block_ip_targets(&self, now: DateTime<Utc>) -> Vec<(String, ResponseBackend)> {
+        self.active
+            .iter()
+            .filter(|r| {
+                r.response_type == ResponseType::BlockIp
+                    && r.state == LifecycleState::Active
+                    && r.expires_at > now
+            })
+            .map(|r| (r.target.clone(), r.backend.clone()))
+            .collect()
     }
 
     /// Restore active responses from a previous snapshot.
@@ -1745,6 +1777,12 @@ impl ResponseLifecycle {
             .iter()
             .map(|r| {
                 let remaining = (r.expires_at - now).num_seconds().max(0);
+                // Spec 076 phase 2: surface when the rule was last confirmed live
+                // so the dashboard can show "enforced (verified)" vs a stale TTL.
+                let verified = self.verified_live.get(&r.target);
+                let verified_recent = verified
+                    .map(|t| (now - *t).num_seconds() < ENFORCEMENT_VERIFY_STALE_SECS)
+                    .unwrap_or(false);
                 serde_json::json!({
                     "id": r.id,
                     "type": r.response_type,
@@ -1756,6 +1794,8 @@ impl ResponseLifecycle {
                     "ttl_secs": r.ttl_secs,
                     "remaining_secs": remaining,
                     "state": r.state,
+                    "last_verified_live": verified.map(|t| t.to_rfc3339()),
+                    "enforcement_verified": verified_recent,
                 })
             })
             .collect();
@@ -2023,6 +2063,36 @@ mod tests {
             ttl,
             None,
         )
+    }
+
+    #[test]
+    fn verified_live_drives_to_json_enforcement_flag() {
+        // Spec 076 phase 2: the reconciler stamps last_verified_live; the
+        // dashboard JSON reflects it so "enforced" means the rule is live.
+        let mut lc = ResponseLifecycle::new();
+        let now = Utc::now();
+        reg(&mut lc, "203.0.113.7", 3600);
+
+        let targets = lc.active_block_ip_targets(now);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "203.0.113.7");
+
+        // Before verification: unverified, no timestamp.
+        let j = lc.to_json();
+        assert_eq!(
+            j["active"][0]["enforcement_verified"],
+            serde_json::json!(false)
+        );
+        assert!(j["active"][0]["last_verified_live"].is_null());
+
+        // After the reconciler confirms it live: verified + timestamp present.
+        lc.mark_verified_live("203.0.113.7", Utc::now());
+        let j2 = lc.to_json();
+        assert_eq!(
+            j2["active"][0]["enforcement_verified"],
+            serde_json::json!(true)
+        );
+        assert!(j2["active"][0]["last_verified_live"].is_string());
     }
 
     #[test]

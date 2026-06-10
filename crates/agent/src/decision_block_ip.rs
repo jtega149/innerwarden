@@ -640,6 +640,177 @@ async fn is_ip_live_blocked(ip: &str, skill_id: &str) -> bool {
     }
 }
 
+/// Status dump + (optional) apply command for the reconciler, keyed on the
+/// record's backend. `apply` is `None` for backends whose rules are table/chain
+/// specific (nft/firewalld) or kernel-map based (xdp/pf) — those are verify-only
+/// here; their standalone paths own re-application. Prod uses ufw.
+#[allow(clippy::type_complexity)]
+fn reconcile_cmds(
+    backend: &ResponseBackend,
+    ip: &str,
+) -> Option<(
+    (&'static str, Vec<String>),
+    Option<(&'static str, Vec<String>)>,
+)> {
+    match backend {
+        ResponseBackend::Ufw => Some((
+            ("ufw", vec!["status".to_string()]),
+            Some((
+                "ufw",
+                vec![
+                    "deny".into(),
+                    "from".into(),
+                    ip.to_string(),
+                    "to".into(),
+                    "any".into(),
+                ],
+            )),
+        )),
+        ResponseBackend::Iptables => Some((
+            ("iptables", vec!["-S".to_string()]),
+            Some((
+                "iptables",
+                vec![
+                    "-I".into(),
+                    "INPUT".into(),
+                    "-s".into(),
+                    ip.to_string(),
+                    "-j".into(),
+                    "DROP".into(),
+                ],
+            )),
+        )),
+        ResponseBackend::Nftables => Some((("nft", vec!["list".into(), "ruleset".into()]), None)),
+        _ => None,
+    }
+}
+
+async fn run_sudo_stdout(prog: &str, args: &[String]) -> Option<String> {
+    match tokio::process::Command::new("sudo")
+        .arg(prog)
+        .args(args)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        _ => None,
+    }
+}
+
+async fn run_sudo_ok(prog: &str, args: &[String]) -> bool {
+    matches!(
+        tokio::process::Command::new("sudo").arg(prog).args(args).output().await,
+        Ok(o) if o.status.success()
+    )
+}
+
+/// What the reconciler should do for one active block, given the live dump for
+/// its backend. The pure, testable core of the reconcile loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    /// Rule is live in the dump — just stamp it verified.
+    Present,
+    /// Rule is gone and the backend has an apply command — re-apply it.
+    Reapply,
+    /// Rule is gone but the backend has no hand-built apply (verify-only).
+    MissingNoReapply,
+    /// Backend we do not introspect (xdp/pf/firewalld) — its own path owns it.
+    Unsupported,
+    /// No dump available for this backend this tick — skip, retry next tick.
+    NoDump,
+}
+
+fn classify_for_reconcile(
+    backend: &ResponseBackend,
+    ip: &str,
+    dump: Option<&str>,
+) -> ReconcileAction {
+    let apply_available = match reconcile_cmds(backend, ip) {
+        Some((_, apply)) => apply.is_some(),
+        None => return ReconcileAction::Unsupported,
+    };
+    let dump = match dump {
+        Some(d) => d,
+        None => return ReconcileAction::NoDump,
+    };
+    if rule_present_in(dump, ip) {
+        ReconcileAction::Present
+    } else if apply_available {
+        ReconcileAction::Reapply
+    } else {
+        ReconcileAction::MissingNoReapply
+    }
+}
+
+/// Slow-loop block-enforcement reconciler (spec 076 phase 2). Makes the live
+/// firewall match intent: for every active, TTL-valid block whose rule is
+/// missing from the live ruleset, re-apply it; for every block confirmed present
+/// (or just re-applied), stamp `last_verified_live` so the dashboard reflects
+/// reality instead of the TTL alone. This is the proactive counterpart to the
+/// decision-time guard in `execute_block_ip_decision` — it closes the idle
+/// window between a rule silently dropping and the IP's next attack. Returns
+/// `(verified, reapplied)`.
+pub(crate) async fn reconcile_block_enforcement(state: &mut AgentState) -> (usize, usize) {
+    let now = chrono::Utc::now();
+    let targets = state.response_lifecycle.active_block_ip_targets(now);
+    if targets.is_empty() {
+        return (0, 0);
+    }
+
+    // Dump each distinct backend status program ONCE, not per IP.
+    let mut dumps: std::collections::HashMap<&'static str, String> =
+        std::collections::HashMap::new();
+    for (_ip, backend) in &targets {
+        if let Some(((sprog, sargs), _)) = reconcile_cmds(backend, "0.0.0.0") {
+            if !dumps.contains_key(sprog) {
+                if let Some(out) = run_sudo_stdout(sprog, &sargs).await {
+                    dumps.insert(sprog, out);
+                }
+            }
+        }
+    }
+
+    let mut verified = 0usize;
+    let mut reapplied = 0usize;
+    for (ip, backend) in &targets {
+        let dump = reconcile_cmds(backend, ip)
+            .and_then(|((sprog, _), _)| dumps.get(sprog).map(String::as_str));
+        match classify_for_reconcile(backend, ip, dump) {
+            ReconcileAction::Present => {
+                state.response_lifecycle.mark_verified_live(ip, now);
+                verified += 1;
+            }
+            ReconcileAction::Reapply => {
+                if let Some((_, Some((aprog, aargs)))) = reconcile_cmds(backend, ip) {
+                    if run_sudo_ok(aprog, &aargs).await {
+                        warn!(
+                            ip = %ip,
+                            backend = ?backend,
+                            "reconciler restored a dropped firewall block (was missing from the live ruleset)"
+                        );
+                        state.response_lifecycle.mark_verified_live(ip, now);
+                        reapplied += 1;
+                    } else {
+                        warn!(ip = %ip, "reconciler failed to re-apply a dropped block");
+                    }
+                }
+            }
+            ReconcileAction::MissingNoReapply => {
+                warn!(
+                    ip = %ip,
+                    backend = ?backend,
+                    "reconciler: block missing from live ruleset and backend has no auto-reapply (verify-only)"
+                );
+            }
+            ReconcileAction::Unsupported | ReconcileAction::NoDump => {}
+        }
+    }
+    if verified + reapplied > 0 {
+        info!(verified, reapplied, "block-enforcement reconcile complete");
+    }
+    (verified, reapplied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +839,57 @@ mod tests {
         assert_eq!(backend_status_cmd("block-ip-xdp"), None);
         assert_eq!(backend_status_cmd("block-ip-pf"), None);
         assert_eq!(backend_status_cmd("monitor-ip"), None);
+    }
+
+    #[test]
+    fn reconcile_cmds_maps_backends() {
+        use crate::response_lifecycle::ResponseBackend;
+        // ufw + iptables: status dump + an apply command carrying the IP.
+        let (s, a) = reconcile_cmds(&ResponseBackend::Ufw, "1.2.3.4").unwrap();
+        assert_eq!(s.0, "ufw");
+        assert!(a.unwrap().1.contains(&"1.2.3.4".to_string()));
+        let (s, a) = reconcile_cmds(&ResponseBackend::Iptables, "1.2.3.4").unwrap();
+        assert_eq!(s.0, "iptables");
+        assert!(a.unwrap().1.contains(&"1.2.3.4".to_string()));
+        // nftables: verify-only (status, no hand-built apply).
+        let (s, a) = reconcile_cmds(&ResponseBackend::Nftables, "1.2.3.4").unwrap();
+        assert_eq!(s.0, "nft");
+        assert!(a.is_none());
+        // xdp: standalone path owns it -> reconciler skips.
+        assert!(reconcile_cmds(&ResponseBackend::Xdp, "1.2.3.4").is_none());
+    }
+
+    #[test]
+    fn classify_for_reconcile_decides_actions() {
+        use crate::response_lifecycle::ResponseBackend;
+        let ufw = "Status: active\n[1] Anywhere   DENY IN   1.2.3.4\n";
+        // present -> verify; missing + has apply -> reapply
+        assert_eq!(
+            classify_for_reconcile(&ResponseBackend::Ufw, "1.2.3.4", Some(ufw)),
+            ReconcileAction::Present
+        );
+        assert_eq!(
+            classify_for_reconcile(&ResponseBackend::Ufw, "9.9.9.9", Some(ufw)),
+            ReconcileAction::Reapply
+        );
+        // nft missing -> verify-only (no hand-built apply command)
+        assert_eq!(
+            classify_for_reconcile(
+                &ResponseBackend::Nftables,
+                "9.9.9.9",
+                Some("table inet f {}")
+            ),
+            ReconcileAction::MissingNoReapply
+        );
+        // xdp -> unsupported (own path); no dump -> skip this tick
+        assert_eq!(
+            classify_for_reconcile(&ResponseBackend::Xdp, "1.2.3.4", Some("x")),
+            ReconcileAction::Unsupported
+        );
+        assert_eq!(
+            classify_for_reconcile(&ResponseBackend::Ufw, "1.2.3.4", None),
+            ReconcileAction::NoDump
+        );
     }
 
     #[test]

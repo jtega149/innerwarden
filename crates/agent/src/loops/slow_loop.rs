@@ -1243,6 +1243,24 @@ pub(crate) async fn process_narrative_tick(
         state.last_needs_review_timeout = std::time::Instant::now();
     }
 
+    // Spec 076 phase 2 — block-enforcement reconciler. Every 5 min, make the
+    // live firewall match intent: re-apply any active block whose rule silently
+    // dropped (TTL-removal that didn't clear the record, restart reloading a
+    // stale set, external flush), and stamp last_verified_live so the dashboard
+    // reflects the live rule rather than the TTL alone. Proactive counterpart to
+    // the decision-time live-verify guard (spec 076) — closes the idle window.
+    if state.last_block_enforcement_reconcile.elapsed().as_secs() >= 300 {
+        let (verified, reapplied) =
+            crate::decision_block_ip::reconcile_block_enforcement(state).await;
+        if reapplied > 0 {
+            warn!(
+                verified,
+                reapplied, "block-enforcement reconciler restored dropped firewall rules"
+            );
+        }
+        state.last_block_enforcement_reconcile = std::time::Instant::now();
+    }
+
     // Feed events through threat DNA engine (behavioral fingerprinting + anomaly detection).
     if cfg.dna.enabled {
         dna_inline::process_events(

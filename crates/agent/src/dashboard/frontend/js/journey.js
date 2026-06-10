@@ -33,9 +33,22 @@ function renderEnforcementBlock(subjectType, subjectValue, responsesPayload) {
     var remHrs = Math.floor(remMins / 60);
     var remaining = remHrs > 0 ? (remHrs + 'h ' + (remMins % 60) + 'm') : (remMins + 'm');
     var incident = a.incident_id ? ' · <span class="enf-incident">' + esc(a.incident_id) + '</span>' : '';
+    // Spec 076 phase 2: show whether the rule is actually live, not just within
+    // its TTL. `enforcement_verified` comes from the reconciler confirming the
+    // rule against the real firewall — so the panel can't claim "enforced"
+    // while the rule silently dropped.
+    var verifiedBadge;
+    if (a.enforcement_verified) {
+      verifiedBadge = '<span class="enf-verified" title="confirmed live in the firewall by the reconciler">&#10003; live</span>';
+    } else if (a.last_verified_live) {
+      verifiedBadge = '<span class="enf-unverified" title="last confirmed live a while ago — may have lapsed; reconciler will re-check">&#9888; stale</span>';
+    } else {
+      verifiedBadge = '<span class="enf-unverified" title="not yet confirmed against the live firewall">&#9888; unverified</span>';
+    }
     return '<div class="enf-row">'
       + '<span class="enf-backend">' + esc(a.backend || '—') + '</span>'
       + stateBadge
+      + verifiedBadge
       + '<span class="enf-type">' + esc(a.type || 'block_ip') + '</span>'
       + '<span class="enf-ttl">TTL ' + esc(ttlLabel) + '</span>'
       + '<span class="enf-remaining">' + esc(remaining) + ' remaining</span>'
@@ -43,8 +56,12 @@ function renderEnforcementBlock(subjectType, subjectValue, responsesPayload) {
       + '</div>';
   }).join('');
 
+  var allVerified = matches.every(function(a) { return a.enforcement_verified; });
+  var title = allVerified
+    ? 'ENFORCEMENT · enforced right now (verified live)'
+    : 'ENFORCEMENT · enforced (verifying against live firewall)';
   return '<div class="enf-block">'
-    + '<div class="enf-title">ENFORCEMENT · enforced right now</div>'
+    + '<div class="enf-title">' + title + '</div>'
     + rows
     + '</div>';
 }

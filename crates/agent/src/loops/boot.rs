@@ -1453,6 +1453,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         last_orphan_recovery: std::time::Instant::now() - std::time::Duration::from_secs(5 * 60),
         last_needs_review_timeout: std::time::Instant::now()
             - std::time::Duration::from_secs(5 * 60),
+        // Offset so the first reconcile runs ~1 min after boot — catches blocks
+        // dropped while the agent was down / a stale reloaded set, fast.
+        last_block_enforcement_reconcile: std::time::Instant::now()
+            - std::time::Duration::from_secs(4 * 60),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
         dynamic_trusted_ips: Vec::new(),
         dynamic_trusted_users: Vec::new(),
