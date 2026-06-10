@@ -9,6 +9,36 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.10] - 2026-06-10
+
+### Fixed
+- **Block enforcement now verifies the LIVE firewall rule before skipping a
+  re-block (spec 076) — closes a free-pass hole.** The redundant-re-block guard
+  in `execute_block_ip_decision` skipped re-blocking based on the agent's
+  internal TTL record (`response_lifecycle::is_ip_actively_blocked`), not the
+  actual firewall. When that record diverged from reality (a TTL removal that
+  did not clear the record, an agent restart reloading a stale set, or an
+  externally-flushed rule) it false-positived "already blocked" and skipped, so
+  a still-attacking repeat offender got a free pass. Found in prod on a
+  known-malicious IP whose every block decision logged "already blocked: live
+  firewall rule already active" while it was absent from ufw/nft/iptables/XDP.
+  The guard now confirms the rule against the live backend (`backend_status_cmd`
+  + `rule_present_in` + `is_ip_live_blocked`); if it cannot be confirmed live it
+  re-applies (idempotent, never opens a gap). Can only add blocks, never remove
+  or widen them.
+
+### Added
+- **Explained Alerts (spec 075) — every notification teaches and reassures.** A
+  new `detector_catalog` maps each detector to a plain-language "what + why",
+  fused with the live MITRE mapping from `mitre.rs`. The plain-language Telegram
+  alert (`format_simple_message`) now carries a "Why this matters" line with the
+  attacker goal and MITRE attribution, so an alert reads as "InnerWarden saw
+  this, knows what it is, and is handling it" instead of a raw detector name.
+  Communication-only — no detection or severity change. Also maps three
+  previously-unmapped detectors (`keylogger_bash_trap` -> T1056.004,
+  `auditd_disable` / `selinux_apparmor_disable` -> T1562.001) so their alerts
+  carry MITRE too.
+
 ## [0.15.9] - 2026-06-10
 
 ### Added
