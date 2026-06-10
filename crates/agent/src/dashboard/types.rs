@@ -95,6 +95,43 @@ pub(crate) struct HoneypotTestRequest {
     pub(super) duration_secs: Option<u64>,
 }
 
+/// Operator requests that a firewall block on `ip` be removed (2026-06-10).
+/// The natural complement to Block IP — a contained/blocked case offered no
+/// way to lift the block from the UI. This endpoint does NOT touch the
+/// firewall synchronously; it QUEUES the unblock (writes an
+/// `operator_unblock_request` decision row per incident). The agent's slow
+/// loop drains the queue and performs the revert through the real
+/// `response_lifecycle`, so the spec-076 reconciler does not fight a
+/// dashboard-side rule removal. Body fields:
+/// - `ip`: the IP to unblock (must parse as a valid IP address).
+/// - `reason`: operator rationale (mandatory; audit trail).
+/// - `incident_ids`: the case's incidents, so each leaves the "blocked"
+///   bucket once the drain writes the terminal `operator_unblock` row. Empty
+///   is allowed (a synthetic marker incident is used so the IP still unblocks).
+#[derive(Debug, Deserialize)]
+pub(crate) struct UnblockIpRequest {
+    pub(super) ip: String,
+    pub(super) reason: String,
+    #[serde(default)]
+    pub(super) incident_ids: Vec<String>,
+}
+
+/// Operator triages a whole case (2026-06-10): dismiss it out of "Needs your
+/// attention", mark it as monitored/observing, or re-open it. Writes one
+/// operator-action decision per incident in the case; because the dashboard
+/// read path classifies the LATEST decision per incident, the operator's row
+/// wins and the case moves to the right bucket. Body fields:
+/// - `incident_ids`: every incident in the case (the frontend already has them
+///   from the journey payload).
+/// - `action`: `"dismiss"` | `"monitor"` | `"reopen"`.
+/// - `reason`: operator rationale (mandatory; audit trail).
+#[derive(Debug, Deserialize)]
+pub(crate) struct TriageCaseRequest {
+    pub(super) incident_ids: Vec<String>,
+    pub(super) action: String,
+    pub(super) reason: String,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ActionResponse {
     pub(super) success: bool,

@@ -243,6 +243,67 @@ pub(crate) async fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize 
             }
         }
 
+        // Truthful-containment guard (operator report 2026-06-10 +
+        // [[project_block_enforcement_verify_live]]): a High/Critical orphan
+        // whose IP is ALREADY live-blocked at the firewall is a *contained*
+        // threat, not one that "needs your attention". Routing it to
+        // needs_review made the dashboard cry for operator action on a
+        // neutralised IP (the prod symptom: 4 threat_intel IPs that nft was
+        // already dropping showed up under "Needs your attention"). Before the
+        // needs_review fallback, verify LIVE — mirroring the fast-loop churn
+        // guard in `incident_flow` (block-mitigated detector AND a TTL-valid
+        // live block) — and record a truthful `block_ip`/contained decision
+        // instead. This consults `response_lifecycle::is_ip_actively_blocked`
+        // (the in-memory, TTL-accurate view the write path trusts), never a
+        // static record. Spec 062 is preserved for everything NOT live-blocked:
+        // those still route to needs_review and stay visible/audited.
+        if high_impact {
+            if let Some(ip) = target_ip.as_deref() {
+                if crate::incident_flow::is_block_mitigated_detector(&incident_id)
+                    && state.response_lifecycle.is_ip_actively_blocked(ip, now)
+                {
+                    let entry = DecisionEntry {
+                        ts: now,
+                        incident_id: incident_id.clone(),
+                        host: hostname(),
+                        ai_provider: ORPHAN_AI_PROVIDER.to_string(),
+                        // Classifies as Contained (block_ip + a success
+                        // execution_result) via threat_contract, so the case
+                        // leaves "Needs your attention" and reads as the
+                        // already-enforced block it actually is.
+                        action_type: "block_ip".to_string(),
+                        target_ip: target_ip.clone(),
+                        target_user: None,
+                        skill_id: None,
+                        confidence: 1.0,
+                        // No skill ran: orphan-recovery only verified an
+                        // existing live block; it applied no new firewall rule.
+                        auto_executed: false,
+                        dry_run: false,
+                        reason: format!(
+                            "Orphan-recovery: {severity}-severity incident is {age_human} old; \
+                                 its IP {ip} is already blocked at the firewall (verified live via \
+                                 the response lifecycle). Threat is contained — recorded as \
+                                 contained instead of needs_review. No new firewall rule applied."
+                        ),
+                        estimated_threat: severity.clone(),
+                        execution_result: "blocked (already enforced, verified live)".to_string(),
+                        prev_hash: None,
+                        decision_layer: Some("observation_verifier".to_string()),
+                    };
+                    match crate::decisions::append_chained(data_dir, &entry, Some(store)) {
+                        Ok(()) => written += 1,
+                        Err(e) => warn!(
+                            incident_id = %incident_id,
+                            error = %e,
+                            "orphan_recovery: failed to write contained (already-blocked) decision"
+                        ),
+                    }
+                    continue;
+                }
+            }
+        }
+
         let (action_type, execution_result, estimated_threat, reason): (
             &str,
             &str,
@@ -890,6 +951,140 @@ mod tests {
         assert_eq!(
             parsed.get("action_type").and_then(|v| v.as_str()),
             Some("needs_review")
+        );
+    }
+
+    // ── Truthful-containment guard (operator report 2026-06-10) ──────
+    // A High/Critical orphan whose IP is ALREADY live-blocked at the
+    // firewall must be recorded as Contained (block_ip), not parked in
+    // needs_review — otherwise the dashboard cries "Needs your attention"
+    // for a neutralised threat. The guard fires ONLY when both hold:
+    // (a) the detector is one a firewall block fully mitigates AND
+    // (b) the IP has a TTL-valid live block in the response lifecycle.
+
+    #[tokio::test]
+    async fn run_sweep_high_crit_orphan_already_blocked_records_contained_not_needs_review() {
+        use crate::response_lifecycle::{ResponseBackend, ResponseType};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        // Register a live block on the orphan's IP (make_orphan_sev pins the
+        // entity IP to 203.0.113.10) with a block-mitigated detector prefix.
+        state.response_lifecycle.register(
+            ResponseType::BlockIp,
+            ResponseBackend::Ufw,
+            "203.0.113.10",
+            "threat_intel:203.0.113.10:1:t",
+            3600,
+            None,
+        );
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan_sev(
+                "threat_intel:203.0.113.10:1:t",
+                two_hours_ago,
+                innerwarden_core::event::Severity::Critical,
+            ))
+            .unwrap();
+
+        let written = run_sweep(&mut state, tmp.path()).await;
+        assert_eq!(written, 1);
+
+        let rows = store
+            .decisions_for_incident("threat_intel:203.0.113.10:1:t")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(
+            parsed.get("action_type").and_then(|v| v.as_str()),
+            Some("block_ip"),
+            "already-blocked High/Crit orphan must record Contained, never needs_review"
+        );
+        assert_eq!(
+            parsed.get("ai_provider").and_then(|v| v.as_str()),
+            Some(ORPHAN_AI_PROVIDER),
+        );
+        let exec = parsed
+            .get("execution_result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            exec.starts_with("blocked"),
+            "execution_result must classify as contained (blocked*): {exec}"
+        );
+        // auto_executed must be false: we verified an existing block, we did
+        // not apply a new firewall rule. Honesty over vanity.
+        assert_eq!(
+            parsed.get("auto_executed").and_then(|v| v.as_bool()),
+            Some(false),
+        );
+        let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            reason.contains("verified live") && reason.contains("No new firewall rule"),
+            "reason must be honest about verify-live + no new rule applied: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sweep_high_crit_orphan_block_mitigated_but_not_live_blocked_routes_needs_review() {
+        // Condition (b) fails: detector is block-mitigated but there is NO
+        // live block for the IP. Must fall through to needs_review (Spec 062).
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan_sev(
+                "threat_intel:203.0.113.10:1:t",
+                two_hours_ago,
+                innerwarden_core::event::Severity::Critical,
+            ))
+            .unwrap();
+
+        run_sweep(&mut state, tmp.path()).await;
+        let rows = store
+            .decisions_for_incident("threat_intel:203.0.113.10:1:t")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(
+            parsed.get("action_type").and_then(|v| v.as_str()),
+            Some("needs_review"),
+            "block-mitigated detector with NO live block must still route to needs_review"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sweep_high_crit_orphan_blocked_but_active_harm_detector_routes_needs_review() {
+        // Condition (a) fails: the IP is live-blocked, but the detector
+        // (privesc) is NOT one a firewall block mitigates — a block does not
+        // stop an in-progress privilege escalation, so the human must still
+        // review it. Mirrors the fast-loop churn guard's active-harm carve-out.
+        use crate::response_lifecycle::{ResponseBackend, ResponseType};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        state.response_lifecycle.register(
+            ResponseType::BlockIp,
+            ResponseBackend::Ufw,
+            "203.0.113.10",
+            "privesc:203.0.113.10:1:t",
+            3600,
+            None,
+        );
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan_sev(
+                "privesc:203.0.113.10:1:t",
+                two_hours_ago,
+                innerwarden_core::event::Severity::Critical,
+            ))
+            .unwrap();
+
+        run_sweep(&mut state, tmp.path()).await;
+        let rows = store
+            .decisions_for_incident("privesc:203.0.113.10:1:t")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(
+            parsed.get("action_type").and_then(|v| v.as_str()),
+            Some("needs_review"),
+            "active-harm detector must route to needs_review even when the IP is blocked"
         );
     }
 

@@ -1570,6 +1570,19 @@ impl ResponseLifecycle {
         })
     }
 
+    /// Lifecycle ids of every `BlockIp` entry currently tracked for `ip`,
+    /// regardless of TTL/state (a `RevertFailed` entry is still a live rule we
+    /// must try to revert). Used by the operator-unblock drain to drive each
+    /// entry through `request_manual_revert` → `execute_revert` →
+    /// `mark_reverted`. Returns an empty vec when the IP has no tracked block.
+    pub fn active_block_ids_for_ip(&self, ip: &str) -> Vec<String> {
+        self.active
+            .iter()
+            .filter(|r| r.response_type == ResponseType::BlockIp && r.target == ip)
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
     /// Generate Prometheus metrics lines.
     #[allow(dead_code)] // exposed by /metrics endpoint in spec 016
     pub fn to_prometheus_lines(&self) -> String {

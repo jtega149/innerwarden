@@ -1228,6 +1228,21 @@ pub(crate) async fn process_narrative_tick(
         state.last_orphan_recovery = std::time::Instant::now();
     }
 
+    // 2026-06-10 — operator-unblock drain. Runs every tick (one bounded SQL
+    // scan, usually empty). Drains `operator_unblock_request` rows queued by
+    // the dashboard's Unblock button and performs the real revert through
+    // `response_lifecycle` so the block-enforcement reconciler does not
+    // re-apply a dashboard-side rule removal. Kept off a longer timer on
+    // purpose: an operator who clicks Unblock should not wait 10 minutes.
+    {
+        let unblocked =
+            crate::operator_actions::run_unblock_drain(state, data_dir, cfg.responder.dry_run)
+                .await;
+        if unblocked > 0 {
+            info!(unblocked, "slow_loop: drained operator unblock requests");
+        }
+    }
+
     // Spec 062 Phase 2 — needs_review timeout sweep. Every 10 minutes,
     // auto-resolve low/medium needs_review items that sat past the grace
     // window with no human action (honest `auto_resolved_timeout` dismiss).

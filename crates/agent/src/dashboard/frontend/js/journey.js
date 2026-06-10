@@ -873,15 +873,38 @@ async function loadJourney(subjectType, subjectValue, focusIncidentId) {
       ? ' disabled title="Watch mode: actions are dry-run only. Switch to Guard mode to execute."'
       : '';
     const watchStyle = isWatchMode ? 'opacity:0.55;cursor:not-allowed' : '';
+    const blockedNow = j.outcome === 'blocked'
+      || (j.block_state && j.block_state.kind === 'blocked_now');
     if (actionCfg && actionCfg.enabled && subjectType === 'ip') {
-      if (j.outcome !== 'blocked') {
+      if (!blockedNow) {
         actionBtns += `<button type="button" class="journey-btn action-block" style="${watchStyle}"${watchAttrs}
           onclick="showActionModal('block_ip','${esc(subjectValue)}',null)">⊘ Block IP</button>`;
+      } else {
+        // 2026-06-10: the inverse of Block. A contained/blocked case used to
+        // offer ZERO buttons (Block hides once blocked). Unblock queues a
+        // revert the agent loop performs (see /api/action/unblock-ip).
+        actionBtns += `<button type="button" class="journey-btn action-unblock" style="${watchStyle}"${watchAttrs}
+          onclick="showActionModal('unblock_ip','${esc(subjectValue)}',null)">⊘ Unblock IP</button>`;
       }
     }
     if (actionCfg && actionCfg.enabled && subjectType === 'user') {
       actionBtns += `<button type="button" class="journey-btn action-suspend" style="${watchStyle}"${watchAttrs}
         onclick="showActionModal('suspend_user',null,'${esc(subjectValue)}')">⏸ Suspend sudo</button>`;
+    }
+    // 2026-06-10: case-level triage verbs. Operate on every incident in the
+    // case (collected from the journey at click time). A case in "Needs your
+    // attention" (outcome 'open') can be Dismissed or moved to Monitor; an
+    // already-handled case can be Reopened.
+    if (actionCfg && actionCfg.enabled) {
+      if (j.outcome === 'open') {
+        actionBtns += `<button type="button" class="journey-btn action-dismiss" style="${watchStyle}"${watchAttrs}
+          onclick="showCaseTriageModal('dismiss')">✓ Dismiss (reviewed)</button>`;
+        actionBtns += `<button type="button" class="journey-btn action-monitor" style="${watchStyle}"${watchAttrs}
+          onclick="showCaseTriageModal('monitor')">⊙ Monitor</button>`;
+      } else if (['dismissed', 'monitoring', 'blocked', 'honeypot'].indexOf(j.outcome) !== -1) {
+        actionBtns += `<button type="button" class="journey-btn action-reopen" style="${watchStyle}"${watchAttrs}
+          onclick="showCaseTriageModal('reopen')">↺ Reopen</button>`;
+      }
     }
 
     // D5: store journey data globally for scrollToChapter

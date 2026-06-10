@@ -9,6 +9,41 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Already-blocked threats no longer show up under "Needs your attention".**
+  When a High/Critical incident became an orphan (no AI decision recorded — a
+  deploy orphan or provider skip) the orphan-recovery sweep routed it to
+  `needs_review` unconditionally, even when its IP was already blocked at the
+  firewall. On prod this surfaced threat-intel IPs that `ufw`/`nft` were already
+  dropping as cases that "need your attention". The sweep now verifies LIVE
+  (`response_lifecycle::is_ip_actively_blocked`, mirroring the fast-loop churn
+  guard: a block-mitigated detector AND a TTL-valid live block) and records a
+  truthful `block_ip`/contained decision instead — so a neutralised threat reads
+  as contained, not as pending operator action. Genuinely-unhandled High/Critical
+  orphans still route to `needs_review` (Spec 062 invariant preserved).
+- **Operator decision overrides now actually drive the case outcome.** The
+  dashboard's override/reopen rows (`operator_override:<action>`,
+  `operator_reopen`) were classified as unknown strings, so a "Dismiss" left the
+  case stuck in "Needs your attention". `threat_contract::classify_decision` now
+  understands the operator-action vocabulary, so Dismiss clears a case, Monitor
+  moves it to Observing, Reopen returns it to attention, and an operator unblock
+  resolves it.
+
+### Added
+- **More case actions than just "Block IP".** The case detail offered only a
+  Block button (which hid once a case was blocked, leaving zero actions). New
+  operator actions, all behind the same auth + CSRF gate as block-ip and
+  honouring watch/guard mode:
+  - **Unblock IP** (`POST /api/action/unblock-ip`) — the inverse of Block. It
+    QUEUES the revert (writes an `operator_unblock_request`); the agent slow
+    loop drains it and performs the real revert through `response_lifecycle`,
+    clearing the persisted block records only on a confirmed revert. Going
+    through the agent loop is deliberate: a dashboard-side rule removal would be
+    re-applied by the spec-076 block-enforcement reconciler within minutes.
+  - **Dismiss / Monitor / Reopen a case** (`POST /api/action/triage-case`) —
+    writes one operator-action decision per incident in the case; the read
+    path's latest-decision-per-incident selection makes the operator's verb win.
+
 ## [0.15.10] - 2026-06-10
 
 ### Fixed

@@ -1053,6 +1053,238 @@ pub(super) async fn api_action_label_decision(
     }
 }
 
+// ---------------------------------------------------------------------------
+// 2026-06-10 (operator report): the case detail offered only "Block IP".
+// These add the inverse + the triage verbs an operator needs once a case is
+// already contained or sitting in needs_review. Both routes live in the
+// auth+CSRF-protected `dashboard` router, so they inherit the same gate as
+// block-ip. Neither touches the firewall synchronously: unblock QUEUES the
+// revert for the agent slow loop (so the spec-076 reconciler does not fight a
+// dashboard-side rule removal); triage writes operator-action decision rows
+// that the read path classifies (see threat_contract::classify_decision).
+// ---------------------------------------------------------------------------
+
+const ALLOWED_TRIAGE_ACTIONS: &[&str] = &["dismiss", "monitor", "reopen"];
+
+/// POST /api/action/unblock-ip — operator queues removal of a firewall block.
+pub(super) async fn api_action_unblock_ip(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::UnblockIpRequest>,
+) -> Json<ActionResponse> {
+    let skill_id = "operator_unblock".to_string();
+    if state.insecure_http {
+        warn!("unblock executed over HTTP without TLS — consider a reverse proxy with TLS");
+    }
+    if !state.action_cfg.enabled {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "dashboard actions are disabled - set responder.enabled = true in agent.toml"
+                .to_string(),
+            skill_id,
+        });
+    }
+    let ip = body.ip.trim().to_string();
+    if ip.is_empty() || body.reason.trim().is_empty() {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "ip and reason are required".to_string(),
+            skill_id,
+        });
+    }
+    if ip.parse::<std::net::IpAddr>().is_err() {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "ip must be a valid IP address".to_string(),
+            skill_id,
+        });
+    }
+    // One queue row per case incident so each leaves the "blocked" bucket once
+    // the drain writes its terminal row. No incidents supplied → a synthetic
+    // marker so the IP still unblocks.
+    let incident_ids: Vec<String> = if body.incident_ids.is_empty() {
+        vec![format!("operator_unblock:{ip}")]
+    } else {
+        body.incident_ids.clone()
+    };
+    let mut wrote = 0usize;
+    for iid in &incident_ids {
+        let entry = DecisionEntry {
+            ts: Utc::now(),
+            incident_id: iid.clone(),
+            host: hostname(),
+            ai_provider: "dashboard:operator".to_string(),
+            action_type: "operator_unblock_request".to_string(),
+            target_ip: Some(ip.clone()),
+            target_user: None,
+            skill_id: Some(skill_id.clone()),
+            confidence: 1.0,
+            auto_executed: false,
+            dry_run: state.action_cfg.dry_run,
+            reason: body.reason.trim().to_string(),
+            estimated_threat: "manual".to_string(),
+            execution_result: "queued".to_string(),
+            prev_hash: None,
+            decision_layer: Some("manual_operator".to_string()),
+        };
+        if let Err(e) = append_decision_entry(&state.data_dir, &entry, state.sqlite_store.as_ref())
+        {
+            warn!("failed to write unblock request decision: {e}");
+        } else {
+            wrote += 1;
+        }
+    }
+
+    let mut audit = AdminActionEntry {
+        ts: Utc::now(),
+        operator: "dashboard:operator".to_string(),
+        source: "dashboard".to_string(),
+        action: "unblock_request".to_string(),
+        target: ip.clone(),
+        parameters: serde_json::json!({
+            "reason": body.reason,
+            "incident_ids": incident_ids,
+        }),
+        result: if wrote > 0 { "queued" } else { "failed" }.to_string(),
+        prev_hash: None,
+    };
+    if let Err(e) = append_admin_action(&state.data_dir, &mut audit) {
+        warn!("failed to write admin audit: {e:#}");
+    }
+
+    info!(ip = %ip, queued = wrote, "dashboard action: unblock-ip queued");
+    Json(ActionResponse {
+        success: wrote > 0,
+        dry_run: state.action_cfg.dry_run,
+        message: if wrote > 0 {
+            format!(
+                "Unblock queued for {ip}. The agent removes the firewall rule on its next slow-loop \
+                 tick (≤30 s); the case updates once the revert is confirmed."
+            )
+        } else {
+            "failed to queue unblock (store unavailable)".to_string()
+        },
+        skill_id,
+    })
+}
+
+/// POST /api/action/triage-case — operator dismisses / monitors / reopens a
+/// whole case. Writes one operator-action decision per incident; the read
+/// path's latest-decision-per-incident selection makes the operator's row win.
+pub(super) async fn api_action_triage_case(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::TriageCaseRequest>,
+) -> Json<ActionResponse> {
+    let action = body.action.trim();
+    let skill_id = "operator_triage".to_string();
+    if state.insecure_http {
+        warn!("triage executed over HTTP without TLS — consider a reverse proxy with TLS");
+    }
+    if !state.action_cfg.enabled {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "dashboard actions are disabled - set responder.enabled = true in agent.toml"
+                .to_string(),
+            skill_id,
+        });
+    }
+    if body.reason.trim().is_empty() {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "reason is required".to_string(),
+            skill_id,
+        });
+    }
+    if body.incident_ids.is_empty() {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: "incident_ids is required".to_string(),
+            skill_id,
+        });
+    }
+    if !ALLOWED_TRIAGE_ACTIONS.contains(&action) {
+        return Json(ActionResponse {
+            success: false,
+            dry_run: state.action_cfg.dry_run,
+            message: format!("action must be one of {:?}", ALLOWED_TRIAGE_ACTIONS),
+            skill_id,
+        });
+    }
+    // Map the operator verb to the decision action_type the read-path
+    // classifier understands (threat_contract::classify_decision).
+    let action_type = match action {
+        "dismiss" => "operator_override:dismiss".to_string(),
+        "monitor" => "operator_override:monitor".to_string(),
+        // reopen brings a handled case back into "Needs your attention".
+        _ => "operator_reopen".to_string(),
+    };
+    let mut wrote = 0usize;
+    for iid in &body.incident_ids {
+        let entry = DecisionEntry {
+            ts: Utc::now(),
+            incident_id: iid.clone(),
+            host: hostname(),
+            ai_provider: "dashboard:operator".to_string(),
+            action_type: action_type.clone(),
+            target_ip: None,
+            target_user: None,
+            skill_id: Some(skill_id.clone()),
+            confidence: 1.0,
+            auto_executed: false,
+            dry_run: state.action_cfg.dry_run,
+            reason: body.reason.trim().to_string(),
+            estimated_threat: "manual".to_string(),
+            // "ok" so any read path that consults execution_result classifies
+            // the operator's verb as a success (the journey path hardcodes
+            // "ok" already; this keeps the two consistent).
+            execution_result: "ok".to_string(),
+            prev_hash: None,
+            decision_layer: Some("manual_operator".to_string()),
+        };
+        if let Err(e) = append_decision_entry(&state.data_dir, &entry, state.sqlite_store.as_ref())
+        {
+            warn!(incident_id = %iid, "failed to write triage decision: {e}");
+        } else {
+            wrote += 1;
+        }
+    }
+
+    let mut audit = AdminActionEntry {
+        ts: Utc::now(),
+        operator: "dashboard:operator".to_string(),
+        source: "dashboard".to_string(),
+        action: format!("triage_{action}"),
+        target: body
+            .incident_ids
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "case".to_string()),
+        parameters: serde_json::json!({
+            "reason": body.reason,
+            "incident_ids": body.incident_ids,
+            "action": action,
+        }),
+        result: format!("{wrote} incidents updated"),
+        prev_hash: None,
+    };
+    if let Err(e) = append_admin_action(&state.data_dir, &mut audit) {
+        warn!("failed to write admin audit: {e:#}");
+    }
+
+    info!(action = %action, updated = wrote, "dashboard action: triage-case");
+    Json(ActionResponse {
+        success: wrote > 0,
+        dry_run: state.action_cfg.dry_run,
+        message: format!("case {action}: {wrote} incident(s) updated"),
+        skill_id,
+    })
+}
+
 /// Truncate a string to at most `max_chars` chars, appending an
 /// ellipsis when truncated. Used by override reason to bound the
 /// length of the original AI rationale included in the audit row.
@@ -2501,5 +2733,184 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert_eq!(v["label"], "TP");
         assert_eq!(v["decision_id"], 99);
+    }
+
+    // ── Unblock + triage-case handlers (2026-06-10) ──────────────────
+
+    /// Enabled (guard-mode) dashboard state backed by a real SQLite store, so
+    /// the new action handlers reach their decision-writing happy path.
+    fn enabled_state(
+        dir: &std::path::Path,
+    ) -> (DashboardState, std::sync::Arc<innerwarden_store::Store>) {
+        let store = std::sync::Arc::new(innerwarden_store::Store::open(dir).unwrap());
+        let mut st = test_dashboard_state(dir);
+        st.action_cfg = std::sync::Arc::new(DashboardActionConfig {
+            enabled: true,
+            dry_run: false,
+            ..DashboardActionConfig::default()
+        });
+        st.sqlite_store = Some(store.clone());
+        (st, store)
+    }
+
+    fn latest_action_type(store: &innerwarden_store::Store, incident_id: &str) -> Option<String> {
+        let rows = store.decisions_for_incident(incident_id).unwrap();
+        rows.last().and_then(|s| {
+            serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .and_then(|v| {
+                    v.get("action_type")
+                        .and_then(|a| a.as_str())
+                        .map(str::to_string)
+                })
+        })
+    }
+
+    #[tokio::test]
+    async fn unblock_ip_disabled_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Default state has actions disabled.
+        let state = test_dashboard_state(dir.path());
+        let body = crate::dashboard::types::UnblockIpRequest {
+            ip: "8.8.8.8".to_string(),
+            reason: "false positive".to_string(),
+            incident_ids: vec![],
+        };
+        let resp = api_action_unblock_ip(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn unblock_ip_rejects_invalid_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _store) = enabled_state(dir.path());
+        let body = crate::dashboard::types::UnblockIpRequest {
+            ip: "not-an-ip".to_string(),
+            reason: "oops".to_string(),
+            incident_ids: vec![],
+        };
+        let resp = api_action_unblock_ip(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("valid IP"));
+    }
+
+    #[tokio::test]
+    async fn unblock_ip_requires_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _store) = enabled_state(dir.path());
+        let body = crate::dashboard::types::UnblockIpRequest {
+            ip: "8.8.8.8".to_string(),
+            reason: "   ".to_string(),
+            incident_ids: vec![],
+        };
+        let resp = api_action_unblock_ip(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("required"));
+    }
+
+    #[tokio::test]
+    async fn unblock_ip_queues_request_per_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, store) = enabled_state(dir.path());
+        let body = crate::dashboard::types::UnblockIpRequest {
+            ip: "203.0.113.7".to_string(),
+            reason: "confirmed false positive".to_string(),
+            incident_ids: vec!["threat_intel:203.0.113.7:1:t".to_string()],
+        };
+        let resp = api_action_unblock_ip(State(state), Json(body)).await;
+        assert!(resp.0.success);
+        assert!(resp.0.message.contains("queued"));
+        // A queue row landed in SQLite for the case incident; the slow-loop
+        // drain will pick it up.
+        assert_eq!(
+            latest_action_type(&store, "threat_intel:203.0.113.7:1:t").as_deref(),
+            Some("operator_unblock_request"),
+        );
+    }
+
+    #[tokio::test]
+    async fn unblock_ip_synthesises_incident_when_none_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, store) = enabled_state(dir.path());
+        let body = crate::dashboard::types::UnblockIpRequest {
+            ip: "203.0.113.8".to_string(),
+            reason: "manual".to_string(),
+            incident_ids: vec![],
+        };
+        let resp = api_action_unblock_ip(State(state), Json(body)).await;
+        assert!(resp.0.success);
+        assert_eq!(
+            latest_action_type(&store, "operator_unblock:203.0.113.8").as_deref(),
+            Some("operator_unblock_request"),
+        );
+    }
+
+    #[tokio::test]
+    async fn triage_case_rejects_unknown_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _store) = enabled_state(dir.path());
+        let body = crate::dashboard::types::TriageCaseRequest {
+            incident_ids: vec!["x:1".to_string()],
+            action: "delete".to_string(),
+            reason: "r".to_string(),
+        };
+        let resp = api_action_triage_case(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("action must be one of"));
+    }
+
+    #[tokio::test]
+    async fn triage_case_requires_incident_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _store) = enabled_state(dir.path());
+        let body = crate::dashboard::types::TriageCaseRequest {
+            incident_ids: vec![],
+            action: "dismiss".to_string(),
+            reason: "r".to_string(),
+        };
+        let resp = api_action_triage_case(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("incident_ids is required"));
+    }
+
+    #[tokio::test]
+    async fn triage_case_dismiss_writes_override_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, store) = enabled_state(dir.path());
+        let body = crate::dashboard::types::TriageCaseRequest {
+            incident_ids: vec!["i:1".to_string(), "i:2".to_string()],
+            action: "dismiss".to_string(),
+            reason: "reviewed, benign scanner".to_string(),
+        };
+        let resp = api_action_triage_case(State(state), Json(body)).await;
+        assert!(resp.0.success);
+        // Each incident gets an operator_override:dismiss row — the read path
+        // classifies that as Dismissed, clearing the case from attention.
+        assert_eq!(
+            latest_action_type(&store, "i:1").as_deref(),
+            Some("operator_override:dismiss"),
+        );
+        assert_eq!(
+            latest_action_type(&store, "i:2").as_deref(),
+            Some("operator_override:dismiss"),
+        );
+    }
+
+    #[tokio::test]
+    async fn triage_case_reopen_writes_reopen_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, store) = enabled_state(dir.path());
+        let body = crate::dashboard::types::TriageCaseRequest {
+            incident_ids: vec!["i:9".to_string()],
+            action: "reopen".to_string(),
+            reason: "needs another look".to_string(),
+        };
+        let resp = api_action_triage_case(State(state), Json(body)).await;
+        assert!(resp.0.success);
+        assert_eq!(
+            latest_action_type(&store, "i:9").as_deref(),
+            Some("operator_reopen"),
+        );
     }
 }

@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-agent"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-agent-guard"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-ctl"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-dna"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -2472,14 +2472,14 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-ebpf-types"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "innerwarden-hypervisor"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2493,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-killchain"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-sensor"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "aya",
@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-shield"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -2576,7 +2576,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-smm"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2591,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-store"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2609,7 +2609,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-supervisor"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "clap",
@@ -2625,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden_core"
-version = "0.15.9"
+version = "0.15.10"
 dependencies = [
  "anyhow",
  "chrono",

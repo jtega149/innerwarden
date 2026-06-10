@@ -697,6 +697,11 @@ pub async fn serve(
         .route("/api/action/block-ip", post(api_action_block_ip))
         .route("/api/action/suspend-user", post(api_action_suspend_user))
         .route("/api/action/config", get(api_action_config))
+        // 2026-06-10 (operator report): more case actions than just "Block IP".
+        // unblock-ip QUEUES a revert for the agent slow loop; triage-case writes
+        // operator-action decision rows the read path classifies.
+        .route("/api/action/unblock-ip", post(api_action_unblock_ip))
+        .route("/api/action/triage-case", post(api_action_triage_case))
         // 2026-05-01 (`tracked-spec-ai-override`): operator
         // overrides AI decisions / re-opens dismissed incidents /
         // labels decisions for retraining. Audit-only for v1.
