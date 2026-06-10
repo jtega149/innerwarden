@@ -176,15 +176,29 @@ pub(crate) async fn execute_block_ip_decision(
     // decision rather than a "skipped" no-op that would re-orphan. This runs
     // AFTER the safety gates (allowlist/safelist/circuit-breaker) so it can
     // never widen what gets blocked — it only suppresses a duplicate.
+    // …but only skip when the firewall rule is VERIFIABLY live. The lifecycle
+    // record can diverge from the actual firewall: a TTL removal that did not
+    // clear the record, an agent restart that reloaded a stale set, or an
+    // externally-flushed rule. Skipping on a stale record gives a repeat
+    // attacker a free pass — prod 2026-06-10: hundreds of known-bad IPs were
+    // "actively blocked" per the record yet absent from ufw, so every new hit
+    // was skipped and never re-blocked. Verify against the live backend first.
     if state.response_lifecycle.is_ip_actively_blocked(ip, now_utc) {
-        info!(
+        if is_ip_live_blocked(ip, skill_id).await {
+            info!(
+                ip,
+                "already actively blocked (verified live) — skipping redundant re-block"
+            );
+            return (
+                "already blocked: live firewall rule verified active for this IP".to_string(),
+                true,
+            );
+        }
+        warn!(
             ip,
-            "already actively blocked (live firewall rule) — skipping redundant re-block"
+            "lifecycle marks this IP actively blocked but no live firewall rule found — re-applying (stale record / dropped rule)"
         );
-        return (
-            "already blocked: live firewall rule already active for this IP".to_string(),
-            true,
-        );
+        // fall through: re-apply so a still-attacking IP never gets a free pass.
     }
 
     state.recent_blocks.push_back(now_utc);
@@ -579,11 +593,101 @@ where
     Ok(())
 }
 
+/// The status command for the firewall backend behind a block skill. `None`
+/// for backends we cannot cheaply introspect (xdp/pf/unknown) — the caller then
+/// re-applies (idempotent) rather than risk a free pass.
+fn backend_status_cmd(skill_id: &str) -> Option<(&'static str, &'static [&'static str])> {
+    if skill_id.contains("ufw") {
+        Some(("ufw", &["status"]))
+    } else if skill_id.contains("nft") {
+        Some(("nft", &["list", "ruleset"]))
+    } else if skill_id.contains("iptables") {
+        Some(("iptables", &["-S"]))
+    } else if skill_id.contains("firewalld") {
+        Some(("firewall-cmd", &["--list-all"]))
+    } else {
+        None
+    }
+}
+
+/// True when `ip` appears as a whole token in firewall status output. Splits on
+/// any char that cannot be part of an IP/CIDR so `1.2.3.4` never matches inside
+/// `11.2.3.4` or `1.2.3.40`.
+fn rule_present_in(status_output: &str, ip: &str) -> bool {
+    status_output
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == ':' || c == '/'))
+        .any(|tok| tok == ip)
+}
+
+/// Best-effort check of whether `ip` is in the LIVE firewall ruleset for the
+/// backend behind `skill_id`. Returns `false` when the backend is not
+/// introspectable or the query fails — callers treat `false` as "re-apply",
+/// which is idempotent and never opens a gap. Uses the same `sudo` path the
+/// block skills use to apply rules.
+async fn is_ip_live_blocked(ip: &str, skill_id: &str) -> bool {
+    let (prog, args) = match backend_status_cmd(skill_id) {
+        Some(c) => c,
+        None => return false,
+    };
+    match tokio::process::Command::new("sudo")
+        .arg(prog)
+        .args(args)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => rule_present_in(&String::from_utf8_lossy(&o.stdout), ip),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::time::Instant;
+
+    #[test]
+    fn backend_status_cmd_maps_known_backends() {
+        assert_eq!(
+            backend_status_cmd("block-ip-ufw"),
+            Some(("ufw", &["status"][..]))
+        );
+        assert_eq!(
+            backend_status_cmd("block-ip-nftables"),
+            Some(("nft", &["list", "ruleset"][..]))
+        );
+        assert_eq!(
+            backend_status_cmd("block-ip-iptables"),
+            Some(("iptables", &["-S"][..]))
+        );
+        assert_eq!(
+            backend_status_cmd("block-ip-firewalld"),
+            Some(("firewall-cmd", &["--list-all"][..]))
+        );
+        // Backends we cannot cheaply introspect -> None -> caller re-applies.
+        assert_eq!(backend_status_cmd("block-ip-xdp"), None);
+        assert_eq!(backend_status_cmd("block-ip-pf"), None);
+        assert_eq!(backend_status_cmd("monitor-ip"), None);
+    }
+
+    #[test]
+    fn rule_present_in_matches_whole_ip_token_only() {
+        let ufw = "Status: active\n[2419] Anywhere   DENY IN   45.148.10.121\n";
+        assert!(rule_present_in(ufw, "45.148.10.121"));
+        // No false positive on a substring / neighbouring IP.
+        assert!(!rule_present_in(ufw, "45.148.10.12"));
+        assert!(!rule_present_in(ufw, "145.148.10.121"));
+        assert!(!rule_present_in(ufw, "45.148.10.1"));
+        // Absent IP.
+        assert!(!rule_present_in(ufw, "8.8.8.8"));
+        // CIDR token preserved.
+        assert!(rule_present_in(
+            "-A INPUT -s 10.0.0.0/8 -j DROP",
+            "10.0.0.0/8"
+        ));
+        // Empty output.
+        assert!(!rule_present_in("", "1.2.3.4"));
+    }
 
     fn mem_store() -> innerwarden_store::Store {
         innerwarden_store::Store::open_memory().expect("memory store")
