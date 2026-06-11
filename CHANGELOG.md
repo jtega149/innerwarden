@@ -10,6 +10,22 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Input-robustness hardening across the enrichment clients (same class as the
+  DShield bug).** A Zero-Trust audit found the DShield failure mode lurking in
+  siblings and a few unbounded reads:
+  - **geoip** (`ip-api.com`): `isp`/`asn` were strict `String`s, so a bare-integer
+    `as` or a `null` field failed the whole record and silently killed geo
+    enrichment for every IP — exactly the DShield incident. Now a `lenient_string`
+    deserializer (string/number/null) + a body cap.
+  - **AbuseIPDB**: required scalars (`abuseConfidenceScore`, `totalReports`,
+    `numDistinctUsers`, `isPublic`) get `#[serde(default)]` so a schema flip can't
+    fail the record.
+  - **Body-size caps** on the threat-feed IOC reader (operator-configured, often
+    plain-`http://`, MITM-able), DShield, and the fleet poller — an unbounded
+    `text()`/`json()` could OOM the agent. Mirrors the CrowdSec 8 MB cap.
+  - **Honesty fix**: the orphan-recovery contained-decision text said "verified
+    live" when it only consults the in-memory response lifecycle (no live firewall
+    re-check); the text now states the real source.
 - **DShield enrichment was silently dead.** DShield's per-IP API returns the AS
   number as a bare integer (`"as":48090`) for many IPs, but the `as_number`
   field was typed `Option<String>` (tests only covered the quoted-string form).

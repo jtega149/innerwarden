@@ -26,17 +26,35 @@ use tracing::{debug, warn};
 
 #[derive(Deserialize)]
 struct IpApiResponse {
+    #[serde(default)]
     status: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     country: String,
-    #[serde(rename = "countryCode", default)]
+    #[serde(rename = "countryCode", default, deserialize_with = "lenient_string")]
     country_code: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     city: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     isp: String,
-    #[serde(rename = "as", default)]
+    #[serde(rename = "as", default, deserialize_with = "lenient_string")]
     asn: String,
+}
+
+/// Accept a string, a bare number (stringified), or null for a string field
+/// (defaults to empty). ip-api.com returns the `as` field as a bare integer
+/// for some IPs and fields can arrive as `null`; a plain `String` field would
+/// fail the WHOLE record and silently kill geo enrichment for every IP — the
+/// exact failure mode the DShield `as` bug had in prod (2026-06-11).
+fn lenient_string<'de, D>(de: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(de)?;
+    Ok(match v {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    })
 }
 
 /// Lightweight geolocation summary attached to `DecisionContext`.
@@ -117,7 +135,25 @@ impl GeoIpClient {
             return None;
         }
 
-        let data: IpApiResponse = match resp.json().await {
+        // Cap the body before parsing — ip-api responses are tiny; a hostile
+        // or MITM'd response should not be able to OOM the agent.
+        const MAX_BODY: usize = 256 * 1024;
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(ip, error = %e, "ip-api.com body read failed");
+                return None;
+            }
+        };
+        if bytes.len() > MAX_BODY {
+            warn!(
+                ip,
+                body_bytes = bytes.len(),
+                "ip-api.com response too large"
+            );
+            return None;
+        }
+        let data: IpApiResponse = match serde_json::from_slice(&bytes) {
             Ok(d) => d,
             Err(e) => {
                 warn!(ip, error = %e, "failed to parse ip-api.com response");
@@ -179,6 +215,31 @@ mod tests {
         assert_eq!(resp.city, "");
         assert_eq!(resp.isp, "");
         assert_eq!(resp.asn, "");
+    }
+
+    #[test]
+    fn lenient_parse_survives_integer_as_and_null_fields() {
+        // Regression for the DShield/geoip type-flip class: ip-api can return
+        // `as` as a BARE INTEGER and string fields as `null`. With plain
+        // `String` fields this failed the whole record and silently killed geo
+        // enrichment for every IP. lenient_string stringifies the number and
+        // treats null as empty, so the record still parses.
+        let json = r#"{
+            "status":"success",
+            "country":"Brazil",
+            "countryCode":null,
+            "city":null,
+            "isp":12345,
+            "as":268869
+        }"#;
+        let resp: IpApiResponse =
+            serde_json::from_str(json).expect("must parse with integer `as`/`isp` + null fields");
+        assert_eq!(resp.status, "success");
+        assert_eq!(resp.country, "Brazil");
+        assert_eq!(resp.country_code, "");
+        assert_eq!(resp.city, "");
+        assert_eq!(resp.isp, "12345");
+        assert_eq!(resp.asn, "268869");
     }
 
     #[test]

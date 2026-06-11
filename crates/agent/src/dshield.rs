@@ -225,7 +225,20 @@ impl DshieldClient {
             return None;
         }
 
-        match resp.json::<DshieldResponse>().await {
+        // Cap the body before parsing (keyless public API; defense-in-depth).
+        const MAX_BODY: usize = 1024 * 1024;
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(ip, error = %e, "DShield body read failed");
+                return None;
+            }
+        };
+        if bytes.len() > MAX_BODY {
+            warn!(ip, body_bytes = bytes.len(), "DShield response too large");
+            return None;
+        }
+        match serde_json::from_slice::<DshieldResponse>(&bytes) {
             Ok(d) => Some(DshieldReputation::from_ip(d.ip)),
             Err(e) => {
                 warn!(ip, error = %e, "failed to parse DShield response");

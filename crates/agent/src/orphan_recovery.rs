@@ -282,12 +282,13 @@ pub(crate) async fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize 
                         dry_run: false,
                         reason: format!(
                             "Orphan-recovery: {severity}-severity incident is {age_human} old; \
-                                 its IP {ip} is already blocked at the firewall (verified live via \
-                                 the response lifecycle). Threat is contained — recorded as \
-                                 contained instead of needs_review. No new firewall rule applied."
+                                 its IP {ip} is tracked as blocked by the response lifecycle \
+                                 (TTL-accurate in-memory view; not a live firewall re-check). \
+                                 Threat is treated as contained — recorded as contained instead of \
+                                 needs_review. No new firewall rule applied."
                         ),
                         estimated_threat: severity.clone(),
-                        execution_result: "blocked (already enforced, verified live)".to_string(),
+                        execution_result: "blocked (per response lifecycle)".to_string(),
                         prev_hash: None,
                         decision_layer: Some("observation_verifier".to_string()),
                     };
@@ -1017,9 +1018,16 @@ mod tests {
             Some(false),
         );
         let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        // Honest text: it must NOT claim "verified live" (it only checks the
+        // in-memory lifecycle, not the live firewall) and must say no new rule
+        // was applied.
         assert!(
-            reason.contains("verified live") && reason.contains("No new firewall rule"),
-            "reason must be honest about verify-live + no new rule applied: {reason}"
+            !reason.contains("verified live"),
+            "reason must NOT overclaim 'verified live' (no live firewall re-check happens): {reason}"
+        );
+        assert!(
+            reason.contains("response lifecycle") && reason.contains("No new firewall rule"),
+            "reason must be honest about the in-memory lifecycle source + no new rule: {reason}"
         );
     }
 
