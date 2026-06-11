@@ -10,6 +10,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **`systemd_persistence` false positives on benign systemctl ops.** Two FP classes
+  reported from a live Telegram alert (2026-06-11): (1) `systemctl is-enabled <unit>`
+  — a read-only query — fired because `contains("enable")` matched the "enable" inside
+  "is-enabled"; (2) a bare `systemctl daemon-reload` (ubiquitous: every package install,
+  deploy, and the agent's own restart dance) fired as High. Now persistence verbs are
+  matched as TOKENS (`enable`/`reenable`/`link`), read-only verbs (`is-enabled`,
+  `is-active`, `status`, …) stay silent, and a bare `daemon-reload` only alerts when the
+  command references a suspicious path. Real persistence (unit-file writes + `enable`) is
+  still caught aggressively. Regression tests added.
 - **MCP proxy: capped the line reader (OOM/DoS).** The agent-guard MCP proxy
   (`innerwarden agent proxy -- <server>`) sits in front of UNTRUSTED MCP servers
   (and an untrusted client); its `tokio` `Lines` reader grew a single

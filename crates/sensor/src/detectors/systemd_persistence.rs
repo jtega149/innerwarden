@@ -174,8 +174,15 @@ impl SystemdPersistenceDetector {
             return None;
         }
 
-        let is_enable = cmd_lower.contains("enable");
-        let is_daemon_reload = cmd_lower.contains("daemon-reload");
+        // Match persistence verbs as TOKENS, not substrings. `cmd_lower.contains("enable")`
+        // fired on the read-only query `systemctl is-enabled <unit>` ("is-enabled" contains
+        // "enable") — a false positive reported 2026-06-11. `enable`/`reenable`/`link`
+        // establish persistence; `is-enabled`/`is-active`/`status`/`show` are read-only.
+        let tokens: Vec<&str> = cmd_lower.split_whitespace().collect();
+        let is_enable = tokens
+            .iter()
+            .any(|&t| t == "enable" || t == "reenable" || t == "link");
+        let is_daemon_reload = tokens.contains(&"daemon-reload");
 
         if !is_enable && !is_daemon_reload {
             return None;
@@ -188,6 +195,15 @@ impl SystemdPersistenceDetector {
 
         // Check for suspicious ExecStart paths in the command context
         let has_suspicious_path = SUSPICIOUS_EXEC_PATHS.iter().any(|p| cmd_lower.contains(p));
+
+        // A bare `systemctl daemon-reload` is ubiquitous and benign — every package
+        // install, every deploy, the agent's own restart dance reloads units. It only
+        // signals persistence when a malicious unit was just written, so require a
+        // suspicious path before flagging a reload. `enable`/`link` stay aggressive
+        // (they are the actual persistence-establishing verbs).
+        if is_daemon_reload && !is_enable && !has_suspicious_path {
+            return None;
+        }
 
         let severity = if has_suspicious_path {
             Severity::Critical
@@ -416,11 +432,51 @@ mod tests {
     }
 
     #[test]
-    fn detects_systemctl_daemon_reload() {
+    fn bare_daemon_reload_is_benign() {
+        // Regression (2026-06-11 FP): a bare `systemctl daemon-reload` is ubiquitous
+        // (every package install / deploy / the agent's own restart dance) and is NOT
+        // persistence on its own — the real signal is the unit-file write (caught
+        // separately) + `enable`. It must not alert without a suspicious path.
         let mut det = SystemdPersistenceDetector::new("test", 600);
         let now = Utc::now();
         let inc = det.process(&cmd_event("systemctl daemon-reload", "bash", 2001, now));
-        assert!(inc.is_some());
+        assert!(inc.is_none(), "bare daemon-reload must not alert");
+    }
+
+    #[test]
+    fn is_enabled_query_is_not_persistence() {
+        // Regression (2026-06-11 FP): `systemctl is-enabled <unit>` is a read-only query.
+        // The old `contains("enable")` matched the "enable" inside "is-enabled" and fired.
+        // Token matching must treat `is-enabled` as a non-verb and stay silent.
+        let mut det = SystemdPersistenceDetector::new("test", 600);
+        let now = Utc::now();
+        let inc = det.process(&cmd_event(
+            "systemctl --system is-enabled -- nginx.service",
+            "bash",
+            2002,
+            now,
+        ));
+        assert!(
+            inc.is_none(),
+            "is-enabled is a read-only query, not persistence"
+        );
+        // Other read-only verbs likewise silent.
+        assert!(det
+            .process(&cmd_event(
+                "systemctl is-active nginx.service",
+                "bash",
+                2003,
+                now
+            ))
+            .is_none());
+        assert!(det
+            .process(&cmd_event(
+                "systemctl status nginx.service",
+                "bash",
+                2004,
+                now
+            ))
+            .is_none());
     }
 
     #[test]
