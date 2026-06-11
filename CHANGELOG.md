@@ -10,6 +10,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **DShield enrichment was silently dead.** DShield's per-IP API returns the AS
+  number as a bare integer (`"as":48090`) for many IPs, but the `as_number`
+  field was typed `Option<String>` (tests only covered the quoted-string form).
+  serde failed the whole record — `invalid type: integer, expected a string` —
+  so the ISC reputation signal was dropped for every IP (239 `failed to parse
+  DShield response` warnings in 2 days on prod). A `lenient_string` deserializer
+  now accepts string-or-number-or-null on the AS string fields.
 - **Already-blocked threats no longer show up under "Needs your attention".**
   When a High/Critical incident became an orphan (no AI decision recorded — a
   deploy orphan or provider skip) the orphan-recovery sweep routed it to
