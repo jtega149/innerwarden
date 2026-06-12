@@ -9,6 +9,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.11] - 2026-06-12
+
+Headline: the **Execution Gate eBPF primitive** ships — a free, auditable,
+kernel-level allowlist primitive that is **inert by default** and changes
+nothing for existing users. Plus a Zero-Trust input-robustness sweep across the
+enrichment clients and a batch of false-positive + operator-experience fixes.
+Also reactivates the install-ping for the client deployment.
+
 ### Fixed
 - **`systemd_persistence` false positives on benign systemctl ops.** Two FP classes
   reported from a live Telegram alert (2026-06-11): (1) `systemctl is-enabled <unit>`
