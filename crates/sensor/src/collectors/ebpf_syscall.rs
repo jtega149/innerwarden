@@ -615,6 +615,23 @@ fn bytes_to_string(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..end]).to_string()
 }
 
+/// `ExecveEvent.argv[0]` lives at bytes 352..480 of the `#[repr(C)]` layout
+/// (after kind/pid/tgid/uid/gid/ppid = 24, cgroup_id = 8, comm = 64,
+/// filename = 256). The Execution Gate writes `b"EXEC_GATE"` there so its
+/// kind-6 blocks are distinguishable from the legacy full-hook / kill-chain /
+/// neural blocks — every other kind-6 emitter zeroes argv, so the marker is
+/// unambiguous. `filename` then carries the REAL attempted path (a denied exec
+/// leaves `/proc/<pid>` pointing at the old image, so the path is only
+/// recoverable from the event itself).
+const EXEC_GATE_MARKER: &[u8; 9] = b"EXEC_GATE";
+const EXECVE_ARGV0_OFFSET: usize = 352;
+
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+fn is_exec_gate_block(data: &[u8]) -> bool {
+    let end = EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len();
+    data.len() >= end && data[EXECVE_ARGV0_OFFSET..end] == EXEC_GATE_MARKER[..]
+}
+
 /// Pin path for the XDP blocklist BPF map.
 /// The agent writes to this map via bpftool to add/remove blocked IPs.
 const XDP_PIN_DIR: &str = "/sys/fs/bpf/innerwarden";
@@ -2123,6 +2140,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
                     let filename = bytes_to_string(&data[96..352]);
+                    let gate = is_exec_gate_block(data);
 
                     let container_id = resolve_container_id(pid);
 
@@ -2134,25 +2152,45 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "cgroup_id": cgroup_id,
                         "action": "blocked",
                     });
+                    if gate {
+                        details["blocked_by"] = serde_json::Value::String("exec_gate".to_string());
+                    }
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
 
                     let mut tags =
                         vec!["ebpf".to_string(), "lsm".to_string(), "blocked".to_string()];
+                    if gate {
+                        tags.push("exec_gate".to_string());
+                    }
                     let mut entities = vec![];
                     if let Some(ref cid) = container_id {
                         tags.push("container".to_string());
                         entities.push(EntityRef::container(cid));
                     }
 
+                    let (kind, summary) = if gate {
+                        (
+                            "lsm.exec_gate_blocked".to_string(),
+                            format!(
+                                "Execution Gate blocked unknown binary: {comm} tried to run {filename}"
+                            ),
+                        )
+                    } else {
+                        (
+                            "lsm.exec_blocked".to_string(),
+                            format!("LSM blocked execution: {comm} tried to run {filename}"),
+                        )
+                    };
+
                     Some(Event {
                         ts: chrono::Utc::now(),
                         host: host.to_string(),
                         source: "ebpf".to_string(),
-                        kind: "lsm.exec_blocked".to_string(),
+                        kind,
                         severity: Severity::Critical,
-                        summary: format!("LSM blocked execution: {comm} tried to run {filename}"),
+                        summary,
                         details,
                         tags,
                         entities,
@@ -3264,6 +3302,27 @@ pub async fn run(_tx: crate::event_channels::EbpfTx, _host: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Execution Gate: kind-6 events from the gate carry b"EXEC_GATE" in
+    // argv[0] (bytes 352..361) and the REAL attempted path in filename;
+    // legacy/kill-chain/neural kind-6 emitters zero argv. This anchor pins
+    // the marker offset against ExecveEvent layout drift.
+    #[test]
+    fn exec_gate_marker_detected_only_when_present() {
+        // Full-size ExecveEvent buffer, argv zeroed → NOT a gate block.
+        let mut data = vec![0u8; 1400];
+        assert!(!is_exec_gate_block(&data));
+        // Marker at argv[0] → gate block.
+        data[EXECVE_ARGV0_OFFSET..EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len()]
+            .copy_from_slice(EXEC_GATE_MARKER);
+        assert!(is_exec_gate_block(&data));
+        // Marker must be exact — a prefix is not enough.
+        data[EXECVE_ARGV0_OFFSET + 8] = 0;
+        assert!(!is_exec_gate_block(&data));
+        // Buffer too short for argv (legacy 352-byte minimum) → never a gate block.
+        assert!(!is_exec_gate_block(&vec![0u8; 352]));
+        assert!(!is_exec_gate_block(b""));
+    }
 
     // Spec 069: the syscall handlers attach as kprobes on the architecture
     // syscall ENTRY WRAPPER. The symbol must match the build-host arch.

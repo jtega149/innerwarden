@@ -86,7 +86,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unknown binary blocked at exec, allowlisted binaries run, clean disarm, no
   brick. `scripts/verify-lsm-hooks.sh` now also pins the per-program FUNC
   symbol surface (bpf-linker folds same-hook programs into one ELF section, so
-  the section check alone cannot see a dropped program).
+  the section check alone cannot see a dropped program). The gate's block is
+  surfaced as a dedicated **`lsm.exec_gate_blocked`** event carrying the real
+  attempted path inline (`details.filename` + `blocked_by: exec_gate`) — read
+  straight from `bprm->filename`, since a denied exec leaves `/proc/<pid>`
+  pointing at the old image and the path is unrecoverable afterwards.
 - **More case actions than just "Block IP".** The case detail offered only a
   Block button (which hid once a case was blocked, leaving zero actions). New
   operator actions, all behind the same auth + CSRF gate as block-ip and

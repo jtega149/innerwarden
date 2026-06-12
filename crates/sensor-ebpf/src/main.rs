@@ -738,10 +738,14 @@ fn try_exec_gate(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(0); // path-hash on the allowlist → allow
     }
 
-    // Unknown binary under an armed gate — emit EXEC_GATE_BLOCKED (fixed marker,
-    // verifier-safe like the kill-chain/neural blocks) so the agent's gate_decision
-    // can classify + (auto/operator) approve. It correlates the path via the
-    // concurrent execve kprobe event (same pid) + comm.
+    // Unknown binary under an armed gate — emit a block event carrying the REAL
+    // attempted path in `filename` (read straight from bprm->filename, same
+    // verifier-proven pattern as the legacy hook) and the b"EXEC_GATE" marker in
+    // argv[0] (every other kind-6 emitter zeroes argv, so the marker is
+    // unambiguous). The consumer renders it as `lsm.exec_gate_blocked` with the
+    // path inline — no fragile execve-event correlation needed (a denied exec
+    // leaves /proc/<pid> pointing at the OLD image, so userspace could not
+    // recover the attempted path after the fact).
     let pid_tgid = bpf_get_current_pid_tgid();
     let ts = unsafe { bpf_ktime_get_ns() };
     let cg = unsafe { bpf_get_current_cgroup_id() };
@@ -758,8 +762,9 @@ fn try_exec_gate(ctx: &LsmContext) -> Result<i32, i64> {
         event.argc = 0;
         event.argv = [[0u8; 128]; 8];
         event.filename = [0u8; 256];
-        let msg = b"EXEC_GATE_BLOCKED";
-        event.filename[..msg.len()].copy_from_slice(msg);
+        let _ = unsafe { bpf_probe_read_kernel_str_bytes(filename_ptr, &mut event.filename) };
+        let marker = b"EXEC_GATE";
+        event.argv[0][..marker.len()].copy_from_slice(marker);
         if let Ok(comm) = bpf_get_current_comm() {
             event.comm[..comm.len().min(MAX_COMM_LEN)]
                 .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
