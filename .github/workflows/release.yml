@@ -469,6 +469,13 @@ jobs:
       # in the repo as operator-facing recipes; rebuild + push on demand from a
       # workstation with more headroom if and when needed.
 
+  # macOS binaries are the "Phantom" light tier: detection + response work
+  # via log-based collectors (unified log), launchd, and the pf firewall, but
+  # there is NO eBPF on macOS — eBPF kernel programs are Linux-only, so the
+  # macOS sensor runs ZERO kernel hooks. Every eBPF-fed detector (privesc,
+  # c2_callback, container_escape, the Execution Gate, ...) is inert on macOS.
+  # README.md "Platform Support" documents this for users; do not advertise
+  # eBPF capability for the macOS build.
   build-release-macos:
     name: Build and publish (macOS)
     runs-on: macos-latest
@@ -547,24 +554,34 @@ jobs:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
           set -euo pipefail
-          # Scorecard PinnedDependencies fix (mirror of the Linux block
-          # above): drop `pip install -q cryptography` in favour of the
-          # pre-installed openssl CLI. macOS-latest ships LibreSSL 3.3.6+
-          # which supports `pkeyutl -sign -rawin -in <file>`. `base64 |
-          # tr -d \\n` is the cross-platform stand-in for `base64 -w 0`
-          # (BSD base64 uses `-b 0` not `-w 0`; the tr is portable).
+          # macOS runners expose LibreSSL as the system `openssl`
+          # (/usr/bin/openssl). LibreSSL's `pkeyutl` has NO `-rawin` flag and
+          # cannot raw-sign Ed25519 at all — it fails with
+          # `pkeyutl: Option unknown option -rawin` (exit 1). An earlier
+          # comment here wrongly claimed "LibreSSL 3.3.6+ supports -rawin";
+          # it does not, and that broke EVERY macOS release run from 0.15.9
+          # through 0.15.11 (Linux was unaffected since ubuntu ships real
+          # OpenSSL 3.x). Fix: use Homebrew's openssl@3 (genuine OpenSSL 3.x,
+          # keg-only so it is NOT on PATH) explicitly. This keeps the signing
+          # scheme byte-for-byte identical to the Linux job — Ed25519 over the
+          # 32-byte SHA-256 digest via `pkeyutl -sign -rawin -in <file>` —
+          # so the same verifier accepts both. `brew install` is idempotent
+          # and fast when the keg is already present on the runner image.
           #
-          # Wave 2026-05-18 fix: same pipe-vs-file gotcha as the Linux
-          # block — `-rawin` reads from stdin only if stdin is seekable,
-          # which a pipe is not. Use a temp digest file instead.
+          # `-rawin` needs a SEEKABLE input, so the digest goes through a temp
+          # file, not a pipe. `base64 | tr -d \\n` is the cross-platform
+          # stand-in for GNU `base64 -w 0` (BSD base64 has no `-w`).
+          brew install openssl@3 >/dev/null
+          OSSL="$(brew --prefix openssl@3)/bin/openssl"
+          "$OSSL" version
           echo "$RELEASE_SIGNING_KEY" > /tmp/sign-key.pem
           chmod 600 /tmp/sign-key.pem
           for binary in dist/innerwarden-*; do
             [[ "$binary" == *.sha256 ]] && continue
             [[ "$binary" == *.sig ]] && continue
             echo "signing $(basename $binary)..."
-            openssl dgst -sha256 -binary "$binary" > /tmp/sign-digest.bin
-            openssl pkeyutl -sign -inkey /tmp/sign-key.pem -rawin -in /tmp/sign-digest.bin \
+            "$OSSL" dgst -sha256 -binary "$binary" > /tmp/sign-digest.bin
+            "$OSSL" pkeyutl -sign -inkey /tmp/sign-key.pem -rawin -in /tmp/sign-digest.bin \
               | base64 \
               | tr -d '\n' > "${binary}.sig"
           done

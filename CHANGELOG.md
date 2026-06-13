@@ -9,6 +9,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **macOS release signing.** The release workflow's "Sign macOS release
+  binaries" step failed on every run from 0.15.9 through 0.15.11
+  (`pkeyutl: Option unknown option -rawin`, exit 1) because macOS runners
+  expose LibreSSL as the system `openssl`, and LibreSSL's `pkeyutl` cannot
+  raw-sign Ed25519. It now uses Homebrew's `openssl@3` explicitly, keeping the
+  signature scheme byte-for-byte identical to the Linux job. Linux releases were
+  never affected. (Note: macOS binaries ship without eBPF — eBPF is Linux-only;
+  the macOS sensor uses log-based collectors. See README "Platform Support".)
+
 ### Changed
 - **Install/upgrade telemetry is now opt-OUT (was opt-in), transparent, and
   covers upgrades.** The anonymous install ping flips to on-by-default; disable
