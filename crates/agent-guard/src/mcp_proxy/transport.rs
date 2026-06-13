@@ -546,9 +546,15 @@ mod tests {
             .unwrap();
         to_proxy.write_all(b"\n").await.unwrap();
         to_proxy.shutdown().await.unwrap();
-        assert_eq!(handle.await.unwrap().unwrap(), 0);
+        // Drain the output CONCURRENTLY with the proxy, not after it. Awaiting
+        // `handle` first and only then reading `from_proxy` is a duplex race: if
+        // the reader isn't draining while the proxy writes/closes, the test can
+        // observe an empty/partial buffer (rare CI flake, 2026-06-13). `join!`
+        // runs both to completion together — real pipe semantics.
         let mut out = String::new();
-        from_proxy.read_to_string(&mut out).await.unwrap();
+        let (proxy_res, read_res) = tokio::join!(handle, from_proxy.read_to_string(&mut out));
+        assert_eq!(proxy_res.unwrap().unwrap(), 0);
+        read_res.unwrap();
         assert!(out.contains(CLEAN) && out.contains(CREDS));
         assert_eq!(out.matches('\n').count(), 2, "blank dropped");
     }

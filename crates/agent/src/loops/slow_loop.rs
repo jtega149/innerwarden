@@ -1226,6 +1226,23 @@ pub(crate) async fn process_narrative_tick(
             );
         }
         state.last_orphan_recovery = std::time::Instant::now();
+
+        // Re-verify already-decided needs_review cases against the LIVE firewall
+        // (operator report 2026-06-13): a High/Crit case decided needs_review
+        // BEFORE its IP got blocked stays in "needs your attention" forever once
+        // the block lands later — #987 only verified at first-decision, and the
+        // in-memory block record can diverge from an orphaned ufw rule. This
+        // flips such cases to a truthful Contained decision by probing the actual
+        // firewall (never the record). Recon-only (active-harm stays surfaced);
+        // hole-free (returns raise new incidents + live-verified re-block).
+        let recontained =
+            crate::orphan_recovery::reverify_already_blocked_needs_review(state, data_dir).await;
+        if recontained > 0 {
+            tracing::info!(
+                recontained,
+                "slow_loop: re-verified {recontained} needs_review case(s) as already-contained (live firewall)"
+            );
+        }
     }
 
     // 2026-06-10 — operator-unblock drain. Runs every tick (one bounded SQL

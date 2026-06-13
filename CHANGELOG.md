@@ -9,6 +9,26 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Truthful containment for already-blocked `needs_review` cases.** A
+  High/Critical case decided `needs_review` *before* its IP was blocked stayed in
+  the dashboard's "Needs your attention" forever once the firewall started
+  dropping it — pestering the operator about an already-contained threat (#987
+  only verified at first-decision; the in-memory block record can also diverge
+  from an orphaned ufw rule). A new slow-loop pass
+  (`orphan_recovery::reverify_already_blocked_needs_review`) re-checks every
+  current `needs_review` case against the **live firewall** (ufw + iptables probe,
+  never the internal record — per spec-076) and records a truthful Contained
+  decision for any IP it is actually dropping. Hole-free: it only contains
+  recon-class detectors a firewall block fully mitigates (active-harm —
+  reverse_shell/c2/data_exfil/ransomware/kill_chain — always stays surfaced even
+  when blocked), a failed probe contains nothing, and a returning attacker raises
+  a new incident handled by the live-verified re-block path (no free pass).
+- **De-flake `mcp_proxy::transport::advisory_is_a_transparent_pipe`.** The test
+  awaited the proxy task before reading its output, a duplex race that could
+  observe an empty/partial buffer under CI load. It now drains concurrently
+  (`tokio::join!`).
+
 ### Added
 - **Execution Gate operator "Trust Exec" + allow_exec rules (spec 077 P3/P4).**
   The approve side of the gate, open-core: the OSS agent owns the approval UX, the
