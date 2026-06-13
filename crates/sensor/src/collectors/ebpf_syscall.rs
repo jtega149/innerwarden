@@ -624,12 +624,22 @@ fn bytes_to_string(buf: &[u8]) -> String {
 /// leaves `/proc/<pid>` pointing at the old image, so the path is only
 /// recoverable from the event itself).
 const EXEC_GATE_MARKER: &[u8; 9] = b"EXEC_GATE";
+/// Observe-mode (spec 077 P2): the gate emits this marker instead of EXEC_GATE
+/// when LSM_POLICY key 3 == 2 — a would-block (exec was ALLOWED, logged only).
+const EXEC_OBSERVE_MARKER: &[u8; 9] = b"EXEC_OBSV";
 const EXECVE_ARGV0_OFFSET: usize = 352;
 
 #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
 fn is_exec_gate_block(data: &[u8]) -> bool {
     let end = EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len();
     data.len() >= end && data[EXECVE_ARGV0_OFFSET..end] == EXEC_GATE_MARKER[..]
+}
+
+/// True when this kind-6 event is an OBSERVE-mode would-block (gate allowed it).
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+fn is_exec_gate_observe(data: &[u8]) -> bool {
+    let end = EXECVE_ARGV0_OFFSET + EXEC_OBSERVE_MARKER.len();
+    data.len() >= end && data[EXECVE_ARGV0_OFFSET..end] == EXEC_OBSERVE_MARKER[..]
 }
 
 /// Pin path for the XDP blocklist BPF map.
@@ -2141,6 +2151,9 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let comm = bytes_to_string(&data[32..96]);
                     let filename = bytes_to_string(&data[96..352]);
                     let gate = is_exec_gate_block(data);
+                    // Observe mode (spec 077 P2): the gate WOULD have blocked but
+                    // allowed the exec (learning). Logged only, never an incident.
+                    let observe = is_exec_gate_observe(data);
 
                     let container_id = resolve_container_id(pid);
 
@@ -2150,19 +2163,25 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "comm": comm,
                         "filename": filename,
                         "cgroup_id": cgroup_id,
-                        "action": "blocked",
+                        "action": if observe { "would_block" } else { "blocked" },
                     });
                     if gate {
                         details["blocked_by"] = serde_json::Value::String("exec_gate".to_string());
+                    } else if observe {
+                        details["would_block_by"] =
+                            serde_json::Value::String("exec_gate".to_string());
                     }
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
 
-                    let mut tags =
-                        vec!["ebpf".to_string(), "lsm".to_string(), "blocked".to_string()];
-                    if gate {
+                    let mut tags = vec!["ebpf".to_string(), "lsm".to_string()];
+                    tags.push(if observe { "would_block" } else { "blocked" }.to_string());
+                    if gate || observe {
                         tags.push("exec_gate".to_string());
+                    }
+                    if observe {
+                        tags.push("observe".to_string());
                     }
                     let mut entities = vec![];
                     if let Some(ref cid) = container_id {
@@ -2170,17 +2189,30 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         entities.push(EntityRef::container(cid));
                     }
 
-                    let (kind, summary) = if gate {
+                    let (kind, summary, severity) = if observe {
+                        (
+                            "lsm.exec_gate_would_block".to_string(),
+                            format!(
+                                "Execution Gate (observe) would block: {comm} tried to run {filename} \
+                                 — allowed (learning). Approve to allowlist, or it is denied once armed."
+                            ),
+                            // Learning signal, not a block — keep it out of the
+                            // critical incident stream (onboarding can be noisy).
+                            Severity::Info,
+                        )
+                    } else if gate {
                         (
                             "lsm.exec_gate_blocked".to_string(),
                             format!(
                                 "Execution Gate blocked unknown binary: {comm} tried to run {filename}"
                             ),
+                            Severity::Critical,
                         )
                     } else {
                         (
                             "lsm.exec_blocked".to_string(),
                             format!("LSM blocked execution: {comm} tried to run {filename}"),
+                            Severity::Critical,
                         )
                     };
 
@@ -2189,7 +2221,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         host: host.to_string(),
                         source: "ebpf".to_string(),
                         kind,
-                        severity: Severity::Critical,
+                        severity,
                         summary,
                         details,
                         tags,
@@ -3322,6 +3354,24 @@ mod tests {
         // Buffer too short for argv (legacy 352-byte minimum) → never a gate block.
         assert!(!is_exec_gate_block(&vec![0u8; 352]));
         assert!(!is_exec_gate_block(b""));
+    }
+
+    // Spec 077 P2: observe mode emits EXEC_OBSV (would-block, allowed) — distinct
+    // from EXEC_GATE (real block). The two markers must not cross-detect.
+    #[test]
+    fn exec_observe_marker_distinct_from_block() {
+        let mut data = vec![0u8; 1400];
+        assert!(!is_exec_gate_observe(&data));
+        data[EXECVE_ARGV0_OFFSET..EXECVE_ARGV0_OFFSET + EXEC_OBSERVE_MARKER.len()]
+            .copy_from_slice(EXEC_OBSERVE_MARKER);
+        assert!(is_exec_gate_observe(&data));
+        assert!(!is_exec_gate_block(&data)); // observe is NOT a block
+                                             // and a real block is not an observe
+        let mut blk = vec![0u8; 1400];
+        blk[EXECVE_ARGV0_OFFSET..EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len()]
+            .copy_from_slice(EXEC_GATE_MARKER);
+        assert!(is_exec_gate_block(&blk));
+        assert!(!is_exec_gate_observe(&blk));
     }
 
     // Spec 069: the syscall handlers attach as kprobes on the architecture

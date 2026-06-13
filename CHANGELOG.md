@@ -10,6 +10,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Execution Gate observe mode (spec 077 P2).** `LSM_POLICY` key 3 gains mode
+  `2 = observe`: the eBPF gate computes the path-hash and, on an allowlist miss,
+  emits a `lsm.exec_gate_would_block` event (Info) **but allows the exec** —
+  instead of `-EPERM` (mode 1 = enforce). This is the safe-onboarding primitive:
+  a host runs the gate in observe to *learn* its allowlist without bricking, then
+  flips to enforce after a clean window. The would-block carries the real
+  attempted path (marker `EXEC_OBSV`, distinct from the enforce `EXEC_GATE`).
+  Ships inert (mode 0 default); arming/observe is the paid Active Defence step.
 - **Operator "Trust IP" — a monitor-only allowlist managed from the dashboard.**
   New endpoints `POST /api/action/trust-ip`, `POST /api/action/untrust-ip`, and
   `GET /api/action/trusted-ips` (all under the existing dashboard auth + CSRF

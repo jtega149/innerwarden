@@ -707,11 +707,15 @@ pub fn innerwarden_lsm_exec_gate(ctx: LsmContext) -> i32 {
 }
 
 fn try_exec_gate(ctx: &LsmContext) -> Result<i32, i64> {
-    // Only enforce when armed (LSM_POLICY key 3 == 1). Disarmed = inert.
-    let armed = unsafe { LSM_POLICY.get(&3u32) }.copied().unwrap_or(0);
-    if armed != 1 {
+    // LSM_POLICY key 3 = exec-gate mode: 0 = off (inert), 1 = enforce (deny
+    // unknown with -EPERM), 2 = OBSERVE (emit a would-block event but ALLOW —
+    // for safe onboarding: learn the allowlist on a live host without bricking
+    // it, then flip to enforce after a clean window). Spec 077 P2.
+    let mode = unsafe { LSM_POLICY.get(&3u32) }.copied().unwrap_or(0);
+    if mode != 1 && mode != 2 {
         return Ok(0);
     }
+    let observe = mode == 2;
     // Read bprm->filename. The byte offset is supplied at load time by the
     // userspace loader from kernel BTF (CO-RE) via BPRM_OFFSETS key 0, so the gate
     // works across kernels — the offset differs (96 on 6.8; `filename` is at
@@ -763,7 +767,10 @@ fn try_exec_gate(ctx: &LsmContext) -> Result<i32, i64> {
         event.argv = [[0u8; 128]; 8];
         event.filename = [0u8; 256];
         let _ = unsafe { bpf_probe_read_kernel_str_bytes(filename_ptr, &mut event.filename) };
-        let marker = b"EXEC_GATE";
+        // Marker distinguishes a real block (enforce) from a would-block
+        // (observe) so the consumer renders lsm.exec_gate_blocked vs
+        // lsm.exec_gate_would_block. Both are 9 bytes.
+        let marker: &[u8] = if observe { b"EXEC_OBSV" } else { b"EXEC_GATE" };
         event.argv[0][..marker.len()].copy_from_slice(marker);
         if let Ok(comm) = bpf_get_current_comm() {
             event.comm[..comm.len().min(MAX_COMM_LEN)]
@@ -771,7 +778,12 @@ fn try_exec_gate(ctx: &LsmContext) -> Result<i32, i64> {
         }
         entry.submit(0);
     }
-    Ok(-1) // unknown binary under an armed gate → -EPERM
+    // Observe mode allows the exec (learning, no brick); enforce denies it.
+    if observe {
+        Ok(0)
+    } else {
+        Ok(-1) // unknown binary under an armed gate → -EPERM
+    }
 }
 
 // ── Spec 052 Phase 1: minimal LSM hook ────────────────────────────────
