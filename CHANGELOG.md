@@ -10,6 +10,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Installer (`install.sh`) failed on a clean `curl | sudo bash`.** Three bugs,
+  all on the product's front-door install path, now fixed + guarded by CI:
+  1. `SUPERVISED: unbound variable` — the var was referenced under `set -u` but
+     never declared. Now defaulted (`SUPERVISED="${SUPERVISED:-false}"`, opt-in)
+     with a `--supervised` flag.
+  2. `[responder]: command not found` — a backtick in a comment **inside an
+     unquoted `<<EOF` heredoc** ran as a command substitution. Backticks removed.
+  3. `/dev/tty: No such device or address` — the headless guard tested the device
+     node's permission bits (`-r`) but the actual open still fails with no
+     controlling terminal (piped/cloud-init/CI), aborting the install. Now probes
+     by actually opening `/dev/tty`, and the interactive wizard is non-fatal.
+  Removed dead `prompt_yes_no` (zero callers).
+- **New `Installer` CI workflow** (`.github/workflows/installer.yml`) so this
+  class never ships again: shellcheck (static, catches the heredoc/quoting class)
+  **plus** a runtime smoke test that runs the installer exactly as users do
+  (piped, no TTY) and asserts `innerwarden-sensor` + `innerwarden-agent` come up
+  active — the only way to catch the `set -u` / heredoc / tty runtime failures
+  shellcheck can't see.
 - **Truthful containment for already-blocked `needs_review` cases.** A
   High/Critical case decided `needs_review` *before* its IP was blocked stayed in
   the dashboard's "Needs your attention" forever once the firewall started

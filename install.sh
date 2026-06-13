@@ -36,6 +36,11 @@ CANARY=0
 VERBOSE=0
 SIMULATE=0
 SIMULATE_MODE="basic"
+# Supervised mode is opt-in (see the supervisor-unit block below). It MUST be
+# declared here: it is referenced under `set -u` later, so a missing default
+# aborts the whole install with "SUPERVISED: unbound variable". Override via the
+# --supervised flag or the SUPERVISED env var.
+SUPERVISED="${SUPERVISED:-false}"
 for arg in "$@"; do
   case "$arg" in
     --with-integrations) WITH_INTEGRATIONS=1 ;;
@@ -44,6 +49,7 @@ for arg in "$@"; do
     --simulate) SIMULATE=1 ;;
     --simulate-mode=basic) SIMULATE_MODE="basic" ;;
     --simulate-mode=advanced) SIMULATE_MODE="advanced" ;;
+    --supervised) SUPERVISED=true ;;
   esac
 done
 
@@ -141,23 +147,6 @@ normalize_bool() {
       echo "false"
       ;;
   esac
-}
-
-prompt_yes_no() {
-  local question="$1"
-  local default_answer="$2" # yes|no
-  local suffix answer normalized
-
-  if [[ "${default_answer}" == "yes" ]]; then
-    suffix="[Y/n]"
-  else
-    suffix="[y/N]"
-  fi
-
-  read -r -p "${question} ${suffix} " answer
-  answer="${answer:-${default_answer}}"
-  normalized="$(normalize_bool "${answer}")"
-  [[ "${normalized}" == "true" ]]
 }
 
 term_cols() {
@@ -942,7 +931,7 @@ provider = "${AI_PROVIDER}"
 model = "${AI_MODEL}"
 context_events = 20
 # confidence_threshold: minimum AI confidence (0.0-1.0) for auto-execution.
-# Trial safety comes from `[responder] enabled = false` below, NOT from this
+# Trial safety comes from [responder] enabled = false below, NOT from this
 # value. The agent clamps any threshold > 1.0 back to the 0.85 default on load
 # (a >1.0 "never executes" sentinel once silently disabled ALL autonomous
 # response, because AI confidence is always in [0.0, 1.0]).
@@ -1393,10 +1382,16 @@ fi
 # Headless installs (no /dev/tty: cloud-init, CI, Ansible) must NOT abort
 # here - warden + its config were already provisioned above, so just skip
 # the interactive wizard and tell the operator how to finish later.
-if [[ -e /dev/tty ]] && [[ -r /dev/tty ]]; then
-  $SUDO innerwarden setup < /dev/tty
+# `[[ -r /dev/tty ]]` only tests the device node's permission bits — it passes
+# even when there is NO controlling terminal (curl|sudo bash from a pipe, SSH
+# non-interactive, cloud-init, CI), and then `< /dev/tty` aborts the whole
+# install with "No such device or address". Probe by actually OPENING it, and
+# keep the wizard non-fatal so a clean install never exits non-zero on this step.
+if (: < /dev/tty) 2>/dev/null; then
+  $SUDO innerwarden setup < /dev/tty \
+    || vlog "interactive setup exited non-zero — run 'sudo innerwarden setup' to finish."
 else
-  vlog "No TTY detected (headless install) - skipping interactive setup."
+  vlog "No usable TTY (headless/piped install) - skipping interactive setup."
   vlog "Run 'sudo innerwarden setup' later to configure AI provider / notifications."
 fi
 
