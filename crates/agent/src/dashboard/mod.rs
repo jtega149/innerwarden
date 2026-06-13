@@ -707,6 +707,11 @@ pub async fn serve(
         .route("/api/action/trust-ip", post(api_action_trust_ip))
         .route("/api/action/untrust-ip", post(api_action_untrust_ip))
         .route("/api/action/trusted-ips", get(api_action_trusted_ips))
+        // Execution Gate operator "Trust Exec" — authorise a binary path (2FA-
+        // gated). Writes an allow_exec rule the paid watch daemon hot-reloads.
+        .route("/api/action/trust-exec", post(api_action_trust_exec))
+        .route("/api/action/untrust-exec", post(api_action_untrust_exec))
+        .route("/api/action/trusted-execs", get(api_action_trusted_execs))
         // 2026-05-01 (`tracked-spec-ai-override`): operator
         // overrides AI decisions / re-opens dismissed incidents /
         // labels decisions for retraining. Audit-only for v1.

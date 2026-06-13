@@ -1610,7 +1610,10 @@ pub(super) struct OrphanResolutionRequest {
 /// Returns `Ok(())` when 2FA is disabled (no enforcement) OR when the
 /// supplied code matches. Returns `Err(reason)` otherwise so the
 /// caller can include the human-readable cause in the audit row.
-fn verify_dashboard_totp(state: &DashboardState, supplied: &str) -> Result<(), &'static str> {
+pub(super) fn verify_dashboard_totp(
+    state: &DashboardState,
+    supplied: &str,
+) -> Result<(), &'static str> {
     if !state.two_factor.is_enforced() {
         return Ok(());
     }

@@ -157,6 +157,30 @@ pub(crate) struct UntrustIpRequest {
     pub(super) reason: String,
 }
 
+/// Authorise a binary PATH for the Execution Gate (operator "Trust Exec").
+/// - `path`: absolute binary path to allow (no globs — the kernel enforces an
+///   exact path).
+/// - `reason`: operator rationale (mandatory; audit trail).
+/// - `totp`: 6-digit 2FA code. Required when `[security].method = "totp"` (arming
+///   exec is a sensitive action); ignored when 2FA is disabled.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TrustExecRequest {
+    pub(super) path: String,
+    pub(super) reason: String,
+    #[serde(default)]
+    pub(super) totp: String,
+}
+
+/// Remove a path from the Execution Gate operator allowlist.
+#[derive(Debug, Deserialize)]
+pub(crate) struct UntrustExecRequest {
+    pub(super) path: String,
+    #[serde(default)]
+    pub(super) reason: String,
+    #[serde(default)]
+    pub(super) totp: String,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ActionResponse {
     pub(super) success: bool,

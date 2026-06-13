@@ -10,6 +10,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Execution Gate operator "Trust Exec" + allow_exec rules (spec 077 P3/P4).**
+  The approve side of the gate, open-core: the OSS agent owns the approval UX, the
+  paid `exec-gate watch` daemon owns enforcement, and they meet at the shared
+  `/etc/innerwarden/rules/exec-gate` rules directory.
+  - New `operator_exec_trust` module writes `allow_exec` rules (the same artifact
+    an advanced user can hand-write) the paid daemon hot-reloads into the kernel
+    allowlist.
+  - Dashboard `POST /api/action/trust-exec` (+ `untrust-exec`, `GET trusted-execs`)
+    authorise/revoke a binary path. Authorising an exec is a **sensitive action**,
+    so it is **2FA-gated** (`verify_dashboard_totp`, when `[security].method = totp`)
+    and recorded in the hash-chained admin-actions audit. Globs are rejected (the
+    kernel enforces an exact path).
+  - `innerwarden rule list` now shows Execution Gate `allow_exec` rules, and
+    `rule disable/enable <id>` toggles them (revoke takes effect within one watch
+    cycle). Without the paid daemon these rules are inert.
 - **Execution Gate observe mode (spec 077 P2).** `LSM_POLICY` key 3 gains mode
   `2 = observe`: the eBPF gate computes the path-hash and, on an allowlist miss,
   emits a `lsm.exec_gate_would_block` event (Info) **but allows the exec** —
