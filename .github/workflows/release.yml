@@ -503,7 +503,16 @@ jobs:
 
       # ── Tests ──────────────────────────────────────────────────────────────
       - name: Run tests
-        run: cargo test --workspace
+        # macOS runners have a low per-process thread cap. At full test
+        # parallelism each test spawns its own tokio runtime + thread-pools and
+        # exhausts it -> `pthread_create` fails with EAGAIN (OS code 35,
+        # "Resource temporarily unavailable") and unrelated tests (threat_report,
+        # web_push, webhook) flake-fail, failing the whole macOS release build
+        # even though the code is fine (Linux passes). Raise the fd limit and cap
+        # test concurrency so the macOS release gate is reliable.
+        run: |
+          ulimit -n 8192 2>/dev/null || true
+          cargo test --workspace -- --test-threads=2
 
       # ── Build x86_64-apple-darwin ──────────────────────────────────────────
       - name: Build (x86_64-apple-darwin)
