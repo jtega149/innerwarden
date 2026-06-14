@@ -10,6 +10,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Integration Advisor no longer flags Telegram + Slack as a problem.** Running
+  both notification channels (Telegram for real-time, Slack for team visibility)
+  is an intentional, supported setup, but the advisor showed it as a red
+  "OVERLAP DETECTED" warning. It is now a neutral "MULTI-CHANNEL ACTIVE"
+  informational note.
 - **Flaky MCP-proxy pipe tests.** The proxy tests that pipe through a real
   spawned child ran on a single-threaded tokio runtime and drained the duplex on
   the same thread that awaits the child, so under CI load the reader could

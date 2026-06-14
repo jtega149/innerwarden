@@ -308,10 +308,13 @@ function renderStatus(s, collectors) {
   // ── Section 2b: Integration advisor ────────────────────────────────────
   const conflicts = [];
   // (No conflicts to check - fail2ban removed, AbuseIPDB reports delayed)
+
+  // Informational notes: valid setups worth being aware of, NOT problems.
+  const notes = [];
   if (integ.telegram && integ.slack) {
-    conflicts.push({
+    notes.push({
       a: 'Telegram', b: 'Slack',
-      msg: 'Both send the same High/Critical alert. If you are the only operator, this doubles notification volume with no benefit. Use Telegram for real-time response, Slack for team visibility.'
+      msg: 'Both channels deliver High/Critical alerts — an intentional, supported setup: Telegram for real-time response on your phone, Slack for team visibility. Solo operator who wants less noise can keep just one, but running both is fine.'
     });
   }
 
@@ -322,14 +325,16 @@ function renderStatus(s, collectors) {
   if (!integ.cloudflare && resp.enabled) recommendations.push({ icon: lucideIcon('shield'), text:'Enable Cloudflare - push blocked IPs to the edge after every block-ip decision', cmd:'innerwarden integrate cloudflare' });
   if (!integ.mesh) recommendations.push({ icon: lucideIcon('link'), text:'Enable Mesh - share threat intel with other InnerWarden instances', cmd:'innerwarden integrate mesh' });
 
-  if (conflicts.length > 0 || recommendations.length > 0) {
+  if (conflicts.length > 0 || notes.length > 0 || recommendations.length > 0) {
     html += '<div class="report-section"><div class="report-section-title">Integration Advisor</div>' +
       '<style>' +
       '.advisor-block{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:12px}' +
       '.advisor-conflict{border-left:3px solid var(--warn)}' +
+      '.advisor-note{border-left:3px solid var(--muted)}' +
       '.advisor-rec{border-left:3px solid var(--accent)}' +
       '.advisor-label{font-size:0.65rem;font-weight:700;letter-spacing:0.06em;margin-bottom:6px}' +
       '.advisor-label.warn{color:var(--warn)}' +
+      '.advisor-label.info{color:var(--muted)}' +
       '.advisor-label.ok{color:var(--accent)}' +
       '.advisor-pair{font-size:0.75rem;font-weight:700;color:var(--text);margin-bottom:3px}' +
       '.advisor-msg{font-size:0.68rem;color:var(--muted);line-height:1.5}' +
@@ -341,6 +346,14 @@ function renderStatus(s, collectors) {
         '<div class="advisor-label warn" style="display:flex;align-items:center;gap:6px">' + lucideIcon('alert-triangle',{size:14}) + ' OVERLAP DETECTED</div>' +
         '<div class="advisor-pair">' + esc(c.a) + ' ↔ ' + esc(c.b) + '</div>' +
         '<div class="advisor-msg">' + esc(c.msg) + '</div>' +
+        '</div>';
+    });
+
+    notes.forEach(n => {
+      html += '<div class="advisor-block advisor-note">' +
+        '<div class="advisor-label info" style="display:flex;align-items:center;gap:6px">' + lucideIcon('info',{size:14}) + ' MULTI-CHANNEL ACTIVE</div>' +
+        '<div class="advisor-pair">' + esc(n.a) + ' + ' + esc(n.b) + '</div>' +
+        '<div class="advisor-msg">' + esc(n.msg) + '</div>' +
         '</div>';
     });
 
