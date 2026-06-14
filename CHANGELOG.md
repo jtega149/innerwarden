@@ -10,6 +10,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`innerwarden mesh connect <peer>` — one-command collaborative defense.**
+  Enables mesh, registers the peer, and opens the local host firewall
+  (ufw/firewalld, source-scoped to the peer IP) for the mesh port in a single
+  step, instead of `mesh enable` + `mesh add-peer` + a manual firewall edit.
+  Accepts `host`, `host:port`, or a URL; normalizes to the mesh's HTTP scheme.
 - **`innerwarden harden` — two new check categories.**
   - **Kernel Hardening**: 15 CIS-aligned sysctls the advisor did not check
     before (`kptr_restrict`, `dmesg_restrict`, Yama `ptrace_scope`,
@@ -36,6 +41,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     module(s)" low finding on Azure/AWS/GCP images.
 
 ### Fixed
+- **Mesh could be silently disabled by a corrupt state file.** A zero-byte
+  `mesh-state.json` (left by the previous non-atomic save when the agent was
+  killed mid-write) made `load_state` return an error, which aborted mesh
+  init — no listener, no peering — with only a swallowed warning. Found on a
+  production node where the file had been empty (mesh dead) for ~2 months.
+  Mesh persistence now (a) writes atomically (temp + rename, so a kill can't
+  leave a truncated file) and (b) fails soft on an empty/corrupt file (warn +
+  start fresh). `innerwarden mesh status` no longer errors on such a file
+  either. (innerwarden-mesh bumped to `12890c08`.)
 - **`innerwarden agent scan` missed interpreter-launched AI agents.** Detection
   matched `/proc/<pid>/comm` only. OpenClaw installed via npm runs as
   `node .../node_modules/openclaw/dist/index.js`, and node renames its main

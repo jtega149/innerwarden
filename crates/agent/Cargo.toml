@@ -38,7 +38,7 @@ aya = "0.13"
 innerwarden_core = { path = "../core" }
 innerwarden-store = { path = "../store" }
 innerwarden-agent-guard = { path = "../agent-guard" }
-innerwarden-mesh = { git = "https://github.com/InnerWarden/innerwarden-mesh.git", rev = "ef89c9a468709454ed501b528e30fca2741a2313" }
+innerwarden-mesh = { git = "https://github.com/InnerWarden/innerwarden-mesh.git", rev = "12890c08f7b2e9fa9f34c9bdf2972750a43a3a55" }
 innerwarden-smm = { path = "../smm" }
 innerwarden-hypervisor = { path = "../hypervisor" }
 innerwarden-killchain = { path = "../killchain" }

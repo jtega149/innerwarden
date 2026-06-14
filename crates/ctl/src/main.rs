@@ -998,6 +998,23 @@ enum MeshCommand {
         label: Option<String>,
     },
 
+    /// Connect to a peer in one step: enable mesh, add the peer, and open the
+    /// local firewall for the mesh port. The smooth path — one command and the
+    /// two nodes can reach each other (then restart the agent to apply).
+    ///
+    /// Examples:
+    ///   innerwarden mesh connect 203.0.113.7
+    ///   innerwarden mesh connect http://10.0.1.5:8790 --label prod-eu
+    Connect {
+        /// Peer host or endpoint. Accepts `host`, `host:port`, or
+        /// `http://host:port` (defaults to port 8790).
+        endpoint: String,
+
+        /// Human-friendly label for this peer
+        #[arg(long)]
+        label: Option<String>,
+    },
+
     /// Show mesh network status.
     Status,
 }
@@ -2177,6 +2194,10 @@ fn dispatch_config(cli: &Cli, command: &Option<ConfigAllCommand>) -> Result<()> 
                 ref endpoint,
                 ref label,
             } => commands::mesh::cmd_mesh_add_peer(cli, endpoint, label.as_deref()),
+            MeshCommand::Connect {
+                ref endpoint,
+                ref label,
+            } => commands::mesh::cmd_mesh_connect(cli, endpoint, label.as_deref()),
             MeshCommand::Status => commands::mesh::cmd_mesh_status(cli),
         },
         Some(ConfigAllCommand::Validate { ref path }) => cmd_config_validate(path),
@@ -2803,6 +2824,10 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 ref endpoint,
                 ref label,
             } => commands::mesh::cmd_mesh_add_peer(&cli, endpoint, label.as_deref()),
+            MeshCommand::Connect {
+                ref endpoint,
+                ref label,
+            } => commands::mesh::cmd_mesh_connect(&cli, endpoint, label.as_deref()),
             MeshCommand::Status => commands::mesh::cmd_mesh_status(&cli),
         },
         Command::Incidents {

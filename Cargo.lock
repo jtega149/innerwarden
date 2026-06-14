@@ -2505,7 +2505,7 @@ dependencies = [
 [[package]]
 name = "innerwarden-mesh"
 version = "0.1.0"
-source = "git+https://github.com/InnerWarden/innerwarden-mesh.git?rev=ef89c9a468709454ed501b528e30fca2741a2313#ef89c9a468709454ed501b528e30fca2741a2313"
+source = "git+https://github.com/InnerWarden/innerwarden-mesh.git?rev=12890c08f7b2e9fa9f34c9bdf2972750a43a3a55#12890c08f7b2e9fa9f34c9bdf2972750a43a3a55"
 dependencies = [
  "anyhow",
  "axum",
