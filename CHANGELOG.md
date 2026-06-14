@@ -9,6 +9,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **`configure ai azure_openai` wrote a config that silently 404'd.** Azure's
+  chat endpoint is versioned via a required `api-version` query param the agent
+  reads from `[ai].api_version`; `configure ai` never wrote it, so every Azure
+  request ended in `?api-version=` and failed with no obvious cause. Now a
+  known-good default (`2024-12-01-preview`) is written for Azure, `azure` is
+  accepted as an alias for `azure_openai`, and configuring Azure without
+  `--base-url` (the per-resource endpoint) fails loudly at configure-time
+  instead of writing a dead config.
+- **`innerwarden doctor` reported a false `OPENAI_API_KEY not set` for Azure.**
+  The Azure provider fell through to the OpenAI arm of the AI check, so a
+  correctly-configured Azure host saw a confusing failure. `doctor` now resolves
+  and validates `AZURE_OPENAI_API_KEY` for `azure_openai`/`azure`.
+
 ## [0.15.12] - 2026-06-14
 
 ### Fixed

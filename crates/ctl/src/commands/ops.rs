@@ -201,6 +201,21 @@ pub(crate) fn build_ai_provider_check(provider: &str, resolved_key: Option<&str>
             ),
         },
         "ollama" => Check::ok("Ollama provider configured (reachability is checked separately)"),
+        "azure_openai" | "azure" => match resolved_key {
+            None => Check::fail(
+                "AZURE_OPENAI_API_KEY not set (provider = \"azure_openai\")",
+                "Get the key + endpoint from your Azure OpenAI resource, then run:\n\n  innerwarden configure ai azure_openai --key <key> --model <deployment> --base-url https://<resource>.openai.azure.com",
+            ),
+            // Azure keys are 32-char hex or longer base64-ish strings with no
+            // stable prefix, so only emptiness is a meaningful format signal.
+            Some(k) if !k.trim().is_empty() => {
+                Check::ok("AZURE_OPENAI_API_KEY is set (provider = \"azure_openai\")")
+            }
+            Some(_) => Check::fail(
+                "AZURE_OPENAI_API_KEY is set but empty (provider = \"azure_openai\")",
+                "Run:\n  innerwarden configure ai azure_openai --key <key> --base-url https://<resource>.openai.azure.com",
+            ),
+        },
         // Default: openai (also handles unknown providers gracefully)
         _ => match resolved_key {
             None => Check::fail(
@@ -2035,10 +2050,10 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             )
         });
     } else {
-        let env_var = if provider == "anthropic" {
-            "ANTHROPIC_API_KEY"
-        } else {
-            "OPENAI_API_KEY"
+        let env_var = match provider.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "azure_openai" | "azure" => "AZURE_OPENAI_API_KEY",
+            _ => "OPENAI_API_KEY",
         };
         let key = resolve_key(env_var);
         cfg.push(build_ai_provider_check(&provider, key.as_deref()));
@@ -3364,6 +3379,31 @@ mod tests {
     fn build_ai_provider_check_ollama_returns_ok() {
         let c = build_ai_provider_check("ollama", None);
         assert_eq!(c.sev, Sev::Ok);
+    }
+
+    #[test]
+    fn build_ai_provider_check_azure_missing_key_fails_with_azure_var() {
+        // Regression: azure used to fall through to the openai arm and report
+        // "OPENAI_API_KEY not set" — a confusing false fail for azure users.
+        let c = build_ai_provider_check("azure_openai", None);
+        assert_eq!(c.sev, Sev::Fail);
+        assert!(c.label.contains("AZURE_OPENAI_API_KEY"));
+        assert!(!c
+            .label
+            .contains("OPENAI_API_KEY not set (provider = \"openai\")"));
+    }
+
+    #[test]
+    fn build_ai_provider_check_azure_alias_with_key_is_ok() {
+        let c = build_ai_provider_check("azure", Some("8Y59hQabcdef0123456789"));
+        assert_eq!(c.sev, Sev::Ok);
+        assert!(c.label.contains("AZURE_OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn build_ai_provider_check_azure_empty_key_fails() {
+        let c = build_ai_provider_check("azure_openai", Some("   "));
+        assert_eq!(c.sev, Sev::Fail);
     }
 
     #[test]

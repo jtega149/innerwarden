@@ -5,6 +5,11 @@ use anyhow::Result;
 
 use crate::{config_editor, prompt, require_sudo, restart_agent, systemd, write_env_key, Cli};
 
+/// Default Azure OpenAI `api-version` written by `configure ai azure_openai`.
+/// This is the stable chat-completions version the agent's azure provider
+/// targets; operators can override it by editing `[ai].api_version`.
+pub(crate) const AZURE_DEFAULT_API_VERSION: &str = "2024-12-01-preview";
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WizardProvider {
     pub(crate) name: &'static str,
@@ -449,6 +454,15 @@ fn cmd_configure_ai_with_restart(
     if !cli.dry_run {
         require_sudo(cli);
     }
+    // "azure" is the natural name a user types; the agent's provider id is
+    // "azure_openai". Alias it so the config that lands is actually usable
+    // instead of a silently-wrong `provider = "azure"` the agent can't load.
+    let provider = if provider.eq_ignore_ascii_case("azure") {
+        "azure_openai"
+    } else {
+        provider
+    };
+    let is_azure = provider == "azure_openai";
     let (default_model, key_var, default_base_url) =
         crate::commands::setup::ai_provider_defaults(provider);
     let model = model.unwrap_or(&default_model);
@@ -482,6 +496,16 @@ fn cmd_configure_ai_with_restart(
 
     let base_url = base_url.or(default_base_url.as_deref());
 
+    // Azure OpenAI has no fixed endpoint — it is per-resource. Without it the
+    // agent builds `/openai/deployments/<model>/chat/completions?...` against an
+    // empty host and every request 404s with no obvious cause. Fail loudly at
+    // configure-time instead of writing a config that silently never works.
+    if is_azure && base_url.is_none() {
+        anyhow::bail!(
+            "provider 'azure_openai' requires --base-url (your Azure resource endpoint).\nRun:\n  innerwarden configure ai azure_openai --key <key> --model <deployment> --base-url https://<resource>.openai.azure.com"
+        );
+    }
+
     if cli.dry_run {
         match base_url {
             Some(url) => println!(
@@ -493,12 +517,28 @@ fn cmd_configure_ai_with_restart(
                 cli.agent_config.display()
             ),
         }
+        if is_azure {
+            println!("  [dry-run] would set [ai] api_version={AZURE_DEFAULT_API_VERSION}");
+        }
     } else {
         config_editor::write_bool(&cli.agent_config, "ai", "enabled", true)?;
         config_editor::write_str(&cli.agent_config, "ai", "provider", provider)?;
         config_editor::write_str(&cli.agent_config, "ai", "model", model)?;
         if let Some(url) = base_url {
             config_editor::write_str(&cli.agent_config, "ai", "base_url", url)?;
+        }
+        // Azure's chat endpoint is versioned via a required `api-version` query
+        // param. The agent reads it from [ai].api_version; if we leave it empty
+        // the URL ends in `?api-version=` and Azure rejects it. Write a known-good
+        // default so a fresh `configure ai azure_openai` works with no extra step.
+        if is_azure {
+            config_editor::write_str(
+                &cli.agent_config,
+                "ai",
+                "api_version",
+                AZURE_DEFAULT_API_VERSION,
+            )?;
+            println!("  [ok] api_version set to {AZURE_DEFAULT_API_VERSION} (edit agent.toml to override)");
         }
         println!("  [ok] agent.toml updated (provider={provider}, model={model})");
     }
@@ -1156,6 +1196,48 @@ mod tests {
 
         let env = std::fs::read_to_string(tmp.path().join("agent.env")).expect("read agent env");
         assert_eq!(env, "OPENAI_API_KEY=sk-test\n");
+    }
+
+    #[test]
+    fn cmd_configure_ai_azure_requires_base_url() {
+        // Azure has no fixed endpoint; configuring it without --base-url would
+        // write a config that silently 404s. Fail loudly instead.
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+
+        let err = cmd_configure_ai(&cli, "azure_openai", Some("k"), Some("dep"), None)
+            .expect_err("azure must require a base url");
+        assert!(err.to_string().contains("requires --base-url"));
+    }
+
+    #[test]
+    fn cmd_configure_ai_azure_alias_writes_api_version_and_provider() {
+        // `azure` is aliased to `azure_openai` and a working api_version default
+        // is written so the agent's chat endpoint is valid out of the box.
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), false);
+
+        cmd_configure_ai_with_restart(
+            &cli,
+            "azure",
+            Some("azure-key"),
+            Some("gpt-5.4-mini"),
+            Some("https://res.openai.azure.com"),
+            false,
+        )
+        .expect("azure configure should write temp config");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("read agent config");
+        assert!(agent.contains("provider = \"azure_openai\""));
+        assert!(agent.contains("model = \"gpt-5.4-mini\""));
+        assert!(agent.contains("base_url = \"https://res.openai.azure.com\""));
+        assert!(
+            agent.contains(&format!("api_version = \"{AZURE_DEFAULT_API_VERSION}\"")),
+            "azure config must persist a non-empty api_version: {agent}"
+        );
+
+        let env = std::fs::read_to_string(tmp.path().join("agent.env")).expect("read agent env");
+        assert_eq!(env, "AZURE_OPENAI_API_KEY=azure-key\n");
     }
 
     #[test]
