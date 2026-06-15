@@ -9,31 +9,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-- **Recurring flaky MCP-proxy pipe tests killed at the root.** The tests that
-  pipe through a real spawned child block-buffer/flush on exit, and under CI
-  load the duplex reader could return a partial buffer even with a 2-worker
-  runtime + concurrent draining. They now re-run the whole exchange until the
-  expected output is present (a genuine failure still fails every attempt).
-  Test-only.
-- **`innerwarden enable` could not repair a half-enabled capability.** A
-  capability marked enabled in config but missing its sudoers drop-in (so
-  block-ip silently could not run firewall commands) was a dead end: `doctor`
-  flagged it and told you to run `innerwarden enable block-ip`, but that command
-  replied "already enabled, nothing to do" and never re-applied. `enable` now
-  takes `--force` to re-run apply and repair drift (idempotent), and `doctor`
-  points at `sudo innerwarden enable <cap> --force`.
-- **Integration Advisor no longer flags Telegram + Slack as a problem.** Running
-  both notification channels (Telegram for real-time, Slack for team visibility)
-  is an intentional, supported setup, but the advisor showed it as a red
-  "OVERLAP DETECTED" warning. It is now a neutral "MULTI-CHANNEL ACTIVE"
-  informational note.
-- **Flaky MCP-proxy pipe tests.** The proxy tests that pipe through a real
-  spawned child ran on a single-threaded tokio runtime and drained the duplex on
-  the same thread that awaits the child, so under CI load the reader could
-  observe an empty buffer (intermittent `out.contains(...)` failures, e.g. on
-  PR #1010). They now use a 2-worker runtime so the reader progresses
-  independently of the child wait. Test-only; no behavior change.
+## [0.15.13] - 2026-06-15
 
 ### Added
 - **`innerwarden setup` is now cloud-aware.** It detects the host's cloud
@@ -70,41 +46,46 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     pre-merge `/sbin/...` path, so the query retries the alias before flagging.
   - Stock cloud/virt/AMD/NIC kernel modules (Azure Hyper-V + MANA, RDMA/IB,
     AMD `ccp`, `irqbypass`, AWS `ena`, GCP `gve`, `dm_multipath`, common NIC
-    drivers, …) are added to the known-good set, clearing the "unusual kernel
+    drivers, ...) are added to the known-good set, clearing the "unusual kernel
     module(s)" low finding on Azure/AWS/GCP images.
 
 ### Fixed
 - **Mesh could be silently disabled by a corrupt state file.** A zero-byte
   `mesh-state.json` (left by the previous non-atomic save when the agent was
   killed mid-write) made `load_state` return an error, which aborted mesh
-  init — no listener, no peering — with only a swallowed warning. Found on a
-  production node where the file had been empty (mesh dead) for ~2 months.
-  Mesh persistence now (a) writes atomically (temp + rename, so a kill can't
-  leave a truncated file) and (b) fails soft on an empty/corrupt file (warn +
-  start fresh). `innerwarden mesh status` no longer errors on such a file
-  either. (innerwarden-mesh bumped to `12890c08`.)
+  init — no listener, no peering — with only a swallowed warning. Mesh
+  persistence now (a) writes atomically (temp + rename) and (b) fails soft on an
+  empty/corrupt file (warn + start fresh). `innerwarden mesh status` no longer
+  errors on such a file either. (innerwarden-mesh bumped to `12890c08`.)
 - **`innerwarden agent scan` missed interpreter-launched AI agents.** Detection
-  matched `/proc/<pid>/comm` only. OpenClaw installed via npm runs as
-  `node .../node_modules/openclaw/dist/index.js`, and node renames its main
-  thread, so `comm` is `MainThread` (never `openclaw`) — `agent scan` reported
-  "No known agents detected" on a host actively running OpenClaw. The same blind
-  spot hid every node/python-launched agent (aider, goose, cline, …). Detection
-  now falls back to scanning `/proc/<pid>/cmdline`: when the executable is a
-  known interpreter, a signature name matched as an exact path component
-  (`node_modules/openclaw/…`) or a `python -m <module>` argument is detected.
-  Stays precise — bare args (`grep openclaw`) and `openclaw.md` do not match.
+  matched `/proc/<pid>/comm` only, so a node/python-launched agent (OpenClaw,
+  aider, goose, cline, ...) whose `comm` is `node`/`python`/`MainThread` was
+  reported as "No known agents detected". Detection now also scans
+  `/proc/<pid>/cmdline` when the executable is a known interpreter, matching a
+  signature name as an exact path component or a `python -m <module>` argument.
+  Stays precise — bare args and `<name>.md` do not match.
 - **`configure ai azure_openai` wrote a config that silently 404'd.** Azure's
-  chat endpoint is versioned via a required `api-version` query param the agent
-  reads from `[ai].api_version`; `configure ai` never wrote it, so every Azure
-  request ended in `?api-version=` and failed with no obvious cause. Now a
-  known-good default (`2024-12-01-preview`) is written for Azure, `azure` is
-  accepted as an alias for `azure_openai`, and configuring Azure without
-  `--base-url` (the per-resource endpoint) fails loudly at configure-time
-  instead of writing a dead config.
+  chat endpoint needs an `api-version` query param the agent reads from
+  `[ai].api_version`; `configure ai` never wrote it. Now a known-good default is
+  written for Azure, `azure` is accepted as an alias for `azure_openai`, and
+  configuring Azure without `--base-url` fails loudly at configure-time.
 - **`innerwarden doctor` reported a false `OPENAI_API_KEY not set` for Azure.**
-  The Azure provider fell through to the OpenAI arm of the AI check, so a
-  correctly-configured Azure host saw a confusing failure. `doctor` now resolves
-  and validates `AZURE_OPENAI_API_KEY` for `azure_openai`/`azure`.
+  `doctor` now resolves and validates `AZURE_OPENAI_API_KEY` for
+  `azure_openai`/`azure` instead of falling through to the OpenAI check.
+- **`innerwarden enable` could not repair a half-enabled capability.** A
+  capability marked enabled in config but missing its sudoers drop-in (so
+  block-ip silently could not run firewall commands) was a dead end: `enable`
+  replied "already enabled, nothing to do" and never re-applied. `enable` now
+  takes `--force` to re-run apply and repair drift (idempotent), and `doctor`
+  points at `sudo innerwarden enable <cap> --force`.
+- **Integration Advisor no longer flags Telegram + Slack as a problem.** Running
+  both notification channels (Telegram for real-time, Slack for team visibility)
+  is an intentional setup; it is now a neutral "MULTI-CHANNEL ACTIVE" note rather
+  than a red "OVERLAP DETECTED" warning.
+- **Flaky MCP-proxy pipe tests eliminated.** Tests that pipe through a real
+  spawned child occasionally saw a partial/empty read under CI load; they now
+  run on a multi-worker runtime and re-run the exchange until the expected
+  output is present. Test-only; no behavior change.
 
 ## [0.15.12] - 2026-06-14
 
