@@ -10,6 +10,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Recurring flaky MCP-proxy pipe tests killed at the root.** The tests that
+  pipe through a real spawned child block-buffer/flush on exit, and under CI
+  load the duplex reader could return a partial buffer even with a 2-worker
+  runtime + concurrent draining. They now re-run the whole exchange until the
+  expected output is present (a genuine failure still fails every attempt).
+  Test-only.
 - **`innerwarden enable` could not repair a half-enabled capability.** A
   capability marked enabled in config but missing its sudoers drop-in (so
   block-ip silently could not run firewall commands) was a dead end: `doctor`

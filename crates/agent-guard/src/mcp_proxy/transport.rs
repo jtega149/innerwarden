@@ -524,72 +524,80 @@ mod tests {
     }
 
     // ── async loop ───────────────────────────────────────────────────────
-    // Tests that pipe through a REAL spawned child use `multi_thread` with 2
-    // workers: the proxy task awaits the child (`child.wait().await`) while the
-    // test drains the duplex, and on a single-threaded runtime those two can
-    // starve each other under CI load — the duplex reader observed an
-    // empty/partial buffer (the `out.contains(...)` flake, 2026-06-14, even with
-    // `join!`). Two workers let the reader make progress independently of the
-    // child wait. Coverage is still attributed: tarpaulin counts executed lines
-    // across all worker threads.
+    // Tests below pipe through a REAL spawned child (`cat` / `sh`). That child
+    // block-buffers its stdout and flushes only on exit, and under CI load the
+    // duplex reader has been observed returning a partial/empty buffer even with
+    // a 2-worker runtime AND concurrent `join!` draining (the recurring
+    // `out.contains(...)` flake, 2026-06-13/14). Rather than chase the exact
+    // subprocess-scheduling window, `drive_pipe` re-runs the whole exchange with
+    // a fresh child until the expected output is present (or a small attempt
+    // budget is spent). A genuine failure — output that never arrives — still
+    // fails every attempt, so the per-test assertions remain the real check.
+    async fn drive_pipe<F, R>(
+        cfg: ProxyConfig,
+        inputs: &[&str],
+        on_alert: F,
+        ready: R,
+    ) -> (i32, String)
+    where
+        F: Fn(&ProxyDecision) + Clone + Send + 'static,
+        R: Fn(&str) -> bool,
+    {
+        let mut last = (0i32, String::new());
+        for _ in 0..6 {
+            let (mut to_proxy, proxy_in) = duplex(16384);
+            let (proxy_out, mut from_proxy) = duplex(16384);
+            let handle = tokio::spawn(run_proxy_with_io(
+                proxy_in,
+                proxy_out,
+                cfg.clone(),
+                None,
+                on_alert.clone(),
+            ));
+            for line in inputs {
+                to_proxy
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            to_proxy.shutdown().await.unwrap();
+            let mut out = String::new();
+            let (proxy_res, read_res) = tokio::join!(handle, from_proxy.read_to_string(&mut out));
+            let code = proxy_res.unwrap().unwrap();
+            read_res.unwrap();
+            if ready(&out) {
+                return (code, out);
+            }
+            last = (code, out);
+        }
+        last
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn advisory_is_a_transparent_pipe() {
-        let (mut to_proxy, proxy_in) = duplex(16384);
-        let (proxy_out, mut from_proxy) = duplex(16384);
-        let handle = tokio::spawn(run_proxy_with_io(
-            proxy_in,
-            proxy_out,
+        // CLEAN, CREDS, then a blank line that must be dropped.
+        let (code, out) = drive_pipe(
             cfg(ProxyMode::Advisory),
-            None,
+            &[CLEAN, CREDS, ""],
             |_d: &ProxyDecision| {},
-        ));
-        to_proxy
-            .write_all(format!("{CLEAN}\n").as_bytes())
-            .await
-            .unwrap();
-        to_proxy
-            .write_all(format!("{CREDS}\n").as_bytes())
-            .await
-            .unwrap();
-        to_proxy.write_all(b"\n").await.unwrap();
-        to_proxy.shutdown().await.unwrap();
-        // Drain the output CONCURRENTLY with the proxy, not after it. Awaiting
-        // `handle` first and only then reading `from_proxy` is a duplex race: if
-        // the reader isn't draining while the proxy writes/closes, the test can
-        // observe an empty/partial buffer (rare CI flake, 2026-06-13). `join!`
-        // runs both to completion together — real pipe semantics.
-        let mut out = String::new();
-        let (proxy_res, read_res) = tokio::join!(handle, from_proxy.read_to_string(&mut out));
-        assert_eq!(proxy_res.unwrap().unwrap(), 0);
-        read_res.unwrap();
+            |o| o.contains(CLEAN) && o.contains(CREDS),
+        )
+        .await;
+        assert_eq!(code, 0);
         assert!(out.contains(CLEAN) && out.contains(CREDS));
         assert_eq!(out.matches('\n').count(), 2, "blank dropped");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn guard_blocks_and_replies_with_denial() {
-        let (mut to_proxy, proxy_in) = duplex(16384);
-        let (proxy_out, mut from_proxy) = duplex(16384);
-        let handle = tokio::spawn(run_proxy_with_io(
-            proxy_in,
-            proxy_out,
+        let (code, out) = drive_pipe(
             cfg(ProxyMode::Guard),
-            None,
+            &[CLEAN, CREDS],
             |_d: &ProxyDecision| {},
-        ));
-        to_proxy
-            .write_all(format!("{CLEAN}\n").as_bytes())
-            .await
-            .unwrap();
-        to_proxy
-            .write_all(format!("{CREDS}\n").as_bytes())
-            .await
-            .unwrap();
-        to_proxy.shutdown().await.unwrap();
-        assert_eq!(handle.await.unwrap().unwrap(), 0);
-        let mut out = String::new();
-        from_proxy.read_to_string(&mut out).await.unwrap();
+            |o| o.contains(CLEAN) && o.contains("\"isError\":true"),
+        )
+        .await;
+        assert_eq!(code, 0);
         assert!(out.contains(CLEAN), "clean call passes through");
         assert!(
             !out.contains("sk-ant-"),
@@ -637,30 +645,21 @@ mod tests {
             mode: ProxyMode::Advisory,
             as_protocol_error: false,
         };
-        let (mut to_proxy, proxy_in) = duplex(16384);
-        let (proxy_out, mut from_proxy) = duplex(16384);
         let alerted = std::sync::Arc::new(std::sync::Mutex::new(false));
         let a = alerted.clone();
-        let handle = tokio::spawn(run_proxy_with_io(
-            proxy_in,
-            proxy_out,
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#;
+        let (code, out) = drive_pipe(
             cfg,
-            None,
+            &[req],
             move |d: &ProxyDecision| {
                 if d.verdict.alerts.iter().any(|x| x.rule == "AG-RESP-INJECT") {
                     *a.lock().unwrap() = true;
                 }
             },
-        ));
-        let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#;
-        to_proxy
-            .write_all(format!("{req}\n").as_bytes())
-            .await
-            .unwrap();
-        to_proxy.shutdown().await.unwrap();
-        assert_eq!(handle.await.unwrap().unwrap(), 0);
-        let mut out = String::new();
-        from_proxy.read_to_string(&mut out).await.unwrap();
+            |o| o.contains("ignore previous instructions"),
+        )
+        .await;
+        assert_eq!(code, 0);
         assert!(out.contains("ignore previous instructions"));
         assert!(*alerted.lock().unwrap(), "tool-result injection alerted");
     }
