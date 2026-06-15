@@ -114,6 +114,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub slack: SlackConfig,
     #[serde(default)]
+    pub discord: DiscordConfig,
+    #[serde(default)]
     pub cloudflare: CloudflareConfig,
     #[serde(default)]
     pub allowlist: AllowlistConfig,

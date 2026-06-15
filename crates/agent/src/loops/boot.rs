@@ -1049,6 +1049,27 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         None
     };
 
+    let discord_client: Option<discord::DiscordClient> = if cfg.discord.enabled {
+        let url = cfg.discord.resolved_webhook_url();
+        if url.is_empty() {
+            warn!("discord.enabled = true but webhook_url not configured - disabling");
+            None
+        } else {
+            match discord::DiscordClient::new(&url) {
+                Ok(c) => {
+                    info!("Discord notifications enabled");
+                    Some(c)
+                }
+                Err(e) => {
+                    warn!("failed to create Discord client: {e:#}");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     // Create approval channel - polling task is spawned after state is built (continuous mode only)
     let (approval_tx, approval_rx_for_state) =
         tokio::sync::mpsc::channel::<telegram::ApprovalResult>(64);
@@ -1302,6 +1323,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             None
         },
         slack_client,
+        discord_client,
         cloudflare_client: if cfg.cloudflare.enabled {
             let token = cloudflare::resolve_api_token(&cfg.cloudflare.api_token);
             if token.is_empty() || cfg.cloudflare.zone_id.is_empty() {

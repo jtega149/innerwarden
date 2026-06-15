@@ -1,14 +1,14 @@
-//! Unified chat-channel registry (spec 078, Phase 1).
+//! Unified chat-channel registry (spec 078).
 //!
-//! Operator-facing chat channels — Telegram, Slack, and (future) Discord —
-//! share a single [`ChatChannel`] trait and a single registry
-//! ([`collect_chat_channels`]) so every notification kind fans out the same
-//! way, with one severity-rank + filter-level gate applied uniformly.
+//! Operator-facing chat channels — Telegram, Slack, and Discord — share a
+//! single [`ChatChannel`] trait and a single registry ([`collect_chat_channels`])
+//! so every notification kind (incident alert, action report, summary) fans out
+//! the same way, with one severity-rank + filter-level gate applied uniformly.
 //!
-//! Adding a channel is then a closed change: implement [`ChatChannel`], build
-//! its client at boot, and add one line to [`collect_chat_channels`] — no
-//! dispatch site is touched. Phase 1 covers the incident-alert kind; action
-//! reports and burst/group summaries move onto the trait in Phase 2.
+//! Adding a channel is a closed change: implement [`ChatChannel`], build its
+//! client at boot, and add one line to [`collect_chat_channels`] — no dispatch
+//! site is touched. Discord (Phase 3) was added exactly that way: a new
+//! `discord` module + `[discord]` config + one boot block + one registry line.
 //!
 //! Webhook (machine JSON) and Web Push (browser) are intentionally NOT chat
 //! channels — they have no "action report" concept and keep their own dispatch
@@ -158,6 +158,39 @@ impl ChatChannel for SlackChannel {
     }
 }
 
+pub(crate) struct DiscordChannel {
+    client: crate::discord::DiscordClient,
+    min_rank: u8,
+    filter_level: ChannelFilterLevel,
+    dashboard_url: Option<String>,
+}
+
+#[async_trait]
+impl ChatChannel for DiscordChannel {
+    fn name(&self) -> &'static str {
+        "discord"
+    }
+    fn min_rank(&self) -> u8 {
+        self.min_rank
+    }
+    fn filter_level(&self) -> ChannelFilterLevel {
+        self.filter_level
+    }
+    async fn incident_alert(&self, incident: &Incident, _ctx: &ChatContext) -> anyhow::Result<()> {
+        self.client
+            .send_incident_alert(incident, self.dashboard_url.as_deref())
+            .await
+    }
+    async fn action_report(&self, report: &ActionReport) -> anyhow::Result<()> {
+        self.client
+            .send_action_report(report, self.dashboard_url.as_deref())
+            .await
+    }
+    async fn summary(&self, html: &str) -> anyhow::Result<()> {
+        self.client.send_summary(html).await
+    }
+}
+
 /// Build the active chat-channel set from config + live clients.
 ///
 /// A channel is included iff it is enabled in config AND its client was
@@ -190,6 +223,21 @@ pub(crate) fn collect_chat_channels(
                     None
                 } else {
                     Some(cfg.slack.dashboard_url.clone())
+                },
+            }));
+        }
+    }
+
+    if cfg.discord.enabled {
+        if let Some(dc) = &state.discord_client {
+            channels.push(Box::new(DiscordChannel {
+                client: dc.clone(),
+                min_rank: severity_rank(&cfg.discord.parsed_min_severity()),
+                filter_level: cfg.discord.channel_notifications.notification_level,
+                dashboard_url: if cfg.discord.dashboard_url.is_empty() {
+                    None
+                } else {
+                    Some(cfg.discord.dashboard_url.clone())
                 },
             }));
         }
@@ -598,6 +646,61 @@ mod tests {
         assert_eq!(channels.len(), 1);
         fan_out_action_report(&channels, &report()).await;
         fan_out_summary(&channels, "<b>burst</b> of 5").await;
+
+        hook.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn collect_includes_discord_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.discord_client = Some(
+            crate::discord::DiscordClient::new("https://discord.com/api/webhooks/1/x").unwrap(),
+        );
+        let mut cfg = AgentConfig::default();
+        cfg.discord.enabled = true;
+        let names: Vec<&str> = collect_chat_channels(&cfg, &state)
+            .iter()
+            .map(|c| c.name())
+            .collect();
+        assert_eq!(names, vec!["discord"]);
+
+        // Disabled in config -> excluded even though the client exists.
+        cfg.discord.enabled = false;
+        assert!(collect_chat_channels(&cfg, &state).is_empty());
+    }
+
+    /// Contract test: a real Discord channel built by the registry handles
+    /// EVERY notification kind (alert + action report + summary) end-to-end.
+    /// This is the "add a channel and it works first try" guarantee — if a new
+    /// channel forgets a kind it cannot compile; this proves the wiring too.
+    #[tokio::test]
+    async fn discord_channel_handles_all_kinds_through_the_registry() {
+        let mut server = mockito::Server::new_async().await;
+        let hook = server
+            .mock("POST", "/api/webhooks/1/tok")
+            .with_status(204)
+            .expect(3) // alert + action report + summary
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.discord_client = Some(
+            crate::discord::DiscordClient::new(format!("{}/api/webhooks/1/tok", server.url()))
+                .unwrap(),
+        );
+
+        let mut cfg = AgentConfig::default();
+        cfg.discord.enabled = true;
+        cfg.discord.dashboard_url = "https://dash.example".to_string();
+
+        let channels = collect_chat_channels(&cfg, &state);
+        assert_eq!(channels.len(), 1);
+        let ctx = ChatContext::from_config(&cfg);
+        fan_out_alert(&channels, &incident(Severity::Critical), &ctx).await;
+        fan_out_action_report(&channels, &report()).await;
+        fan_out_summary(&channels, "<b>burst</b>").await;
 
         hook.assert_async().await;
     }

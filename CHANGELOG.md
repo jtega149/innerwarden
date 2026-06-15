@@ -9,6 +9,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Discord notifications.** A new `[discord]` channel (Incoming Webhook) gets
+  incident alerts, action reports, and burst summaries as colour-coded Discord
+  embeds — full parity with Telegram and Slack. Enable with `[discord] enabled =
+  true` + `webhook_url = "https://discord.com/api/webhooks/…"` (or env
+  `DISCORD_WEBHOOK_URL`); optional `min_severity` / `dashboard_url` /
+  `channel_notifications` mirror Slack. Off by default; an empty webhook
+  disables it at boot with a warning (never panics). Built on the spec 078
+  chat-channel registry — it touched only a new `discord` module, the config,
+  one boot block, and one registry line, with no dispatch-site edits. (Spec 078
+  Phase 3.)
+
 ### Changed
 - **Unified chat-channel registry for notifications (internal).** Telegram and
   Slack incident alerts now fan out through one `ChatChannel` trait + registry

@@ -89,6 +89,7 @@ mod decision_honeypot;
 mod decision_skill_actions;
 mod decisions;
 mod detector_catalog;
+mod discord;
 mod dna_inline;
 mod dshield;
 mod environment_profile;
@@ -548,6 +549,8 @@ struct AgentState {
     geoip_client: Option<geoip::GeoIpClient>,
     /// Slack client for incident notifications (None when disabled).
     slack_client: Option<slack::SlackClient>,
+    /// Discord client for incident notifications (None when disabled).
+    discord_client: Option<discord::DiscordClient>,
     /// Cloudflare integration client (None when disabled).
     cloudflare_client: Option<cloudflare::CloudflareClient>,
     /// Circuit breaker: when tripped by a high-volume incident burst, AI analysis
