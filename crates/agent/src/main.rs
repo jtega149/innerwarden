@@ -148,6 +148,7 @@ mod needs_review_timeout;
     clippy::needless_range_loop
 )]
 mod neural_lifecycle;
+mod notification_channels;
 mod notification_gate;
 mod notification_pipeline;
 mod observation_verify;

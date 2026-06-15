@@ -9,6 +9,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Unified chat-channel registry for notifications (internal).** Telegram and
+  Slack incident alerts now fan out through one `ChatChannel` trait + registry
+  (`notification_channels`) instead of two hand-wired dispatch blocks. Each
+  channel applies the same severity-rank + filter-level gate, and one channel
+  failing never blocks the others. Behaviour is identical for existing
+  channels; the point is that a new operator-facing channel (e.g. Discord) now
+  plugs in by implementing one trait + one registry line, with no edits to any
+  dispatch site. Webhook and Web Push remain non-chat sinks. (Spec 078 Phase 1.)
+
 ### Fixed
 - **No more "Threat neutralized — Dismissed" notification spam.** The
   post-execution action report fired for every decided action, including

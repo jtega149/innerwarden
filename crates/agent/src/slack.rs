@@ -12,6 +12,11 @@ use tracing::warn;
 /// Uses Block Kit for a structured, readable message.
 /// Failure is logged as a warning and swallowed - a dead Slack webhook must
 /// never stop the agent from processing events (fail-open policy).
+///
+/// `Clone` is cheap: the only non-trivial field is a `reqwest::Client`, whose
+/// clone shares the underlying connection pool. The chat-channel registry
+/// (spec 078) clones it into a `Box<dyn ChatChannel>`.
+#[derive(Clone)]
 pub struct SlackClient {
     /// Slack Incoming Webhook URL.
     webhook_url: String,
