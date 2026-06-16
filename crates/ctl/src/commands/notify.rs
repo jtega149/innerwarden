@@ -976,7 +976,12 @@ pub(crate) fn cmd_test_alert(cli: &Cli, channel: Option<&str>) -> Result<()> {
     let mut any_tested = false;
     let mut any_failed = false;
 
-    println!("InnerWarden - test alert\n");
+    // Same label real incidents are stamped with (sensor `[agent] host_id`),
+    // so the operator can tell which box a test alert came from when several
+    // hosts share one Telegram chat / Slack channel.
+    let host = crate::helpers::host_label(&cli.sensor_config);
+
+    println!("InnerWarden - test alert ({host})\n");
 
     // ── Telegram ─────────────────────────────────────────────────────────
     let try_telegram = channel_selected(test_only, "telegram");
@@ -994,8 +999,10 @@ pub(crate) fn cmd_test_alert(cli: &Cli, channel: Option<&str>) -> Result<()> {
                 any_tested = true;
                 print!("  Telegram ... ");
                 std::io::stdout().flush().ok();
-                let msg = "🔔 *Test alert from InnerWarden*\n\nYour Telegram notifications are working correctly\\.";
-                match send_telegram_message_md(&tok, &cid, msg) {
+                let msg = format!(
+                    "🔔 *Test alert from InnerWarden*\nFrom host: `{host}`\n\nYour Telegram notifications are working correctly\\."
+                );
+                match send_telegram_message_md(&tok, &cid, &msg) {
                     Ok(()) => println!("ok"),
                     Err(e) => {
                         println!("FAILED: {e:#}");
@@ -1027,7 +1034,7 @@ pub(crate) fn cmd_test_alert(cli: &Cli, channel: Option<&str>) -> Result<()> {
                 print!("  Slack ...... ");
                 std::io::stdout().flush().ok();
                 let payload = serde_json::json!({
-                    "text": "🔔 *Test alert from InnerWarden* - Slack notifications are working correctly."
+                    "text": format!("🔔 *Test alert from InnerWarden* — host `{host}` — Slack notifications are working correctly.")
                 });
                 match ureq::post(&url)
                     .header("Content-Type", "application/json")

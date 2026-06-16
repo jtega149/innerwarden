@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **`innerwarden notify test` now names the host.** The test alert (Telegram + Slack) includes the host label (sensor `[agent] host_id`, same as real incidents) so operators sharing one chat/channel across several boxes can tell which server it came from.
+
 ### Added
 - **Discord notifications.** A new `[discord]` channel (Incoming Webhook) gets
   incident alerts, action reports, and burst summaries as colour-coded Discord
