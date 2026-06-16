@@ -739,6 +739,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             honeypot_port: cfg.honeypot.port,
             telegram_enabled: cfg.telegram.enabled,
             slack_enabled: cfg.slack.enabled,
+            discord_enabled: cfg.discord.enabled,
             cloudflare_enabled: cfg.cloudflare.enabled,
             crowdsec_enabled: cfg.crowdsec.enabled,
             webhook_format: cfg.webhook.format.clone(),

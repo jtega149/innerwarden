@@ -814,6 +814,28 @@ enum NotifyCommand {
         no_test: bool,
     },
 
+    /// Set up Discord notifications (interactive wizard).
+    ///
+    /// Walks you through creating an Incoming Webhook in your Discord server.
+    /// The webhook URL is saved to agent.env.
+    ///
+    /// Examples:
+    ///   innerwarden notify discord
+    ///   innerwarden notify discord --webhook-url https://discord.com/api/webhooks/...
+    Discord {
+        /// Discord Incoming Webhook URL (skips the wizard prompt)
+        #[arg(long)]
+        webhook_url: Option<String>,
+
+        /// Minimum severity to notify: low, medium, high, critical (default: high)
+        #[arg(long, default_value = "high")]
+        min_severity: String,
+
+        /// Skip the test message after configuring
+        #[arg(long)]
+        no_test: bool,
+    },
+
     /// Set up HTTP webhook notifications (sends alerts to any HTTP endpoint).
     ///
     /// Examples:
@@ -1672,6 +1694,25 @@ enum ConfigAllCommand {
         no_test: bool,
     },
 
+    /// Set up Discord notifications.
+    ///
+    /// Examples:
+    ///   innerwarden config discord
+    ///   innerwarden config discord --webhook-url https://discord.com/api/webhooks/...
+    Discord {
+        /// Discord Incoming Webhook URL
+        #[arg(long)]
+        webhook_url: Option<String>,
+
+        /// Minimum severity to notify: low, medium, high, critical
+        #[arg(long, default_value = "high")]
+        min_severity: String,
+
+        /// Skip the test message after configuring
+        #[arg(long)]
+        no_test: bool,
+    },
+
     /// Set up HTTP webhook notifications.
     ///
     /// Examples:
@@ -2148,6 +2189,16 @@ fn dispatch_config(cli: &Cli, command: &Option<ConfigAllCommand>) -> Result<()> 
             ref min_severity,
             no_test,
         }) => commands::notify::cmd_configure_slack(
+            cli,
+            webhook_url.as_deref(),
+            min_severity,
+            *no_test,
+        ),
+        Some(ConfigAllCommand::Discord {
+            ref webhook_url,
+            ref min_severity,
+            no_test,
+        }) => commands::notify::cmd_configure_discord(
             cli,
             webhook_url.as_deref(),
             min_severity,
@@ -2768,6 +2819,16 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 ref min_severity,
                 no_test,
             }) => commands::notify::cmd_configure_slack(
+                &cli,
+                webhook_url.as_deref(),
+                min_severity,
+                *no_test,
+            ),
+            Some(NotifyCommand::Discord {
+                ref webhook_url,
+                ref min_severity,
+                no_test,
+            }) => commands::notify::cmd_configure_discord(
                 &cli,
                 webhook_url.as_deref(),
                 min_severity,

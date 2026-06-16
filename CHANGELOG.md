@@ -20,6 +20,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   chat-channel registry — it touched only a new `discord` module, the config,
   one boot block, and one registry line, with no dispatch-site edits. (Spec 078
   Phase 3.)
+- **`innerwarden notify discord` setup command** + a **Discord integration card**
+  on the dashboard's Alerts & Notifications panel. The command (and its
+  `innerwarden config discord` alias) prompts for / accepts a webhook URL, saves
+  it, flips `[discord]`, sends a test message, and restarts the agent — same UX
+  as `notify slack`. (Spec 078 Phase 3b.)
 
 ### Changed
 - **Unified chat-channel registry for notifications (internal).** Telegram and
