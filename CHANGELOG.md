@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Daily digest ("Daily Security Briefing") now reaches Slack + Discord, not just Telegram.** The once-a-day report was sent only through `telegram_client`, so Slack-only hosts (and shared channels) never got it. It now fans out through the spec 078 chat-channel registry: Telegram keeps its uncapped `send_text_message` path (a busy day can't drop it), and Slack/Discord receive it too. One dedup marker still guarantees one send per day.
+
 ### Changed
 - **`innerwarden notify test` now names the host.** The test alert (Telegram + Slack) includes the host label (sensor `[agent] host_id`, same as real incidents) so operators sharing one chat/channel across several boxes can tell which server it came from.
 

@@ -101,30 +101,57 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                 state.last_narrative_at = Some(std::time::Instant::now());
                 info!(date = today, "daily summary updated");
 
-                // Daily Telegram digest
+                // Daily digest ("Daily Security Briefing") — fans out to every
+                // operator chat channel (Telegram + Slack + Discord), not just
+                // Telegram. Spec 078 migrated alerts/action-reports/burst
+                // summaries to the registry; this is the daily report doing the
+                // same so Slack-only boxes (and shared channels) get it too.
                 if let Some(hour) = cfg.telegram.daily_summary_hour {
                     let now_local = chrono::Local::now();
                     let today_naive = now_local.date_naive();
                     let already_sent = state.last_daily_summary_telegram == Some(today_naive);
                     if !already_sent && now_local.hour() >= u32::from(hour) {
+                        let text = build_daily_digest_text(cfg, state, data_dir, today);
+                        let mut sent_any = false;
+
+                        // Telegram keeps its own send_text_message path: unlike
+                        // send_alert_html (used by the registry summary), it has
+                        // no per-hour alert cap, so a busy day can never drop the
+                        // daily digest.
                         if let Some(tg) = state.telegram_client.clone() {
-                            let text = build_daily_digest_text(cfg, state, data_dir, today);
                             match tg.send_text_message(&text).await {
                                 Ok(()) => {
-                                    state.last_daily_summary_telegram = Some(today_naive);
-                                    // Persist the dedup marker so the next agent
-                                    // restart skips re-emitting today's briefing.
-                                    // Pre-2026-05-09 this was in-memory only —
-                                    // operator received multiple "Daily Security
-                                    // Briefing" messages on the same day because
-                                    // every restart after `daily_summary_hour`
-                                    // (default 9 UTC) hit a fresh `None` and
-                                    // re-fired the digest.
-                                    state.store.set_last_daily_briefing_date(today_naive);
+                                    sent_any = true;
                                     info!(date = today, "daily Telegram digest sent");
                                 }
                                 Err(e) => warn!("failed to send daily Telegram digest: {e:#}"),
                             }
+                        }
+
+                        // Slack / Discord via the chat-channel registry; Telegram
+                        // is already handled above (skip it to avoid a double send).
+                        let channels =
+                            crate::notification_channels::collect_chat_channels(cfg, state);
+                        for ch in channels.iter().filter(|c| c.name() != "telegram") {
+                            match ch.summary(&text).await {
+                                Ok(()) => {
+                                    sent_any = true;
+                                    info!(channel = ch.name(), date = today, "daily digest sent");
+                                }
+                                Err(e) => {
+                                    warn!(channel = ch.name(), "failed to send daily digest: {e:#}")
+                                }
+                            }
+                        }
+
+                        // Mark sent once it reached at least one channel, so a
+                        // restart after the hour does not re-fire (pre-2026-05-09
+                        // bug: in-memory-only marker re-emitted "Daily Security
+                        // Briefing" on every restart) and a transient
+                        // single-channel failure does not loop all day.
+                        if sent_any {
+                            state.last_daily_summary_telegram = Some(today_naive);
+                            state.store.set_last_daily_briefing_date(today_naive);
                         }
                     }
                 }
@@ -241,6 +268,42 @@ mod tests {
             std::fs::read_to_string(&summary_path).expect("summary should still exist"),
             "sentinel"
         );
+    }
+
+    #[tokio::test]
+    async fn daily_digest_fans_out_to_slack_when_due() {
+        // No telegram client (the Azure / Slack-only case) — the digest must
+        // still reach Slack through the chat-channel registry.
+        let mut server = mockito::Server::new_async().await;
+        let hook = server
+            .mock("POST", "/services/T/B/X")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let dir = TempDir::new().expect("tempdir");
+        let mut cfg = cfg_with_narrative();
+        cfg.telegram.daily_summary_hour = Some(0); // hour gate: now >= 0 → due
+        cfg.slack.enabled = true;
+
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.slack_client = Some(
+            crate::slack::SlackClient::new(format!("{}/services/T/B/X", server.url())).unwrap(),
+        );
+        state.last_daily_summary_telegram = None;
+        state
+            .narrative_acc
+            .events_by_kind
+            .insert("ssh.login_failed".to_string(), 3);
+        state
+            .narrative_acc
+            .ingest_incidents(&[crate::tests::test_incident("203.0.113.10")]);
+
+        maybe_write_daily_summary_and_digest(dir.path(), "2026-05-13", 3, &cfg, &mut state).await;
+
+        hook.assert_async().await;
+        // Dedup marker set → won't re-fire today.
+        assert!(state.last_daily_summary_telegram.is_some());
     }
 
     #[tokio::test]
