@@ -352,6 +352,30 @@ run_scenario() {
   "$SENSOR_BIN" --config "$sensor_cfg" > "$sensor_log" 2>&1 &
   local sensor_pid=$!
   sleep 3
+  # Flake guard (01-ssh-brute-single): on a loaded CI runner the sensor may not
+  # finish reading auth.log + running the detector within the 3s base window,
+  # so SIGINT lands mid-detection and the scenario sees 0 incidents. For
+  # scenarios that actually drive the sensor through auth.log, keep waiting
+  # (capped) until the sensor has written its detection to the store, then
+  # SIGINT. Seeded scenarios (empty auth.log) just consume the base window and
+  # are unaffected.
+  if [[ -s "$auth_log" ]]; then
+    local _sqa_db="$data_dir/innerwarden.db"
+    local _w
+    for ((_w = 0; _w < 30; _w++)); do
+      local _n
+      _n=$("$PYTHON_BIN" - "$_sqa_db" <<'PY' 2>/dev/null || echo 0
+import sqlite3, sys
+try:
+    print(sqlite3.connect(sys.argv[1]).execute("SELECT COUNT(*) FROM incidents").fetchone()[0])
+except Exception:
+    print(0)
+PY
+)
+      [[ "${_n:-0}" -gt 0 ]] && break
+      sleep 0.3
+    done
+  fi
   kill -INT "$sensor_pid" 2>/dev/null || true
   if ! wait_for_pid_exit "$sensor_pid" 3; then
     kill -TERM "$sensor_pid" 2>/dev/null || true
