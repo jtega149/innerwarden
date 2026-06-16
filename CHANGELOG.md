@@ -25,6 +25,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `innerwarden config discord` alias) prompts for / accepts a webhook URL, saves
   it, flips `[discord]`, sends a test message, and restarts the agent — same UX
   as `notify slack`. (Spec 078 Phase 3b.)
+- **`innerwarden setup` wizard now offers Discord** as a notification channel
+  in the `[3/4] Notification channels` multi-select, with detection of an
+  existing `[discord]` config and a guided configurator at apply-time. (Spec 078
+  Phase 3c.)
 
 ### Changed
 - **Unified chat-channel registry for notifications (internal).** Telegram and

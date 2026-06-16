@@ -114,6 +114,17 @@ coverage:
           # format_alert, and `serve` (driven over in-memory pipes) in
           # agent_proxy.rs, plus the agent-guard proxy itself.
           - "!crates/ctl/src/commands/agent_proxy.rs"
+          # `innerwarden setup` is an interactive wizard: a MultiSelect over
+          # notification channels plus per-channel `cmd_configure_*` prompts
+          # that block on the test's stdin (same class as ctl/src/main.rs and
+          # agent_proxy.rs). The pure logic it composes IS unit-tested in
+          # setup.rs's own `#[cfg(test)]` module — notification_plan_defaults /
+          # from_selections, compute_setup_existing_channels,
+          # channels_to_configure_in_apply, already_configured_*,
+          # sensor_restart_decision, resolve_responder_plan_from_selection — and
+          # those still count toward the `ctl` project gate. Only the
+          # interactive apply loop (which prompts on stdin) is unreachable.
+          - "!crates/ctl/src/commands/setup.rs"
           - "!crates/sensor/src/main.rs"
           # Sensor dispatch/wiring: process_event dispatches to 79
           # detectors + writes incidents via SQLite. Unit-testing
