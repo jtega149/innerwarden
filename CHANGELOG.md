@@ -10,6 +10,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **AI briefing "Ignored" count now matches the dashboard "Filtered out" tile.** The briefing said "Ignored 21" while the Home tile said "Filtered out 11" — the briefing counted `dismissed.incidents + allowlisted.incidents` while the tile is `dismissed.unique_attackers` (one attacker fires many incidents). The briefing's `ignored` is now `dismissed.unique_attackers` and drops the separate allowlisted/operator-trust bucket. The incident-count lines ("operator-relevant incidents today", "observing") stay incident-based so they keep agreeing with the Sensors HUD and Report totals.
+- **Operator suggestions are operator-actionable again.** The dashboard "Suggestions" surfaced trial/rollout/dev-tuning notes ("improve detector payload completeness", "before widening rollout", "proceed to next phase", "signal quality") that a steady-state operator can't act on. Rewrote them to plain operator guidance and dropped the internal detector-payload diagnostic from the operator surface.
+
+### Fixed
 - **Daily briefing/digest now names the host.** The digest body led with no host, so on a shared Telegram chat / Slack channel you couldn't tell which server's briefing it was. It now leads with `🖥 <host>` (the incident host label / sensor `host_id`, same as real alerts), falling back to the system hostname.
 
 ### Fixed
