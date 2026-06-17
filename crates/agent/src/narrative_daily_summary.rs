@@ -214,7 +214,20 @@ fn build_daily_digest_text(
     // Drain deferred incidents for digest breakdown.
     let mut deferred: Vec<(String, u32)> = state.telegram_deferred.drain().collect();
     deferred.sort_by(|a, b| b.1.cmp(&a.1));
-    telegram::format_daily_digest_enriched(
+
+    // Host header so a shared chat channel (Telegram / Slack / Discord across
+    // several boxes) shows which server the briefing is from. Prefer the host
+    // the incidents are stamped with (sensor `host_id`, same label real alerts
+    // carry); fall back to the system hostname.
+    let host = state
+        .narrative_acc
+        .incidents
+        .first()
+        .map(|i| i.host.clone())
+        .filter(|h| !h.is_empty() && h != "unknown")
+        .unwrap_or_else(daily_digest_host_fallback);
+
+    let digest = telegram::format_daily_digest_enriched(
         incidents_today,
         decisions_today,
         critical_count,
@@ -228,7 +241,29 @@ fn build_daily_digest_text(
             needs_review_groups: pipeline_stats.needs_review_groups,
             deferred,
         },
-    )
+    );
+    format!("🖥 <b>{}</b>\n{digest}", html_escape_host(&host))
+}
+
+/// System hostname for the digest header when no incident carries a host.
+fn daily_digest_host_fallback() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Minimal HTML escape for the host label in the Telegram-HTML digest header.
+fn html_escape_host(h: &str) -> String {
+    h.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -337,6 +372,9 @@ mod tests {
 
         let text = build_daily_digest_text(&cfg, &mut state, dir.path(), "2026-05-13");
 
+        // Host header (from the incident host) so a shared channel shows which box.
+        assert!(text.starts_with("🖥"), "digest leads with a host header");
+        assert!(text.contains("test-host"));
         assert!(text.contains("Incidents: 2"));
         assert!(text.contains("Critical: 1 | High: 1"));
         assert!(text.contains("Deferred:"));

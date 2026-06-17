@@ -10,6 +10,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Daily briefing/digest now names the host.** The digest body led with no host, so on a shared Telegram chat / Slack channel you couldn't tell which server's briefing it was. It now leads with `🖥 <host>` (the incident host label / sensor `host_id`, same as real alerts), falling back to the system hostname.
+
+### Fixed
 - **Daily digest ("Daily Security Briefing") now reaches Slack + Discord, not just Telegram.** The once-a-day report was sent only through `telegram_client`, so Slack-only hosts (and shared channels) never got it. It now fans out through the spec 078 chat-channel registry: Telegram keeps its uncapped `send_text_message` path (a busy day can't drop it), and Slack/Discord receive it too. One dedup marker still guarantees one send per day.
 
 ### Changed
