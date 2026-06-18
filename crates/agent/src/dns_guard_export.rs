@@ -119,6 +119,7 @@ mod tests {
         let cfg = config::DnsGuardConfig {
             export_enabled: true,
             denylist_path: path.to_string_lossy().into_owned(),
+            ..Default::default()
         };
         // No threat feed configured in the test state → empty domain set, but the
         // header file is still written (exercises throttle + gather + build + write).
@@ -137,6 +138,7 @@ mod tests {
         let cfg = config::DnsGuardConfig {
             export_enabled: false,
             denylist_path: path.to_string_lossy().into_owned(),
+            ..Default::default()
         };
         process_dns_guard_export_tick(&cfg, &state);
         assert!(!path.exists(), "disabled export writes nothing");

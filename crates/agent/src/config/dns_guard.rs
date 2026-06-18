@@ -22,6 +22,16 @@ pub struct DnsGuardConfig {
     /// atomically (temp + rename) so the guard never reads a half-written file.
     #[serde(default = "default_dns_guard_denylist_path")]
     pub denylist_path: String,
+    /// Master switch for ingesting the DNS Guard's block events back into the
+    /// agent as incidents (so a blocked malicious lookup is visible in IW). Off
+    /// by default.
+    #[serde(default)]
+    pub ingest_enabled: bool,
+    /// The DNS Guard's events JSONL (matches the daemon's `--events`). The agent
+    /// tails it (byte-offset cursor) and turns `dns_guard.blocked` lines into
+    /// incidents.
+    #[serde(default = "default_dns_guard_events_path")]
+    pub events_path: String,
 }
 
 impl Default for DnsGuardConfig {
@@ -29,10 +39,16 @@ impl Default for DnsGuardConfig {
         Self {
             export_enabled: false,
             denylist_path: default_dns_guard_denylist_path(),
+            ingest_enabled: false,
+            events_path: default_dns_guard_events_path(),
         }
     }
 }
 
 fn default_dns_guard_denylist_path() -> String {
     "/etc/innerwarden/dns-deny.txt".to_string()
+}
+
+fn default_dns_guard_events_path() -> String {
+    "/var/lib/innerwarden/dns_guard-events.jsonl".to_string()
 }

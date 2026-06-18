@@ -1295,6 +1295,11 @@ pub(crate) async fn process_narrative_tick(
     // (5 min) + write-only-if-changed; no-op unless `[dns_guard] export_enabled`.
     crate::dns_guard_export::process_dns_guard_export_tick(&cfg.dns_guard, state);
 
+    // DNS Guard ingest — tail the guard's block events (byte-offset cursor) and
+    // surface each `dns_guard.blocked` malicious-domain lookup as a High incident
+    // so it's visible in IW. No-op unless `[dns_guard] ingest_enabled`.
+    crate::dns_guard_ingest::process_dns_guard_ingest_tick(data_dir, &cfg.dns_guard, state);
+
     // Spec 062 Phase 2 — needs_review timeout sweep. Every 10 minutes,
     // auto-resolve low/medium needs_review items that sat past the grace
     // window with no human action (honest `auto_resolved_timeout` dismiss).
