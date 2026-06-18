@@ -379,7 +379,6 @@ pub(crate) struct DecideInputs<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct RegisteredFacts {
     pub agent_id: String,
-    pub name: String,
     pub kind: Kind,
     /// `cmdline_fingerprint` captured at connect (`interpreter|script`, the
     /// first-2-argv joined by `|`). The STRONG cross-check: the live fingerprint
@@ -419,17 +418,20 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
         return ManagedAgentVerdict::NotManaged;
     };
 
-    // (2) Live cmdline re-ID: the live argv must identify the SAME known agent as
-    // the registry record. Defeats comm-forgery (comm=MainThread set by malware
-    // with no matching cmdline) and requires a KNOWN agent signature (not just
-    // any process whose fingerprint happens to match). Combined with the
-    // fingerprint equality below, this is the multi-signal AND.
+    // (2) Live cmdline re-ID: the live argv MUST identify a KNOWN agent signature
+    // (defeats comm-forgery — comm=MainThread set by malware with no matching
+    // cmdline). We do NOT require the resolved signature name to equal the
+    // registry's stored `name`: `innerwarden agent connect <pid>` records the
+    // process COMM as the name (e.g. "MainThread" for a node-launched agent),
+    // while `identify_cmdline` resolves the SIGNATURE name ("OpenClaw"), so a
+    // strict equality wrongly rejected a CORRECTLY-registered agent (found on the
+    // Azure box: ag-0001 stored name="MainThread"). Identity is pinned instead by
+    // the EXACT cmdline-fingerprint match below (2b) — which already defeats
+    // pid-reuse / a different agent landing on the same pid — so the name match
+    // was redundant. `live_name` (the resolved signature) becomes the audit name.
     let Some(live_name) = inputs.live_sig_name else {
         return ManagedAgentVerdict::NotManaged;
     };
-    if !live_name.eq_ignore_ascii_case(&reg.name) {
-        return ManagedAgentVerdict::NotManaged;
-    }
 
     // (2b) Fingerprint equality — the STRONG, non-forgeable backbone. The live
     // `interpreter|script` fingerprint, recomputed exactly as `capture_proc_facts`
@@ -478,7 +480,7 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
         }
         return ManagedAgentVerdict::Managed {
             agent_id: reg.agent_id.clone(),
-            name: reg.name.clone(),
+            name: live_name.to_string(),
         };
     };
     let install_dir = registered_install_dir(Some(script));
@@ -522,7 +524,7 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
 
     ManagedAgentVerdict::Managed {
         agent_id: reg.agent_id.clone(),
-        name: reg.name.clone(),
+        name: live_name.to_string(),
     }
 }
 
@@ -569,7 +571,6 @@ pub(crate) fn verify_managed_agent_self_activity(
     // (1) Registry hit by pid.
     let registered = registry.by_pid(pid).map(|a| RegisteredFacts {
         agent_id: a.id.clone(),
-        name: a.name.clone(),
         kind: a.kind,
         cmdline_fingerprint: a.cmdline_fingerprint.clone(),
     });
@@ -727,6 +728,75 @@ mod tests {
             proc,
             false,
         )
+    }
+
+    /// A registry whose stored `name` is the process COMM ("MainThread"), kind
+    /// Tool — EXACTLY what `innerwarden agent connect <pid>` records for a
+    /// node-launched agent in production (verified on the Azure box: ag-0001).
+    fn registry_with_comm_named_openclaw(pid: u32) -> Registry {
+        let mut reg = Registry::new();
+        reg.connect_with_facts(
+            "MainThread", // ← the COMM, not the signature name
+            pid,
+            Some("ag-0001"),
+            Some(OPENCLAW_INTERP.to_string()),
+            Some(1000),
+            Some(openclaw_fingerprint()),
+        )
+        .expect("connect");
+        reg
+    }
+
+    /// Regression (found deploying 0.15.16 to the Azure box, 2026-06-18):
+    /// `agent connect <pid>` stores the process COMM ("MainThread") as the
+    /// registry `name`, while `identify_cmdline` resolves the SIGNATURE name
+    /// ("OpenClaw"). The earlier verifier required `live_sig_name == reg.name`,
+    /// which wrongly BLOCKED a correctly-registered OpenClaw (the prior tests used
+    /// `connect_with_facts("OpenClaw", …)` and masked it). The verifier must now
+    /// resolve it as Managed — identity is pinned by the cmdline-fingerprint, not
+    /// the stored name — and surface the RESOLVED signature name in the audit.
+    #[test]
+    fn comm_named_registry_entry_is_still_managed() {
+        let pid = 4242;
+        let reg = registry_with_comm_named_openclaw(pid);
+        let stub = StubProc::default()
+            .with_proc(pid, openclaw_proc(1000))
+            .with_owner("/home/lab/.env", 1000);
+        match verify(pid, Some("/home/lab/.env"), &reg, &stub) {
+            ManagedAgentVerdict::Managed { name, agent_id } => {
+                assert_eq!(name, "OpenClaw", "audit name must resolve to the signature");
+                assert!(
+                    agent_id.starts_with("ag-"),
+                    "agent_id is the registry-minted id, got {agent_id}"
+                );
+            }
+            other => panic!("comm-named registry entry must be Managed, got {other:?}"),
+        }
+    }
+
+    /// The name-equality was redundant with the fingerprint pin, NOT a relaxation:
+    /// even with the comm-named entry, a DIFFERENT script at the same pid (still
+    /// identifies as OpenClaw by path component, but a different fingerprint) must
+    /// still BLOCK. Proves the cmdline-fingerprint — not the name — is the pin.
+    #[test]
+    fn comm_named_entry_with_wrong_fingerprint_blocks() {
+        let pid = 4242;
+        let reg = registry_with_comm_named_openclaw(pid);
+        let evil = ResolvedProcess {
+            argv: vec![
+                "/usr/bin/node".into(),
+                // identifies as OpenClaw (path component) but a DIFFERENT script
+                "/home/lab/.npm-global/lib/node_modules/openclaw/dist/evil.js".into(),
+            ],
+            exe_path: Some("/usr/bin/node".into()),
+            uid: Some(1000),
+        };
+        let stub = StubProc::default().with_proc(pid, evil);
+        assert_eq!(
+            verify(pid, None, &reg, &stub),
+            ManagedAgentVerdict::NotManaged,
+            "comm-named entry must still BLOCK when the live fingerprint differs"
+        );
     }
 
     // ── 7 required anti-evasion tests (spec 081) ──────────────────────────
