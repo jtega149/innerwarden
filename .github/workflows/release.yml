@@ -503,14 +503,20 @@ jobs:
 
       # ── Tests ──────────────────────────────────────────────────────────────
       - name: Run tests
-        # macOS runners have a low per-process thread cap. At full test
-        # parallelism each test spawns its own tokio runtime + thread-pools and
-        # exhausts it -> `pthread_create` fails with EAGAIN (OS code 35,
-        # "Resource temporarily unavailable") and unrelated tests (threat_report,
-        # web_push, webhook) flake-fail, failing the whole macOS release build
-        # even though the code is fine (Linux passes). Raise the fd limit and cap
-        # test concurrency so the macOS release gate is reliable.
+        # macOS runners have a low per-process THREAD cap (kern.maxprocperuid).
+        # Each Store-opening test leaves a lingering reaper thread
+        # (r2d2 / scheduled-thread-pool); across the full ~3800-test run these
+        # accumulate and `pthread_create` eventually fails with EAGAIN (OS code
+        # 35, "Resource temporarily unavailable") near the end — threat_report /
+        # web_push / webhook flake-fail and the whole macOS release goes red even
+        # though the code is fine (Linux passes). The earlier fix raised the FD
+        # limit (`ulimit -n`), which is the WRONG knob — pthread_create is bounded
+        # by the PROCESS/THREAD limit (`ulimit -u`), not file descriptors. Raise
+        # the kernel maxproc (needs sudo) AND the shell `ulimit -u`, keep the fd
+        # bump and the concurrency cap, so the macOS release gate is reliable.
         run: |
+          sudo launchctl limit maxproc 8192 16384 2>/dev/null || true
+          ulimit -u 8192 2>/dev/null || ulimit -u unlimited 2>/dev/null || true
           ulimit -n 8192 2>/dev/null || true
           cargo test --workspace -- --test-threads=2
 
