@@ -1153,6 +1153,13 @@ pub(crate) async fn process_narrative_tick(
             &kc_events,
             &mut state.correlation_engine,
         );
+        // Spec 081 — managed-agent coexistence: register the kernel PID-block
+        // for offending chain PIDs, but WITHHOLD it for a positively-verified,
+        // IW-managed AI agent acting on its own services (data_exfil/exploit_c2
+        // shape). Detection is unchanged — the incidents were already produced
+        // above and are written + notified below. The verifier fails closed, so
+        // a real attacker / forged identity / recycled pid is still kernel-blocked.
+        killchain_inline::register_kernel_blocks(&kc_incidents, state).await;
         killchain_inline::write_incidents(data_dir, state.sqlite_store.as_deref(), &kc_incidents);
         // Phase 7B (audit RC-2 — Slice C): kill chain detections fire
         // on operator SSH sessions (operator runs `cat /etc/passwd`,

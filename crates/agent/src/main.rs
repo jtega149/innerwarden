@@ -137,6 +137,7 @@ mod knowledge_graph;
 mod learned_suppression;
 mod loops;
 mod lsm_policy;
+mod managed_agent_guard;
 mod mesh;
 mod mitre;
 mod narrative;
@@ -709,6 +710,14 @@ struct AgentState {
     /// running until the process exits, same as before. The group
     /// becomes load-bearing the moment the signal handler lands.
     task_group: task_group::TaskGroup,
+    /// Spec 081 — managed-agent coexistence. The SAME live agent-guard registry
+    /// the dashboard mutates via `agent connect` (shared `Arc`), so the
+    /// response-side `managed_agent_guard` verifier consulted in the slow-loop
+    /// (kernel PID-block + userspace IP-block paths) sees operator-vouched
+    /// agents the instant they connect. Plus a shared signature index for the
+    /// live cmdline re-ID step.
+    agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>>,
+    signature_index: Arc<innerwarden_agent_guard::signatures::SignatureIndex>,
 }
 
 /// Tracks a deferred honeypot-or-block decision waiting for operator input via Telegram.

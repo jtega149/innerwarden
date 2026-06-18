@@ -268,6 +268,12 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     }
 }
 
@@ -561,6 +567,12 @@ async fn golden_path_dry_run_produces_decision_entry() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     // 4. Run the incident tick
@@ -752,6 +764,12 @@ async fn allowed_skills_whitelist_enforced() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -924,6 +942,12 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1097,6 +1121,12 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1255,6 +1285,12 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1423,6 +1459,12 @@ async fn decision_cooldown_suppresses_repeat() {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        signature_index: std::sync::Arc::new(
+            innerwarden_agent_guard::signatures::SignatureIndex::new(),
+        ),
     };
 
     let mut cursor = reader::AgentCursor::default();

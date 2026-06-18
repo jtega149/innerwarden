@@ -410,6 +410,9 @@ pub async fn serve(
     max_sessions: usize,
     advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>>,
     rule_engine: Arc<innerwarden_agent_guard::rules::RuleEngine>,
+    // Spec 081: shared agent-guard registry (also held by the main agent loop's
+    // response gate) so `agent connect` mutations are visible to the verifier.
+    agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>>,
     agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
     deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
     knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
@@ -501,35 +504,14 @@ pub async fn serve(
         session_timeout_minutes,
         max_sessions,
         advisory_cache: advisory_cache.clone(),
-        // 2026-05-18: rehydrate the agent-guard registry from the
-        // on-disk snapshot so `agent connect` survives an agent
-        // restart. The watchdog dance from #681 swaps the agent
-        // binary every deploy; before persistence the registry came
-        // back empty and the operator had to re-run `innerwarden
-        // agent connect` after every release. A missing snapshot
-        // (clean install) returns an empty registry — not an error.
-        // A corrupt snapshot is surfaced as a warning and we fall
-        // back to empty so the dashboard still starts.
-        agent_registry: Arc::new(tokio::sync::Mutex::new({
-            let snapshot_path = data_dir.join("agent-guard-registry.json");
-            match innerwarden_agent_guard::registry::Registry::restore_from(&snapshot_path) {
-                Ok(reg) => {
-                    if reg.count_total() > 0 {
-                        info!(
-                            path = %snapshot_path.display(),
-                            agents = reg.count_agents(),
-                            tools = reg.count_tools(),
-                            "agent-guard registry restored from snapshot",
-                        );
-                    }
-                    reg
-                }
-                Err(e) => {
-                    warn!(error = %e, path = %snapshot_path.display(), "failed to restore agent-guard registry; starting empty");
-                    innerwarden_agent_guard::registry::Registry::new()
-                }
-            }
-        })),
+        // 2026-05-18 + spec 081: the agent-guard registry is now built ONCE in
+        // `loops::boot` (rehydrated from the on-disk snapshot so `agent connect`
+        // survives a watchdog binary swap) and the SAME `Arc<Mutex<Registry>>`
+        // is shared between this dashboard and the main agent loop's
+        // `managed_agent_guard` response gate. The dashboard receives it as a
+        // parameter rather than restoring its own copy, so a connect made via
+        // the dashboard API is immediately visible to the response gate.
+        agent_registry,
         rule_engine,
         agent_alert_tx,
         deep_security,
@@ -7113,6 +7095,9 @@ mod tests {
             16,
             Arc::new(RwLock::new(VecDeque::new())),
             Arc::new(innerwarden_agent_guard::rules::RuleEngine::empty()),
+            Arc::new(tokio::sync::Mutex::new(
+                innerwarden_agent_guard::registry::Registry::new(),
+            )),
             agent_alert_tx,
             Arc::new(RwLock::new(DeepSecuritySnapshot::default())),
             Arc::new(std::sync::RwLock::new(

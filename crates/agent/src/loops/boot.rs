@@ -623,6 +623,38 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     let (agent_alert_tx, mut agent_alert_rx) =
         tokio::sync::mpsc::channel::<dashboard::AgentGuardAlert>(64);
 
+    // Spec 081 — managed-agent coexistence. Build the agent-guard registry ONCE
+    // here and share the SAME `Arc<Mutex<Registry>>` between the dashboard (which
+    // mutates it via `agent connect`) and the main agent loop's response-side
+    // `managed_agent_guard` verifier (kernel PID-block + userspace IP-block). The
+    // registry rehydrates from the on-disk snapshot so a watchdog binary swap
+    // does not drop operator-vouched agents (missing snapshot = empty registry,
+    // corrupt = warn + empty). Built unconditionally because `AgentState` always
+    // needs it, even when the dashboard task is disabled.
+    let agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>> = {
+        let snapshot_path = cli.data_dir.join("agent-guard-registry.json");
+        let reg = match innerwarden_agent_guard::registry::Registry::restore_from(&snapshot_path) {
+            Ok(reg) => {
+                if reg.count_total() > 0 {
+                    info!(
+                        path = %snapshot_path.display(),
+                        agents = reg.count_agents(),
+                        tools = reg.count_tools(),
+                        "agent-guard registry restored from snapshot (shared with response gate)",
+                    );
+                }
+                reg
+            }
+            Err(e) => {
+                warn!(error = %e, path = %snapshot_path.display(), "failed to restore agent-guard registry; starting empty");
+                innerwarden_agent_guard::registry::Registry::new()
+            }
+        };
+        Arc::new(tokio::sync::Mutex::new(reg))
+    };
+    let signature_index: Arc<innerwarden_agent_guard::signatures::SignatureIndex> =
+        Arc::new(innerwarden_agent_guard::signatures::SignatureIndex::new());
+
     // Build the primary AI provider and capability router ONCE, before
     // the dashboard spawn. Both the dashboard task and the main agent
     // loop share the same `Arc`-wrapped provider and the same router
@@ -797,6 +829,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         );
 
         let agent_alert_tx = agent_alert_tx.clone();
+        // Spec 081: hand the dashboard the SAME shared registry the response
+        // gate uses, so `agent connect` mutations are visible to the verifier.
+        let dashboard_registry = agent_registry.clone();
         let deep_security = deep_security_snapshot.clone();
         let dashboard_graph = shared_graph.clone();
         // Share the router built above with the dashboard. `AiRouter` is
@@ -875,6 +910,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 max_sessions,
                 dashboard_advisory_cache,
                 rule_engine,
+                dashboard_registry,
                 agent_alert_tx,
                 deep_security,
                 dashboard_graph,
@@ -1508,6 +1544,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
         task_group: crate::task_group::TaskGroup::new(),
+        // Spec 081 — managed-agent coexistence: the SAME registry shared with the
+        // dashboard (built above), so the response gate sees `agent connect`s live.
+        agent_registry: agent_registry.clone(),
+        signature_index: signature_index.clone(),
     };
 
     // Spec 005 Phase 7: replay persisted feedback so demotions survive

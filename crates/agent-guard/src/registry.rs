@@ -14,6 +14,43 @@ use crate::signatures::{Kind, SignatureIndex};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Capture identity facts for a pid from `/proc/<pid>` at connect time (spec
+/// 081 registry hardening). Returns `(exe_path, owner_uid, cmdline_fingerprint)`,
+/// each `None` on any read failure. Best-effort: a failure here never blocks the
+/// connect — the verifier simply has less to cross-check (and the live re-ID +
+/// exe-root checks still stand). On non-Linux the `/proc` reads return None.
+fn capture_proc_facts(pid: u32) -> (Option<String>, Option<u32>, Option<String>) {
+    let base = format!("/proc/{pid}");
+
+    let exe_path = std::fs::read_link(format!("{base}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+
+    let owner_uid = std::fs::read_to_string(format!("{base}/status"))
+        .ok()
+        .and_then(|s| {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("Uid:") {
+                    return rest.split_whitespace().next().and_then(|v| v.parse().ok());
+                }
+            }
+            None
+        });
+
+    let cmdline_fingerprint = std::fs::read(format!("{base}/cmdline")).ok().map(|bytes| {
+        // interpreter|script-path — the two argv tokens that carry the identity
+        // (e.g. `node|/home/lab/.npm-global/.../openclaw/dist/index.js`).
+        let argv: Vec<String> = bytes
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        argv.into_iter().take(2).collect::<Vec<_>>().join("|")
+    });
+
+    (exe_path, owner_uid, cmdline_fingerprint)
+}
+
 /// A connected agent instance.
 #[derive(Debug)]
 pub struct ConnectedAgent {
@@ -27,6 +64,19 @@ pub struct ConnectedAgent {
     pub session: SessionTracker,
     pub policy: AgentPolicy,
     pub stats: AgentStats,
+    // ── Spec 081 registry hardening ──────────────────────────────────────
+    // Identity facts captured LIVE from `/proc/<pid>` at connect time so a
+    // self-registered or pid-recycled process cannot inherit the managed-agent
+    // response relaxation by holding a registry pid alone. The
+    // `managed_agent_guard` verifier cross-checks the live process against these.
+    /// `/proc/<pid>/exe` readlink target at connect. `None` when unreadable.
+    pub exe_path: Option<String>,
+    /// Owner uid of the process at connect (`/proc/<pid>/status` Uid:). `None`
+    /// when unreadable.
+    pub owner_uid: Option<u32>,
+    /// Stable fingerprint of `/proc/<pid>/cmdline` at connect (interpreter +
+    /// script path). `None` when unreadable.
+    pub cmdline_fingerprint: Option<String>,
 }
 
 /// Policy applied to a connected agent.
@@ -78,11 +128,40 @@ impl Registry {
     }
 
     /// Connect an agent by PID. Returns the agent ID.
+    ///
+    /// Spec 081: captures identity facts (`exe_path`, `owner_uid`,
+    /// `cmdline_fingerprint`) LIVE from `/proc/<pid>` so the managed-agent
+    /// response relaxation cannot be inherited by a self-registered or
+    /// pid-recycled process holding only the registry pid.
     pub fn connect(
         &mut self,
         name: &str,
         pid: u32,
         instance_label: Option<&str>,
+    ) -> Result<String, String> {
+        let (exe_path, owner_uid, cmdline_fingerprint) = capture_proc_facts(pid);
+        self.connect_with_facts(
+            name,
+            pid,
+            instance_label,
+            exe_path,
+            owner_uid,
+            cmdline_fingerprint,
+        )
+    }
+
+    /// Connect with explicitly-supplied identity facts. Used by `connect()`
+    /// (which captures them live) and by tests (which inject them). Keeping the
+    /// `/proc` read out of this function makes the registry insertion logic
+    /// testable without a live process.
+    pub fn connect_with_facts(
+        &mut self,
+        name: &str,
+        pid: u32,
+        instance_label: Option<&str>,
+        exe_path: Option<String>,
+        owner_uid: Option<u32>,
+        cmdline_fingerprint: Option<String>,
     ) -> Result<String, String> {
         // Check if this PID is already connected
         if self.agents.values().any(|a| a.pid == pid) {
@@ -112,6 +191,9 @@ impl Registry {
             session: SessionTracker::new(),
             policy: AgentPolicy::default(),
             stats: AgentStats::default(),
+            exe_path,
+            owner_uid,
+            cmdline_fingerprint,
         };
 
         tracing::info!(
@@ -120,6 +202,7 @@ impl Registry {
             pid,
             label = %agent.instance_label,
             kind = ?kind,
+            exe = agent.exe_path.as_deref().unwrap_or("?"),
             "agent connected"
         );
 
@@ -231,6 +314,9 @@ impl Registry {
                 connected_at: a.connected_at,
                 policy: a.policy.clone(),
                 stats: a.stats.clone(),
+                exe_path: a.exe_path.clone(),
+                owner_uid: a.owner_uid,
+                cmdline_fingerprint: a.cmdline_fingerprint.clone(),
             })
             .collect();
         RegistrySnapshot {
@@ -303,6 +389,9 @@ impl Registry {
                     session: SessionTracker::new(),
                     policy: p.policy,
                     stats: p.stats,
+                    exe_path: p.exe_path,
+                    owner_uid: p.owner_uid,
+                    cmdline_fingerprint: p.cmdline_fingerprint,
                 },
             );
         }
@@ -337,6 +426,14 @@ pub struct PersistedAgent {
     pub connected_at: DateTime<Utc>,
     pub policy: AgentPolicy,
     pub stats: AgentStats,
+    // Spec 081 registry hardening — backward-compatible: a snapshot written by
+    // pre-081 code simply omits these and they default to None on restore.
+    #[serde(default)]
+    pub exe_path: Option<String>,
+    #[serde(default)]
+    pub owner_uid: Option<u32>,
+    #[serde(default)]
+    pub cmdline_fingerprint: Option<String>,
 }
 
 // `AgentStats` needs `Deserialize` for the round-trip; the existing
@@ -562,6 +659,9 @@ mod tests {
                 connected_at: chrono::Utc::now(),
                 policy: AgentPolicy::default(),
                 stats: AgentStats::default(),
+                exe_path: None,
+                owner_uid: None,
+                cmdline_fingerprint: None,
             }],
         };
         std::fs::write(&path, serde_json::to_string(&snapshot).unwrap()).unwrap();
@@ -579,6 +679,180 @@ mod tests {
             parsed > 0x42,
             "new id {new_id} should be > ag-0042 to avoid collision"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Spec 081 registry hardening — exe_path / owner_uid /
+    // cmdline_fingerprint round-trip + backward-compat.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn connect_with_facts_stores_identity_facts() {
+        let mut reg = Registry::new();
+        let id = reg
+            .connect_with_facts(
+                "OpenClaw",
+                unique_pid(),
+                Some("prod"),
+                Some("/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js".to_string()),
+                Some(1000),
+                Some(
+                    "node|/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js"
+                        .to_string(),
+                ),
+            )
+            .unwrap();
+        let agent = reg.get_mut(&id).unwrap();
+        assert_eq!(agent.owner_uid, Some(1000));
+        assert!(agent
+            .exe_path
+            .as_deref()
+            .unwrap()
+            .contains("node_modules/openclaw"));
+        assert!(agent
+            .cmdline_fingerprint
+            .as_deref()
+            .unwrap()
+            .starts_with("node|"));
+    }
+
+    #[test]
+    fn hardening_facts_round_trip_through_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        let pid = unique_pid();
+        let mut reg = Registry::new();
+        reg.connect_with_facts(
+            "OpenClaw",
+            pid,
+            Some("prod"),
+            Some("/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js".to_string()),
+            Some(1000),
+            Some("node|/home/lab/x".to_string()),
+        )
+        .unwrap();
+        reg.save_to(&path).unwrap();
+
+        let restored = Registry::restore_from(&path).unwrap();
+        let agent = restored.by_pid(pid).expect("restored");
+        assert_eq!(agent.owner_uid, Some(1000));
+        assert_eq!(
+            agent.exe_path.as_deref(),
+            Some("/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js")
+        );
+        assert_eq!(
+            agent.cmdline_fingerprint.as_deref(),
+            Some("node|/home/lab/x")
+        );
+    }
+
+    #[test]
+    fn pre_081_snapshot_without_hardening_fields_restores_with_none() {
+        // Backward-compat: a snapshot written before spec 081 has no
+        // exe_path/owner_uid/cmdline_fingerprint keys. `#[serde(default)]`
+        // must default them to None instead of failing the restore.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        let pid = unique_pid();
+        let legacy = format!(
+            r#"{{
+              "schema_version": 1,
+              "next_id": 2,
+              "agents": [{{
+                "id": "ag-0001",
+                "name": "openclaw",
+                "instance_label": "legacy",
+                "pid": {pid},
+                "kind": "Agent",
+                "integration": "official",
+                "connected_at": "2026-05-18T00:00:00Z",
+                "policy": {{"mode":"warn","block_sensitive_paths":true,"wrap_mcp":true,"max_calls_per_minute":30}},
+                "stats": {{"tool_calls":0,"blocked":0,"warnings":0,"files_accessed":0}}
+              }}]
+            }}"#
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let restored = Registry::restore_from(&path).expect("legacy snapshot must restore");
+        let agent = restored.by_pid(pid).expect("restored legacy agent");
+        assert_eq!(agent.exe_path, None);
+        assert_eq!(agent.owner_uid, None);
+        assert_eq!(agent.cmdline_fingerprint, None);
+    }
+
+    // -----------------------------------------------------------------
+    // Spec 081 registry hardening — LIVE `/proc` capture path
+    // (`capture_proc_facts` + `connect`). These hit the real `/proc` of the
+    // running test process so the capture branch is covered on Linux CI; on
+    // non-Linux the reads return None and we assert that fail-soft shape.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn capture_proc_facts_reads_own_process() {
+        let (exe_path, owner_uid, cmdline_fingerprint) = capture_proc_facts(std::process::id());
+        if cfg!(target_os = "linux") {
+            assert!(
+                exe_path.is_some(),
+                "own /proc/self/exe must readlink on Linux"
+            );
+            assert!(
+                owner_uid.is_some(),
+                "own /proc/self/status Uid must parse on Linux"
+            );
+            let fp = cmdline_fingerprint.expect("own /proc/self/cmdline must read on Linux");
+            assert!(
+                !fp.is_empty(),
+                "fingerprint (first-2-argv joined by |) must be non-empty"
+            );
+        } else {
+            // No /proc → best-effort capture yields all-None (connect still works).
+            assert!(exe_path.is_none());
+            assert!(owner_uid.is_none());
+            assert!(cmdline_fingerprint.is_none());
+        }
+    }
+
+    #[test]
+    fn capture_proc_facts_missing_pid_is_all_none() {
+        // A pid that does not exist → every /proc read fails → all None. This
+        // is the fail-soft branch that keeps connect() working even when the
+        // live capture cannot read anything.
+        let (exe_path, owner_uid, cmdline_fingerprint) = capture_proc_facts(u32::MAX);
+        assert!(exe_path.is_none());
+        assert!(owner_uid.is_none());
+        assert!(cmdline_fingerprint.is_none());
+    }
+
+    #[test]
+    fn connect_captures_live_proc_facts_for_own_pid() {
+        // `connect` (as opposed to `connect_with_facts`) runs the live
+        // `capture_proc_facts` against the supplied pid. Using the test
+        // process's own pid means the capture succeeds on Linux and the stored
+        // ConnectedAgent carries the identity facts.
+        let mut reg = Registry::new();
+        let pid = std::process::id();
+        let id = reg
+            .connect("OpenClaw", pid, None)
+            .expect("connect with live capture");
+        let agent = reg.by_pid(pid).expect("stored agent");
+        assert_eq!(agent.id, id);
+        if cfg!(target_os = "linux") {
+            assert!(
+                agent.exe_path.is_some(),
+                "connect() must capture /proc/self/exe on Linux"
+            );
+            assert!(
+                agent.owner_uid.is_some(),
+                "connect() must capture owner uid on Linux"
+            );
+            assert!(
+                agent
+                    .cmdline_fingerprint
+                    .as_deref()
+                    .map(|f| !f.is_empty())
+                    .unwrap_or(false),
+                "connect() must capture a non-empty cmdline fingerprint on Linux"
+            );
+        }
     }
 
     #[test]
