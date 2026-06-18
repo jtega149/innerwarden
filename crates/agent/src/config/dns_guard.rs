@@ -20,6 +20,11 @@ pub struct DnsGuardConfig {
     pub export_enabled: bool,
     /// File the agent writes (and the DNS Guard's `--denylist` reads). Written
     /// atomically (temp + rename) so the guard never reads a half-written file.
+    /// Defaults to the **data dir** (`/var/lib/innerwarden`), not the config dir:
+    /// the agent runs as the unprivileged `innerwarden` user and can only write
+    /// its data dir — a `/etc/innerwarden` default fails with permission denied
+    /// (found deploying on a real box). The DNS Guard runs as root and reads it
+    /// from there.
     #[serde(default = "default_dns_guard_denylist_path")]
     pub denylist_path: String,
     /// Master switch for ingesting the DNS Guard's block events back into the
@@ -46,7 +51,7 @@ impl Default for DnsGuardConfig {
 }
 
 fn default_dns_guard_denylist_path() -> String {
-    "/etc/innerwarden/dns-deny.txt".to_string()
+    "/var/lib/innerwarden/dns-deny.txt".to_string()
 }
 
 fn default_dns_guard_events_path() -> String {

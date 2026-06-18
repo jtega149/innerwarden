@@ -54,19 +54,46 @@ pub(crate) fn process_dns_guard_export_tick(cfg: &config::DnsGuardConfig, state:
     }
 }
 
-/// Collect the agent's known-malicious domains (deduped + sorted). Sourced from
-/// the consolidated threat-feed intel. Returns empty if no feed is configured.
+/// Collect the agent's known-malicious domains (deduped + sorted, cleaned).
+/// Sourced from the consolidated threat-feed intel. Returns empty if no feed is
+/// configured.
 fn gather_malicious_domains(state: &AgentState) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     if let Some(tf) = state.threat_feed.as_ref() {
-        for d in &tf.state().malicious_domains {
-            let n = d.trim().trim_end_matches('.').to_ascii_lowercase();
-            if !n.is_empty() {
-                out.insert(n);
+        for raw in &tf.state().malicious_domains {
+            if let Some(d) = clean_domain_entry(raw) {
+                out.insert(d);
             }
         }
     }
     out
+}
+
+/// A threat-feed "domain" entry may be a bare domain OR a **hosts-file line**
+/// (`0.0.0.0 evil.com`, `127.0.0.1\tevil.com`) — many public domain blocklists
+/// ship in hosts format and the feed ingestion stored the raw lines. Take the
+/// last whitespace-separated token as the candidate, lowercase it, strip a
+/// trailing dot, and reject anything not domain-shaped (a bare IP, no dot, or
+/// non-hostname characters). Without this the denylist fills with `127.0.0.1\t…`
+/// junk that never matches a real query.
+fn clean_domain_entry(raw: &str) -> Option<String> {
+    let token = raw.split_whitespace().last()?;
+    let d = token.trim().trim_end_matches('.').to_ascii_lowercase();
+    if d.is_empty() || !d.contains('.') {
+        return None;
+    }
+    // reject a bare IPv4 (all digits + dots)
+    if d.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    // only hostname-legal characters
+    if !d
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(d)
 }
 
 /// Render the denylist file content: a header comment + one domain per line,
@@ -149,6 +176,27 @@ mod tests {
         assert!(interval_elapsed(0, 1000, 300));
         assert!(!interval_elapsed(1000, 1100, 300));
         assert!(interval_elapsed(1000, 1300, 300));
+    }
+
+    #[test]
+    fn clean_domain_entry_handles_hosts_format_and_junk() {
+        // bare domain
+        assert_eq!(clean_domain_entry("Evil.COM."), Some("evil.com".into()));
+        // hosts-file lines (the real test001 feed shape) → just the domain
+        assert_eq!(
+            clean_domain_entry("127.0.0.1\twww.rnft8u0a.shop"),
+            Some("www.rnft8u0a.shop".into())
+        );
+        assert_eq!(
+            clean_domain_entry("0.0.0.0 c2.evil.net"),
+            Some("c2.evil.net".into())
+        );
+        // junk / non-domains rejected
+        assert_eq!(clean_domain_entry("127.0.0.1"), None); // bare IP
+        assert_eq!(clean_domain_entry("localhost"), None); // no dot
+        assert_eq!(clean_domain_entry(""), None);
+        assert_eq!(clean_domain_entry("# comment"), None); // last token "comment" has no dot
+        assert_eq!(clean_domain_entry("bad domain with spaces!.x"), None); // illegal char
     }
 
     #[test]
