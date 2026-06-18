@@ -106,6 +106,44 @@ use innerwarden_core::event::Severity;
 use innerwarden_core::incident::Incident;
 
 // ---------------------------------------------------------------------------
+// Live "Needs review" count for the Daily Security Briefing
+// ---------------------------------------------------------------------------
+
+/// The number of open cases that still need an operator decision RIGHT NOW,
+/// computed from the SAME canonical source the dashboard "Needs review" tile
+/// reads (`data_api::compute_overview_counts_from_sqlite`, whose
+/// `attention_count` is the per-attacker `KpiBucket::Attention` aggregate /
+/// `case_metrics::KpiBucket::Attention -> NeedsReview`).
+///
+/// The daily briefing MUST use this, not
+/// `grouping_engine.drain_digest_stats().needs_review_groups` — that is a
+/// transient per-window group counter drained on every send, so it diverges
+/// from the live dashboard number (e.g. a Low/Medium `needs_review` incident
+/// auto-dismissed by the spec-062 24h timeout is still counted by the grouped
+/// counter but has already dropped out of the live `attention_count`). Reading
+/// the live source at send time means the briefing can never tell the operator
+/// to "review N items" that the dashboard shows as zero.
+///
+/// `date` is the local-day key (`%Y-%m-%d`) the briefing is for; the function
+/// returns 0 on any store/query error so a transient SQLite hiccup degrades to
+/// the honest "nothing needs you" rather than a fabricated number.
+pub(crate) fn live_needs_review_count(store: &innerwarden_store::Store, date: &str) -> usize {
+    let now = chrono::Utc::now();
+    data_api::compute_overview_counts_from_sqlite(
+        store,
+        date,
+        0,    // sev_min_rank: no severity floor — count every open case
+        None, // detector_substring: all detectors
+        None, // hour_filter: the whole day
+        now,
+        &data_api::DegradedSignals::default(),
+        std::path::Path::new(""), // data_dir: unused for the attention tally
+    )
+    .map(|c| c.attention_count)
+    .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // Security headers middleware
 // ---------------------------------------------------------------------------
 

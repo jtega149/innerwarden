@@ -377,6 +377,12 @@ pub fn truncate_callback_pub(s: &str) -> String {
     truncate_utf8_bytes(s, TELEGRAM_MAX_CALLBACK_BYTES)
 }
 
+/// Crate wrapper for `country_flag_emoji` — used by the daily briefing body to
+/// render a flag next to a blocked source IP. Empty string on bad input.
+pub(crate) fn country_flag_emoji_pub(code: &str) -> String {
+    country_flag_emoji(code)
+}
+
 /// Visual score bar for AbuseIPDB confidence (e.g. "████░░░░ 80/100").
 pub(super) fn reputation_score_bar(score: u8) -> String {
     let filled = (score as usize * 8 / 100).min(8);
@@ -677,9 +683,13 @@ fn simple_detail_line(incident: &Incident, ip_entity: &Option<String>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The retired enriched-digest anchors import directly from `burst` (the
+    // `telegram::` re-export was dropped when `format_daily_briefing` became the
+    // production renderer).
+    use crate::telegram::burst::{format_daily_digest_enriched, PipelineDigestStats};
     use crate::telegram::{
-        append_to_allowlist, explain_detector, format_daily_digest, format_daily_digest_enriched,
-        format_simple_status, log_false_positive, PipelineDigestStats,
+        append_to_allowlist, explain_detector, format_daily_digest, format_simple_status,
+        log_false_positive,
     };
     use chrono::Utc;
     use innerwarden_core::{entities::EntityRef, event::Severity, incident::Incident};
