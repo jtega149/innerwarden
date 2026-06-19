@@ -808,6 +808,27 @@ pub(crate) async fn handle_telegram_bot_command(
     }
 
     // /capabilities - list capabilities and integrations with inline enable buttons
+    // Bare /enable or /disable (no capability arg): show usage + the tappable
+    // capabilities keyboard instead of an "unknown command" hint.
+    if result.incident_id == "__cap_usage__" {
+        info!(operator = %result.operator_name, "Telegram bare /enable or /disable received");
+        if cfg.telegram.bot.enabled {
+            let text = format!(
+                "Usage: <code>/enable &lt;capability&gt;</code> or <code>/disable &lt;capability&gt;</code>.\n\
+                 Tap a capability below, or run <code>/capabilities</code> for the full list.\n\n{}",
+                format_capabilities(cfg)
+            );
+            let keyboard = capabilities_keyboard(cfg);
+            if let Some(ref tg) = state.telegram_client {
+                let tg = tg.clone();
+                tokio::spawn(async move {
+                    let _ = tg.send_text_with_keyboard(&text, keyboard).await;
+                });
+            }
+        }
+        return true;
+    }
+
     if result.incident_id == "__capabilities__" {
         info!(operator = %result.operator_name, "Telegram /capabilities command received");
         if cfg.telegram.bot.enabled {
@@ -1165,6 +1186,7 @@ mod tests {
             "__blocked__",
             "__unknown_cmd__",
             "__capabilities__",
+            "__cap_usage__",
             "__start__",
             "__enable2fa__",
         ];

@@ -347,7 +347,10 @@ pub(super) fn parse_callback(data: &str, operator: &str) -> Option<ApprovalResul
             chosen_action: String::new(),
         });
     }
-    // Capabilities inline keyboard: "enable:<id>" → routed to __enable__:<id> handler
+    // Capabilities inline keyboard: "enable:<id>" is forwarded verbatim as
+    // `enable:<id>` and consumed by the dedicated `enable:` handler in
+    // bot_commands (runs `innerwarden enable <id>` via CLI). This is distinct
+    // from the `__enable__:<cap>` path used by the typed `/enable <cap>` command.
     if let Some(cap_id) = data.strip_prefix("enable:") {
         return Some(ApprovalResult {
             incident_id: format!("enable:{cap_id}"),

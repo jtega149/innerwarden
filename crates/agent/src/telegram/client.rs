@@ -243,7 +243,10 @@ impl TelegramClient {
                             }),
                             serde_json::json!({
                                 "text": "🙈 Ignore",
-                                "callback_data": "quick:ignore"
+                                // Carry the incident id so the tap records a real
+                                // false-positive signal (routed to __fp__ like the
+                                // fp: button), not just a toast that claims it did.
+                                "callback_data": callback_data("quick:ignore:", &incident.incident_id)
                             }),
                         ]);
 
@@ -1342,12 +1345,38 @@ impl TelegramClient {
                                     if cb_chat_id != 0 {
                                         self.react(cb_chat_id, cb_msg_id, "\u{1f4a1}").await;
                                     }
-                                } else if data == "quick:ignore" {
-                                    // Just ack with toast - no further action needed
+                                } else if let Some(id) = data.strip_prefix("quick:ignore:") {
+                                    // Record a REAL false-positive signal: route the
+                                    // incident through __fp__ exactly like the fp:
+                                    // button so the feedback tracker learns from it.
+                                    // The toast only claims "logged" because it now is.
                                     let _ = self
                                         .answer_callback_toast(
                                             &callback.id,
                                             "👍 Logged as false positive. Keeping eyes on it.",
+                                        )
+                                        .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f44d}").await;
+                                    }
+                                    let result = ApprovalResult {
+                                        incident_id: format!("__fp__:{id}"),
+                                        approved: true,
+                                        always: false,
+                                        operator_name: operator.clone(),
+                                        chosen_action: String::new(),
+                                    };
+                                    if approval_tx.send(result).await.is_err() {
+                                        return;
+                                    }
+                                } else if data == "quick:ignore" {
+                                    // Legacy button (pre-id, still in old chat history):
+                                    // no incident id to attribute, so do NOT claim it
+                                    // was logged. Just dismiss honestly.
+                                    let _ = self
+                                        .answer_callback_toast(
+                                            &callback.id,
+                                            "👍 Dismissed. I'll keep watching.",
                                         )
                                         .await;
                                     if cb_chat_id != 0 {
@@ -1651,6 +1680,12 @@ impl TelegramClient {
                                     || text.starts_with("/list ")
                                 {
                                     "__capabilities__".to_string()
+                                } else if text == "/enable" || text == "/disable" {
+                                    // Bare command with no capability argument: reply
+                                    // with usage instead of the generic "unknown
+                                    // command" hint (which makes the user feel they
+                                    // broke it). strip_prefix below needs the arg.
+                                    "__cap_usage__".to_string()
                                 } else if let Some(cap) = text.strip_prefix("/enable ") {
                                     format!("__enable__:{cap}")
                                 } else if let Some(cap) = text.strip_prefix("/disable ") {
@@ -2888,6 +2923,80 @@ mod tests {
         assert!(
             ids.iter().any(|id| id == "__start__"),
             "/start message should route to __start__ sentinel"
+        );
+
+        drop(rx);
+        if tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quick_ignore_records_fp_and_bare_enable_shows_usage() -> anyhow::Result<()> {
+        // quick:ignore:<id> must route a REAL false-positive (__fp__:<id>) to the
+        // feedback tracker (it previously only showed a toast claiming it did),
+        // and bare /enable / /disable must route to the usage sentinel instead of
+        // the generic unknown-command hint.
+        let updates = vec![json!({
+            "ok": true,
+            "result": [
+                {
+                    "update_id": 41,
+                    "callback_query": {
+                        "id": "cb-41",
+                        "from": { "first_name": "Bob" },
+                        "data": "quick:ignore:inc-99",
+                        "message": { "message_id": 4041, "chat": { "id": 99 } }
+                    }
+                },
+                {
+                    "update_id": 42,
+                    "message": {
+                        "message_id": 4042,
+                        "text": "/enable",
+                        "from": { "first_name": "Bob" },
+                        "chat": { "id": 99 }
+                    }
+                },
+                {
+                    "update_id": 43,
+                    "message": {
+                        "message_id": 4043,
+                        "text": "/disable",
+                        "from": { "first_name": "Bob" },
+                        "chat": { "id": 99 }
+                    }
+                }
+            ]
+        })];
+
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port, cert_dir.path())?);
+        let (tx, mut rx) = mpsc::channel::<ApprovalResult>(16);
+        let mut task = tokio::spawn(client.run_polling(tx));
+
+        let mut ids = Vec::new();
+        while let Ok(Some(r)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            ids.push(r.incident_id);
+            if ids.len() >= 3 {
+                break;
+            }
+        }
+        assert!(
+            ids.iter().any(|id| id == "__fp__:inc-99"),
+            "quick:ignore:<id> must record a real false positive (__fp__:<id>), got {ids:?}"
+        );
+        assert_eq!(
+            ids.iter()
+                .filter(|id| id.as_str() == "__cap_usage__")
+                .count(),
+            2,
+            "bare /enable and /disable must both route to __cap_usage__, got {ids:?}"
         );
 
         drop(rx);
