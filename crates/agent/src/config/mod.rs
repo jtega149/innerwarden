@@ -7,6 +7,7 @@ use serde::Deserialize;
 // Spec 068: config sections relocated into submodules. Defaults,
 // validation helpers, load(), AgentConfig and tests stay here; the
 // section structs are re-exported so every `config::*` path is unchanged.
+mod agent_guard;
 mod ai;
 mod dashboard;
 mod dns_guard;
@@ -25,6 +26,7 @@ mod retention;
 mod shield;
 mod signing;
 
+pub use agent_guard::*;
 pub use ai::*;
 pub use dashboard::*;
 pub use dns_guard::*;
@@ -68,6 +70,12 @@ pub struct AgentConfig {
     /// paid `innerwarden-dns-guard` resolver's denylist file. Default off.
     #[serde(default)]
     pub dns_guard: DnsGuardConfig,
+    /// Spec 081: managed-agent coexistence. Gates the slow-loop registry
+    /// reconciliation that auto-registers co-located AI agents (and prunes dead
+    /// pids) so the response-side verifier's `by_pid` hint survives agent
+    /// restarts. `auto_register` defaults ON.
+    #[serde(default)]
+    pub agent_guard: AgentGuardConfig,
     /// Spec 062: decision review + learned suppression. Absent `[learning]`
     /// section deserializes to safe defaults (shadow mode), so existing
     /// agent.toml files upgrade with no edits.
@@ -2276,6 +2284,7 @@ enabled = true
             "zero_trust",
             "graph_only_detectors",
             "incident_flow",
+            "agent_guard",
         ];
         // Build a minimal TOML with every section header. None of the
         // sections gets unknown keys, so they all default-fill. If any

@@ -61,6 +61,7 @@ mod abuseipdb;
 mod abuseipdb_report_budget;
 mod agent_context;
 mod agent_discovery;
+mod agent_registry_reconcile;
 mod ai;
 mod allowlist;
 mod attacker_intel;
@@ -665,6 +666,11 @@ struct AgentState {
     /// Spec 076 phase 2 — last block-enforcement reconcile tick (re-applies
     /// firewall rules that silently dropped while their record stayed Active).
     last_block_enforcement_reconcile: std::time::Instant,
+    /// Spec 081 follow-up — last agent-guard registry reconcile tick. Throttles
+    /// the slow-loop auto-registration / dead-pid pruning of co-located AI agents
+    /// (see `agent_registry_reconcile`) to ~5 min so the response-side verifier's
+    /// `by_pid` hint survives agent restarts without a per-tick `/proc` scan.
+    last_agent_registry_reconcile: std::time::Instant,
     /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
     /// Hot-reloaded every 60s. Merged with static config allowlist at check time.
     dynamic_trusted_ips: Vec<String>,

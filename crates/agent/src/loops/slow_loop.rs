@@ -1345,6 +1345,20 @@ pub(crate) async fn process_narrative_tick(
         state.last_block_enforcement_reconcile = std::time::Instant::now();
     }
 
+    // Spec 081 follow-up — agent-guard registry reconciliation. Self-throttled
+    // (5 min): auto-register co-located AI agents (OpenClaw, …) so the managed-
+    // agent response gate's `by_pid` hint survives agent restarts, and prune
+    // dead pids so a recycled pid can never inherit the spec-081 exemption. Only
+    // supplies the membership hint — the verifier still independently re-IDs +
+    // fingerprint-matches + trusted-root + own-config + uid-checks live (no new
+    // hole). No-op unless `[agent_guard] auto_register = true` (default on).
+    crate::agent_registry_reconcile::process_agent_registry_reconcile_tick(
+        &cfg.agent_guard,
+        state,
+        data_dir,
+    )
+    .await;
+
     // Feed events through threat DNA engine (behavioral fingerprinting + anomaly detection).
     if cfg.dna.enabled {
         dna_inline::process_events(

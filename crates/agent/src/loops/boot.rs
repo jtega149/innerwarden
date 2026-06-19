@@ -1525,6 +1525,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         // dropped while the agent was down / a stale reloaded set, fast.
         last_block_enforcement_reconcile: std::time::Instant::now()
             - std::time::Duration::from_secs(4 * 60),
+        // Offset so the first agent-guard registry reconcile runs ~1 min after
+        // boot — re-registers a co-located agent that restarted (new pid) while
+        // the agent was down, before the next incident could sever it.
+        last_agent_registry_reconcile: std::time::Instant::now()
+            - std::time::Duration::from_secs(4 * 60),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
         dynamic_trusted_ips: Vec::new(),
         dynamic_trusted_users: Vec::new(),
