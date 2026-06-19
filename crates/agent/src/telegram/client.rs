@@ -1662,6 +1662,12 @@ impl TelegramClient {
                                     "__decisions__".to_string()
                                 } else if text == "/blocked" || text.starts_with("/blocked ") {
                                     "__blocked__".to_string()
+                                } else if text == "/mode" {
+                                    // Bare /mode → show current mode + options.
+                                    "__mode__:".to_string()
+                                } else if let Some(m) = text.strip_prefix("/mode ") {
+                                    // /mode guard|watch|dryrun → live mode change.
+                                    format!("__mode__:{m}")
                                 } else if text == "/guard" || text.starts_with("/guard ") {
                                     "__guard__".to_string()
                                 } else if text == "/watch" || text.starts_with("/watch ") {

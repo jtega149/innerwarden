@@ -671,6 +671,13 @@ struct AgentState {
     /// (see `agent_registry_reconcile`) to ~5 min so the response-side verifier's
     /// `by_pid` hint survives agent restarts without a per-tick `/proc` scan.
     last_agent_registry_reconcile: std::time::Instant,
+    /// One-shot signal from the Telegram `/mode` command (set deep in the
+    /// command handler, which only has `&mut state`) up to the main loop, which
+    /// owns `cfg`, applies the change via `agent_context::apply_guardian_mode`,
+    /// then persists it to agent.toml. Kept as a signal (not a separate
+    /// override) so the mutated `cfg` stays the single source of truth for every
+    /// `cfg.responder.*` enforcement read, with no per-site threading and no gap.
+    pending_mode_change: Option<telegram::GuardianMode>,
     /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
     /// Hot-reloaded every 60s. Merged with static config allowlist at check time.
     dynamic_trusted_ips: Vec<String>,

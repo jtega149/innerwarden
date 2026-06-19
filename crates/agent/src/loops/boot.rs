@@ -548,7 +548,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
     // Load config (optional - all fields have sensible defaults).
     // Done before dashboard check so action config can be wired in.
-    let cfg = match &cli.config {
+    // `mut` so the Telegram `/mode` command can flip the responder guardian
+    // mode live (applied to this owned cfg in the main loop, then persisted).
+    // Mutating cfg in place keeps it the single source of truth for every
+    // downstream `cfg.responder.*` enforcement read (no per-site override).
+    let mut cfg = match &cli.config {
         Some(path) => config::load(path)?,
         None => config::AgentConfig::default(),
     };
@@ -1530,6 +1534,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         // the agent was down, before the next incident could sever it.
         last_agent_registry_reconcile: std::time::Instant::now()
             - std::time::Duration::from_secs(4 * 60),
+        pending_mode_change: None,
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
         dynamic_trusted_ips: Vec::new(),
         dynamic_trusted_users: Vec::new(),
@@ -1907,6 +1912,23 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         };
 
         loop {
+            // Apply a live `/mode` change requested via Telegram on the previous
+            // tick. Done here, in the loop that owns `cfg`, so the mutation is
+            // borrow-clean and every subsequent enforcement read sees the new
+            // mode. Also persist the two keys to agent.toml for restart
+            // durability (best-effort; the in-memory flip already took effect).
+            if let Some(mode) = crate::agent_context::take_and_apply_pending_mode(
+                &mut cfg,
+                &mut state.pending_mode_change,
+                cli.config.as_deref(),
+            ) {
+                info!(
+                    mode = ?mode,
+                    responder_enabled = cfg.responder.enabled,
+                    dry_run = cfg.responder.dry_run,
+                    "guardian mode changed live via Telegram /mode"
+                );
+            }
             let shutdown = tokio::select! {
                 _ = incident_ticker.tick() => {
                     crate::loops::fast_loop::run_incident_tick(

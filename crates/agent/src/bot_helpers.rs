@@ -1144,6 +1144,66 @@ fn execute_verified_action(
                 }
             }
         }
+        two_factor::PendingActionType::ModeChange { ref mode } => {
+            apply_mode_change_request(state, operator, mode);
+        }
+    }
+}
+
+/// Parse a `/mode` argument and queue the guardian-mode change for the main
+/// loop (which owns `cfg` and applies + persists it). Shared by the 2FA-off
+/// inline path and the post-TOTP path so the actuation logic lives in one place.
+/// Unknown argument replies with usage and queues nothing.
+pub(crate) fn apply_mode_change_request(state: &mut AgentState, operator: &str, mode_arg: &str) {
+    let mode = match mode_arg.trim().to_ascii_lowercase().as_str() {
+        "guard" | "live" | "on" | "defend" => Some(telegram::GuardianMode::Guard),
+        "watch" | "monitor" | "passive" | "off" => Some(telegram::GuardianMode::Watch),
+        "dryrun" | "dry-run" | "dry_run" | "simulate" => Some(telegram::GuardianMode::DryRun),
+        _ => None,
+    };
+    match mode {
+        Some(m) => {
+            state.pending_mode_change = Some(m);
+            let (label, desc) = match m {
+                telegram::GuardianMode::Guard => {
+                    ("Guard", "auto-defend is ON. I block threats automatically.")
+                }
+                telegram::GuardianMode::Watch => (
+                    "Watch",
+                    "passive monitor. I alert you but take no action myself.",
+                ),
+                telegram::GuardianMode::DryRun => (
+                    "Dry-run",
+                    "I simulate the action and log what I would do, but change nothing.",
+                ),
+            };
+            write_telegram_triage_audit(
+                state,
+                "__mode__",
+                operator,
+                "mode_change",
+                None,
+                None,
+                format!("Operator {operator} switched guardian mode to {label}"),
+                format!("mode_change:{label}"),
+            );
+            tg_reply(
+                state,
+                format!(
+                    "\u{1f6e1}\u{fe0f} <b>Mode set to {label}</b>\n{desc}\nApplied now and saved for the next restart."
+                ),
+            );
+        }
+        None => {
+            tg_reply(
+                state,
+                format!(
+                    "Unknown mode <code>{}</code>. Use <code>/mode guard</code> (auto-defend), \
+                     <code>/mode watch</code> (monitor only), or <code>/mode dryrun</code> (simulate).",
+                    telegram::escape_html_pub(mode_arg)
+                ),
+            );
+        }
     }
 }
 
@@ -1414,6 +1474,42 @@ mod tests {
         assert_eq!(
             graph_last_decisions(&kg, 3),
             "⚖️ No decisions yet today - standing by."
+        );
+    }
+
+    #[test]
+    fn apply_mode_change_request_queues_valid_mode_and_rejects_garbage() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        // Each canonical word + an alias queues the right mode.
+        apply_mode_change_request(&mut state, "op", "guard");
+        assert!(matches!(
+            state.pending_mode_change,
+            Some(telegram::GuardianMode::Guard)
+        ));
+        apply_mode_change_request(&mut state, "op", "WATCH");
+        assert!(matches!(
+            state.pending_mode_change,
+            Some(telegram::GuardianMode::Watch)
+        ));
+        apply_mode_change_request(&mut state, "op", "dry-run");
+        assert!(matches!(
+            state.pending_mode_change,
+            Some(telegram::GuardianMode::DryRun)
+        ));
+        apply_mode_change_request(&mut state, "op", "off");
+        assert!(matches!(
+            state.pending_mode_change,
+            Some(telegram::GuardianMode::Watch)
+        ));
+
+        // Garbage must NOT queue a change (fail closed; the prior value stays).
+        state.pending_mode_change = None;
+        apply_mode_change_request(&mut state, "op", "destroy-everything");
+        assert!(
+            state.pending_mode_change.is_none(),
+            "an unknown mode must not queue any change"
         );
     }
 

@@ -529,6 +529,46 @@ pub(crate) async fn handle_telegram_bot_command(
         return true;
     }
 
+    // /mode [guard|watch|dryrun] - live guardian-mode control from the phone.
+    // Bare /mode shows the current mode + options; an argument flips it (2FA-gated
+    // because it changes whether the responder enforces for real). The actual
+    // cfg mutation + persist happens in the main loop via pending_mode_change.
+    if let Some(mode_arg) = result.incident_id.strip_prefix("__mode__:") {
+        let mode_arg = mode_arg.trim().to_string();
+        info!(operator = %result.operator_name, mode = %mode_arg, "Telegram /mode command received");
+        if cfg.telegram.bot.enabled {
+            if mode_arg.is_empty() {
+                // No argument: report the current mode and the choices.
+                let mode = guardian_mode(cfg);
+                tg_reply(
+                    state,
+                    format!(
+                        "\u{1f6e1}\u{fe0f} <b>Current mode: {}</b>\n<i>{}</i>\n\n\
+                         Change it: <code>/mode guard</code> (auto-defend), \
+                         <code>/mode watch</code> (monitor only), \
+                         <code>/mode dryrun</code> (simulate).",
+                        mode.label(),
+                        mode.description()
+                    ),
+                );
+            } else if bot_helpers::check_2fa_gate(
+                state,
+                cfg,
+                &result.operator_name,
+                two_factor::PendingActionType::ModeChange {
+                    mode: mode_arg.clone(),
+                },
+            ) {
+                // 2FA enabled: pending stored, TOTP requested. The post-TOTP
+                // path applies the change via apply_mode_change_request.
+            } else {
+                // 2FA disabled: apply immediately.
+                bot_helpers::apply_mode_change_request(state, &result.operator_name, &mode_arg);
+            }
+        }
+        return true;
+    }
+
     if result.incident_id == "__guard__" {
         info!(operator = %result.operator_name, "Telegram /guard command received");
         if cfg.telegram.bot.enabled {
@@ -1218,6 +1258,35 @@ mod tests {
             let handled = handle_telegram_bot_command(&cmd(id), dir.path(), &cfg, &mut state).await;
             assert!(handled, "command {id} should be handled");
         }
+    }
+
+    #[tokio::test]
+    async fn mode_command_queues_change_and_reports_current() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+        // Default config has no 2FA, so /mode applies inline (queues the change).
+        let handled =
+            handle_telegram_bot_command(&cmd("__mode__:guard"), dir.path(), &cfg, &mut state).await;
+        assert!(handled, "__mode__:guard must be handled");
+        assert!(
+            matches!(
+                state.pending_mode_change,
+                Some(telegram::GuardianMode::Guard)
+            ),
+            "/mode guard (no 2FA) must queue a Guard change for the main loop"
+        );
+
+        // Bare /mode reports the current mode and queues nothing new.
+        state.pending_mode_change = None;
+        let handled_bare =
+            handle_telegram_bot_command(&cmd("__mode__:"), dir.path(), &cfg, &mut state).await;
+        assert!(handled_bare, "bare /mode must be handled");
+        assert!(
+            state.pending_mode_change.is_none(),
+            "bare /mode just reports; it must not queue a change"
+        );
     }
 
     #[tokio::test]

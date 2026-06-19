@@ -6,15 +6,92 @@ pub(crate) fn incident_detector(incident_id: &str) -> &str {
     incident_id.split(':').next().unwrap_or("unknown")
 }
 
-/// Returns the current guardian mode based on responder configuration.
+/// Returns the guardian mode implied by the current responder configuration.
+/// Because `/mode` mutates the owned `cfg` in place, this always reflects the
+/// live mode (there is no separate override to consult).
 pub(crate) fn guardian_mode(cfg: &config::AgentConfig) -> telegram::GuardianMode {
-    if !cfg.responder.enabled {
+    mode_from_responder(cfg.responder.enabled, cfg.responder.dry_run)
+}
+
+/// The single source of truth mapping `(enabled, dry_run)` to a guardian mode.
+/// Watch = responder off; DryRun = on but simulated; Guard = on and live.
+pub(crate) fn mode_from_responder(enabled: bool, dry_run: bool) -> telegram::GuardianMode {
+    if !enabled {
         telegram::GuardianMode::Watch
-    } else if cfg.responder.dry_run {
+    } else if dry_run {
         telegram::GuardianMode::DryRun
     } else {
         telegram::GuardianMode::Guard
     }
+}
+
+/// Apply a guardian mode to the responder config in place. The Telegram `/mode`
+/// command mutates the agent's owned `cfg` through this so EVERY downstream
+/// `cfg.responder.{enabled,dry_run}` read (the ~60 enforcement + record sites)
+/// sees the new mode immediately and consistently. There is no config
+/// hot-reload, so this in-place mutation IS the runtime actuation; `/mode` also
+/// persists the same two keys to agent.toml for restart durability.
+///   Watch  = responder off (passive monitor)
+///   DryRun = on but simulated
+///   Guard  = on and live (auto-defend)
+pub(crate) fn apply_guardian_mode(cfg: &mut config::AgentConfig, mode: telegram::GuardianMode) {
+    match mode {
+        telegram::GuardianMode::Watch => {
+            cfg.responder.enabled = false;
+        }
+        telegram::GuardianMode::DryRun => {
+            cfg.responder.enabled = true;
+            cfg.responder.dry_run = true;
+        }
+        telegram::GuardianMode::Guard => {
+            cfg.responder.enabled = true;
+            cfg.responder.dry_run = false;
+        }
+    }
+}
+
+/// Persist the responder mode (the two keys `/mode` changes) to agent.toml,
+/// format-preserving + atomic, so a phone mode flip survives a restart. The
+/// in-memory `cfg` mutation already took effect; this is best-effort durability
+/// (callers log on error, never fail the loop). Creates the `[responder]` table
+/// and the file if missing.
+pub(crate) fn persist_responder_mode(
+    path: &std::path::Path,
+    enabled: bool,
+    dry_run: bool,
+) -> std::io::Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    doc["responder"]["enabled"] = toml_edit::value(enabled);
+    doc["responder"]["dry_run"] = toml_edit::value(dry_run);
+    // Atomic replace: write a sibling temp file then rename (same dir = same fs).
+    let tmp = path.with_extension("toml.iwtmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Take a queued `/mode` change (if any), apply it to `cfg` in place, and
+/// persist it to `config_path` (best-effort). Returns the applied mode so the
+/// caller can log it. Pure of the run loop so the glue is unit-testable.
+pub(crate) fn take_and_apply_pending_mode(
+    cfg: &mut config::AgentConfig,
+    pending: &mut Option<telegram::GuardianMode>,
+    config_path: Option<&std::path::Path>,
+) -> Option<telegram::GuardianMode> {
+    let mode = pending.take()?;
+    apply_guardian_mode(cfg, mode);
+    if let Some(path) = config_path {
+        if let Err(e) = persist_responder_mode(path, cfg.responder.enabled, cfg.responder.dry_run) {
+            tracing::warn!(
+                error = %e,
+                "failed to persist /mode change to agent.toml (in-memory flip still active)"
+            );
+        }
+    }
+    Some(mode)
 }
 
 /// Builds a rich system-state context string injected into every AI chat call.
@@ -265,6 +342,111 @@ mod tests {
 
         cfg.responder.dry_run = false;
         assert!(matches!(guardian_mode(&cfg), telegram::GuardianMode::Guard));
+    }
+
+    #[test]
+    fn apply_guardian_mode_sets_responder_flags() {
+        let mut cfg = config::AgentConfig::default();
+
+        apply_guardian_mode(&mut cfg, telegram::GuardianMode::Guard);
+        assert!(
+            cfg.responder.enabled && !cfg.responder.dry_run,
+            "Guard = on + live"
+        );
+        // round-trip through guardian_mode confirms consistency
+        assert!(matches!(guardian_mode(&cfg), telegram::GuardianMode::Guard));
+
+        apply_guardian_mode(&mut cfg, telegram::GuardianMode::DryRun);
+        assert!(
+            cfg.responder.enabled && cfg.responder.dry_run,
+            "DryRun = on + simulated"
+        );
+        assert!(matches!(
+            guardian_mode(&cfg),
+            telegram::GuardianMode::DryRun
+        ));
+
+        apply_guardian_mode(&mut cfg, telegram::GuardianMode::Watch);
+        assert!(!cfg.responder.enabled, "Watch = responder off");
+        assert!(matches!(guardian_mode(&cfg), telegram::GuardianMode::Watch));
+    }
+
+    #[test]
+    fn persist_responder_mode_is_format_preserving_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        // A config with a comment + an unrelated section that must survive.
+        std::fs::write(
+            &path,
+            "# my agent\n[responder]\nenabled = false\ndry_run = true\nblock_backend = \"ufw\"\n\n[ai]\nenabled = true\n",
+        )
+        .unwrap();
+
+        persist_responder_mode(&path, true, false).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# my agent"),
+            "comment preserved: {written}"
+        );
+        assert!(
+            written.contains("block_backend = \"ufw\""),
+            "sibling key preserved"
+        );
+        assert!(written.contains("[ai]"), "unrelated section preserved");
+
+        // Re-parse and confirm the two keys flipped.
+        let reparsed: config::AgentConfig = toml::from_str(&written).unwrap();
+        assert!(reparsed.responder.enabled);
+        assert!(!reparsed.responder.dry_run);
+    }
+
+    #[test]
+    fn take_and_apply_pending_mode_applies_persists_and_noops_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, "[responder]\nenabled = false\ndry_run = true\n").unwrap();
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = false;
+        cfg.responder.dry_run = true;
+
+        // Empty queue → no-op, returns None, file untouched logic.
+        let mut pending: Option<telegram::GuardianMode> = None;
+        assert!(take_and_apply_pending_mode(&mut cfg, &mut pending, Some(&path)).is_none());
+
+        // Queued Guard → applied to cfg, persisted, queue drained.
+        pending = Some(telegram::GuardianMode::Guard);
+        let applied = take_and_apply_pending_mode(&mut cfg, &mut pending, Some(&path));
+        assert!(matches!(applied, Some(telegram::GuardianMode::Guard)));
+        assert!(pending.is_none(), "queue drained");
+        assert!(
+            cfg.responder.enabled && !cfg.responder.dry_run,
+            "cfg flipped to Guard"
+        );
+        let reparsed: config::AgentConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            reparsed.responder.enabled && !reparsed.responder.dry_run,
+            "persisted"
+        );
+
+        // No config path → applies in memory, skips persist (no panic).
+        pending = Some(telegram::GuardianMode::Watch);
+        assert!(take_and_apply_pending_mode(&mut cfg, &mut pending, None).is_some());
+        assert!(
+            !cfg.responder.enabled,
+            "Watch applied without a config path"
+        );
+    }
+
+    #[test]
+    fn persist_responder_mode_creates_section_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, "[ai]\nenabled = true\n").unwrap();
+        persist_responder_mode(&path, true, true).unwrap();
+        let reparsed: config::AgentConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(reparsed.responder.enabled && reparsed.responder.dry_run);
     }
 
     #[test]

@@ -73,6 +73,7 @@ rpassword = "7"
 rand_core = { version = "0.6", features = ["std"] }
 rand = "0.10"
 toml = "1.1"
+toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 fs2 = "0.4"

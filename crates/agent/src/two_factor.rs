@@ -150,8 +150,19 @@ pub struct PendingAction {
 pub enum PendingActionType {
     AllowlistProcess(String),
     AllowlistIp(String),
-    UndoAllowlist { section: String, key: String },
-    AutoFpAllowlist { section: String, entity: String },
+    UndoAllowlist {
+        section: String,
+        key: String,
+    },
+    AutoFpAllowlist {
+        section: String,
+        entity: String,
+    },
+    /// Live guardian-mode change from `/mode` (guard|watch|dryrun). Privileged:
+    /// flips whether the responder enforces for real, so it is 2FA-gated.
+    ModeChange {
+        mode: String,
+    },
 }
 
 /// Tracks pending 2FA actions and brute force protection state.
