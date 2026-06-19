@@ -1730,11 +1730,15 @@ mod tests {
         );
 
         // (2) Kernel-block path — withhold (Some). Build the killchain evidence
-        // object shape the kernel path reads (pid + pattern=data_exfil + comm).
+        // object shape the kernel path reads (pid + pattern=data_exfil + comm +
+        // the `sensitive_file` the tracker now emits). The read is the agent's
+        // OWN /home/lab/.env (owner uid 1000), so the own-config gate passes on
+        // the kernel path exactly like the userspace path.
         let kc_ev = serde_json::json!({
             "pid": pid,
             "pattern": "data_exfil",
             "comm": "MainThread",
+            "sensitive_file": "/home/lab/.env",
         });
         let kernel =
             crate::killchain_inline::evaluate_kernel_block_withhold(&kc_ev, &reg, &sigindex, &stub);

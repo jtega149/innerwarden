@@ -272,11 +272,25 @@ pub(crate) fn evaluate_kernel_block_withhold(
         return None;
     }
     let comm = ev.get("comm").and_then(|c| c.as_str()).unwrap_or("");
-    // Killchain evidence does not carry the sensitive read path (the tracker
-    // only records the bitmask + comm/pid), so read_path is None here. The
-    // verifier still gates on registry + live cmdline re-ID + exe provenance;
-    // the own-config gate simply does not apply.
+    // DATA_EXFIL kill chains now carry the sensitive read path (the killchain
+    // tracker records the file that set CHAIN_SENSITIVE_READ and emits it as
+    // `sensitive_file`, spec-081). When present, the verifier's own-config gate
+    // applies on THIS kernel-block path too, exactly like the userspace
+    // IP-block path: a subverted-but-genuine managed agent reading a NON-own
+    // file (/etc/shadow, another user's key) is NotManaged → the kernel block
+    // lands. `exploit_c2` (mprotect-RWX + socket, no file read) legitimately has
+    // no path → identity-only verification, as before.
     let read_path = ev.get("sensitive_file").and_then(|p| p.as_str());
+
+    // Fail closed: a DATA_EXFIL chain can ONLY complete through a sensitive
+    // `file.open` (that is what sets CHAIN_SENSITIVE_READ), so the tracker
+    // always records the path. An absent `sensitive_file` on a data_exfil
+    // incident is therefore anomalous — never withhold the kernel block on
+    // identity alone for it, because we cannot prove the read was own-config.
+    // (exploit_c2 has no file dimension and is exempt from this guard.)
+    if pattern.eq_ignore_ascii_case("data_exfil") && read_path.is_none() {
+        return None;
+    }
 
     let verdict = crate::managed_agent_guard::verify_managed_agent_self_activity(
         pid, comm, read_path, registry, sigindex, resolver,
@@ -2821,14 +2835,38 @@ mod tests {
         let reg = kc_registry_with_openclaw(pid);
         let sigindex = SignatureIndex::new();
         let stub = kc_openclaw_stub(pid);
+        // exploit_c2 (node V8 JIT mprotect-RWX + its own outbound socket) has no
+        // file dimension, so identity-only verification withholds the block —
+        // this is OpenClaw's every-boot FP. (data_exfil now requires a present
+        // own-config `sensitive_file`; see the own-config tests below.)
         let ev = serde_json::json!({
             "pid": pid,
-            "pattern": "data_exfil",
+            "pattern": "exploit_c2",
             "comm": "MainThread",
         });
         let out = evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub);
         let (_id, name) = out.expect("gated pattern + managed agent → withhold");
         assert_eq!(name, "OpenClaw");
+    }
+
+    #[test]
+    fn evaluate_kernel_block_withhold_blocks_data_exfil_without_sensitive_file() {
+        // Fail-closed guard: a data_exfil incident with NO `sensitive_file`
+        // (anomalous — the chain can only complete via a sensitive file.open)
+        // must NOT be withheld on identity alone. The block lands.
+        let pid = 4242;
+        let reg = kc_registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = kc_openclaw_stub(pid);
+        let ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+        });
+        assert!(
+            evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub).is_none(),
+            "data_exfil with no sensitive_file must fail closed (block proceeds)"
+        );
     }
 
     #[test]
@@ -2875,5 +2913,58 @@ mod tests {
         // Evidence missing pid → None (no source to attribute).
         let ev = serde_json::json!({ "pattern": "data_exfil", "comm": "MainThread" });
         assert!(evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub).is_none());
+    }
+
+    // ── Spec-081 own-config gate ON the kernel-block path ──────────────────
+    //
+    // DATA_EXFIL kill chains now carry the read path as `sensitive_file`
+    // (killchain tracker change). The two tests below prove the verifier's
+    // own-config gate now governs the kernel execve-deny exactly like the
+    // userspace IP-block path: reading OWN config → withhold; reading
+    // /etc/shadow → the block LANDS even for the genuine managed agent. Before
+    // this change `read_path` was always None on the kernel path, so a
+    // subverted-but-genuine agent reading /etc/shadow wrongly bought the
+    // execve-deny exemption.
+
+    #[test]
+    fn evaluate_kernel_block_withhold_managed_when_sensitive_file_is_own_config() {
+        let pid = 4242;
+        let reg = kc_registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        // Agent reading its OWN /home/lab/.env (under the script-derived home,
+        // owned by the agent uid) — the legitimate startup FP.
+        let stub = kc_openclaw_stub(pid).with_owner("/home/lab/.env", 1000);
+        let ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+            "sensitive_file": "/home/lab/.env",
+        });
+        let out = evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub);
+        let (_id, name) = out.expect("own-config read by verified managed agent → withhold");
+        assert_eq!(name, "OpenClaw");
+    }
+
+    #[test]
+    fn evaluate_kernel_block_withhold_blocks_when_sensitive_file_is_etc_shadow() {
+        let pid = 4242;
+        let reg = kc_registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        // SAME verified managed agent + SAME gated pattern, but the read is
+        // /etc/shadow — NOT its own config. Owner uid 0 != proc uid 1000, and
+        // the path is outside the agent's home/install. The kernel block MUST
+        // land (None). This is the hole #5 closes: identity alone no longer
+        // buys the execve-deny exemption when the read is a foreign secret.
+        let stub = kc_openclaw_stub(pid).with_owner("/etc/shadow", 0);
+        let ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+            "sensitive_file": "/etc/shadow",
+        });
+        assert!(
+            evaluate_kernel_block_withhold(&ev, &reg, &sigindex, &stub).is_none(),
+            "a verified managed agent reading /etc/shadow must still be kernel-blocked"
+        );
     }
 }
