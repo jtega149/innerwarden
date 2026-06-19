@@ -743,6 +743,33 @@ run_root install -o "${INSTALL_USER:-root}" -g "${INSTALL_GROUP:-root}" -m 755 "
 run_root install -o "${INSTALL_USER:-root}" -g "${INSTALL_GROUP:-root}" -m 755 "${IW_CTL_BIN}"    "${BIN_DIR}/innerwarden-ctl"
 run_root install -o "${INSTALL_USER:-root}" -g "${INSTALL_GROUP:-root}" -m 755 "${IW_CTL_BIN}"    "${BIN_DIR}/innerwarden"
 
+# ── Drop the install-facing agent guide (spec 082) ───────────────────────
+# /etc/innerwarden/AGENTS.md is the playbook an AI coding agent reads to
+# configure and operate InnerWarden on this box (what the CLI is, the safe
+# observe->verify->allowlist workflow, the loopback check-command contract).
+# Best-effort and version-matched: fetched at the SAME ref we are installing
+# (raw repo content at the release tag), so the on-box guide matches the
+# binary's command surface. Never fails the install if it cannot be fetched.
+AGENTS_MD_DEST="${CONFIG_DIR}/AGENTS.md"
+agents_md_tmp="${TMP_DIR}/AGENTS.md"
+agents_md_path="agents-install.md"
+agents_md_ok=0
+for ref in "${IW_VERSION}" "main"; do
+  [[ -z "${ref}" || "${ref}" == "canary" ]] && ref="main"
+  if curl -fsSL --output "${agents_md_tmp}" \
+       "https://raw.githubusercontent.com/${GITHUB_REPO}/${ref}/${agents_md_path}" 2>/dev/null \
+       && [[ -s "${agents_md_tmp}" ]]; then
+    agents_md_ok=1
+    break
+  fi
+done
+if [[ "${agents_md_ok}" == "1" ]]; then
+  run_root install -o "${INSTALL_USER:-root}" -g "${IW_USER}" -m 644 "${agents_md_tmp}" "${AGENTS_MD_DEST}"
+  log "agent guide installed: ${AGENTS_MD_DEST} (point your coding agent at it)"
+else
+  log "note: could not fetch the agent guide; see https://innerwarden.com/agents.md"
+fi
+
 # ── Install bpftool for eBPF support (Linux only) ────────────────────────
 # bpftool is required for XDP firewall and LSM enforcement management.
 # The sensor works without it (graceful fallback) but advanced features need it.
