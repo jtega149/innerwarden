@@ -1951,7 +1951,16 @@ pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
     if is_chain_credential {
         chain_flag(pid, CHAIN_SENSITIVE_READ);
     }
-    if is_comm_allowed(2) || is_cgroup_allowed() {
+    // Genuinely-sensitive credential reads (shadow/sudoers/gshadow) must NOT be
+    // dropped by the openat comm/cgroup allowlist. `cat`/`head`/`less` are on the
+    // openat allowlist bit (volume control for noisy readers), so before this an
+    // attacker reading /etc/shadow via any allowlisted tool returned 0 here and
+    // the event never reached SIGMA-004 / the userspace sensitive-read detectors
+    // — a rename-free in-kernel evasion. Bypass the allowlist for the narrow
+    // genuinely-secret set only (== is_chain_credential). passwd/ssl are
+    // deliberately excluded: world-readable + high-frequency (nss, TLS), so they
+    // stay under the allowlist + rate-limit to avoid flooding the ring buffer.
+    if !is_chain_credential && (is_comm_allowed(2) || is_cgroup_allowed()) {
         return 0;
     }
     if !is_sensitive {
