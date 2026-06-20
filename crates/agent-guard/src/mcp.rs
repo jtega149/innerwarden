@@ -358,6 +358,19 @@ pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> Comma
             });
             score += 50;
         }
+        // Filesystem format of a block device: `mkfs.ext4 /dev/sda1`,
+        // `mkfs -t xfs /dev/nvme0n1`. Formatting a real device destroys
+        // everything on it. Gated on `/dev/` so creating a filesystem inside
+        // a loopback image file (`mkfs.ext4 disk.img`) is not flagged.
+        // (Guardrail benchmark 2026-06-20: this was a destructive miss.)
+        if (lower.contains("mkfs.") || lower.contains("mkfs ")) && lower.contains("/dev/") {
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "mkfs formatting a block device (irreversible data destruction)".into(),
+            });
+            score += 50;
+        }
     }
 
     // Dangerous command patterns from threats.rs (if not already caught above).
@@ -459,6 +472,22 @@ mod tests {
         // Benign dd to a regular file MUST NOT be flagged as destructive.
         let b = analyze_command("dd if=input.iso of=/tmp/out.img bs=4M", None);
         assert!(!b.signals.iter().any(|s| s.signal == "destructive_command"));
+    }
+
+    #[test]
+    fn analyze_command_flags_mkfs_device_format() {
+        // Guardrail benchmark 2026-06-20: `mkfs.ext4 /dev/sda1` was an allow.
+        for cmd in ["mkfs.ext4 /dev/sda1", "mkfs -t xfs /dev/nvme0n1"] {
+            let a = analyze_command(cmd, None);
+            assert_eq!(a.recommendation, "deny", "`{cmd}` must deny");
+            assert!(a.signals.iter().any(|s| s.signal == "destructive_command"));
+        }
+        // Creating a filesystem inside a loopback image FILE is legit, not a wipe.
+        let img = analyze_command("mkfs.ext4 disk.img", None);
+        assert!(!img
+            .signals
+            .iter()
+            .any(|s| s.signal == "destructive_command"));
     }
 
     #[test]
