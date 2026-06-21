@@ -116,6 +116,98 @@ fn classify_service_action(is_active: bool, unit_exists: bool) -> ServiceAction 
     }
 }
 
+/// Decide which units to restart after the binaries are swapped.
+///
+/// **Watchdog hosts (the paid Active-Defence supervisor).** When
+/// `innerwarden-watchdog` is active the agent runs as a watchdog-SPAWNED child
+/// and `innerwarden-agent.service` is disabled (but its unit file still exists).
+/// Naively restarting `innerwarden-agent` there does two wrong things: it spawns
+/// a SECOND agent alongside the watchdog's child (duplicate-instance flood), and
+/// it does NOT refresh the running child's binary (the watchdog keeps the old
+/// one). So on a watchdog host we skip the agent unit entirely and restart the
+/// watchdog instead — restarting the watchdog tears down its cgroup (watchdog +
+/// child agent) and respawns the agent on the freshly-swapped binary. Never
+/// `systemctl start innerwarden-agent` on a watchdog host.
+///
+/// Pure so the policy is unit-tested without touching systemd. `(is_active,
+/// unit_exists)` per unit; returns the ordered (unit, action) plan.
+fn plan_service_restarts(
+    watchdog_active: bool,
+    sensor: (bool, bool),
+    agent: (bool, bool),
+) -> Vec<(&'static str, ServiceAction)> {
+    let mut plan = vec![(
+        "innerwarden-sensor",
+        classify_service_action(sensor.0, sensor.1),
+    )];
+    if watchdog_active {
+        // Respawn the agent via its supervisor, not as a standalone service.
+        plan.push(("innerwarden-watchdog", ServiceAction::Restart));
+    } else {
+        plan.push((
+            "innerwarden-agent",
+            classify_service_action(agent.0, agent.1),
+        ));
+    }
+    plan
+}
+
+/// Execute a restart plan, calling `restart` for each Restart/Start unit and
+/// printing the outcome. `restart` is injected (production passes
+/// `systemd::restart_service`) so the control flow — Restart propagates errors,
+/// Start is best-effort, Skip is a no-op — is unit-tested without touching
+/// systemd. A failed Restart aborts the upgrade (the swapped binary is in place
+/// but the service did not come back, which the operator must see); a failed
+/// Start only warns (the unit was already stopped).
+fn execute_restart_plan<F>(plan: &[(&str, ServiceAction)], mut restart: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    for (unit, action) in plan {
+        match action {
+            ServiceAction::Restart => {
+                restart(unit)?;
+                println!("  [done] Restarted {unit}");
+            }
+            ServiceAction::Start => match restart(unit) {
+                Ok(()) => println!("  [done] Started {unit}"),
+                Err(e) => {
+                    println!("  [warn] Could not start {unit}: {e}");
+                    println!("         Check logs: journalctl -u {unit} -n 30");
+                }
+            },
+            ServiceAction::Skip => {}
+        }
+    }
+    Ok(())
+}
+
+/// Restart the services after a binary swap, with all systemd I/O injected so the
+/// full policy — detect watchdog, build the plan, print the watchdog notice,
+/// execute — is unit-tested without touching the host. Production wires
+/// `systemd::is_service_active` / unit-file existence / `systemd::restart_service`;
+/// tests pass in-memory closures. Keeping the I/O at the call site to a single
+/// line (these three closures) is deliberate: it is the only part the unit tests
+/// cannot reach, and it contains no logic.
+fn restart_after_upgrade<A, E, R>(is_active: A, unit_exists: E, mut restart: R) -> Result<()>
+where
+    A: Fn(&str) -> bool,
+    E: Fn(&str) -> bool,
+    R: FnMut(&str) -> Result<()>,
+{
+    let state = |unit: &str| (is_active(unit), unit_exists(unit));
+    let watchdog_active = is_active("innerwarden-watchdog");
+    let plan = plan_service_restarts(
+        watchdog_active,
+        state("innerwarden-sensor"),
+        state("innerwarden-agent"),
+    );
+    if watchdog_active {
+        println!("  [info] watchdog active — respawning the agent via innerwarden-watchdog (not as a standalone service)");
+    }
+    execute_restart_plan(&plan, &mut restart)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_upgrade(
     cli: &Cli,
@@ -412,29 +504,15 @@ fn cmd_upgrade_with_release(
             .unwrap_or(std::path::Path::new("/etc/innerwarden")),
     );
 
-    // Restart running services; also start the agent if it has a unit file but is stopped
+    // Restart running services; also start the agent if it has a unit file but is
+    // stopped. On a watchdog host the agent is respawned via the watchdog instead
+    // of as a standalone service (see restart_after_upgrade / plan_service_restarts).
     println!();
-    for unit in &["innerwarden-sensor", "innerwarden-agent"] {
-        let unit_path = format!("/etc/systemd/system/{unit}.service");
-        let unit_exists = std::path::Path::new(&unit_path).exists();
-        match classify_service_action(systemd::is_service_active(unit), unit_exists) {
-            ServiceAction::Restart => {
-                systemd::restart_service(unit, false)?;
-                println!("  [done] Restarted {unit}");
-            }
-            ServiceAction::Start => {
-                // Unit is installed but stopped - try to start it
-                match systemd::restart_service(unit, false) {
-                    Ok(()) => println!("  [done] Started {unit}"),
-                    Err(e) => {
-                        println!("  [warn] Could not start {unit}: {e}");
-                        println!("         Check logs: journalctl -u {unit} -n 30");
-                    }
-                }
-            }
-            ServiceAction::Skip => {}
-        }
-    }
+    restart_after_upgrade(
+        systemd::is_service_active,
+        |unit| std::path::Path::new(&format!("/etc/systemd/system/{unit}.service")).exists(),
+        |unit| systemd::restart_service(unit, false),
+    )?;
 
     let date_display = release_date_display(release.release_date());
 
@@ -492,6 +570,134 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use tempfile::TempDir;
+
+    #[test]
+    #[test]
+    fn plan_restarts_normal_host_restarts_sensor_and_agent() {
+        // No watchdog: agent is its own active service (test001 / Azure pattern).
+        let plan = plan_service_restarts(false, (true, true), (true, true));
+        assert_eq!(
+            plan,
+            vec![
+                ("innerwarden-sensor", ServiceAction::Restart),
+                ("innerwarden-agent", ServiceAction::Restart),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_restarts_watchdog_host_respawns_via_watchdog_not_agent() {
+        // Watchdog active, agent.service DISABLED but unit-file present (Oracle
+        // prod). Must NOT touch innerwarden-agent (would duplicate-flood); restart
+        // the watchdog so it respawns the agent on the new binary.
+        let plan = plan_service_restarts(true, (true, true), (false, true));
+        assert_eq!(
+            plan,
+            vec![
+                ("innerwarden-sensor", ServiceAction::Restart),
+                ("innerwarden-watchdog", ServiceAction::Restart),
+            ]
+        );
+        // The agent unit must never appear in a watchdog plan.
+        assert!(!plan.iter().any(|(u, _)| *u == "innerwarden-agent"));
+    }
+
+    #[test]
+    fn plan_restarts_normal_host_starts_stopped_agent() {
+        // Agent installed but stopped, no watchdog → Start it (existing behaviour).
+        let plan = plan_service_restarts(false, (true, true), (false, true));
+        assert_eq!(plan[1], ("innerwarden-agent", ServiceAction::Start));
+    }
+
+    #[test]
+    fn execute_restart_plan_calls_restart_for_restart_and_start_skips_skip() {
+        let plan = [
+            ("innerwarden-sensor", ServiceAction::Restart),
+            ("innerwarden-agent", ServiceAction::Start),
+            ("innerwarden-noop", ServiceAction::Skip),
+        ];
+        let mut called: Vec<String> = Vec::new();
+        execute_restart_plan(&plan, |unit| {
+            called.push(unit.to_string());
+            Ok(())
+        })
+        .unwrap();
+        // Restart + Start invoke the callback; Skip does not.
+        assert_eq!(called, vec!["innerwarden-sensor", "innerwarden-agent"]);
+    }
+
+    #[test]
+    fn execute_restart_plan_propagates_restart_error_but_not_start_error() {
+        // A failing Restart aborts the whole plan (returns Err).
+        let restart_plan = [("innerwarden-sensor", ServiceAction::Restart)];
+        let err = execute_restart_plan(&restart_plan, |_| anyhow::bail!("boom")).is_err();
+        assert!(err, "a failed Restart must abort the upgrade");
+
+        // A failing Start is best-effort (warn only) — the plan still succeeds.
+        let start_plan = [("innerwarden-agent", ServiceAction::Start)];
+        let ok = execute_restart_plan(&start_plan, |_| anyhow::bail!("stopped")).is_ok();
+        assert!(ok, "a failed Start must not abort the upgrade");
+    }
+
+    #[test]
+    fn restart_after_upgrade_watchdog_host_restarts_sensor_and_watchdog_not_agent() {
+        // Watchdog active; agent.service present but inactive (Oracle prod). The
+        // full policy (detect → plan → execute) must restart sensor + watchdog and
+        // never the agent unit.
+        let active = |u: &str| u == "innerwarden-sensor" || u == "innerwarden-watchdog";
+        let exists = |_: &str| true; // all unit files present
+        let mut restarted: Vec<String> = Vec::new();
+        restart_after_upgrade(active, exists, |u| {
+            restarted.push(u.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            restarted,
+            vec!["innerwarden-sensor", "innerwarden-watchdog"]
+        );
+        assert!(!restarted.iter().any(|u| u == "innerwarden-agent"));
+    }
+
+    #[test]
+    fn restart_after_upgrade_normal_host_restarts_sensor_and_agent() {
+        // No watchdog; sensor + agent both active services (test001 / Azure).
+        let active = |u: &str| u == "innerwarden-sensor" || u == "innerwarden-agent";
+        let exists = |_: &str| true;
+        let mut restarted: Vec<String> = Vec::new();
+        restart_after_upgrade(active, exists, |u| {
+            restarted.push(u.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(restarted, vec!["innerwarden-sensor", "innerwarden-agent"]);
+    }
+
+    #[test]
+    fn restart_after_upgrade_propagates_a_failed_sensor_restart() {
+        let active = |_: &str| true;
+        let exists = |_: &str| true;
+        let err = restart_after_upgrade(active, exists, |_| anyhow::bail!("sensor down")).is_err();
+        assert!(
+            err,
+            "a failed required-service restart must abort the upgrade"
+        );
+    }
+
+    #[test]
+    fn execute_restart_plan_watchdog_plan_restarts_sensor_and_watchdog_only() {
+        // End-to-end of the watchdog path: the plan from a watchdog host, executed,
+        // must invoke restart for sensor + watchdog and NEVER the agent unit.
+        let plan = plan_service_restarts(true, (true, true), (false, true));
+        let mut called: Vec<String> = Vec::new();
+        execute_restart_plan(&plan, |unit| {
+            called.push(unit.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(called, vec!["innerwarden-sensor", "innerwarden-watchdog"]);
+        assert!(!called.iter().any(|u| u == "innerwarden-agent"));
+    }
 
     #[test]
     fn ping_url_matches_install_sh_query_shape() {
