@@ -1,0 +1,21 @@
+# The rule should match the field `destination_ip = 169.254.169.254` 
+#   AND `process_comm not in [cloud-init, ec2-metadata-collector, 
+#   instance-controller, gcp-metadata-server, azure-metadata-monitor]` 
+#   (operator can extend the allowlist via per-host config later).
+
+title: Linux IMDS Access From Non Metadata Client
+id: 1234567890
+status: test
+level: medium
+references:
+    - https://attack.mitre.org/techniques/T1552/005/
+author: oscd.community
+date: 2026-06-21
+tags:
+    - attack.discovery
+    - attack.t1552.005
+logsource:
+    product: linux
+    category: network
+detection:
+    selection:
