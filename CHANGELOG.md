@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- **spec-081 managed-agent coexistence now works when InnerWarden runs non-root and the agent runs as another user (live FP fix, found 2026-06-21).** A co-located AI agent (OpenClaw) doing a routine task — read its own `/home/lab/.env`, then call its own Azure-OpenAI endpoint — was flagged CRITICAL data-exfiltration and the endpoint was auto-blocked, breaking the agent. Root cause: the managed-agent verifier (`evaluate_managed_agent_downgrade` → `decide`) fail-closed on two facts a non-root IW agent (`innerwarden` uid) cannot obtain about a process owned by a different user (`lab`): (1) `readlink /proc/<pid>/exe` is EACCES cross-uid → `exe_path` None → the interpreter-root gate blocked; (2) `ProtectHome=yes` on the agent unit hid `/home`, so the own-config `stat` for the file-owner uid returned None → the own-config gate blocked. Both made spec-081 silently never downgrade for a cross-user agent, even one correctly registered with a matching cmdline fingerprint. Fixes: (a) **code** — when `/proc/exe` is unreadable the interpreter-root check falls back to `argv[0]`, safe because the exact registered cmdline-fingerprint match already pins identity (an untrusted `argv[0]` like `/tmp/node` still blocks); (b) **ops** — the example agent unit sets `ProtectHome=read-only` (so the verifier can read /home to confirm the agent's own config) with an optional `CAP_SYS_PTRACE` for strict `/proc/exe` verification. No blind spot: a foreign-secret read (`/etc/shadow`, another user's `~/.ssh`), an unregistered/fingerprint-mismatched process, or a known-bad destination still forces the block. New regression tests pin the cross-uid downgrade + the untrusted-argv0 block.
+
 ## [0.15.23] - 2026-06-21
 
 ### Fixed

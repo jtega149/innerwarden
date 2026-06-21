@@ -457,6 +457,23 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
     // agent has no script token → None → fail closed when a read_path is present.
     let script_path = script_path_from_argv(&live.argv);
 
+    // Interpreter path for the trusted-root checks (3b / no-script branch).
+    // Prefer the kernel-truth `/proc/<pid>/exe`, but FALL BACK to argv[0] when it
+    // is unreadable. A NON-ROOT InnerWarden agent cannot `readlink` the
+    // `/proc/<pid>/exe` of a managed agent running as a DIFFERENT user (EACCES),
+    // so `exe_path` is None there — and without this fallback spec-081 silently
+    // failed closed and blocked the agent's own activity (observed live on Azure:
+    // IW runs as uid `innerwarden`, OpenClaw as uid `lab` → exe unreadable →
+    // OpenClaw's own Azure-OpenAI endpoint got auto-blocked). The fallback is safe
+    // ONLY because gate (2b) above already proved the live cmdline fingerprint
+    // (argv[0]|argv[1]) EQUALS the operator-registered fingerprint, so argv[0] is
+    // the vouched interpreter, not an attacker's free-form claim. (Grant the agent
+    // CAP_SYS_PTRACE to restore strict /proc/exe verification — see the unit file.)
+    let interp_path: Option<&str> = live
+        .exe_path
+        .as_deref()
+        .or_else(|| live.argv.first().map(String::as_str));
+
     // (3) Untrusted-root rejection on the SCRIPT (Defect 1): a script under
     // /tmp, /dev/shm, ~/Downloads → block even when the fingerprint+cmdline match
     // and the interpreter is trusted. The install dir is derived from the script
@@ -468,7 +485,7 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
         // closed if a read_path is present (handled at (4)).
         // We can still be Managed for a NO-read-path C2-connect case as long as
         // the interpreter is trusted.
-        let Some(exe) = live.exe_path.as_deref() else {
+        let Some(exe) = interp_path else {
             return ManagedAgentVerdict::NotManaged;
         };
         if !interpreter_root_trusted(exe) {
@@ -489,10 +506,10 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
     }
 
     // (3b) Interpreter provenance (defense-in-depth, Defect 1): the interpreter
-    // binary itself (`/proc/<pid>/exe`) must sit in a trusted system root — never
-    // a `/tmp/node` the attacker dropped. The script carries identity; the
-    // interpreter only has to be a trustworthy launcher.
-    let Some(exe) = live.exe_path.as_deref() else {
+    // binary itself must sit in a trusted system root — never a `/tmp/node` the
+    // attacker dropped. Uses `interp_path` (/proc/exe, or argv[0] when exe is
+    // unreadable cross-uid — safe because the (2b) fingerprint already pinned it).
+    let Some(exe) = interp_path else {
         return ManagedAgentVerdict::NotManaged;
     };
     if !interpreter_root_trusted(exe) {
@@ -772,6 +789,65 @@ mod tests {
             }
             other => panic!("comm-named registry entry must be Managed, got {other:?}"),
         }
+    }
+
+    /// Regression (FP found LIVE on Azure, 2026-06-21): a NON-ROOT InnerWarden
+    /// agent (uid `innerwarden`) cannot `readlink /proc/<pid>/exe` of a managed
+    /// agent running as a DIFFERENT user (OpenClaw as uid `lab`) — EACCES → the
+    /// resolver returns `exe_path: None`. The verifier required `/proc/exe` for the
+    /// interpreter-root check and silently failed closed → OpenClaw read its own
+    /// `.env` then called its own Azure-OpenAI endpoint and InnerWarden BLOCKED the
+    /// endpoint. With the argv[0] fallback (safe because the cmdline fingerprint
+    /// already matched the registered one), the verified agent is Managed.
+    #[test]
+    fn cross_uid_unreadable_exe_falls_back_to_argv0_and_is_managed() {
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let proc_no_exe = ResolvedProcess {
+            argv: OPENCLAW_ARGV.iter().map(|s| s.to_string()).collect(),
+            exe_path: None, // non-root IW agent cannot readlink another uid's /proc/exe
+            uid: Some(1000),
+        };
+        let stub = StubProc::default()
+            .with_proc(pid, proc_no_exe)
+            .with_owner("/home/lab/.env", 1000);
+        assert!(
+            verify(pid, Some("/home/lab/.env"), &reg, &stub).is_managed(),
+            "registered agent with a matching fingerprint must be Managed even when \
+             /proc/exe is unreadable (cross-uid, non-root IW) — argv[0] fallback"
+        );
+    }
+
+    /// The argv[0] fallback must NOT weaken the trusted-root gate: an untrusted
+    /// interpreter path (e.g. argv[0]=/tmp/node) still BLOCKS even with exe None.
+    /// (In practice the (2b) fingerprint would already differ, but guard the gate.)
+    #[test]
+    fn cross_uid_unreadable_exe_with_untrusted_argv0_still_blocks() {
+        let pid = 4242;
+        let mut reg = Registry::new();
+        // Register with a /tmp interpreter fingerprint so (2b) matches the live one.
+        reg.connect_with_facts(
+            "OpenClaw",
+            pid,
+            Some("ag-test"),
+            None,
+            Some(1000),
+            Some(format!("/tmp/node|{OPENCLAW_SCRIPT}")),
+        )
+        .expect("connect");
+        let proc = ResolvedProcess {
+            argv: vec!["/tmp/node".into(), OPENCLAW_SCRIPT.into(), "gateway".into()],
+            exe_path: None,
+            uid: Some(1000),
+        };
+        let stub = StubProc::default()
+            .with_proc(pid, proc)
+            .with_owner("/home/lab/.env", 1000);
+        assert_eq!(
+            verify(pid, Some("/home/lab/.env"), &reg, &stub),
+            ManagedAgentVerdict::NotManaged,
+            "an untrusted interpreter (argv[0]=/tmp/node) must still BLOCK"
+        );
     }
 
     /// The name-equality was redundant with the fingerprint pin, NOT a relaxation:
@@ -1576,29 +1652,35 @@ mod tests {
     /// interpreter exe (`/proc/<pid>/exe` unreadable) must fail closed even with
     /// no read_path. Covers the `exe_path = None` arm of the no-script branch.
     #[test]
-    fn python_dash_m_module_with_no_exe_fails_closed() {
+    fn python_dash_m_module_with_no_exe_and_untrusted_interpreter_fails_closed() {
+        // python -m module: no script token. With /proc/exe unreadable the
+        // interpreter check falls back to argv[0] — so it must still BLOCK when
+        // argv[0] is an UNTRUSTED interpreter the attacker dropped (/tmp/python3).
+        // (A TRUSTED argv[0] no-exe case is Managed — see the cross-uid test above
+        // and the 2026-06-21 Azure FP fix; the fingerprint + module signature pin
+        // identity, the argv[0] root-trust is the remaining gate.)
         let pid = 4023;
         let mut reg = Registry::new();
-        let fp = "/usr/bin/python3|-m";
+        let fp = "/tmp/python3|-m";
         reg.connect_with_facts(
             "Aider",
             pid,
             Some("ag-aider"),
-            Some("/usr/bin/python3".to_string()),
+            None,
             Some(1000),
             Some(fp.to_string()),
         )
         .expect("connect");
         let proc = ResolvedProcess {
-            argv: vec!["/usr/bin/python3".into(), "-m".into(), "aider".into()],
-            exe_path: None, // /proc/<pid>/exe unreadable (pid raced away)
+            argv: vec!["/tmp/python3".into(), "-m".into(), "aider".into()],
+            exe_path: None, // /proc/<pid>/exe unreadable
             uid: Some(1000),
         };
         let stub = StubProc::default().with_proc(pid, proc);
         assert_eq!(
             verify(pid, None, &reg, &stub),
             ManagedAgentVerdict::NotManaged,
-            "no script token AND no exe must fail closed"
+            "untrusted interpreter (argv[0]=/tmp/python3) must fail closed even with matching fingerprint"
         );
     }
 
