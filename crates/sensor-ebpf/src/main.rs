@@ -1722,9 +1722,9 @@ pub fn dispatch_connect(ctx: ProbeContext) -> u32 {
 
 #[inline(always)]
 fn try_dispatch_connect(regs: *const u8) -> Result<(), i64> {
-    if is_comm_allowed(1) || is_cgroup_allowed() {
-        return Ok(());
-    }
+    // Parse the destination BEFORE the comm allowlist gate so a renamed process
+    // cannot suppress an IMDS connect (see is_imds below). The 8-byte sockaddr
+    // read is cheap and connect is far lower frequency than openat.
     let addr_ptr: *const u8 = unsafe { syscall_arg_at!(regs, 1)? as *const u8 };
     let sa_buf = unsafe { bpf_probe_read_user(addr_ptr as *const [u8; 8]).unwrap_or([0u8; 8]) };
     let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
@@ -1734,6 +1734,15 @@ fn try_dispatch_connect(regs: *const u8) -> Result<(), i64> {
     let port = u16::from_be_bytes([sa_buf[2], sa_buf[3]]);
     let addr = u32::from_be_bytes([sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]]);
     if sa_buf[4] == 127 || addr == 0 {
+        return Ok(());
+    }
+    // Cloud instance-metadata endpoint (169.254.169.254 — AWS/GCP/Azure/OpenStack
+    // IMDS). A connect here is how cloud credentials are stolen (imds_ssrf). It is
+    // a hardcoded link-local IP (no DNS for dns_capture to surface) and otherwise
+    // legitimate (never in a threat feed), so NOTHING else backstops it — it must
+    // bypass the comm/cgroup allowlist or a renamed process steals creds silently.
+    let is_imds = sa_buf[4] == 169 && sa_buf[5] == 254 && sa_buf[6] == 169 && sa_buf[7] == 254;
+    if !is_imds && (is_comm_allowed(1) || is_cgroup_allowed()) {
         return Ok(());
     }
 
@@ -1907,6 +1916,39 @@ pub fn dispatch_kill(ctx: ProbeContext) -> u32 {
 // the entry pt_regs via the `syscall_arg!` macro (syscall-ABI position) and
 // mirrors the logic of its typed `innerwarden_*` counterpart.
 
+/// Bounded scan for a credential directory ANYWHERE in the path: `/.ssh/`,
+/// `/.aws/`, `/.kube/`, `/.gnupg/`. Catches home/root private keys and cloud/k8s
+/// creds (`/home/u/.ssh/id_rsa`, `/root/.aws/credentials`, `/home/u/.kube/config`)
+/// that an attacker reads via an openat-allowlisted tool (`cat`/`head`). These are
+/// high-value AND low-frequency-legit, so they must bypass the comm allowlist and
+/// the rate-limit like the /etc secrets do. Verifier-safe: one constant-bounded
+/// loop; the 3-byte discriminator only runs at a `/.` boundary.
+#[inline(always)]
+fn contains_secret_dir(buf: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < 250 && i + 5 < buf.len() {
+        let b0 = buf[i];
+        if b0 == 0 {
+            break;
+        }
+        if b0 == b'/' && buf[i + 1] == b'.' {
+            let a = buf[i + 2];
+            let b = buf[i + 3];
+            let c = buf[i + 4];
+            // /.ssh/  /.aws/  /.kube/  /.gnupg/
+            if (a == b's' && b == b's' && c == b'h')
+                || (a == b'a' && b == b'w' && c == b's')
+                || (a == b'k' && b == b'u' && c == b'b')
+                || (a == b'g' && b == b'n' && c == b'u')
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 #[kprobe]
 pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
     // openat(dfd, filename, flags, mode): filename=arg1, flags=arg2
@@ -1931,9 +1973,13 @@ pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
                                                 // Broader sensitive telemetry: any /etc, /root, /home read. High volume on a
                                                 // live host, so rate-limited below (the kprobe now reads filenames correctly
                                                 // and would otherwise flood the ring buffer).
+    // Credential dirs anywhere (/.ssh/, /.aws/, /.kube/, /.gnupg/) — home/root
+    // private keys + cloud/k8s creds. High value, low legit frequency.
+    let secret_dir = contains_secret_dir(f);
     let is_sensitive = etc
         || (f[0] == b'/' && f[1] == b'r' && f[2] == b'o' && f[3] == b'o' && f[4] == b't')
-        || (f[0] == b'/' && f[1] == b'h' && f[2] == b'o' && f[3] == b'm' && f[4] == b'e');
+        || (f[0] == b'/' && f[1] == b'h' && f[2] == b'o' && f[3] == b'm' && f[4] == b'e')
+        || secret_dir;
     // Kill-chain credential bit (CHAIN_SENSITIVE_READ -> DATA_EXFIL, which can
     // gate the LSM execve-block): ONLY genuine /etc secrets, NOT the broad
     // telemetry set. Previously this fired on EVERY /etc|/root|/home read, so
@@ -1951,23 +1997,28 @@ pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
     if is_chain_credential {
         chain_flag(pid, CHAIN_SENSITIVE_READ);
     }
-    // Genuinely-sensitive credential reads (shadow/sudoers/gshadow) must NOT be
-    // dropped by the openat comm/cgroup allowlist. `cat`/`head`/`less` are on the
-    // openat allowlist bit (volume control for noisy readers), so before this an
-    // attacker reading /etc/shadow via any allowlisted tool returned 0 here and
-    // the event never reached SIGMA-004 / the userspace sensitive-read detectors
-    // — a rename-free in-kernel evasion. Bypass the allowlist for the narrow
-    // genuinely-secret set only (== is_chain_credential). passwd/ssl are
-    // deliberately excluded: world-readable + high-frequency (nss, TLS), so they
-    // stay under the allowlist + rate-limit to avoid flooding the ring buffer.
-    if !is_chain_credential && (is_comm_allowed(2) || is_cgroup_allowed()) {
+    // Genuinely-secret reads must NOT be dropped by the openat comm/cgroup
+    // allowlist. `cat`/`head`/`less` are on the openat allowlist bit (volume
+    // control for noisy readers), so before this an attacker reading a secret via
+    // any allowlisted tool returned 0 here and the event never reached SIGMA-004 /
+    // the userspace sensitive-read / data_exfil detectors — a rename-free in-kernel
+    // evasion. The bypass set is narrow and high-value / low-legit-frequency:
+    //   - /etc/shadow|sudoers|gshadow (is_chain_credential)
+    //   - /etc/ssh host keys (etc + "ssh", distinguished from /etc/ssl by f[7]=='h')
+    //   - /.ssh/ /.aws/ /.kube/ /.gnupg/ anywhere (home/root keys, cloud/k8s creds)
+    // Deliberately EXCLUDED: /etc/passwd (world-readable, nss) and /etc/ssl certs
+    // (read on every TLS handshake) — bypassing those would flood the ring buffer.
+    let etc_ssh = etc && f[5] == b's' && f[6] == b's' && f[7] == b'h';
+    let is_secret_read = is_chain_credential || etc_ssh || secret_dir;
+    if !is_secret_read && (is_comm_allowed(2) || is_cgroup_allowed()) {
         return 0;
     }
     if !is_sensitive {
         return 0;
     }
-    // Always surface credential-file reads; rate-limit the broad remainder.
-    if !is_credential && is_rate_limited(pid) {
+    // Always surface credential reads (incl. the secret dirs); rate-limit the
+    // broad /etc|/root|/home telemetry remainder.
+    if !is_credential && !secret_dir && is_rate_limited(pid) {
         return 0;
     }
     let uid = bpf_get_current_uid_gid() as u32;
