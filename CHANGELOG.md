@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.22] - 2026-06-21
+
 ### Fixed
 - **`innerwarden upgrade` is now watchdog-aware — paid Active-Defence hosts upgrade with one command.** On a host running the `innerwarden-watchdog` supervisor the agent is a watchdog-SPAWNED child and `innerwarden-agent.service` is disabled (its unit file still exists). The old upgrade flow saw the disabled-but-present unit and ran `systemctl restart innerwarden-agent`, which both spawned a SECOND agent alongside the watchdog's child (duplicate-instance flood) and failed to refresh the running child's binary (the watchdog kept the old one) — so watchdog hosts needed a manual stop-watchdog/swap/start-watchdog dance. `upgrade` now detects an active watchdog and, instead of touching the agent unit, restarts `innerwarden-watchdog` (tearing down its cgroup — watchdog + child agent — and respawning the agent on the freshly-swapped binary); it never `systemctl start innerwarden-agent` on a watchdog host. Non-watchdog hosts are unchanged. The restart policy is a pure, unit-tested planner.
 
