@@ -62,8 +62,6 @@ Under the hood: 45 eBPF programs, 82 detectors, 69 cross-layer correlation rules
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
 </h3>
 
-https://github.com/user-attachments/assets/3acf547d-9c5c-4f83-bcfa-22ba68e21741
-
 ---
 
 ### Why this exists
