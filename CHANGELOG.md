@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **InnerWarden no longer flags its OWN egress as a reverse shell (self-FP).** The eBPF reverse-shell sequence detector (`network.outbound_connect` + `process.fd_redirect`/dup2 within a window, per PID) fired Critical `ebpf_reverse_shell` incidents on the agent's and CLI's own legitimate outbound connections — Telegram notifications (149.154.166.x), the dashboard API, threat-feed polling — because the agent connects out and dup2's fds in the same process. Observed as ~126 Critical self-flags in 30 minutes on a test box (source comm `innerwarden-age` / `innerwarden`); pure noise (it did not auto-block) but it spammed incidents and polluted measurements. Now the sequence detector skips a **verified** InnerWarden self-process, gated by `is_verified_infra_process` — i.e. the comm matches `innerwarden*` AND `/proc/<pid>/exe` resolves to a real system path. No blind spot: a process that merely sets `comm=innerwarden-*` but whose exe is `/tmp` (or anywhere non-system) still fires. Verified via the reliable connect-time comm, so skipping the connect also prevents a later corrupted-comm fd_redirect from firing. Regression tests pin both the self-skip and the forged-comm-still-fires case.
+
 ## [0.15.24] - 2026-06-21
 
 ### Security

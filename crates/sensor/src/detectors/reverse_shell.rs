@@ -142,6 +142,20 @@ impl ReverseShellDetector {
             .unwrap_or("unknown");
         let now = event.ts;
 
+        // Self-exclusion: InnerWarden's OWN agent/ctl legitimately connect out
+        // (Telegram notifications, the dashboard API, threat-feed polling) and
+        // dup2 fds, and that connect + fd_redirect shape self-false-fired
+        // `ebpf_reverse_shell` on the product's own egress — observed 126
+        // Critical self-flags / 30 min to Telegram (149.154.166.x) on test001,
+        // with `innerwarden-age` / `innerwarden` as the source comm. Verified via
+        // `/proc/<pid>/exe` (NOT the forgeable comm): a process that merely sets
+        // comm=innerwarden-* but whose exe is /tmp still fires — no blind spot.
+        // Checked on the reliable connect-time comm; skipping the connect means a
+        // later fd_redirect finds no recorded connect and cannot fire either.
+        if super::is_verified_infra_process(comm, pid, &["innerwarden"]) {
+            return None;
+        }
+
         // Record this event for the PID
         let dst_ip = event
             .details
@@ -1053,6 +1067,69 @@ mod tests {
         // Parent 1234 did something unrelated (no connect); child 9999 redirects.
         let inc = det.process(&fd_redirect_event_ppid(9999, 5, 0, 1234, now));
         assert!(inc.is_none());
+    }
+
+    /// A pid above the kernel pid_max ceiling → `/proc/<pid>/exe` never exists →
+    /// `is_verified_infra_process` takes its comm-match + process-exited fallback,
+    /// the same Managed semantics as a live verified InnerWarden process. Avoids
+    /// the flaky-small-live-pid /proc read (RECURRING_BUGS.md).
+    const DEAD_PID: u32 = 4_000_000_001;
+
+    /// Regression anchor (self-FP found 2026-06-21): InnerWarden's own agent/ctl
+    /// connect out (Telegram, API, threat feeds) + dup2 fds, and that shape
+    /// self-false-fired `ebpf_reverse_shell` — 126 Critical self-flags / 30 min on
+    /// test001 (`innerwarden-age` → Telegram 149.154.166.x). The agent must not
+    /// accuse itself of a reverse shell.
+    #[test]
+    fn innerwarden_self_egress_is_not_flagged_as_reverse_shell() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        // Agent connects out, then a fd_redirect at the same pid.
+        assert!(det
+            .process(&connect_event_with_comm(
+                DEAD_PID,
+                "149.154.166.110",
+                443,
+                "innerwarden-agent",
+                now
+            ))
+            .is_none());
+        let inc = det.process(&fd_redirect_event(
+            DEAD_PID,
+            5,
+            0,
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_none(),
+            "InnerWarden's own verified egress must NOT fire ebpf_reverse_shell"
+        );
+    }
+
+    /// No blind spot: a process that merely SETS comm=innerwarden-* but whose
+    /// `/proc/exe` is NOT a system path (here the test binary under target/) is
+    /// still flagged — the exclusion is verified by exe, not the forgeable comm.
+    /// Linux-only: needs a real readable /proc/<pid>/exe (absent on macOS).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forged_innerwarden_comm_from_nonsystem_exe_still_fires() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        let own = std::process::id();
+        assert!(det
+            .process(&connect_event_with_comm(
+                own,
+                "10.0.0.1",
+                4444,
+                "innerwarden-agent",
+                now
+            ))
+            .is_none());
+        let inc = det.process(&fd_redirect_event(own, 5, 0, now + Duration::seconds(1)));
+        assert!(
+            inc.is_some(),
+            "a forged comm=innerwarden-* with a non-system /proc/exe must still fire"
+        );
     }
 
     #[test]
