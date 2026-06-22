@@ -50,7 +50,13 @@ Prompt guardrails try to control what an agent says. Inner Warden controls what 
 
 It lives where the action is: on the machine the agent can affect. Agent-facing checks can review commands and MCP tool calls before they run; host-level sensors still watch what actually executes. If the agent is tricked, the safety layer is not inside the thing being tricked. One binary, one SQLite database, no SIEM bundle, no external IDS, no cloud control plane. Two Rust daemons and a CLI.
 
-45 eBPF kernel programs (loaded in prod; kernel-dependent). 82 detectors. 30 collectors. 69 cross-layer correlation rules. 90+ MITRE ATT&CK techniques covered across 12 ATT&CK tactics. 7900+ unit tests (665 named anchors that pin past bug fixes — see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change. 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. Monthly threat reports. Mesh collaborative defense. **Unified SQLite store** for every artifact (incidents, decisions, KV cache, graph snapshots, attacker profiles). **Explained alerts**: every notification carries a plain-language "what happened + why it matters" with the MITRE technique, so an alert teaches instead of showing a raw detector name. **Intelligent notifications**: incidents group into a single Telegram message per IP instead of one-per-event. **Circuit breaker**: per-hour cap on autonomous block decisions protects against runaway enforcement (pause / log-only / dry-run modes). **Continuous trust scoring**: graduated enforcement plus daily self-check. **Operator Trust IP**: mark an IP/CIDR monitor-only from the dashboard (still detected, logged, and notified — only the auto-block is suppressed; time-boxable; audited). **Truthful containment**: a threat the firewall is already dropping reads as *Contained* instead of nagging you for action it doesn't need, verified against the live firewall. **Regression safety net**: `make scenario-qa` gates every PR against drift for 7 canonical attack scenarios, and a CI smoke test runs the real `curl \| sudo bash` install path on every change so the front door never breaks.
+**In plain terms, it does three things:**
+
+- **Supervise.** It screens an agent's commands and MCP/tool calls *before* they run and returns allow, review, or block, scored against embedded Agent Threat Rules.
+- **Watch.** It sees what actually executes on the host with eBPF, so if something slips past the polite guardrail it is still caught.
+- **Prove.** It records every decision locally in a tamper-evident audit trail. No cloud, your data never leaves the box.
+
+Under the hood: 45 eBPF programs, 82 detectors, 69 cross-layer correlation rules, 90+ MITRE ATT&CK techniques, and 7900+ tests gate every change. The full tour is further down: [what it does](#what-it-does), [what it detects](#what-it-detects), [how it works](#how-it-works).
 
 <h3 align="center">
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
@@ -69,6 +75,9 @@ Apache-2.0. If this project helps make agent automation safer to try, [give it a
 ---
 
 ## Architecture
+
+<details>
+<summary><b>Full layered architecture</b>: firmware (Ring -2) to kernel eBPF to sensor to agent to response. Click to expand.</summary>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -194,6 +203,8 @@ Apache-2.0. If this project helps make agent automation safer to try, [give it a
 │   └───────────────────────────────────────────────────────────┘   │
 └───────────────────────────────────────────────────────────────────┘
 ```
+
+</details>
 
 **Runtime layers between the AI Triage and the notification channels above:**
 
