@@ -10,13 +10,25 @@
 //!   2. `dns.query` for a known tunnel-service domain — catches
 //!      the tunneled session even when the binary was renamed.
 //!
+//! Also catches **mesh / overlay VPN** remote-access tools (`tailscale`,
+//! `zerotier`, `netbird`, `nebula`) — the modern "install a legit mesh VPN on a
+//! compromised host, then SSH in over the tunnel" persistence technique. These
+//! are far more commonly legitimate than the tunnel binaries, so they fire at
+//! **High** (not Critical), exec-only (their coordination DNS is constant on a
+//! legit host and would be pure noise), deduped, and explicitly allowlistable.
+//!
 //! Anti-FP gates:
 //!   - `cloudflared` running as the `cloudflared.service` systemd
 //!     unit silenced via operator allowlist `[detectors.c2_web_tunnel]`
 //!     (operators who legitimately deploy Cloudflare tunnels must
 //!     add `cloudflared` there).
+//!   - mesh-VPN exec deduped (10 min cooldown) + allowlistable — a host that
+//!     always runs Tailscale is allowlisted once; the signal is a host that did
+//!     NOT before. Note: a RENAMED mesh-VPN binary evades the exec-name match
+//!     (behavioural TUN/WireGuard detection is a tracked follow-up).
 //!
-//! MITRE: T1572 (Protocol Tunneling) / T1090.003 (Multi-hop Proxy).
+//! MITRE: T1572 (Protocol Tunneling) / T1090.003 (Multi-hop Proxy) /
+//! T1219 (Remote Access Software).
 
 use std::collections::HashMap;
 
@@ -35,6 +47,24 @@ const TUNNEL_BINARIES: &[&str] = &[
     "frps",
     "chisel",
     "gost",
+];
+
+/// Mesh / overlay VPN remote-access tools. These are a real attacker
+/// persistence channel (install a mesh VPN on a compromised host, then SSH in
+/// over the tunnel — stable, encrypted, NAT-traversing, and it looks like legit
+/// infrastructure). But they are MUCH more commonly legitimate than the tunnel
+/// binaries above (operators run Tailscale for ordinary admin), so they fire at
+/// HIGH (not Critical), exec-only (no coordination-DNS match — that traffic is
+/// constant on a legit host and would be pure noise), deduped, and explicitly
+/// allowlistable. A host that did not run a mesh VPN before suddenly running one
+/// is the signal; a host that always does, the operator allowlists once.
+const MESH_VPN_BINARIES: &[&str] = &[
+    "tailscale",
+    "tailscaled",
+    "zerotier-one",
+    "zerotier-cli",
+    "netbird",
+    "nebula",
 ];
 
 /// Suffix-match against the FQDN in the DNS query. Order matters —
@@ -86,9 +116,15 @@ impl C2WebTunnelDetector {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let argv0_base = argv0.split('/').next_back().unwrap_or(argv0);
-        if !is_tunnel_binary(argv0_base) {
+        // Tunnel binaries (ngrok/cloudflared/…) → Critical; mesh VPNs
+        // (tailscale/zerotier/…) → High (more commonly legit, allowlistable).
+        let (severity, sub_kind) = if is_tunnel_binary(argv0_base) {
+            (Severity::Critical, "exec")
+        } else if is_mesh_vpn_binary(argv0_base) {
+            (Severity::High, "mesh_vpn")
+        } else {
             return None;
-        }
+        };
         let comm = event
             .details
             .get("comm")
@@ -116,7 +152,8 @@ impl C2WebTunnelDetector {
             .unwrap_or(0);
         self.emit(
             event,
-            "exec",
+            severity,
+            sub_kind,
             argv0_base,
             comm,
             parent_comm,
@@ -156,13 +193,24 @@ impl C2WebTunnelDetector {
             .get("comm")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        self.emit(event, "dns", &qname, comm, "", &qname, pid, uid)
+        self.emit(
+            event,
+            Severity::Critical,
+            "dns",
+            &qname,
+            comm,
+            "",
+            &qname,
+            pid,
+            uid,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
         event: &Event,
+        severity: Severity,
         sub_kind: &str,
         target: &str,
         comm: &str,
@@ -179,6 +227,31 @@ impl C2WebTunnelDetector {
             }
         }
         self.last_fired.insert(key.clone(), now);
+        let mesh = sub_kind == "mesh_vpn";
+        let title = if mesh {
+            format!("Remote-access mesh VPN started: {target}")
+        } else {
+            format!("Web-tunnel C2 indicator ({sub_kind}): {target}")
+        };
+        let summary = if mesh {
+            format!(
+                "A mesh/overlay VPN remote-access tool `{target}` ran (comm=`{comm}`, \
+                 parent_comm=`{parent_comm}`, pid={pid}, uid={uid}, command=`{command}`). \
+                 This is LEGITIMATE if you use it for admin access — allowlist it. If you \
+                 did NOT install it, it is a common attacker-persistence channel: an \
+                 implant installs a mesh VPN on a compromised host and connects back in \
+                 over the encrypted tunnel (stable, NAT-traversing, looks like normal \
+                 infrastructure) (T1572 / T1219)."
+            )
+        } else {
+            format!(
+                "Sub-detector `{sub_kind}` matched target `{target}` (comm=`{comm}`, \
+                 parent_comm=`{parent_comm}`, pid={pid}, uid={uid}, command=`{command}`). \
+                 Operator-friendly tunneling tools are a common C2 channel; the same \
+                 binary that lets a developer expose a local port to the internet lets \
+                 an attacker exfiltrate over an attacker-controlled relay (T1572)."
+            )
+        };
         Some(Incident {
             ts: now,
             host: self.host.clone(),
@@ -187,15 +260,9 @@ impl C2WebTunnelDetector {
                 target,
                 now.format("%Y-%m-%dT%H:%M:%SZ")
             ),
-            severity: Severity::Critical,
-            title: format!("Web-tunnel C2 indicator ({sub_kind}): {target}"),
-            summary: format!(
-                "Sub-detector `{sub_kind}` matched target `{target}` (comm=`{comm}`, \
-                 parent_comm=`{parent_comm}`, pid={pid}, uid={uid}, command=`{command}`). \
-                 Operator-friendly tunneling tools are a common C2 channel; the same \
-                 binary that lets a developer expose a local port to the internet lets \
-                 an attacker exfiltrate over an attacker-controlled relay (T1572)."
-            ),
+            severity,
+            title,
+            summary,
             evidence: serde_json::json!([{
                 "kind": "c2_web_tunnel",
                 "sub_kind": sub_kind,
@@ -209,10 +276,23 @@ impl C2WebTunnelDetector {
             }]),
             recommended_checks: vec![
                 format!("Inspect process tree: pstree -p {pid}"),
-                "If the operator legitimately runs Cloudflare tunnels / ngrok, allowlist via [detectors.c2_web_tunnel]".to_string(),
+                if mesh {
+                    "If you legitimately use this mesh VPN (Tailscale/ZeroTier/…) for admin, allowlist it via [detectors.c2_web_tunnel]; otherwise treat as attacker persistence and investigate who installed it".to_string()
+                } else {
+                    "If the operator legitimately runs Cloudflare tunnels / ngrok, allowlist via [detectors.c2_web_tunnel]".to_string()
+                },
                 "Correlate with the host's outbound connections in the last 5 minutes".to_string(),
             ],
-            tags: vec!["c2".to_string(), "tunnel".to_string()],
+            tags: if mesh {
+                vec![
+                    "c2".to_string(),
+                    "tunnel".to_string(),
+                    "remote_access".to_string(),
+                    "persistence".to_string(),
+                ]
+            } else {
+                vec!["c2".to_string(), "tunnel".to_string()]
+            },
             entities: vec![],
         })
     }
@@ -220,6 +300,10 @@ impl C2WebTunnelDetector {
 
 fn is_tunnel_binary(base: &str) -> bool {
     TUNNEL_BINARIES.contains(&base)
+}
+
+fn is_mesh_vpn_binary(base: &str) -> bool {
+    MESH_VPN_BINARIES.contains(&base)
 }
 
 #[cfg(test)]
@@ -280,6 +364,71 @@ mod tests {
             let mut det = C2WebTunnelDetector::new("test");
             assert!(det.process(&exec_event(bin)).is_some(), "{bin} should fire");
         }
+    }
+
+    /// Mesh / overlay VPN remote-access tools (the "install Tailscale on a
+    /// compromised host + SSH in over the tunnel" persistence technique) fire at
+    /// HIGH (not Critical — they are commonly legit) with the mesh_vpn sub_kind.
+    #[test]
+    fn fires_high_on_mesh_vpn_binaries() {
+        for bin in [
+            "/usr/bin/tailscale",
+            "tailscaled",
+            "/usr/sbin/tailscaled",
+            "zerotier-one",
+            "zerotier-cli",
+            "netbird",
+            "nebula",
+        ] {
+            let mut det = C2WebTunnelDetector::new("test");
+            let inc = det
+                .process(&exec_event(bin))
+                .unwrap_or_else(|| panic!("{bin} should fire"));
+            assert_eq!(
+                inc.severity,
+                Severity::High,
+                "{bin} mesh VPN is High, not Critical"
+            );
+            assert!(
+                inc.incident_id.contains(":mesh_vpn:"),
+                "{bin} → mesh_vpn sub_kind"
+            );
+            assert!(inc.tags.contains(&"persistence".to_string()));
+        }
+    }
+
+    /// Regression: the existing tunnel binaries stay Critical (not downgraded).
+    #[test]
+    fn tunnel_binaries_stay_critical() {
+        let mut det = C2WebTunnelDetector::new("test");
+        let inc = det.process(&exec_event("/usr/local/bin/ngrok")).unwrap();
+        assert_eq!(inc.severity, Severity::Critical);
+    }
+
+    /// A mainstream binary that merely contains a substring must NOT fire — exact
+    /// basename match only, so `tailscale-status-helper` / `nebula-graph` etc. and
+    /// ordinary tools stay quiet (no UX noise).
+    #[test]
+    fn does_not_fire_on_unrelated_or_substring_binaries() {
+        let mut det = C2WebTunnelDetector::new("test");
+        for bin in ["/usr/bin/curl", "tailscale-helper", "my-nebula-app", "ssh"] {
+            assert!(
+                det.process(&exec_event(bin)).is_none(),
+                "{bin} must not fire"
+            );
+        }
+    }
+
+    /// Mesh-VPN exec is deduped (cooldown) — a host that runs `tailscale` many
+    /// times in the window does not spam incidents.
+    #[test]
+    fn mesh_vpn_exec_is_deduped_within_cooldown() {
+        let mut det = C2WebTunnelDetector::new("test");
+        assert!(det.process(&exec_event("tailscale")).is_some());
+        assert!(
+            det.process(&exec_event("tailscale")).is_none(),
+            "second tailscale exec within cooldown must be suppressed"
+        );
     }
 
     #[test]
