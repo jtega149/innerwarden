@@ -463,7 +463,6 @@ Enable what you need.
 | `abuseipdb-enrichment` | IP reputation context | Enriched AI prompt |
 | `dshield-enrichment` | SANS ISC IP reputation (keyless, read-only) | Enriched AI prompt |
 | `geoip-enrichment` | Country/ISP geolocation | Enriched AI prompt |
-| `fail2ban-integration` | Sync active fail2ban bans | Block enforcement |
 | `crowdsec-integration` | CrowdSec community intel | Block enforcement (experimental) |
 
 ```bash
@@ -604,15 +603,11 @@ $ innerwarden system scan
   sshd       running  → ssh-protection       ESSENTIAL    [NATIVE]
   docker     running  → container-security    RECOMMENDED  [NATIVE]
   nginx      running  → search-protection     RECOMMENDED  [NATIVE]
-  fail2ban   running  → fail2ban-integration  RECOMMENDED  [NATIVE]
-
-  Conflicts detected:
-    fail2ban-integration + abuseipdb-enrichment: both auto-block IPs; enable one
 
   Activation sequence:
     1. innerwarden enable block-ip
     2. innerwarden enable ssh-protection
-    3. innerwarden enable fail2ban-integration
+    3. innerwarden enable search-protection
 ```
 
 **NATIVE** = reads existing logs, zero external deps. **EXTERNAL** = requires separate tool install.
