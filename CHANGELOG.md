@@ -10,6 +10,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`innerwarden playbook test --insecure`.** The agent dashboard serves HTTPS with a self-signed certificate, so `innerwarden playbook test --url https://127.0.0.1:8787 …` failed with `invalid peer certificate: UnknownIssuer` and the command could not reach its own agent. The new `--insecure` flag skips TLS verification for the self-signed cert (documented as not-for-untrusted-networks), so the dry-run playbook test works against the live HTTPS dashboard. Unit-tested for both the verifying and insecure agent-construction paths.
 - **n8n integration recipe for the Agent Guard API (docs).** New
   `docs/integration-recipes/n8n-agent-guard.md` shows how to drive the existing
   `GET /api/agent/security-context` (threat assessment) and

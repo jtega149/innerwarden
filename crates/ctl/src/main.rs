@@ -1244,6 +1244,12 @@ enum PlaybookCommand {
         /// Basic-auth password (or INNERWARDEN_DASHBOARD_PASSWORD).
         #[arg(long)]
         password: Option<String>,
+
+        /// Skip TLS certificate verification. The agent dashboard serves
+        /// HTTPS with a self-signed cert, so `--url https://...` otherwise
+        /// fails with `UnknownIssuer`. Do NOT use over an untrusted network.
+        #[arg(long)]
+        insecure: bool,
     },
 }
 
@@ -2786,12 +2792,14 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 ref url,
                 ref user,
                 ref password,
+                insecure,
             } => commands::playbook::cmd_playbook_test(
                 id,
                 incident_file,
                 url.as_deref(),
                 user.as_deref(),
                 password.as_deref(),
+                *insecure,
             ),
         },
         Command::Module { ref command } => dispatch_module(&cli, command),
