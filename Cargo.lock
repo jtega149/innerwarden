@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-agent"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
@@ -2409,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-agent-guard"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-ctl"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-dna"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "axum",
@@ -2481,14 +2481,14 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-ebpf-types"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "innerwarden-hypervisor"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-killchain"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-sensor"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "aya",
@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-shield"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "axum",
@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-smm"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-store"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2618,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-supervisor"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "clap",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden_core"
-version = "0.15.24"
+version = "0.15.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3001,9 +3001,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memmap2"
-version = "0.9.10"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
