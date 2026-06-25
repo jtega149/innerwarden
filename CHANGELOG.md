@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Installer no longer sends the telemetry ping from CI / automation.** Installer smoke-tests run on ephemeral CI runners (GitHub Actions and friends), each a fresh machine-id from a US x86_64 box, so every run was writing an `install` row into the opt-out install telemetry, inflating the install count with non-users (most of a given window's "installs" were our own CI). `install.sh` now detects a CI environment (`CI=true/1`, or any of `GITHUB_ACTIONS`/`GITLAB_CI`/`JENKINS_URL`/`BUILDKITE`/`CIRCLECI`/`TF_BUILD`/`TEAMCITY_VERSION`/`DRONE`) and skips the ping (logging that it did). The install itself still runs and is still verified in CI; only the ping is suppressed, so the telemetry reflects real installs. `CI=false` (some dev shells) is correctly treated as not-CI.
+
 ## [0.15.25] - 2026-06-24
 
 ### Security

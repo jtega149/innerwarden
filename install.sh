@@ -1417,7 +1417,19 @@ fi
 # The curl is backgrounded with a 5 s timeout and `-fsS` so it never
 # blocks the install or writes to stdout. If the request fails (DNS,
 # network, server down), the install completes silently regardless.
-if [[ "${INNERWARDEN_NO_TELEMETRY:-0}" != "1" ]]; then
+# Skip the ping in CI / automation. Installer smoke-tests run on ephemeral
+# runners (GitHub Actions et al.), each a fresh machine-id from a US x86_64 box,
+# so without this guard they flood the install telemetry and make adoption look
+# busier than it is. The install itself still runs and is still verified in CI;
+# only the ping is suppressed.
+_iw_in_ci() {
+  case "${CI:-}" in true | TRUE | 1) return 0 ;; esac
+  [[ -n "${GITHUB_ACTIONS:-}${GITLAB_CI:-}${JENKINS_URL:-}${BUILDKITE:-}${CIRCLECI:-}${TF_BUILD:-}${TEAMCITY_VERSION:-}${DRONE:-}" ]]
+}
+
+if _iw_in_ci; then
+  log "CI/automation detected, skipping the install telemetry ping."
+elif [[ "${INNERWARDEN_NO_TELEMETRY:-0}" != "1" ]]; then
   # Anonymous install ping (opt-OUT). One-line notice + how to opt out, so the
   # default-on collection is transparent (informed consent, not silent).
   log "Sending an anonymous install ping (version + OS + CPU arch only — no IP, no host data)."
