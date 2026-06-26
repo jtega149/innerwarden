@@ -2,6 +2,7 @@
 // cargo-fuzz harnesses in fuzz/.
 
 pub mod btf_offsets;
+pub mod cloud_platform;
 pub mod collector_health;
 pub mod collectors;
 pub mod detectors;

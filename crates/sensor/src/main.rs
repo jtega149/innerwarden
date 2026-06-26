@@ -1,5 +1,6 @@
 mod boot;
 mod btf_offsets;
+mod cloud_platform;
 mod collector_health;
 mod collectors;
 mod config;
