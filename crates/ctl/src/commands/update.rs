@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -10,6 +10,115 @@ enum ServiceAction {
     Restart,
     Start,
     Skip,
+}
+
+/// Outcome of the post-download arch smoke-test (`<binary> --version`).
+#[derive(Debug, PartialEq, Eq)]
+enum SmokeOutcome {
+    /// Ran and printed the expected version.
+    Ok,
+    /// Ran on this CPU (good enough to install) but did not print the expected
+    /// version string. Soft warning, not a hard stop.
+    RanUnverified(String),
+    /// Could not execute at all (spawn failure) or was killed by a signal: the
+    /// wrong-arch / corrupt-binary case. Hard stop: refuse the swap.
+    CannotRun(String),
+}
+
+/// Pure verdict from the raw smoke-test signals, separated from process
+/// spawning so every branch is unit-tested.
+///
+/// Hard-fails ONLY when the binary could not execute (spawn failure) or was
+/// killed by a signal. A clean non-zero exit still proves the binary RUNS on
+/// this arch (e.g. a future build that does not recognise `--version`), so it is
+/// treated as soft: we must not break upgrades on a cosmetic mismatch, only on
+/// a genuine "this binary does not run here" (the wrong-CPU-arch outage class).
+fn smoke_test_verdict(
+    spawned: bool,
+    signaled: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+    expected_version: &str,
+) -> SmokeOutcome {
+    if !spawned {
+        return SmokeOutcome::CannotRun(
+            "could not execute (likely the wrong CPU architecture)".to_string(),
+        );
+    }
+    if signaled {
+        return SmokeOutcome::CannotRun(
+            "killed by a signal while running (corrupt or wrong-arch binary)".to_string(),
+        );
+    }
+    if exit_code == Some(0) && stdout.contains(expected_version) {
+        return SmokeOutcome::Ok;
+    }
+    SmokeOutcome::RanUnverified(format!(
+        "did not report version {expected_version} (exit={exit_code:?})"
+    ))
+}
+
+/// Run `<path> --version` and classify the outcome. Unix-only (the only targets
+/// InnerWarden ships). The staged binary must already be sha256+sig verified.
+fn run_smoke_test(path: &Path, expected_version: &str) -> SmokeOutcome {
+    use std::os::unix::process::ExitStatusExt;
+    match std::process::Command::new(path).arg("--version").output() {
+        Err(_) => smoke_test_verdict(false, false, None, "", expected_version),
+        Ok(out) => {
+            let signaled = out.status.signal().is_some();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            smoke_test_verdict(true, signaled, out.status.code(), &stdout, expected_version)
+        }
+    }
+}
+
+/// Stage one downloaded binary into the install dir, arch-smoke-test it there (a
+/// trusted path, so the host's own `host_drift` does not flag the check the way
+/// a `/tmp` exec would), then install it to all of its target names and drop the
+/// staging copy. I/O is injected (`install` / `smoke` / `remove`) so the
+/// staging-gate-then-install-all flow is unit-tested without filesystem or
+/// process I/O, the same inject-for-test shape as [`restart_after_upgrade`].
+/// Hard-fails (keeping the existing binary) only on `SmokeOutcome::CannotRun`.
+fn stage_and_install<I, S, R>(
+    binary: &str,
+    tmp_path: &Path,
+    dests: &[PathBuf],
+    expected_version: &str,
+    mut install: I,
+    smoke: S,
+    mut remove: R,
+) -> Result<()>
+where
+    I: FnMut(&Path, &Path) -> Result<()>,
+    S: FnOnce(&Path, &str) -> SmokeOutcome,
+    R: FnMut(&Path),
+{
+    let staged = dests
+        .first()
+        .map(|d| d.with_extension("iwnew"))
+        .context("install_paths returned no destination")?;
+    install(tmp_path, &staged)?;
+    match smoke(&staged, expected_version) {
+        SmokeOutcome::CannotRun(why) => {
+            remove(&staged);
+            anyhow::bail!(
+                "arch smoke-test failed for {binary}: {why}. Refusing to install; \
+                 the existing binary is untouched. (sha256 + signature already \
+                 verified, so this is an execution failure, almost certainly a \
+                 wrong-CPU-architecture asset.)"
+            );
+        }
+        SmokeOutcome::RanUnverified(note) => {
+            println!("  [warn] {binary} ran but {note}; proceeding (bytes are signed).");
+        }
+        SmokeOutcome::Ok => {}
+    }
+    for dest in dests {
+        install(&staged, dest)?;
+        println!("  [done] {} → {}", binary, dest.display());
+    }
+    remove(&staged);
+    Ok(())
 }
 
 fn release_date_suffix(release_date: Option<&str>) -> String {
@@ -488,11 +597,24 @@ fn cmd_upgrade_with_release(
             }
         }
 
-        // Install to all target names
-        for dest in install_paths(dp.target, install_dir) {
-            install_binary(&tmp_path, &dest, false)?;
-            println!("  [done] {} → {}", binary, dest.display());
-        }
+        // Arch smoke-test BEFORE swapping the live binary. sha256+sig prove the
+        // bytes are authentic, but NOT that they execute on THIS host's CPU;
+        // installing an x86_64 build on aarch64 took prod down on 2026-06-10.
+        // Stage the verified binary into the install dir (a package-trusted path,
+        // so the host's own host_drift detector does not flag the check the way a
+        // /tmp exec would) and run `--version`; refuse the swap if it cannot run.
+        let dests = install_paths(dp.target, install_dir);
+        stage_and_install(
+            binary,
+            &tmp_path,
+            &dests,
+            strip_v(&release.tag_name),
+            |src, dest| install_binary(src, dest, false),
+            run_smoke_test,
+            |p| {
+                let _ = std::fs::remove_file(p);
+            },
+        )?;
     }
 
     // Fix permissions on existing config files - files written before v0.1.9 may
@@ -566,6 +688,198 @@ fn fix_config_dir_permissions(config_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smoke_verdict_spawn_failure_is_hard_stop() {
+        // Wrong-CPU-arch asset: spawn fails (ENOEXEC). MUST hard-stop.
+        assert!(matches!(
+            smoke_test_verdict(false, false, None, "", "0.15.26"),
+            SmokeOutcome::CannotRun(_)
+        ));
+    }
+
+    #[test]
+    fn smoke_verdict_signal_is_hard_stop() {
+        // Killed by a signal (e.g. SIGILL on a bad-arch binary). MUST hard-stop.
+        assert!(matches!(
+            smoke_test_verdict(true, true, None, "", "0.15.26"),
+            SmokeOutcome::CannotRun(_)
+        ));
+    }
+
+    #[test]
+    fn smoke_verdict_version_match_is_ok() {
+        assert_eq!(
+            smoke_test_verdict(
+                true,
+                false,
+                Some(0),
+                "innerwarden-sensor 0.15.26",
+                "0.15.26"
+            ),
+            SmokeOutcome::Ok
+        );
+    }
+
+    #[test]
+    fn smoke_verdict_clean_nonzero_exit_is_soft_not_hard() {
+        // Ran on this arch but exited non-zero (e.g. did not recognise
+        // --version). It RUNS here, so this must NOT abort the upgrade.
+        assert!(matches!(
+            smoke_test_verdict(true, false, Some(2), "usage: ...", "0.15.26"),
+            SmokeOutcome::RanUnverified(_)
+        ));
+    }
+
+    #[test]
+    fn smoke_verdict_zero_exit_wrong_version_is_soft() {
+        // Runs, exits clean, but reports a different version: soft warn, proceed.
+        assert!(matches!(
+            smoke_test_verdict(true, false, Some(0), "innerwarden 0.15.25", "0.15.26"),
+            SmokeOutcome::RanUnverified(_)
+        ));
+    }
+
+    #[test]
+    fn run_smoke_test_on_missing_binary_cannot_run() {
+        let v = run_smoke_test(
+            std::path::Path::new("/nonexistent/iw-smoke-test-xyz"),
+            "0.15.26",
+        );
+        assert!(matches!(v, SmokeOutcome::CannotRun(_)));
+    }
+
+    fn write_exec_script(dir: &std::path::Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("fakebin");
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn run_smoke_test_real_binary_version_match_is_ok() {
+        // Exercises the spawn-succeeds branch: a real executable that prints the
+        // expected version exits 0 and matches => Ok.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_exec_script(tmp.path(), "#!/bin/sh\necho \"fakebin 9.9.9\"\n");
+        assert_eq!(run_smoke_test(&bin, "9.9.9"), SmokeOutcome::Ok);
+    }
+
+    #[test]
+    fn run_smoke_test_real_binary_nonzero_exit_is_soft() {
+        // Spawns fine but exits non-zero: it RUNS on this arch, so soft, not a
+        // hard stop.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_exec_script(tmp.path(), "#!/bin/sh\nexit 3\n");
+        assert!(matches!(
+            run_smoke_test(&bin, "9.9.9"),
+            SmokeOutcome::RanUnverified(_)
+        ));
+    }
+
+    fn dests(n: usize) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| PathBuf::from(format!("/usr/local/bin/iw-bin-{i}")))
+            .collect()
+    }
+
+    #[test]
+    fn stage_and_install_ok_installs_all_dests_from_staged_and_cleans_up() {
+        use std::cell::RefCell;
+        let installs = RefCell::new(Vec::<(PathBuf, PathBuf)>::new());
+        let removed = RefCell::new(Vec::<PathBuf>::new());
+        let ds = dests(2);
+        let r = stage_and_install(
+            "iw-bin",
+            Path::new("/tmp/dl/iw-bin"),
+            &ds,
+            "1.2.3",
+            |src, dest| {
+                installs
+                    .borrow_mut()
+                    .push((src.to_path_buf(), dest.to_path_buf()));
+                Ok(())
+            },
+            |_p, _v| SmokeOutcome::Ok,
+            |p| removed.borrow_mut().push(p.to_path_buf()),
+        );
+        assert!(r.is_ok());
+        let staged = PathBuf::from("/usr/local/bin/iw-bin-0.iwnew");
+        // tmp -> staged, then staged -> each of the 2 dests.
+        assert_eq!(installs.borrow().len(), 3);
+        assert_eq!(
+            installs.borrow()[0],
+            (PathBuf::from("/tmp/dl/iw-bin"), staged.clone())
+        );
+        assert_eq!(installs.borrow()[1], (staged.clone(), ds[0].clone()));
+        assert_eq!(installs.borrow()[2], (staged.clone(), ds[1].clone()));
+        assert_eq!(removed.borrow().as_slice(), &[staged]);
+    }
+
+    #[test]
+    fn stage_and_install_ran_unverified_still_installs() {
+        use std::cell::RefCell;
+        let installs = RefCell::new(0usize);
+        let r = stage_and_install(
+            "iw-bin",
+            Path::new("/tmp/iw-bin"),
+            &dests(1),
+            "1.2.3",
+            |_s, _d| {
+                *installs.borrow_mut() += 1;
+                Ok(())
+            },
+            |_p, _v| SmokeOutcome::RanUnverified("no version".into()),
+            |_p| {},
+        );
+        assert!(r.is_ok());
+        assert_eq!(*installs.borrow(), 2); // tmp->staged + 1 dest
+    }
+
+    #[test]
+    fn stage_and_install_cannot_run_bails_before_dest_install() {
+        use std::cell::RefCell;
+        let installs = RefCell::new(0usize);
+        let removed = RefCell::new(0usize);
+        let r = stage_and_install(
+            "iw-bin",
+            Path::new("/tmp/iw-bin"),
+            &dests(2),
+            "1.2.3",
+            |_s, _d| {
+                *installs.borrow_mut() += 1;
+                Ok(())
+            },
+            |_p, _v| SmokeOutcome::CannotRun("wrong arch".into()),
+            |_p| {
+                *removed.borrow_mut() += 1;
+            },
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("Refusing to install"), "{e}");
+        assert!(e.contains("wrong arch"), "{e}");
+        assert_eq!(
+            *installs.borrow(),
+            1,
+            "only the staged install, no dest swap"
+        );
+        assert_eq!(*removed.borrow(), 1, "staged copy cleaned up on abort");
+    }
+
+    #[test]
+    fn stage_and_install_propagates_install_error() {
+        let r = stage_and_install(
+            "iw-bin",
+            Path::new("/tmp/iw-bin"),
+            &dests(1),
+            "1.2.3",
+            |_s, _d| anyhow::bail!("disk full"),
+            |_p, _v| SmokeOutcome::Ok,
+            |_p| {},
+        );
+        assert!(r.unwrap_err().to_string().contains("disk full"));
+    }
     use crate::upgrade::{detect_arch, GithubAsset, GithubRelease, CURRENT_VERSION};
     use std::io::{Read, Write};
     use std::net::TcpListener;

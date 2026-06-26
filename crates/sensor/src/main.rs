@@ -11,6 +11,7 @@ mod event_pipeline;
 mod incident_builders;
 mod kernel_promote;
 mod main_helpers;
+mod path_trust;
 mod seccomp;
 mod sensor;
 mod sinks;
