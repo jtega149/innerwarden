@@ -384,7 +384,7 @@ mod tests {
             "mistral"
         );
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let audit_path = cli.data_dir.join(format!("admin-actions-{today}.jsonl"));
         let audit = std::fs::read_to_string(audit_path).expect("enable should write audit entry");
         assert!(audit.contains("\"action\":\"enable\""));
@@ -405,7 +405,7 @@ mod tests {
         cmd_enable(&cli, &registry, "ai", ollama_params(), true, false)
             .expect("already-enabled capability should be a no-op");
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         assert!(!cli
             .data_dir
             .join(format!("admin-actions-{today}.jsonl"))
@@ -431,7 +431,7 @@ mod tests {
         cmd_enable_with_deferred_restart(&cli, &registry, "ai", ollama_params(), true, true, true)
             .expect("force should re-apply an already-enabled capability");
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         assert!(
             cli.data_dir
                 .join(format!("admin-actions-{today}.jsonl"))
@@ -492,7 +492,7 @@ mod tests {
             "ai",
             "enabled"
         ));
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let audit_path = cli.data_dir.join(format!("admin-actions-{today}.jsonl"));
         let audit = std::fs::read_to_string(audit_path).expect("disable should write audit entry");
         assert!(audit.contains("\"action\":\"disable\""));
@@ -508,7 +508,7 @@ mod tests {
         cmd_disable(&cli, &registry, "ai", true)
             .expect("already-disabled capability should be a no-op");
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         assert!(!cli
             .data_dir
             .join(format!("admin-actions-{today}.jsonl"))

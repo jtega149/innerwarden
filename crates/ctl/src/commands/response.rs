@@ -1225,13 +1225,13 @@ mod tests {
     // emergency CIDRs (Ubuntu mirrors / Telegram / GitHub Pages / Oracle
     // Cloud) without an audit trail and there was no flag to record WHY.
     /// Wave 8e helper: locate today's admin-actions file. The audit
-    /// writer uses `chrono::Local` for the date and canonicalises the
+    /// writer uses `chrono::Utc` for the date and canonicalises the
     /// data_dir (so `/var/folders/...` becomes `/private/var/folders/...`
     /// on macOS). Mirroring both here keeps the anchor tests robust on
     /// any host the test suite runs on. Reads the actual `data_dir`
     /// from the test CLI so it matches `test_cli`'s `temp/data` choice.
     fn admin_audit_today_in(cli: &Cli) -> std::path::PathBuf {
-        let day = chrono::Local::now()
+        let day = chrono::Utc::now()
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();

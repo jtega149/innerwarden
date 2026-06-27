@@ -4268,7 +4268,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn decisions_reads_jsonl() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("decisions-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4282,7 +4282,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn decisions_action_filter() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("decisions-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4305,7 +4305,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn entity_finds_ip_in_incident() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("incidents-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4319,7 +4319,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn entity_finds_user_in_decision() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("decisions-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4351,7 +4351,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn tune_no_suggestions_when_calibrated() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         // Write a modest event count that matches default thresholds - no suggestion expected
         let events_path = dir.path().join(format!("events-{today}.jsonl"));
         let mut content = String::new();
@@ -4432,7 +4432,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_export_finds_matching_records() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("incidents-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4454,7 +4454,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_erase_no_matching_records() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("events-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4471,7 +4471,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_erase_removes_matching_records() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("events-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4491,7 +4491,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_erase_recomputes_hash_chain_for_decisions() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let path = dir.path().join(format!("decisions-{today}.jsonl"));
         std::fs::write(
             &path,
@@ -4519,7 +4519,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn gdpr_erase_creates_audit_entry() {
         let dir = TempDir::new().unwrap();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let events_path = dir.path().join(format!("events-{today}.jsonl"));
         std::fs::write(
             &events_path,
