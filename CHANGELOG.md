@@ -9,6 +9,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.29] - 2026-06-27
+
+### Fixed
+- **execve events never carried the parent PID in-kernel, leaving the fileless-systemd false-positive gate (0.15.28) inert in production.** The 0.15.28 post-deploy re-audit found `fileless:systemd` still firing on Azure. Root cause: the eBPF execve handler hardcoded `event.ppid = 0`, so every execve `ppid` came from a userspace `/proc/<pid>/status` fallback. That works for long-lived processes (it is why `connect` events have a parent) but misses short-lived ones, notably systemd's sealed-executor `fexecve` of `/proc/self/fd/N` whose `/proc` entry is gone before the ring reader can read it (the audit measured `ppid=0` on 4995/5000 execve events). Because the 0.15.28 fileless-systemd parent-lineage gate needs the parent, it almost never engaged in prod. The fix reads `task_struct->real_parent->tgid` in-kernel at execve, mirroring the Execution Gate's `BPRM_OFFSETS` pattern: a new `TASK_OFFSETS` map (`real_parent` + `tgid` byte offsets) is populated by the userspace loader from kernel BTF (`member_offset`), and the handler does two bounded `bpf_probe_read_kernel` hops. If BTF is unavailable the offsets stay 0, the handler returns 0, and the `/proc` fallback applies unchanged (it never reads a guessed offset). Validated live on a 6.x x86_64 kernel: the verifier accepts the program, the offsets resolve from BTF, and a `comm=systemd` `fexecve` of `/proc/self/fd/N` now reports `ppid=1`, so the gate resolves `/proc/1/exe` to systemd and suppresses the false positive. aarch64 offsets are BTF-resolved identically.
+
 ## [0.15.28] - 2026-06-26
 
 ### Fixed
