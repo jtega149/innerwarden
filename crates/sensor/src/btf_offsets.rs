@@ -312,20 +312,29 @@ mod tests {
     // Build a BTF blob with a `pt_regs` struct carrying the given members at
     // the given BYTE offsets (arch-agnostic — drive it from `expected_offsets`).
     fn build_pt_regs_btf(members: &[(&str, u32)]) -> Vec<u8> {
+        build_struct_btf("pt_regs", members)
+    }
+
+    // Build a BTF blob with one named struct carrying the given members at the
+    // given BYTE offsets. Generalised from `build_pt_regs_btf` so the same
+    // primitives can exercise `member_offset` against any struct name (e.g.
+    // `task_struct` for the execve ppid fix).
+    fn build_struct_btf(struct_name: &str, members: &[(&str, u32)]) -> Vec<u8> {
         let mut strings = vec![0u8]; // index 0 = empty name
-        let ptregs_off = strings.len() as u32;
-        strings.extend_from_slice(b"pt_regs\0");
+        let struct_off = strings.len() as u32;
+        strings.extend_from_slice(struct_name.as_bytes());
+        strings.push(0);
         let mut name_offs = Vec::new();
         for (name, _) in members {
             name_offs.push(strings.len() as u32);
             strings.extend_from_slice(name.as_bytes());
             strings.push(0);
         }
-        // type 1: an INT (exercises the skip table); type 2: struct pt_regs.
+        // type 1: an INT (exercises the skip table); type 2: the struct.
         let mut types = btf_type_common(0, BTF_KIND_INT, 0, 8);
         types.extend_from_slice(&0u32.to_le_bytes());
         types.extend_from_slice(&btf_type_common(
-            ptregs_off,
+            struct_off,
             BTF_KIND_STRUCT,
             members.len() as u32,
             512,
@@ -334,6 +343,26 @@ mod tests {
             types.extend_from_slice(&btf_member(name_offs[i], 1, byte_off * 8));
         }
         build_btf(&strings, &types)
+    }
+
+    #[test]
+    fn member_offset_resolves_task_struct_fields() {
+        // Anchors the EXACT struct + member names `populate_task_offsets`
+        // queries for the execve in-kernel ppid fix. The live offsets on a
+        // 6.x x86_64 kernel (validated on test001) were real_parent=2504,
+        // tgid=2492; the test uses those so a rename of either member (which
+        // would silently re-inert the fileless parent-lineage gate) fails here.
+        let blob = build_struct_btf("task_struct", &[("real_parent", 2504), ("tgid", 2492)]);
+        assert_eq!(
+            member_offset(&blob, "task_struct", "real_parent"),
+            Some(2504)
+        );
+        assert_eq!(member_offset(&blob, "task_struct", "tgid"), Some(2492));
+        // A wrong member name resolves to None (so the loader leaves ppid=0 and
+        // falls back to /proc rather than reading a guessed offset).
+        assert_eq!(member_offset(&blob, "task_struct", "parent"), None);
+        // A wrong struct name also resolves to None.
+        assert_eq!(member_offset(&blob, "mm_struct", "tgid"), None);
     }
 
     #[test]

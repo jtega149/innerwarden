@@ -25,7 +25,7 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_get_current_task, bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, kretprobe, lsm, map, tracepoint, xdp},
@@ -566,6 +566,50 @@ static EXEC_PATH_SCRATCH: PerCpuArray<[u8; 256]> = PerCpuArray::with_max_entries
 /// gate falls back to 96 if this map is empty.
 #[map]
 static BPRM_OFFSETS: HashMap<u32, u32> = HashMap::with_max_entries(4, 0);
+
+/// `task_struct` field byte offsets, populated by the userspace loader from
+/// kernel BTF (CO-RE) so the execve handler can read the real parent across
+/// kernels. Key 0 = `real_parent` (a `task_struct *`); key 1 = `tgid` (the
+/// process PID). Absent / 0 means the handler skips the read and leaves
+/// `ppid = 0` (the userspace `/proc/<pid>/status` fallback then applies, i.e.
+/// the pre-existing behaviour) — it NEVER reads a guessed offset.
+#[map]
+static TASK_OFFSETS: HashMap<u32, u32> = HashMap::with_max_entries(4, 0);
+
+/// `task_struct->real_parent->tgid` for the current task: the parent PROCESS's
+/// PID, captured in-kernel at execve time. Returns 0 when the BTF offsets are
+/// unavailable or any kernel read fails, so the worst case is the pre-existing
+/// `ppid = 0` (userspace then reads `/proc`). This exists because the execve
+/// hook fires for SHORT-LIVED execs (notably systemd's sealed-executor
+/// `fexecve` of `/proc/self/fd/N`) whose `/proc` entry is already gone by the
+/// time the userspace ring reader looks — so the `/proc` fallback alone leaves
+/// their `ppid = 0`, which made the spec-PR1 fileless-systemd parent-lineage
+/// gate inert in prod. Mirrors the Execution Gate's `BPRM_OFFSETS` map-supplied
+/// offset + `bpf_probe_read_kernel` pattern; no vmlinux/CO-RE relocation needed.
+#[inline(always)]
+fn current_real_parent_tgid() -> u32 {
+    let rp_off = match unsafe { TASK_OFFSETS.get(&0u32) }.copied() {
+        Some(o) if o != 0 => o as usize,
+        _ => return 0,
+    };
+    let tgid_off = match unsafe { TASK_OFFSETS.get(&1u32) }.copied() {
+        Some(o) if o != 0 => o as usize,
+        _ => return 0,
+    };
+    let task = unsafe { bpf_get_current_task() };
+    if task == 0 {
+        return 0;
+    }
+    // task_struct->real_parent (a pointer), then ->tgid on that parent.
+    let parent = match unsafe { bpf_probe_read_kernel((task as usize + rp_off) as *const u64) } {
+        Ok(p) if p != 0 => p,
+        _ => return 0,
+    };
+    match unsafe { bpf_probe_read_kernel((parent as usize + tgid_off) as *const u32) } {
+        Ok(v) => v,
+        Err(_) => 0,
+    }
+}
 
 /// Execution Gate SCOPE (Active Defence / paid). Key = cgroup id of a process
 /// tree the gate should enforce (typically the AI agent's systemd cgroup and any
@@ -1727,7 +1771,12 @@ fn try_dispatch_execve(regs: *const u8) -> Result<(), i64> {
     event.tgid = tgid;
     event.uid = uid;
     event.gid = gid;
-    event.ppid = 0;
+    // Capture the real parent PID in-kernel: the execve hook fires for
+    // short-lived processes whose /proc entry is gone before the userspace
+    // ring reader can read PPid, so the /proc fallback alone leaves ppid=0
+    // (which made the fileless-systemd parent-lineage gate inert in prod).
+    // 0 here => userspace /proc fallback (unchanged) — never a guessed offset.
+    event.ppid = current_real_parent_tgid();
     event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     event.ts_ns = ts;
     event.argc = 0;

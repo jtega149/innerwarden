@@ -1087,6 +1087,11 @@ fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     // Populate BPRM_OFFSETS (linux_binprm.filename byte offset) from BTF so the
     // Execution Gate reads the right field across kernels (CO-RE).
     populate_bprm_offset(bpf);
+
+    // Populate TASK_OFFSETS (task_struct.real_parent + .tgid byte offsets) from
+    // BTF so the execve handler can read the real parent PID in-kernel for
+    // short-lived execs (the /proc fallback misses those).
+    populate_task_offsets(bpf);
 }
 
 /// Query the `linux_binprm.filename` byte offset from kernel BTF and write it to
@@ -1120,6 +1125,51 @@ fn populate_bprm_offset(bpf: &mut aya::Ebpf) {
             warn!(error = %e, "BPRM_OFFSETS: failed to write filename offset");
         } else {
             info!("eBPF: BPRM_OFFSETS linux_binprm.filename offset = {off} (from BTF)");
+        }
+    }
+}
+
+/// Query `task_struct.real_parent` + `.tgid` byte offsets from kernel BTF and
+/// write them to the TASK_OFFSETS map (key 0 = real_parent, key 1 = tgid). The
+/// execve eBPF handler reads them to capture the real parent PID in-kernel for
+/// short-lived execs (e.g. systemd's sealed-executor `fexecve`) whose
+/// `/proc/<pid>/status` is gone before the userspace ring reader can read it —
+/// without this their `ppid` stays 0. If BTF is unavailable or the members are
+/// absent, the map stays empty and the handler leaves `ppid = 0` (the userspace
+/// `/proc` fallback applies — unchanged behaviour, never a guessed offset).
+#[cfg(feature = "ebpf")]
+fn populate_task_offsets(bpf: &mut aya::Ebpf) {
+    use aya::maps::HashMap as BpfHashMap;
+
+    let btf = match std::fs::read("/sys/kernel/btf/vmlinux") {
+        Ok(b) => b,
+        Err(e) => {
+            info!(error = %e, "TASK_OFFSETS: no kernel BTF — execve ppid uses /proc fallback");
+            return;
+        }
+    };
+    let real_parent = crate::btf_offsets::member_offset(&btf, "task_struct", "real_parent");
+    let tgid = crate::btf_offsets::member_offset(&btf, "task_struct", "tgid");
+    let (Some(real_parent), Some(tgid)) = (real_parent, tgid) else {
+        info!("TASK_OFFSETS: task_struct.real_parent/tgid not in BTF — execve ppid uses /proc fallback");
+        return;
+    };
+    if let Some(map) = bpf.map_mut("TASK_OFFSETS") {
+        let mut hash: BpfHashMap<_, u32, u32> = match map.try_into() {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "TASK_OFFSETS: map type mismatch");
+                return;
+            }
+        };
+        let ok0 = hash.insert(0u32, real_parent, 0);
+        let ok1 = hash.insert(1u32, tgid, 0);
+        if ok0.is_err() || ok1.is_err() {
+            warn!("TASK_OFFSETS: failed to write task_struct offsets");
+        } else {
+            info!(
+                "eBPF: TASK_OFFSETS task_struct.real_parent={real_parent} tgid={tgid} (from BTF)"
+            );
         }
     }
 }
