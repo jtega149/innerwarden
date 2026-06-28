@@ -1,4 +1,4 @@
-# Inner Warden (John Ortega AI301 Capstone)
+# Inner Warden
 
 **The security agent that fights back.**
 
