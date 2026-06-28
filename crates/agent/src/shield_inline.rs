@@ -389,6 +389,7 @@ pub(crate) fn notify_telegram(
     burst_tracker: &crate::notification_gate::BurstTracker,
     deferred: &mut std::collections::HashMap<String, u32>,
     gate_suppressed_counter: &AtomicU64,
+    host: &str,
 ) {
     let Some(tg) = telegram_client else { return };
 
@@ -419,8 +420,13 @@ pub(crate) fn notify_telegram(
                 } else {
                     "\u{1f7e0}"
                 };
+                let host_prefix = if host.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}] ", crate::telegram::escape_html_pub(host))
+                };
                 let msg = format!(
-                    "\u{1f6e1}\u{fe0f} <b>DDoS Shield</b>\n\n\
+                    "\u{1f6e1}\u{fe0f} <b>{host_prefix}DDoS Shield</b>\n\n\
                      {emoji} {}\n\
                      <b>{title}</b>\n\
                      {summary}",
@@ -434,8 +440,12 @@ pub(crate) fn notify_telegram(
             crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
                 *deferred.entry(ctx.detector.clone()).or_insert(0) += 1;
                 if ctx.is_contained {
-                    if let Some(count) = burst_tracker.record_contained() {
-                        let msg = crate::notification_gate::format_burst_summary(count);
+                    // Shield escalation is an aggregate DDoS event (no single
+                    // attacker IP at the incident level), so source_ip is None.
+                    let category = crate::notification_gate::burst_category(&ctx.detector);
+                    if let Some(mut summary) = burst_tracker.record_contained(category, None) {
+                        summary.host = host.to_string();
+                        let msg = crate::notification_gate::format_burst_summary(host, &summary);
                         let tg = tg.clone();
                         tokio::spawn(async move {
                             let _ = tg.send_alert_html(&msg).await;
@@ -695,7 +705,14 @@ mod tests {
         let mut deferred = HashMap::new();
         let counter = AtomicU64::new(0);
 
-        notify_telegram(&None, &incidents, &burst_tracker, &mut deferred, &counter);
+        notify_telegram(
+            &None,
+            &incidents,
+            &burst_tracker,
+            &mut deferred,
+            &counter,
+            "test-host",
+        );
 
         assert!(deferred.is_empty());
         assert_eq!(counter.load(Ordering::Relaxed), 0);
@@ -723,6 +740,7 @@ mod tests {
             &burst_tracker,
             &mut deferred,
             &counter,
+            "test-host",
         );
 
         assert_eq!(deferred.get("shield").copied(), Some(1));

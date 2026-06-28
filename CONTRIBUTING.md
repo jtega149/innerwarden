@@ -23,7 +23,7 @@ make build      # debug binaries for sensor / agent / ctl
 
 # 4. Try the dashboard locally
 cargo run -p innerwarden-agent -- --data-dir ./data --dashboard
-# open http://127.0.0.1:7378 (default admin password: innerwarden)
+# open https://127.0.0.1:8787 (self-signed HTTPS; set INNERWARDEN_DASHBOARD_USER + INNERWARDEN_DASHBOARD_PASSWORD_HASH to require auth, open-access if unset)
 ```
 
 If `make test` passes on a fresh clone, your environment is good to go.
@@ -48,9 +48,9 @@ If you find an issue you want to work on, **leave a comment** so we can avoid tw
 
 In rough order of how often we merge them:
 
-1. **Test coverage** — every PR that raises a file from <80% to ≥80% closes a labelled issue. Patterns to follow are already in `crates/*/src/**/tests.rs`. The `[help wanted, good first issue, test]` triple-label issues are pre-scoped for you.
+1. **Test coverage** — every PR that raises a file from <80% to ≥80% closes a labelled issue. Patterns to follow are the inline `#[cfg(test)] mod tests` blocks throughout `crates/*/src/`. The `[help wanted, good first issue, test]` triple-label issues are pre-scoped for you.
 2. **New detectors** — `crates/sensor/src/detectors/` accepts new detection rules. Read [Module Authoring](https://github.com/InnerWarden/innerwarden/wiki/Module-Authoring) for the full template.
-3. **Integration recipes** — `integrations/*.toml` plus a recipe doc. See existing examples for `slack`, `telegram`, `pagerduty`.
+3. **Integration recipes** — see `integrations/README.md` for the format. None ship in-tree yet, so new recipes (Slack, Telegram, PagerDuty, ...) are a well-scoped place to start.
 4. **Dashboard polish** — UX improvements, accessibility fixes, lucide icon standardization. Frontend lives in `crates/agent/src/dashboard/frontend/` (vanilla JS + CSS, no framework).
 5. **Documentation** — wiki pages, README clarifications, code-level rustdoc.
 6. **Bug fixes** — small fixes welcome; for non-trivial bugs include a regression test.
@@ -170,7 +170,7 @@ If you are unsure whether a change fits the project's current direction, open an
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE), the same as the rest of the project. Some satellite crates (`smm`, `hypervisor`, `killchain`, `dna`) are BUSL-1.1 or proprietary — those are not in this repo.
+By contributing, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE), the same as the rest of the project. The only in-tree crate under a different license is `crates/shield` (BUSL-1.1); every other crate is Apache-2.0.
 
 ---
 

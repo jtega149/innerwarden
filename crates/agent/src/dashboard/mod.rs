@@ -106,6 +106,44 @@ use innerwarden_core::event::Severity;
 use innerwarden_core::incident::Incident;
 
 // ---------------------------------------------------------------------------
+// Live "Needs review" count for the Daily Security Briefing
+// ---------------------------------------------------------------------------
+
+/// The number of open cases that still need an operator decision RIGHT NOW,
+/// computed from the SAME canonical source the dashboard "Needs review" tile
+/// reads (`data_api::compute_overview_counts_from_sqlite`, whose
+/// `attention_count` is the per-attacker `KpiBucket::Attention` aggregate /
+/// `case_metrics::KpiBucket::Attention -> NeedsReview`).
+///
+/// The daily briefing MUST use this, not
+/// `grouping_engine.drain_digest_stats().needs_review_groups` — that is a
+/// transient per-window group counter drained on every send, so it diverges
+/// from the live dashboard number (e.g. a Low/Medium `needs_review` incident
+/// auto-dismissed by the spec-062 24h timeout is still counted by the grouped
+/// counter but has already dropped out of the live `attention_count`). Reading
+/// the live source at send time means the briefing can never tell the operator
+/// to "review N items" that the dashboard shows as zero.
+///
+/// `date` is the local-day key (`%Y-%m-%d`) the briefing is for; the function
+/// returns 0 on any store/query error so a transient SQLite hiccup degrades to
+/// the honest "nothing needs you" rather than a fabricated number.
+pub(crate) fn live_needs_review_count(store: &innerwarden_store::Store, date: &str) -> usize {
+    let now = chrono::Utc::now();
+    data_api::compute_overview_counts_from_sqlite(
+        store,
+        date,
+        0,    // sev_min_rank: no severity floor — count every open case
+        None, // detector_substring: all detectors
+        None, // hour_filter: the whole day
+        now,
+        &data_api::DegradedSignals::default(),
+        std::path::Path::new(""), // data_dir: unused for the attention tally
+    )
+    .map(|c| c.attention_count)
+    .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // Security headers middleware
 // ---------------------------------------------------------------------------
 
@@ -410,6 +448,9 @@ pub async fn serve(
     max_sessions: usize,
     advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>>,
     rule_engine: Arc<innerwarden_agent_guard::rules::RuleEngine>,
+    // Spec 081: shared agent-guard registry (also held by the main agent loop's
+    // response gate) so `agent connect` mutations are visible to the verifier.
+    agent_registry: Arc<tokio::sync::Mutex<innerwarden_agent_guard::registry::Registry>>,
     agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
     deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
     knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
@@ -501,35 +542,14 @@ pub async fn serve(
         session_timeout_minutes,
         max_sessions,
         advisory_cache: advisory_cache.clone(),
-        // 2026-05-18: rehydrate the agent-guard registry from the
-        // on-disk snapshot so `agent connect` survives an agent
-        // restart. The watchdog dance from #681 swaps the agent
-        // binary every deploy; before persistence the registry came
-        // back empty and the operator had to re-run `innerwarden
-        // agent connect` after every release. A missing snapshot
-        // (clean install) returns an empty registry — not an error.
-        // A corrupt snapshot is surfaced as a warning and we fall
-        // back to empty so the dashboard still starts.
-        agent_registry: Arc::new(tokio::sync::Mutex::new({
-            let snapshot_path = data_dir.join("agent-guard-registry.json");
-            match innerwarden_agent_guard::registry::Registry::restore_from(&snapshot_path) {
-                Ok(reg) => {
-                    if reg.count_total() > 0 {
-                        info!(
-                            path = %snapshot_path.display(),
-                            agents = reg.count_agents(),
-                            tools = reg.count_tools(),
-                            "agent-guard registry restored from snapshot",
-                        );
-                    }
-                    reg
-                }
-                Err(e) => {
-                    warn!(error = %e, path = %snapshot_path.display(), "failed to restore agent-guard registry; starting empty");
-                    innerwarden_agent_guard::registry::Registry::new()
-                }
-            }
-        })),
+        // 2026-05-18 + spec 081: the agent-guard registry is now built ONCE in
+        // `loops::boot` (rehydrated from the on-disk snapshot so `agent connect`
+        // survives a watchdog binary swap) and the SAME `Arc<Mutex<Registry>>`
+        // is shared between this dashboard and the main agent loop's
+        // `managed_agent_guard` response gate. The dashboard receives it as a
+        // parameter rather than restoring its own copy, so a connect made via
+        // the dashboard API is immediately visible to the response gate.
+        agent_registry,
         rule_engine,
         agent_alert_tx,
         deep_security,
@@ -697,6 +717,21 @@ pub async fn serve(
         .route("/api/action/block-ip", post(api_action_block_ip))
         .route("/api/action/suspend-user", post(api_action_suspend_user))
         .route("/api/action/config", get(api_action_config))
+        // 2026-06-10 (operator report): more case actions than just "Block IP".
+        // unblock-ip QUEUES a revert for the agent slow loop; triage-case writes
+        // operator-action decision rows the read path classifies.
+        .route("/api/action/unblock-ip", post(api_action_unblock_ip))
+        .route("/api/action/triage-case", post(api_action_triage_case))
+        // Operator "Trust IP" — monitor-only allowlist (still detected/logged/
+        // notified, only auto-block suppressed). add / remove / list.
+        .route("/api/action/trust-ip", post(api_action_trust_ip))
+        .route("/api/action/untrust-ip", post(api_action_untrust_ip))
+        .route("/api/action/trusted-ips", get(api_action_trusted_ips))
+        // Execution Gate operator "Trust Exec" — authorise a binary path (2FA-
+        // gated). Writes an allow_exec rule the paid watch daemon hot-reloads.
+        .route("/api/action/trust-exec", post(api_action_trust_exec))
+        .route("/api/action/untrust-exec", post(api_action_untrust_exec))
+        .route("/api/action/trusted-execs", get(api_action_trusted_execs))
         // 2026-05-01 (`tracked-spec-ai-override`): operator
         // overrides AI decisions / re-opens dismissed incidents /
         // labels decisions for retraining. Audit-only for v1.
@@ -7098,6 +7133,9 @@ mod tests {
             16,
             Arc::new(RwLock::new(VecDeque::new())),
             Arc::new(innerwarden_agent_guard::rules::RuleEngine::empty()),
+            Arc::new(tokio::sync::Mutex::new(
+                innerwarden_agent_guard::registry::Registry::new(),
+            )),
             agent_alert_tx,
             Arc::new(RwLock::new(DeepSecuritySnapshot::default())),
             Arc::new(std::sync::RwLock::new(

@@ -29,6 +29,19 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Returns the number of incidents handled (webhook sent and/or AI analyzed).
+/// Build the DShield decide-path outputs from a profile's cached reputation: the
+/// LLM prompt line (`as_context_line`) and the structured `is_known_attacker`
+/// signal the Context Gate reads. Pure, so the derivation is unit-tested without
+/// running the full incident loop.
+fn dshield_decide_signal(
+    dshield: Option<&crate::dshield::DshieldReputation>,
+) -> (Option<String>, bool) {
+    (
+        dshield.map(|d| d.as_context_line()),
+        dshield.is_some_and(|d| d.is_known_attacker()),
+    )
+}
+
 pub(crate) async fn process_incidents(
     data_dir: &Path,
     cursor: &mut reader::AgentCursor,
@@ -680,12 +693,15 @@ pub(crate) async fn process_incidents(
         // cached attacker profile (populated by the slow-loop backfill) so the
         // decide path makes NO extra network call. Gives the LLM the IP's
         // global attack telemetry, which AbuseIPDB does not carry.
-        let ip_dshield = crate::learned_suppression::primary_ip(incident).and_then(|ip| {
+        let dshield_rep = crate::learned_suppression::primary_ip(incident).and_then(|ip| {
             state
                 .attacker_profiles
                 .get(&ip)
-                .and_then(|p| p.dshield.as_ref().map(|d| d.as_context_line()))
+                .and_then(|p| p.dshield.clone())
         });
+        // The LLM prompt line + the structured attacker signal for the Context
+        // Gate, both derived in the unit-tested `dshield_decide_signal` helper.
+        let (ip_dshield, ip_dshield_attacker) = dshield_decide_signal(dshield_rep.as_ref());
 
         let ctx = ai::DecisionContext {
             incident,
@@ -702,6 +718,7 @@ pub(crate) async fn process_incidents(
             ip_reputation: ip_reputation.clone(),
             ip_geo: ip_geo_early.clone(),
             ip_dshield,
+            ip_dshield_attacker,
             host_posture: crate::posture::ai_context_line(&state.host_posture),
             prior_decisions: state
                 .sqlite_store
@@ -833,7 +850,7 @@ pub(crate) async fn process_incidents(
         // No operational regression. Future home for declarative
         // playbook-style orchestration: Spec 042 active defense (Lua).
 
-        incident_action_report::maybe_send_post_execution_telegram_report(
+        incident_action_report::maybe_send_post_execution_report(
             incident,
             &decision,
             &execution_result,
@@ -1258,6 +1275,36 @@ mod tests {
 
     fn advisory_cache() -> Arc<RwLock<VecDeque<AdvisoryEntry>>> {
         Arc::new(RwLock::new(VecDeque::new()))
+    }
+
+    #[test]
+    fn dshield_decide_signal_attacker_clean_and_none() {
+        use crate::dshield::DshieldReputation;
+        let mk = |reports: i64, feeds: Vec<String>| DshieldReputation {
+            reports,
+            targets: 0,
+            last_seen: None,
+            as_number: None,
+            as_name: None,
+            as_country: None,
+            network: None,
+            threatfeeds: feeds,
+        };
+        // Known attacker via reports > 0: prompt line present, signal true.
+        let (line, att) = dshield_decide_signal(Some(&mk(7, vec![])));
+        assert!(att);
+        assert!(line.unwrap().contains("DShield(ISC)"));
+        // Known attacker via active feed membership only.
+        let (_, att_feed) = dshield_decide_signal(Some(&mk(0, vec!["blocklist".into()])));
+        assert!(att_feed);
+        // Clean IP (no reports, no feeds): line present, signal false.
+        let (line_clean, att_clean) = dshield_decide_signal(Some(&mk(0, vec![])));
+        assert!(!att_clean);
+        assert!(line_clean.is_some());
+        // DShield off / not backfilled: no line, signal false.
+        let (line_none, att_none) = dshield_decide_signal(None);
+        assert!(line_none.is_none());
+        assert!(!att_none);
     }
 
     #[tokio::test]

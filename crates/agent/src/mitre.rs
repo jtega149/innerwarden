@@ -67,6 +67,9 @@ pub fn map_detector(detector: &str) -> Option<MitreMapping> {
         "log_tampering" => m("Defense Evasion", "T1070", "Indicator Removal"),
         "rootkit" => m("Defense Evasion", "T1014", "Rootkit"),
         "process_injection" => m("Defense Evasion", "T1055", "Process Injection"),
+        "auditd_disable" | "selinux_apparmor_disable" => {
+            m("Defense Evasion", "T1562.001", "Disable or Modify Tools")
+        }
 
         // ── Persistence ─────────────────────────────────────────────────
         "web_shell" => m("Persistence", "T1505.003", "Web Shell"),
@@ -142,6 +145,7 @@ pub fn map_detector(detector: &str) -> Option<MitreMapping> {
             "Match Legitimate Name or Location",
         ),
         "data_archive" => m("Collection", "T1560", "Archive Collected Data"),
+        "keylogger_bash_trap" => m("Collection", "T1056.004", "Input Capture: Keylogging"),
         "proxy_tunnel" => m("Command and Control", "T1090", "Proxy"),
 
         _ => None,
@@ -289,6 +293,10 @@ pub fn all_technique_ids() -> Vec<&'static str> {
         "data_archive",
         "proxy_tunnel",
         "data_exfil_ebpf",
+        // spec 075: explained-alert detectors that were previously unmapped
+        "auditd_disable",
+        "selinux_apparmor_disable",
+        "keylogger_bash_trap",
     ];
 
     let mut ids = BTreeSet::new();
@@ -693,6 +701,30 @@ mod tests {
             "Defense Evasion",
             "T1070",
             "Indicator Removal",
+        );
+    }
+
+    #[test]
+    fn test_explained_alert_detectors_now_mapped() {
+        // spec 075: these were unmapped, so their explained alerts lacked the
+        // MITRE attribution line. Anchored here so they keep it.
+        assert_mapping(
+            "keylogger_bash_trap",
+            "Collection",
+            "T1056.004",
+            "Input Capture: Keylogging",
+        );
+        assert_mapping(
+            "auditd_disable",
+            "Defense Evasion",
+            "T1562.001",
+            "Disable or Modify Tools",
+        );
+        assert_mapping(
+            "selinux_apparmor_disable",
+            "Defense Evasion",
+            "T1562.001",
+            "Disable or Modify Tools",
         );
     }
 

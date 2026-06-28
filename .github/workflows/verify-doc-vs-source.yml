@@ -1,11 +1,18 @@
 name: Doc vs Source
 
-# Asserts that the collector and detector lists in `.claude/CLAUDE.md`
-# match what is actually in `crates/sensor/src/{collectors,detectors}/`.
-# Fails the PR if a new file lands without doc updates, or if the docs
-# claim modules that do not exist (Wave 8b/8c shipped this gate after
-# four phantom collectors and six phantom/missing detectors silently
-# misled operators for months).
+# Three doc-honesty gates:
+#  1. verify-doc-vs-source: collector/detector LISTS in `.claude/CLAUDE.md`
+#     match `crates/sensor/src/{collectors,detectors}/` (gitignored file, so
+#     this skips cleanly on CI checkouts that lack it).
+#  2. verify-readme-counts: the count CLAIMS in README.md agree with
+#     themselves and with the source tree. README is tracked + public, so
+#     this one always runs. Added after a 2026-06 audit found 96 stale-count
+#     inconsistencies across the docs (README itself had two internal
+#     contradictions); counts can no longer silently drift.
+#  3. verify-agents-install-commands: the install-facing agent guide
+#     (agents-install.md, spec 082 — shipped to agents on-box + at
+#     innerwarden.com/agents.md) must pin the current version and may only
+#     name commands that exist in the real CLI (crates/ctl/src/main.rs).
 
 on:
   pull_request:
@@ -25,3 +32,19 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run verify-doc-vs-source.sh
         run: ./scripts/verify-doc-vs-source.sh
+
+  verify-readme-counts:
+    name: Verify README counts match source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run verify-readme-counts.sh
+        run: ./scripts/verify-readme-counts.sh
+
+  verify-agents-install-commands:
+    name: Verify install-facing agent guide matches CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run verify-agents-install-commands.sh
+        run: ./scripts/verify-agents-install-commands.sh

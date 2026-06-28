@@ -10,15 +10,605 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **The agent-guard command inspector now flags attempts to disable InnerWarden itself (in-path self-protection).** The `check-command` brain (`POST /api/agent/check-command`, the MCP `innerwarden_check_command` tool, and the `agent proxy` guard) previously scored commands like `systemctl stop innerwarden-*`, `pkill -f innerwarden`, `innerwarden uninstall`, and `rm`/`truncate` of InnerWarden's own binaries, config, data, or pinned eBPF objects as `allow` / risk 0 - so an AI coding agent wired through the in-path guardrail could be talked into turning the monitor off without the guard objecting. A new `security_tooling_tamper` signal (score 60 -> `deny`) in `crates/agent-guard` (`threats::check_security_tamper` + `SECURITY_TAMPER_INDICATORS` / `INNERWARDEN_SELF_PATHS`) now denies InnerWarden self-disable/removal plus the universal defense-evasion verbs (`systemctl stop auditd`, `setenforce 0`, `auditctl -e 0`, disabling AppArmor; MITRE T1562/T1489). File removal requires a destructive verb AND an InnerWarden path, so status reads and restarts (`innerwarden get status`, `systemctl status`/`restart innerwarden-agent`, grepping a config under `/etc/innerwarden`) are NOT flagged. Closes the command-layer half of the self-tamper gap surfaced by the 2026-06-27 AI-coding-agent guardrail evaluation (the kernel-side `mitre_hunt` uid-0 self-stop carve-out is tracked separately). New unit tests pin deny on the tamper set, deny on the host-monitor set, and allow on the benign reads/restart.
+- **`innerwarden agent install-hook` wires the in-path command guard into Claude Code (enforcing, not advisory).** `agent mcp-serve` and `POST /api/agent/check-command` are advisory - a coding agent running its raw shell tool never asks. The new command writes a fail-closed guard script plus a PreToolUse `Bash` hook into the agent's `settings.json` (`~/.claude/settings.json` by default; `--settings`/`--url`/`--block-review` override), so every shell command the agent proposes is POSTed to the loopback `check-command` brain and blocked (exit 2) before it runs when the verdict is `deny` (or `review` with `--block-review`), failing CLOSED if the agent is unreachable. The settings merge is idempotent and preserves existing keys/hooks. Currently supports Claude Code. Unit-tested: the JSON merge (empty / idempotent / preserves existing / repairs a non-object root) and the generated script (deny-only vs block-review, the check-command call, fail-closed on error).
+
+### Fixed
+- **The admin-action audit log was stamped with local time, drifting off the UTC date scheme.** `append_admin_action` named `admin-actions-<date>.jsonl` from `chrono::Local::now()`, while every other date-stamped file InnerWarden writes (`events-`/`incidents-`/`decisions-*.jsonl`) and the reader (`today_date_string`) use UTC. In a non-UTC timezone straddling midnight (e.g. UK/BST after 00:00 local, still the previous UTC day) the audit entry landed on a different date than the rest of the system, splitting the day's audit trail and breaking the reader plus the `cmd_tune` audit test on that boundary. Now UTC, consistent with the rest of the date-stamped files.
+- **The correlation-chain block path bypassed the cloud safelist and banned Canonical on Hetzner (cloud-FP sweep follow-up).** Two sibling response paths gate a candidate IP against the cloud/CDN safelist before escalating: the repeat-offender path and the completed-correlation-chain path. The repeat-offender path was switched from `identify_provider` (a first-octet heuristic that only knows a handful of broad ranges) to `cloud_safelist::safelist_label` (the real CIDR walk) on 2026-05-08, but the chain path was missed and still used the heuristic. Result: the `Data Exfiltration (eBPF Sequence)` chain (CL-008-class) banned Canonical `185.125.190.49` (apt/livepatch) on Hetzner, because `185.125.188.0/22` is in the safelist's CIDR table but the first-octet heuristic does not know `185.x`. Both paths now route through one shared `safelisted_provider` helper (a thin wrapper over `safelist_label`), so the gate cannot drift between them again. **Anti-evasion preserved:** the safelist is the existing CIDR table (no new IP hardcoded), and a real attacker IP outside every safelist range (`203.0.113.45`, `45.148.10.121`) is still blockable by both paths. A new `#[tokio::test]` drives both async paths end-to-end with a CIDR-only safelisted IP and asserts each purges it from reputation state instead of escalating.
+
+## [0.15.29] - 2026-06-27
+
+### Fixed
+- **execve events never carried the parent PID in-kernel, leaving the fileless-systemd false-positive gate (0.15.28) inert in production.** The 0.15.28 post-deploy re-audit found `fileless:systemd` still firing on Azure. Root cause: the eBPF execve handler hardcoded `event.ppid = 0`, so every execve `ppid` came from a userspace `/proc/<pid>/status` fallback. That works for long-lived processes (it is why `connect` events have a parent) but misses short-lived ones, notably systemd's sealed-executor `fexecve` of `/proc/self/fd/N` whose `/proc` entry is gone before the ring reader can read it (the audit measured `ppid=0` on 4995/5000 execve events). Because the 0.15.28 fileless-systemd parent-lineage gate needs the parent, it almost never engaged in prod. The fix reads `task_struct->real_parent->tgid` in-kernel at execve, mirroring the Execution Gate's `BPRM_OFFSETS` pattern: a new `TASK_OFFSETS` map (`real_parent` + `tgid` byte offsets) is populated by the userspace loader from kernel BTF (`member_offset`), and the handler does two bounded `bpf_probe_read_kernel` hops. If BTF is unavailable the offsets stay 0, the handler returns 0, and the `/proc` fallback applies unchanged (it never reads a guessed offset). Validated live on a 6.x x86_64 kernel: the verifier accepts the program, the offsets resolve from BTF, and a `comm=systemd` `fexecve` of `/proc/self/fd/N` now reports `ppid=1`, so the gate resolves `/proc/1/exe` to systemd and suppresses the false positive. aarch64 offsets are BTF-resolved identically.
+
+## [0.15.28] - 2026-06-26
+
+### Fixed
+
+Cloud-platform false-positive sweep from a 7-day decision-log audit of an Azure VM (the same method as the clean Oracle audit). A cloud VM's own platform agents and the platform control plane tripped the generic detectors, including a wrong auto-block of the Azure WireServer management IP. Every fix is keyed on a NON-IP signal (no platform IP is hardcoded in the product, by operator policy: "IPs change"); each ships with anti-evasion tests; the detector count is unchanged (82).
+
+- **`fileless:systemd` flooded Critical on every unit start (Azure: 1206 Critical/week, all `comm=systemd`).** systemd v254+ copies `systemd-executor` into a sealed memfd and `fexecve`s it via `/proc/self/fd/N` at the start of every unit, which the fileless detector read as in-memory malware execution. The exec event carries no `exe_path`, so the fix resolves the launching process's **parent** via `/proc/<ppid>/exe` (the kernel symlink, which `prctl(PR_SET_NAME)`/`argv[0]` cannot forge) and suppresses only the self-fd `fexecve` form launched by a systemd manager. **Anti-evasion preserved:** `/memfd:`, `/dev/fd/`, `(deleted)`, `/proc/<other-pid>/fd/`, and any non-systemd parent (a shell/dropper running `exec /proc/self/fd/N`) still fire; an unresolvable parent fails safe to firing; the memfd payload is still caught at creation by `kernel_promote`.
+- **Cloud guest agents tripped C2 / flood / IMDS-SSRF detectors, auto-blocking the platform control plane.** A cloud VM's management agents (Azure WALinuxAgent, AWS SSM agent / cloud-init, GCP guest agent, OCI cloud agent) poll the platform control plane (WireServer, IMDS) often enough to look like C2 beaconing, connection floods, and IMDS access by an unexpected process. On Azure this fed a cross-layer correlation that auto-blocked the WireServer management IP `168.63.129.16` six times (a block that can sever the VM from its management plane), and produced 869 IMDS needs-review incidents. New `crates/sensor/src/cloud_platform.rs` (a crate-root helper, not a detector) recognises the platform's agents by non-forgeable process identity: the cloud is auto-detected from DMI/SMBIOS (firmware strings, not anything userspace can forge); a compiled agent is matched by its real `/proc/<pid>/exe`; an interpreter agent (`python3 /usr/sbin/waagent`, `cloud-init`) is trusted only when its script argument is a known agent path that exists on disk as a **root-owned** file under a trusted system directory; and extension-handler children (relative script path) are matched by walking up to four parent hops to the real agent. `is_guest_agent(pid, uid)` is gated on a recognised cloud VM AND `uid 0`, and is used **downgrade-only** in `c2_callback`, `outbound_anomaly`, and `imds_ssrf` (the interpreter case its exe-prefix list missed). **Anti-evasion (tested):** an `argv` that merely names a guest-agent path without the file being root-owned, a trusted interpreter running a `/tmp` script, an untrusted interpreter, a planted look-alike path, on-prem Hyper-V (not Azure), bare metal, a non-root process, and a webserver runtime hitting IMDS all still fire. The WireServer actor was the Azure guest agent (`python3 -u /usr/sbin/waagent`), not the co-located AI agent.
+- **`dns_tunneling` flagged Azure platform service DNS as high-entropy tunneling (Azure: 667/667 false positives).** The host resolving Azure Storage / SQL / Service Bus / Key Vault FQDNs (`<resource>.blob.core.windows.net`, `<vault>.vault.azure.net`) tripped the Shannon-entropy heuristic on the random-looking resource name. The existing `DNS_ALLOWED_DOMAINS` allowlist (already covering provider-controlled zones like `oraclevcn.com`, `internal.cloudapp.net`, `azure.com`, `amazonaws.com`, `googleapis.com`) was simply missing the Azure service zones; `windows.net` and `azure.net` are added. This is a domain allowlist, not an IP one: Microsoft controls these zones and does not delegate arbitrary subdomains, so a DNS tunnel cannot be built under them. **Anti-evasion preserved:** the dot-boundary match means `evil-windows.net` is not trusted, and tunneling through an attacker-controlled zone still fires.
+
+## [0.15.27] - 2026-06-26
+
+### Fixed
+- **`memfd_create` fileless-execution false positives on legitimate tools (prod 7-day audit).** The `kernel:memfd_fileless` detector fired 17 High incidents in a week on benign memfd users: `fwupdmgr` (firmware updater), systemd's `(sd-executor)`, and `tokio-rt-worker` (a generic Rust async-runtime thread name: InnerWarden's own agent and any other Rust service). The first two are added to the curated `comm` allowlist, but the Rust-runtime case is fixed the **non-forgeable** way, not by allowlisting a generic thread name (which any Rust payload could wear): a new third FP layer clears a memfd only when the creating process's **kernel-captured exe path** (`details.exe_path`, the `execve` filename) lives under a package-managed system directory (`path_trust::is_trusted_system_path`, the single source of truth now shared with `host_drift`). **Anti-evasion preserved:** a payload running from `/tmp`, with a deleted backing file (`(deleted)`), or memfd-backed exec is explicitly NOT trusted and still promotes, and the `fexecve`-from-memfd follow-up stays in the recommended checks. New tests pin the FP fixes AND the evasion cases (untrusted/deleted/`memfd:` exe paths still fire), plus a cross-test that `host_drift` and `kernel_promote` agree on what "trusted" means.
+- **Cloud-range safelist could free-pass an AbuseIPDB-confirmed attacker (Context Gate blind spot).** The 7-day audit found the Warden classifier `ignore`-ing IPs marked `safelist=Google Cloud, abuseipdb=100`: a cloud-range safelist was burying a community-confirmed attacker, exactly the free pass an attacker buys by renting cloud. The deterministic Context Gate now reads the existing `ip_reputation` (AbuseIPDB) and, **escalate-only** (identical shape to the DShield signal), refuses to passively close (dismiss/ignore) an incident whose IP scores `>= 90/100`, and blocks the provenance-driven benign-dismiss for such IPs. It can only ever raise a weak passive close to a surface (Monitor / RequestConfirmation), never relax an enforcement verdict, so a noisy shared-cloud IP at this score is at worst Monitored, never auto-blocked. The high floor avoids flooding the operator on borderline scores. New tests pin: confirmed-attacker passive close is surfaced, an enforcement verdict is left intact, a below-floor score is unchanged, the provenance self-dismiss is refused for a confirmed attacker, and the no-reputation path is unchanged.
+- **`innerwarden upgrade` now arch-smoke-tests a new binary before swapping it in.** sha256 + signature prove the downloaded bytes are authentic but NOT that they execute on this host's CPU; installing an x86_64 build on the aarch64 prod box took it down on 2026-06-10. The upgrader now stages each verified binary into the install directory (a package-trusted path, so the host's own `host_drift` detector does not flag the check the way a `/tmp` exec would, which is what produced the self-inflicted Critical `host_drift` incidents seen in the audit during the manual aarch64 deploy ritual) and runs `--version`. It **hard-fails and keeps the existing binary** only when the binary cannot execute (spawn failure / killed by signal, the wrong-CPU-arch / corruption case); a clean non-zero exit or a cosmetic version-string mismatch is a soft warning that proceeds, so upgrades never break on anything but a genuinely non-runnable asset. This retires the manual "`file` + `./bin --version` in /tmp before swap" procedure by doing it in-product. The smoke-test verdict logic is a pure, fully unit-tested function.
+
+## [0.15.26] - 2026-06-25
+
+### Changed
+- **DShield (SANS ISC) reputation is now a real decision signal on the Warden classifier path, not just LLM context.** DShield enrichment already attached the community's global attack history to attacker profiles and fed the LLM prompt, but the on-device Warden classifier and its deterministic Context Gate ignored it. The gate now reads a structured `ip_dshield_attacker` signal (`DshieldReputation::is_known_attacker`: ISC reports > 0 or active threat-feed membership) and, **escalate-only**, (1) refuses to passively close (dismiss/ignore) an incident from a DShield-confirmed global attacker, surfacing it instead, and (2) blocks the provenance-driven benign-dismiss for such IPs. It can only ever raise a weak verdict, never relax an enforcement action. The trained classifier's text input is intentionally **not** changed (novel input is out-of-distribution; enriching the model input is the separate re-distill path), so the model's behaviour is unchanged; DShield acts deterministically in the gate that wraps it. New unit tests pin: a confirmed attacker's confident dismiss is surfaced, an enforcement verdict is left intact, and a non-DShield low-severity dismiss is unchanged.
+
+### Fixed
+- **Installer no longer sends the telemetry ping from CI / automation.** Installer smoke-tests run on ephemeral CI runners (GitHub Actions and friends), each a fresh machine-id from a US x86_64 box, so every run was writing an `install` row into the opt-out install telemetry, inflating the install count with non-users (most of a given window's "installs" were our own CI). `install.sh` now detects a CI environment (`CI=true/1`, or any of `GITHUB_ACTIONS`/`GITLAB_CI`/`JENKINS_URL`/`BUILDKITE`/`CIRCLECI`/`TF_BUILD`/`TEAMCITY_VERSION`/`DRONE`) and skips the ping (logging that it did). The install itself still runs and is still verified in CI; only the ping is suppressed, so the telemetry reflects real installs. `CI=false` (some dev shells) is correctly treated as not-CI.
+
+## [0.15.25] - 2026-06-24
+
+### Security
+- **`quinn-proto` 0.11.14 → 0.11.15 (RUSTSEC-2026-0185).** Fixes a remote memory-exhaustion advisory (unbounded out-of-order stream reassembly) in the transitive QUIC dependency. The unrelated `tract-onnx` 0.22 → 0.23 bump was deliberately NOT taken (breaks the build + would need inference-parity revalidation of the Local Warden classifier for zero security benefit).
+- **`memmap2` 0.9.10 → 0.9.11 (RUSTSEC-2026-0186).** Clears an "unchecked pointer offset" unsoundness advisory (published 2026-06-20) in a transitive mmap dependency that only enters the tree with the `local-classifier` feature. Lockfile-only; `cargo deny check` is clean (advisories/bans/licenses/sources all ok).
+- **`rustls` 0.23.40 → 0.23.41 and `bytes` 1.11.1 → 1.12.0.** Routine backward-compatible dependency maintenance.
+
+### Added
+- **Execution Gate can now enforce around just the AI agent (agent-scoped mode, spec 083 eBPF primitive).** The Execution Gate is a path-exact allowlist enforced in the kernel; host-wide it fits a locked-down appliance, but a general-purpose server constantly execs legitimate new/transient binaries (`dpkg`/`apt` maintainer scripts, `certbot` renewals, dynamic container workloads), so a host-wide allowlist would block them. New **opt-in cgroup scoping** lets the gate enforce solely inside the AI agent's process tree and allow everything else unconditionally — "zero-trust for the agent" without touching the rest of the machine. New pinned map `EXEC_GATE_SCOPE` (`/sys/fs/bpf/innerwarden/exec_gate_scope`, cgroup id → 1) holds the agent's cgroup id(s); the gate consults `LSM_POLICY` key 4: when `1`, `try_exec_gate` fires only for tasks whose current cgroup id is in `EXEC_GATE_SCOPE` and allows every other exec. Key 4 absent/0 = host-wide, the original behaviour, so this is opt-in with **no regression**. The scope map is `repin_preserving` so it survives sensor restart; empty-while-scoped is fail-open (the gate never fires), so a wipe is not a brick. Free + **INERT** in the OSS sensor (key 4 unset); the paid `config-sign` tooling populates the scope and flips key 4. Verifier-cheap: one map read plus, when scoped, one `bpf_get_current_cgroup_id` lookup, both patterns already used in the gate hook. eBPF program count unchanged (a new map, not a new program).
+- **Mesh-VPN persistence detection is now rename-proof (behavioural TUN/WireGuard signal).** The previous exec-name detector (`tailscale`/`zerotier`/…) could be evaded by renaming the binary. New `tunnel_iface` collector (collector #31) watches `/sys/class/net` for a *new* tun/WireGuard interface appearing at runtime and classifies by the kernel-set TYPE (`uevent: DEVTYPE=wireguard` or the `tun_flags` attribute), **not** the name — so a renamed mesh-VPN binary is still caught, because the tunnel still has to create a `tun`/`wg` interface to route traffic. Interfaces present at startup are baselined (the operator's own VPN), so only a tunnel that comes up *later* fires. The `c2_web_tunnel` detector promotes the event to a **High**, allowlistable (`[detectors.c2_web_tunnel]`) incident with the same dual-use framing ("legitimate if you started a VPN — allowlist it; if not, it is attacker persistence", T1572/T1219). On by default (`AlwaysOnCollectorConfig`), 30s poll, deduped on the 600s cooldown. New unit tests pin: WireGuard caught by `DEVTYPE` even under a non-tunnel name, TUN caught by `tun_flags`, plain interfaces ignored, and the High `mesh_vpn_iface` incident. Closes the rename-evasion follow-up tracked when the exec-name detector shipped.
+- **`innerwarden playbook test --insecure`.** The agent dashboard serves HTTPS with a self-signed certificate, so `innerwarden playbook test --url https://127.0.0.1:8787 …` failed with `invalid peer certificate: UnknownIssuer` and the command could not reach its own agent. The new `--insecure` flag skips TLS verification for the self-signed cert (documented as not-for-untrusted-networks), so the dry-run playbook test works against the live HTTPS dashboard. Unit-tested for both the verifying and insecure agent-construction paths.
+- **n8n integration recipe for the Agent Guard API (docs).** New
+  `docs/integration-recipes/n8n-agent-guard.md` shows how to drive the existing
+  `GET /api/agent/security-context` (threat assessment) and
+  `POST /api/agent/check-command` (safety validation) endpoints from an [n8n](https://n8n.io/)
+  workflow: HTTP Request node configuration for each endpoint, the request/response shapes
+  and recommendation thresholds (`allow`/`review`/`deny`), and a complete importable
+  workflow JSON that halts automatically when the server threat level is elevated or a
+  command is denied. Documentation-only — no code or behaviour change. Closes the n8n gap
+  noted alongside the existing OpenClaw guide; linked from `integrations/README.md`.
+- **Mesh / overlay-VPN remote-access tools are now detected as a persistence channel (Tailscale, ZeroTier, NetBird, Nebula).** Closes a real gap: an attacker who lands on a host can install a mesh VPN (`tailscale`/`tailscaled`, `zerotier-one`/`zerotier-cli`, `netbird`, `nebula`) and SSH back in over the encrypted, NAT-traversing tunnel — stable persistent access that looks like ordinary infrastructure (T1572 protocol tunneling / T1219 remote-access software). Ngrok/Cloudflare/bore/frp/chisel were already covered by `c2_web_tunnel`; the mesh-VPN family was not. The detector now fires on exec of a known mesh-VPN binary. **UX-safe by design** because these tools are commonly legitimate: fired at **High** (not Critical, unlike the C2 tunnels) so it never auto-blocks on its own, **exec-only** (no coordination-DNS matching, which would be noisy on hosts that legitimately run a mesh VPN), deduped on a 600s cooldown, and allowlistable via `[detectors.c2_web_tunnel]`; the incident text says plainly "LEGITIMATE if you use it for admin access — allowlist it; if you did NOT install it, it is a common attacker-persistence channel." **Anti-gap, honestly scoped:** the match is on the exact argv0 basename, so a *renamed* mesh-VPN binary evades exec-name detection — that limitation is documented in the detector and tracked as a behavioural TUN/WireGuard follow-up (the tunnel still has to create a `tun`/`wg` interface, which is the rename-proof signal). New unit tests pin: mesh binaries fire High with sub_kind `mesh_vpn`, the existing tunnel binaries stay Critical, substring/unrelated binaries stay quiet, and repeat execs are deduped. Detector count unchanged (82 — extends the existing `c2_web_tunnel`).
+
+### Fixed
+- **KG decide-modifier (spec 043) is no longer inert — it now measures entity tenure with a clock that survives restarts.** The Knowledge-Graph confidence modifier was sitting at `modifier_raw=0.0` on essentially every incident in production, so it never did its job (suppressing false positives on long-tenured benign IPs) and could never accumulate the "non-zero `would_change_action`" data its own promotion gate requires. Root cause: its useful benign-suppression bands gate on `first_seen_age_days >= 7`, but it read `first_seen` from the **in-memory KG IP node**, which is rebuilt from a *dated, daily* graph snapshot and effectively resets across days/restarts — so the age gate was unreachable. Fix: `merge_persisted_profile` now overlays the **persisted attacker-intel profile** (loaded from redb on boot, carrying the true first sighting + composite risk) onto the KG features, taking the OLDER age and HIGHER risk. This makes the age-gated benign bands reachable for genuinely long-lived IPs and keeps the repeat-offender band honest, with **no detection weakening** (the merge only lengthens tenure / raises risk, never the reverse). Still **shadow mode** by default — it now produces real signal to validate before any operator flips it to `enforce`. New unit tests pin the unlock and the never-weakens invariant.
+- **InnerWarden no longer flags its OWN egress as a reverse shell (self-FP).** The eBPF reverse-shell sequence detector (`network.outbound_connect` + `process.fd_redirect`/dup2 within a window, per PID) fired Critical `ebpf_reverse_shell` incidents on the agent's and CLI's own legitimate outbound connections — Telegram notifications (149.154.166.x), the dashboard API, threat-feed polling — because the agent connects out and dup2's fds in the same process. Observed as ~126 Critical self-flags in 30 minutes on a test box (source comm `innerwarden-age` / `innerwarden`); pure noise (it did not auto-block) but it spammed incidents and polluted measurements. Now the sequence detector skips a **verified** InnerWarden self-process, gated by `is_verified_infra_process` — i.e. the comm matches `innerwarden*` AND `/proc/<pid>/exe` resolves to a real system path. No blind spot: a process that merely sets `comm=innerwarden-*` but whose exe is `/tmp` (or anywhere non-system) still fires. Verified via the reliable connect-time comm, so skipping the connect also prevents a later corrupted-comm fd_redirect from firing. Regression tests pin both the self-skip and the forged-comm-still-fires case.
+
+## [0.15.24] - 2026-06-21
+
+### Security
+- **spec-081 managed-agent coexistence now works when InnerWarden runs non-root and the agent runs as another user (live FP fix, found 2026-06-21).** A co-located AI agent (OpenClaw) doing a routine task — read its own `/home/lab/.env`, then call its own Azure-OpenAI endpoint — was flagged CRITICAL data-exfiltration and the endpoint was auto-blocked, breaking the agent. Root cause: the managed-agent verifier (`evaluate_managed_agent_downgrade` → `decide`) fail-closed on two facts a non-root IW agent (`innerwarden` uid) cannot obtain about a process owned by a different user (`lab`): (1) `readlink /proc/<pid>/exe` is EACCES cross-uid → `exe_path` None → the interpreter-root gate blocked; (2) `ProtectHome=yes` on the agent unit hid `/home`, so the own-config `stat` for the file-owner uid returned None → the own-config gate blocked. Both made spec-081 silently never downgrade for a cross-user agent, even one correctly registered with a matching cmdline fingerprint. Fixes: (a) **code** — when `/proc/exe` is unreadable the interpreter-root check falls back to `argv[0]`, safe because the exact registered cmdline-fingerprint match already pins identity (an untrusted `argv[0]` like `/tmp/node` still blocks); (b) **ops** — the example agent unit sets `ProtectHome=read-only` (so the verifier can read /home to confirm the agent's own config) with an optional `CAP_SYS_PTRACE` for strict `/proc/exe` verification. No blind spot: a foreign-secret read (`/etc/shadow`, another user's `~/.ssh`), an unregistered/fingerprint-mismatched process, or a known-bad destination still forces the block. New regression tests pin the cross-uid downgrade + the untrusted-argv0 block.
+
+## [0.15.23] - 2026-06-21
+
+### Fixed
+- **`innerwarden upgrade` now retries transient asset/sidecar download failures.** Right after a release, GitHub's asset CDN intermittently fails individual binary or sidecar (`.sha256`/`.sig`) downloads while it propagates the new release. The old code aborted on the first such failure, which made `upgrade` brittle in exactly that window — deploying 0.15.22, two consecutive runs on one box each failed on a *different* sidecar before a manual `curl --retry` deploy succeeded. The binary download and both sidecar fetches now retry (4 attempts, 3s apart); a binary retry re-creates the destination so a partial download is never kept. Retry policy is a pure, unit-tested helper.
+
+## [0.15.22] - 2026-06-21
+
+### Fixed
+- **`innerwarden upgrade` is now watchdog-aware — paid Active-Defence hosts upgrade with one command.** On a host running the `innerwarden-watchdog` supervisor the agent is a watchdog-SPAWNED child and `innerwarden-agent.service` is disabled (its unit file still exists). The old upgrade flow saw the disabled-but-present unit and ran `systemctl restart innerwarden-agent`, which both spawned a SECOND agent alongside the watchdog's child (duplicate-instance flood) and failed to refresh the running child's binary (the watchdog kept the old one) — so watchdog hosts needed a manual stop-watchdog/swap/start-watchdog dance. `upgrade` now detects an active watchdog and, instead of touching the agent unit, restarts `innerwarden-watchdog` (tearing down its cgroup — watchdog + child agent — and respawning the agent on the freshly-swapped binary); it never `systemctl start innerwarden-agent` on a watchdog host. Non-watchdog hosts are unchanged. The restart policy is a pure, unit-tested planner.
+
+### Security
+- **Discovery-tactic free-pass no longer granted on a parent name alone; reverse-shell detection survives `fork()` (evasion audit E3 + E4).** Two more confirmed evasions from the adversarial detector audit, both detection-only. (E3) The `exec_context` classifier granted `OpInteractive` — the free-pass that silences the entire Discovery tactic (`discovery_burst` / `discovery_anomaly` / `nmap_scan`) — to any uid>999 process whose **parent comm** was a shell name (`bash`/`zsh`/`sh`/…). That name is forgeable (`prctl(PR_SET_NAME)`) and even a real `bash -c` spawned by cron/systemd/an implant matches it, so an implant parented by a shell ran recon invisibly (re-opening the spec-050 gap). `OpInteractive` now additionally requires a real controlling terminal: the execve emitter records the parent's `tty_nr` from `/proc/<ppid>/stat` as `has_tty`, and the classifier only grants the free-pass when a tty is present — an interactive ssh shell owns a pts, an implant/reverse-shell/daemon-spawned shell does not. A missing `has_tty` (non-eBPF sources) defaults to "surface it". (E4) The eBPF reverse-shell sequence (`network.outbound_connect` + `process.fd_redirect` onto stdio) was correlated strictly per-PID, so a reverse shell that `connect()`s in the parent then `fork()`s and `dup2()`s the socket in the child (classic socat / `python: fork; child dup2+exec`) never matched — the connect was under the parent pid, the redirect under the child. The fd_redirect event now carries the parent pid (resolved for stdio dups only) and the detector correlates over the process's own ring UNION its parent's, so the forked reverse shell fires Critical; a child redirect whose parent never connected still does not fire. New unit anchors pin every case. No generic signal relaxed; both make a specific evasion harder. Detector count unchanged (82).
+
+## [0.15.21] - 2026-06-21
+
+### Security
+- **Credential reads beyond `/etc/shadow` and IMDS connects were droppable in-kernel by a renamed process (B1's siblings, from the evasion audit).** Two more forgeable-`comm` blind spots in the eBPF hooks. (1) **openat:** B1 made only `/etc/shadow|sudoers|gshadow` bypass the openat comm allowlist, so reading *any other* secret through an allowlisted tool (`cat`/`head`) still returned 0 in-kernel — `/root/.ssh/id_rsa`, `~/.ssh/id_ed25519`, `~/.aws/credentials`, `~/.kube/config`, `/etc/ssh` host keys never reached the sensitive-read / `data_exfil` detectors. The bypass set is now widened to the genuinely-secret, low-legit-frequency surface: a bounded path scan for a credential directory anywhere (`/.ssh/`, `/.aws/`, `/.kube/`, `/.gnupg/`) plus `/etc/ssh` host keys, and those reads also skip the rate-limit. `/etc/passwd` (world-readable, nss) and `/etc/ssl` certs (read on every TLS handshake) are deliberately still volume-gated so the ring buffer cannot be flooded. (2) **connect:** the cloud instance-metadata endpoint `169.254.169.254` (AWS/GCP/Azure/OpenStack IMDS) was dropped by the connect comm allowlist for a renamed process — and nothing else backstops it (it is a hardcoded link-local IP, so `dns_capture` never sees it, and it is otherwise legitimate). The destination is now parsed *before* the comm gate and an IMDS connect always emits regardless of process name, so a renamed beacon cannot silently steal cloud credentials. Both validated live on test001 (eBPF rebuilt; verifier-accepted, 27 hooks active): a `cat`-comm read of a home `/.ssh/` key and an `nginx`-comm connect to `169.254.169.254` both now emit (were dropped). No generic signal relaxed; specific high-value signals made always-on.
+- **Two comm/scope evasions closed by an adversarial detector audit (forgeable-`comm` and fixed-scope blind spots).** A red-team audit of the detectors' false-positive-reduction gates (verified two ways: reachable+swallows AND not-caught-by-another-layer) confirmed several gates an attacker could satisfy on purpose. Two contained ones are fixed here; the rest (eBPF credential-read widening, the discovery interactive-shell gate, reverse-shell cross-PID correlation) are tracked for follow-up. (1) **io_uring rootkit detector defeatable by process name.** io_uring is THE syscall-bypass channel (the ARMO "curing" rootkit); its allowlist compared only the **forgeable** `comm` with a loose `starts_with`, so naming an implant `nginx` (or even `nodejs-evil`) via `prctl(PR_SET_NAME)`/exec turned off detection of ring creation and every high-risk opcode (CONNECT/ACCEPT/OPENAT/URING_CMD = C2, reverse shell, credential theft, kernel-exploit passthrough). Now gated through `is_verified_infra_process` — the allowlist holds only if `/proc/PID/exe` resolves to a real system path, so a forged-comm implant living in /tmp, /home, or /dev/shm is no longer exempted. (2) **SUID page-cache integrity scanned only 10 hardcoded paths.** The DirtyCred-class page-cache-poisoning detector (T1068/T1014) checked a fixed allowlist (su/sudo/passwd/...), so poisoning any *other* SUID-root binary (fusermount3, Xorg, ntfs-3g, ssh-keysign, distro helpers under /usr/lib*) was never cache-vs-disk verified. It now also dynamically enumerates the live setuid binaries on the host (bounded walk of the standard binary dirs) and scans those too, keeping the 10 as a guaranteed floor. Both are detection-only, no count change; new unit anchors pin the spoof-catch (Linux: a verified non-system exe path) and the off-allowlist scan.
+- **`cat /etc/shadow` was dropped in-kernel before the credential carve-out (rename-free read evasion), found by atomic-bench.** The eBPF `openat` hook always-emits genuine credential-file reads so a rate-limit can never lose them, BUT the comm/cgroup **allowlist** early-return (`is_comm_allowed(2) || is_cgroup_allowed() → return 0`) sat ABOVE that carve-out. `cat`/`head`/`less` are on the `openat` allowlist bit (they are noisy readers, kept off the ring for volume control), so an attacker reading `/etc/shadow` (or `/etc/sudoers`, `/etc/gshadow`) through any allowlisted tool returned 0 in-kernel and the `file.open` event never reached SIGMA-004 or the userspace sensitive-read detectors — a technique-independent, rename-free evasion (the atomic `cat /etc/shadow` correctly showed MISS). Fixed by bypassing the allowlist early-return for the **narrow genuinely-secret set only** (`is_chain_credential` = shadow/sudoers/gshadow), so those reads are always surfaced regardless of which tool issued them. `passwd`/`ssl` are deliberately NOT bypassed (world-readable + high-frequency: nss, TLS handshakes), so they stay under the allowlist + rate-limit and the ring buffer cannot be flooded. No generic signal relaxed; a specific high-value signal is made always-on. (eBPF object rebuilt; validated live on test001 — the shadow-read atomic flips MISS → CATCH.)
+
+### Added
+- **`[allowlist] self_infra_ips` — keep your OWN boxes out of the feeds without a detection blind spot.** When you run more than one box, the feed-serving agent sees your *other* infrastructure (a sibling server, a CI runner) as a remote source, and it pollutes the operator threats feed and the public live feed. Until now the only "treat as self-traffic" list was a hardcoded set of cloud-provider ranges (`cloud_safelist`), which is deliberately NOT the place to add your own IPs (you must never IP-trust a cloud range to silence noise, attackers use the cloud too) and is not something a product can ship per-operator. New **config-driven** `[allowlist] self_infra_ips` (IPs or CIDRs, **empty by default, nothing hardcoded into the product**): an incident whose external IPs are all your own infrastructure is flagged `research_only`, so it is **still detected, logged, and kept for training/investigation** but does not surface in either feed. It feeds the SAME `is_self_traffic_ip` gate the auto-detected local-interface IPs already use; bare IPs are treated as `/32`, a typo is skipped (not fatal), and an attacker IP in no list stays fully visible. This is for addresses you own and control, set per deployment, explicitly not a way to safelist a cloud provider.
+
+### Fixed
+- **Two detector misses + a latent false positive, all found by the atomic-bench MITRE catch/miss run.** A private run of the new `innerwarden-test/atomic-bench` layer (18 ATT&CK-mapped Linux atomics, per-atomic isolated detection windows) surfaced two real detector defects in the sensor. (1) **`crontab` persistence shadowed by a leading `crontab -l`:** the classic install one-liner `(crontab -l; echo '* * * * * /tmp/payload') | crontab -` was missed because `is_crontab_command` used `find("crontab -")` (FIRST match only), so the benign read-only `crontab -l` shadowed the trailing MODIFYING `crontab -`. It now scans every occurrence; the `-l`-alone false-positive anchor from 2026-05-09 is kept, so neither direction regresses. (2) **`chmod 777` (world-writable, T1222.002) not detected:** `file_permission_mod` caught setuid (`chmod u+s`) but the comment's promised "world-writable patterns" were never in the list, so `chmod 777`/`o+w` passed. Added a position-correct octal/symbolic world-writable check (Medium severity, lower than a setuid grant). While there, fixed a **pre-existing FP in the same function**: the octal entries `chmod 4`/`chmod 2`/`chmod 6` were substring matches, so `chmod 600 ~/.ssh/id_rsa` (the *correct* secure perm) was wrongly flagged as a setuid privesc; octal is now parsed by digit position, so only true 4-digit setuid/setgid fires and owner/group-only 3-digit modes are silent. New unit anchors pin every case (the shadowed reinstall fires, `chmod 777`/`o+w` fire at Medium, `600`/`640`/`700`/`755` stay silent, `4755`/`6755` still fire). Detection-only change, no count change.
+- **Guardrail `check-command`: a false positive and a miss, both found by the first guardrail benchmark.** A private run of the new guardrail catch-rate benchmark (`innerwarden-test/guardrail-bench`) surfaced two real defects in the pre-execution analyzer. (1) **False positive:** ATR-2026-111 matched ANY `$()` command substitution and scored it critical, so everyday shell like `tar czf backup-$(date +%F).tgz ./src` and `echo $(git rev-parse HEAD)` was denied. Tightened the rule to require a dangerous command inside the subshell (mirrors the backtick condition right below it), so `$(cat /etc/passwd)` / `$(curl ...)` / `$(... | base64)` still fire while benign substitutions pass. (2) **Miss:** `mkfs.ext4 /dev/sda1` (formatting a block device, irreversible) returned `allow`; added it to the destructive set, gated on `/dev/` so `mkfs.ext4 disk.img` (a loopback image) stays benign. On the corpus this moved catch 94.6% -> 97.3% and false positives 5% -> 0%, with no blind spot (the malicious cases are still caught by their content). New `crates/agent-guard/examples/guardrail_bench` runs the corpus through the same `analyze_command` offline (no agent, no kernel) so the benchmark re-runs instantly after a rule fix.
+
+### Changed
+- **Public live feed reads what actually happened, not "High severity threat detected."** A large share of real catches on the `/live` sales feed fell through `live_feed_title`/`live_feed_reason` to the generic severity line (`High severity threat detected.` / `Suspicious activity detected and logged.`) even though the detector was known, because the title map had no arm for them. On the production feed that was ~110 of 112 items (proto_anomaly, threat_intel, honeypot, suspicious_login). Added specific, **sanitized** headlines + reasons for those detectors plus `data_exfiltration`, `credential_harvest`, `sudo_abuse`, `setns_owner`, `untrusted_root_exec`, `provenance`, `nmap_scan` (no paths, rule names, or thresholds leaked — a regression test asserts the new headlines carry none). The site (`inner-warden-site`) was updated in parallel to map the `detector` field straight to its copy, so the feed says "known-bad IP turned away", "took the honeypot bait", "protocol anomaly" instead of a flat severity line. (The own-infra IP noise on the feed is handled separately by the config-driven `[allowlist] self_infra_ips` above, NOT by adding a cloud range to the hardcoded safelist.)
+
+## [0.15.20] - 2026-06-20
+
+### Added
+- **Spec 082 Phase 2 — `innerwarden agent mcp-serve`: InnerWarden as an MCP server (the advisory front door).** An AI coding agent can now wire InnerWarden as an MCP server over stdio and *voluntarily* ask it, before acting, `innerwarden_check_command` (is this shell command safe → deny/review/allow), `innerwarden_check_ip` (is this IP a known threat / blocked), and `innerwarden_security_context` (host threat level + recommendation). New `crates/ctl/src/commands/agent_mcp_serve.rs` is a THIN adapter over the already-running loopback Agent API (`/api/agent/check-command`, `check-ip`, `security-context`) — one brain, one source of truth (`agent-guard` + ATR rules); it does NOT re-implement detection. It reuses the `agent-guard` `mcp_proxy::jsonrpc` envelope/framing and a sync stdin/stdout request loop. **No-gaps security:** stdio-only (never opens a network listener — it is spawned locally by the MCP client, so it is inherently local); the single most important job beyond transport is the **response projection** — each loopback response is projected down to an explicit field allowlist so detection internals NEVER cross the MCP boundary (`check-command`'s `signals`/`explanation`/`risk_score`/`severity` and the ATR rule-id+matched-condition, `check-ip`'s `detectors`/`incident_count`/`last_seen`, `security-context`'s `top_threats`/counts are all stripped — a probing agent learns only deny/review/allow, never which rule fired); an unparseable/missing verdict fails to `review`, never `allow`; `check_command` is token-bucket rate-limited (the loopback already snitches to the operator on deny/review); logs go to stderr only (stdout is the JSON-RPC channel); inputs are validated (`additionalProperties:false`, IP parse, command-length bound). This is **additive and advisory** — a compromised agent that never calls these tools is still caught by the enforcement moat (the `agent proxy` MCP guard + host eBPF / Execution Gate), which is unchanged. 23 unit tests cover the protocol handlers + the projection (asserting no internal leaks) via a dependency-injected fetcher (no live agent needed). The site-side discovery (`/.well-known/ai-catalog.json` capabilities catalog) is deferred to a follow-up (and is intentionally not shipped while the site is being reworked).
+- **Spec 082 Phase 1 — Agent-native install/operate guidance.** A user with no InnerWarden tells their coding agent "install InnerWarden"; until now the agent had to guess the CLI and the safe-config workflow from human docs. New install-facing **`agents-install.md`** is the authoritative playbook an AI coding agent (Claude Code / Cursor / Copilot / Codex) reads to install InnerWarden, configure it adapted to the specific machine (`setup`/`scan`/`harden`/`calibrate`), answer the user's questions, and — critically — **safely** observe-and-allowlist what is normal on that host. It is grounded in the REAL CLI surface (grouped `get`/`system`/`config`/`trust`/`agent` commands + top-level lifecycle), the loopback `POST /api/agent/check-command` deny/review/allow contract on `127.0.0.1:8787`, and the on-device safe-learning primitives (`config responder --dry-run`, baseline, `system calibrate/tune`, `trust add/list/suppress`). The **safe allowlist workflow is never blind**: observe/dry-run → let the baseline learn → VERIFY each candidate (reputation + human confirm for anything ambiguous) → propose, never auto-apply → only then arm enforce; the guide explicitly forbids allowlisting a process/IP/path just because it is currently running (malware is "currently running" too) and points at the `skill_gate` proof floor + the paid Execution-Gate `rehearse` for pre-arm zero-deny proof. It is a SEPARATE file from the dev-facing repo-root `AGENTS.md` (graphify). `install.sh` now drops the **version-matched** guide on-box at `/etc/innerwarden/AGENTS.md` (best-effort: fetched from the repo at the SAME release ref it is installing; never fails the install). The site publishes a discovery copy at `https://www.innerwarden.com/agents.md` + an `llms.txt`, and `robots.txt` points LLM crawlers at both. A new CI gate (`scripts/verify-agents-install-commands.sh`, wired into the Doc-vs-Source workflow) keeps the guide honest: it must pin the current Cargo.toml version and may only name commands that exist in the real clap surface (`crates/ctl/src/main.rs`) — no phantom commands, no stale version. Phase 2 (an `innerwarden agent mcp-serve` MCP server over the loopback brain + `/.well-known/ai-catalog.json` discovery) is sequenced next and intentionally NOT shipped here (no advertising an endpoint that does not exist yet).
+
+## [0.15.19] - 2026-06-19
+
+### Added
+- **Telegram command overhaul: the phone is now a real control surface, de-cluttered and honest.** A full audit of the bot commands found the menu was not broken (no dead/404 command) but it *lied*: several controls named an action they did not perform. All fixed. (1) **`/mode guard|watch|dryrun` actuates the guardian mode live** from the phone (the lay operator cannot SSH, so the old "go run `innerwarden configure responder`" was a dead end). There is no config hot-reload, so the main loop (which owns `cfg`) mutates `cfg.responder.{enabled,dry_run}` in place via a one-shot `pending_mode_change` signal, then persists the two keys to agent.toml; mutating the owned cfg keeps it the single source of truth for every one of the ~60 downstream `cfg.responder.*` enforcement reads (no per-site override, no gap). 2FA-gated via a new `PendingActionType::ModeChange`. (2) **Profile-aware menu** (`setMyCommands` scoped by `cfg.telegram.is_simple_profile()`): a lay operator sees a tiny 5-command menu (`status · threats · mode · ask · help`, plain language), the technical profile gets the full 11; `/guard`+`/watch` are dropped from the menu in favour of `/mode` (still typed-handled for back-compat) and `/posture` is promoted. (3) **`/unblock <ip>` (2FA)** reverses a containment from the same surface that blocked it; it queues an `operator_unblock_request` the slow-loop drain reverts through the response lifecycle (the only path the spec-076 reconciler will not re-apply). (4) **Settings buttons actuate**: the inline `profile:`/`sensitivity:` buttons now apply at runtime + persist (profile re-registers the menu; sensitivity flips the bot channel's alert-noise filter) instead of printing a CLI hint. (5) **Honesty fixes**: `quick:ignore` records a *real* false-positive (was a toast that saved nothing); `/blocked` no longer reads as "unprotected" when the session list is empty; bare `/enable`/`/disable` show usage instead of "unknown command". **Security**: inbound authorization now **fails closed** (a non-numeric / misconfigured `chat_id` drops all updates instead of authorising every sender for the root-level `/enable` and enforcement-flipping `/mode`).
+- **Auto-register co-located AI agents so the spec-081 managed-agent guard survives agent restarts.** Spec 081 withholds the auto-block / kernel-deny RESPONSE for a positively verified, IW-managed AI agent (e.g. OpenClaw) acting on its OWN config / services, and the verifier's first signal is a registry hit (`registry.by_pid(pid)`). That registry was previously populated ONLY by the operator running `innerwarden agent connect <pid>`, and entries are PID-keyed — so when the co-located agent restarted under a NEW pid the entry went stale, the verifier returned `NotManaged`, and enforce (`responder dry_run = false`) re-severed the agent IW is meant to guard. A new throttled slow-loop reconciliation step (`crates/agent/src/agent_registry_reconcile.rs`, ~5 min via `AgentState::last_agent_registry_reconcile`, NOT every 30s tick) keeps the registry in sync with the live agent processes: it `scan_processes`-detects running known-agent signatures and `connect()`-registers any not already present (the hardened `connect()` captures the live `/proc` exe_path / owner_uid / cmdline_fingerprint the verifier cross-checks), prunes any registry entry whose pid is neither freshly detected NOR a live `/proc/<pid>` (so a recycled/stale pid can never inherit the exemption), and persists to the SAME `agent-guard-registry.json` snapshot the agent loads at boot. Capped at 64 registrations and never panics on a `/proc` race. **No new hole:** auto-registration only supplies the `by_pid` membership hint — the verifier STILL independently gates the exemption on live `identify_cmdline` re-ID + exact cmdline-fingerprint equality + trusted interpreter/script root + own-config read path (owned by the agent's uid, not a credential sub-path) + matching uid, all re-verified live and fail-closed, and rejects any non-`Agent`/`Tool` kind — so auto-registering detected agents grants nothing the verifier would not already accept; pruning dead pids is pure hardening. New `[agent_guard] auto_register` config (default **true**) so the product just works for a co-located agent while an operator can opt out.
+
+### Security
+- **Spec 081 — apply the own-config gate on the KERNEL-block path (close an LPE divergence).** The managed-agent verifier withholds the kernel execve-deny only for a verified agent reading its OWN config, but killchain `DATA_EXFIL` evidence did not carry the read path, so the kernel-block path verified IDENTITY only while the userspace IP-block path correctly applied the own-config gate. A subverted-but-genuine managed agent (same pid, same exact cmdline fingerprint, trusted roots) reading `/etc/shadow` and connecting out could have bought the execve-deny exemption on the kernel path. The killchain tracker now records the file that set `CHAIN_SENSITIVE_READ` and emits it as `sensitive_file`, so `evaluate_kernel_block_withhold` applies the own-config gate on the kernel path identically to userspace (own config → withhold; `/etc/shadow` or a foreign secret → the block lands). Fail-closed: a `data_exfil` chain with no `sensitive_file` is anomalous (it can only complete via a sensitive `file.open`) and is never withheld on identity alone; `exploit_c2` (JIT-RWX + socket, no file) keeps identity-only verification.
+
+### Fixed
+- **Every operator notification now names the server.** Telegram single-incident alerts (detailed + simple) and post-action reports carried no host (Slack/Discord already did), so a multi-server operator could not tell which box an alert came from. Both now render the incident's origin host; the action report's previously-ignored host param is wired up. (Burst summary + daily briefing already name the server, from 0.15.18.)
+- **Three CI flake classes closed at the root** (they intermittently red-herringed release PRs): the `02-ssh-brute-coordinated` scenario (`scenario_qa.sh` waited on the FIRST incident then SIGINT'd the sensor; now waits until the incident count QUIESCES); the `replay-qa` daily-summary assertion (same fixed-sleep-then-kill bound left the sensor's events unwritten → `events_count = 0` → no summary; now quiesce-waits on the SQLite event count); and the ctl `serve_drives_the_proxy_over_pipes` unit test (`cat` block-buffers its echo until exit, racing the proxy's break-on-EOF; replaced with an `sh` line-echoer that writes each line immediately, plus a bounding timeout).
+
+## [0.15.18] - 2026-06-18
+
+### Changed
+- **Daily Security Briefing rewritten to be accurate and boss-readable.** The daily Telegram/Slack/Discord briefing was misleading a non-technical operator on four counts; all four are fixed. (1) **"Needs review" now equals the LIVE dashboard number.** It used to render `grouping_engine.drain_digest_stats().needs_review_groups`, a transient per-window group counter drained on every send, which diverged from the dashboard "Needs review" tile the operator actually clicks into. A Low/Medium `needs_review` incident auto-dismissed by the spec-062 24h timeout was still counted by the grouped counter even though it had already dropped out of the live count, so the briefing told the operator to "review N items" the dashboard showed as zero. The briefing now reads the SAME canonical source the dashboard reads (`dashboard::live_needs_review_count` → `data_api::compute_overview_counts_from_sqlite`'s per-attacker `KpiBucket::Attention`), renders it as actionable copy (`N security event(s) still need your decision. Open InnerWarden → Cases → "Needs review" and Block, Dismiss, or Monitor each.`), and reconciles to the live source so it can never point the operator at an already-closed item; 0 → `Nothing needs you right now`. (2) **No raw detector names.** Every per-category line now routes through `detector_catalog::digest_gloss(detector)` (spec-075 catalog) for a plain-language label plus a one-clause "why it matters", and the `_ => detector` raw fallback in `friendly_detector_name` is gone, a new `humanize_detector` Title-Cases any uncurated/dotted name so no `kernel_devnode_exposed` / `telemetry.stream_silence` snake_case ever leaks. The catalog gained curated entries for the previously-uncovered briefing detectors (`threat_intel`, `proto_anomaly`, `kernel_devnode_exposed`, `network_sniffing`, `kernel`, `telemetry.stream_silence`, `logging_config_change`, `automated_file_collection`, `suspicious_login`, plus a `honeypot` response gloss); the long tail collapses into `… and N more (see dashboard)`. (3) **Headline numbers explained.** `Made N automatic decisions across M security events (one event can need several decisions)` kills the "more decisions than events?" confusion, the cryptic `(post-posture)` token became `after accounting for this server's hardening`, and the briefing leads with a plain bottom-line verdict (`Quiet day` / `Busy day, all contained` / `N items need your decision`). (4) **Leads with blocked sources.** A real daily report now opens with `Blocked N attacking IP(s) (K still contained)` and the top sources by block frequency (with country flag on a cheap geo-cache hit, never an HTTP call from the digest path; cross-referenced against `response_lifecycle.active_block_ip_targets` for live containment). All three profiles (simple/technical/enriched) are boss-readable; `technical` only appends a raw-counter footer. An optional one-line `💡 Proactive:` suggestion fires on an unambiguous pattern (e.g. heavy SSH password-guessing → recommend key-only SSH). The old `format_daily_digest_enriched`/`PipelineDigestStats` are superseded (kept `#[allow(dead_code)]` for their copy-regression anchors).
+- **Burst summary now names the server and explains the attack.** The "heavy attack" Telegram/Slack/Discord notification that fires when 50+ threats are auto-blocked in an hour used to say only `50 threats auto-blocked this hour. All contained.`, useless to a multi-server operator: it never said WHICH server, never said WHAT kind of attack, and always read "50" (it fires the instant the count crosses the threshold). It now (a) names the server via a `[agent] tags` → knowledge-graph hostname → `/etc/hostname` ladder (resolved once, cheap), (b) breaks down the top categories blocked so far into ~7 plain-language buckets (DDoS / flood, Password-guessing, Scans & probes, Exploit / C2, Data-exfiltration, Privilege-escalation / escape, Other) with counts, (c) reports how many distinct attacker IPs, and (d) says honestly `Blocked 50+` (it fires at the threshold, not the final total) plus a "should you worry?" reassurance that this is normal internet background noise. `BurstTracker::record_contained` now accumulates per-category counts + distinct source IPs over the window and returns a `BurstSummary` snapshot; a new `burst_category(detector)` classifier maps detector/kill-chain/shield kinds to the coarse buckets. The single shield "DDoS Shield" SendNow alert also gains the `[host]` prefix. Wired into all four burst-emit paths (incident pipeline, killchain inline, shield inline, mesh). Host strings are HTML-escaped.
+
+### Security
+- **Bumped the `tract-*` family 0.22.1 → 0.22.2 (CVE-2026-55093 / GHSA-x5mv-8wgw-29hg).** `tract-nnef`'s NNEF `.dat` tensor parser had an unchecked `product(shape) * size_of` that wraps in release builds, yielding a `Tensor` whose reported `len` (e.g. 2^61) far exceeds its tiny backing allocation → an out-of-bounds read on model load (CWE-190 → CWE-125, medium). `tract-onnx` is the on-device Local Warden classifier backend (`local-classifier` feature); InnerWarden only loads its own pinned, SHA-256-verified ONNX model (not attacker-supplied NNEF archives), so exposure is low, but the dependency is patched anyway. Dependabot could not apply the bump alone because the interdependent `tract-*` crates must move together; updated as a family to 0.22.2.
+
+### Fixed
+- **Managed-agent verifier now resolves a real `agent connect`-registered agent (spec 081 follow-up).** Deploying 0.15.16 to the Azure box surfaced that `innerwarden agent connect <pid>` records the process **COMM** (`MainThread` for a node-launched agent) as the registry `name`, while the verifier's live `identify_cmdline` resolves the **signature** name (`OpenClaw`). The verifier required `live_sig_name == reg.name`, so a CORRECTLY-registered OpenClaw was rejected → it would still have been auto-blocked/kernel-blocked under enforce. (The spec-081 tests used `connect_with_facts("OpenClaw", …)` and masked it; production `connect` stores the comm.) The name-equality was **redundant** with the exact `cmdline_fingerprint` match (the real identity pin — it already defeats pid-reuse / a different agent at the same pid), so it is dropped: the verifier now requires only that the live cmdline re-IDs *a* known agent signature AND the live `interpreter|script` fingerprint EQUALS the one captured at `connect()`. No relaxation — a regression test proves a comm-named entry whose live fingerprint differs still BLOCKS. The audit line now surfaces the resolved signature name (`OpenClaw`) rather than the stored comm. Without this, `[responder] dry_run=false` (enforce) on a host running a registered agent would still sever it.
+
+## [0.15.16] - 2026-06-18
+
+### Added
+- **Spec 081 — Managed-Agent Coexistence: stop severing a co-located, IW-managed AI agent.** When a legit AI agent IW is meant to GUARD (e.g. OpenClaw running as `node .../node_modules/openclaw/dist/index.js`, comm `MainThread`) reads its OWN `.env` and connects to its OWN Slack/Azure endpoint, that NORMAL startup matched the generic `sensitive_read → outbound_connect` exfil/C2 signature and IW auto-BLOCKED the (shared) destination IP **and** KERNEL-PID-BLOCKED the agent (denying its next execve) — severing the very agent IW guards. New `crates/agent/src/managed_agent_guard.rs` verifier withholds ONLY the auto-block/kernel-deny RESPONSE for a positively-verified managed agent on its own services; DETECTION is untouched (the incident still fires + the operator is still notified — downgrade, never silence). The relaxation is **source-based** (the agent identity — registry hit AND live `/proc/<pid>/cmdline` re-ID AND non-attacker-writable exe root AND own-config-path-owned-by-agent-uid, all re-verified live, fail-closed), **never destination-based** (keeps working when the Slack/Azure IP rotates; a known-bad destination still forces the block), and **agent-agnostic** (any agent-guard signature, not hardcoded to OpenClaw). Wired at the kernel PID-block (`killchain_inline::register_kernel_blocks`, gated to the `data_exfil`/`exploit_c2` FP shape) and at the userspace destination-IP block convergence point (`decision_block_ip::execute_block_ip_decision`, covering both the AI-router and killchain paths). Registry hardened to capture `exe_path`/`owner_uid`/`cmdline_fingerprint` live at `connect()` (backward-compatible serde defaults) so a self-registered or pid-recycled process cannot inherit the exemption. 7 required anti-evasion tests lock the no-hole property; the response-side wiring (`SystemProc` real-`/proc` resolver, `registry::capture_proc_facts`/`connect()` live capture, the userspace-IP-block and kernel-block decision helpers) was extracted into pure-of-`AgentState` functions and covered by unit tests plus a cross/integration test proving the SAME OpenClaw incident is spared on BOTH response paths (IP-block downgrade + kernel-block withhold) while an unregistered pid blocks on both.
+
+### Fixed
+- **macOS release job no longer flakes the whole release red on the runner thread-cap.** The `Build and publish (macOS)` job re-ran the full `cargo test --workspace` on the macOS runner, where a low per-process thread cap + leaked r2d2/scheduled-thread-pool reaper threads make `pthread_create` fail with EAGAIN near the end of the agent crate's large test binary — so `0.15.12`, `0.15.14` and `0.15.15` all published Linux assets but failed to publish the light-tier ("Phantom") macOS binaries even though the code was fine. The macOS job `needs: build-release`, and that Linux job already runs the IDENTICAL `cargo test --workspace` as a hard gate before macOS starts (and the PR `validate` workflow runs it on every change), so the macOS re-run was redundant for correctness — its only unique surface is the tiny macOS-specific code path (there is no eBPF on macOS). The macOS test step is now `continue-on-error: true` (still runs, failures stay visible in its log) with `--test-threads=1`, so a runner thread-cap flake can never block the macOS binary publish while a real logic regression is still caught by the Linux gate.
+
+## [0.15.15] - 2026-06-18
+
+### Fixed
+- **DNS Guard export now cleans hosts-file feed entries.** A field deploy on a real box surfaced that the agent's consolidated threat-feed stores many malicious domains in hosts-file form (`127.0.0.1\tevil.com`, `0.0.0.0 evil.com`) — public domain blocklists ship that way and the feed ingestion kept the raw lines. The exporter was writing those raw lines to the DNS Guard denylist, producing tens of thousands of `127.0.0.1\t…` junk entries that never match a real query. It now extracts the actual domain (last whitespace token), lowercases + strips a trailing dot, and rejects bare IPs / no-dot / non-hostname junk. The default `denylist_path` also moved from `/etc/innerwarden` (root config dir) to `/var/lib/innerwarden` (the agent's data dir): the agent runs as the unprivileged `innerwarden` user and the `/etc` default failed with permission denied. Found by deploying the guard in observe on a lab box whose feed had 65k "domains", all hosts-format; with the fixes the agent exported 64,252 clean domains and the guard would-blocked them.
+
+### Added
+- **DNS Guard block events become incidents — the block loop is now visible in IW.** Closes the bridge: the agent tails the DNS Guard's events JSONL (`[dns_guard] events_path`, byte-offset cursor so each line is seen once) and turns every `dns_guard.blocked` into a **High incident** — a host/agent tried to resolve a known-bad domain and was stopped, a strong compromise indicator. `would_block` (observe-mode telemetry) is intentionally NOT an incident (observe is for measuring the blast radius, not alerting). The incident id is stable per domain so repeats group; same-domain hits dedup within a batch. Gated by `ingest_enabled` (default off). With the exporter (which feeds IW's intel into the guard's denylist) this completes the round trip: IW detects → guard blocks the lookup → IW records the block.
+- **DNS Guard intel bridge — free detection feeds the paid domain-prevention layer.** The paid Active Defence ships a second pre-authorization moat alongside the Execution Gate: `innerwarden-dns-guard`, a forwarding resolver that refuses to *resolve* a malicious domain (C2 / exfil / DGA / tunneling) before the connection is made — the AI-agent guardrail (point a sandbox's `resolv.conf` at it and the agent literally cannot look up an exfil/C2 domain). This OSS change is the free half of the wire: a new `[dns_guard]` config section + a slow-loop exporter that, when `export_enabled = true`, writes the agent's known-malicious domains (the consolidated threat-feed intel: IOC feeds + dns_c2 / dns_tunneling) to `denylist_path` (default `/var/lib/innerwarden/dns-deny.txt`). The write is atomic (temp + rename, so the guard never reads a half-written file), throttled (5 min), and skipped when unchanged (no reload churn); the running DNS Guard hot-reloads the file and blocks the listed domains. Off by default — an OSS-only install does nothing. Same free-detect / paid-prevent line as the Execution Gate (the detection is free and auditable; arming the prevention is the paid layer).
+
+## [0.15.14] - 2026-06-17
+
+### Added
+- **Execution Gate divergence monitor — the free honesty net so the paid gate can never silently go inert (spec 080 G4).** The Execution Gate (paid Active Defence) is armed from a signed allowlist file that a watcher reconciles into kernel BPF maps. A 2026-06-17 fleet audit found a silent failure mode: a prod box with a signed `observe` allowlist of 1685 entries while the live kernel map was **inert with 0 entries** — staged but never applied, so the gate was doing nothing and nobody knew. Now the agent slow loop reads the LIVE pinned `EXEC_ALLOWLIST` + `LSM_POLICY` maps every 10 min and compares them to the signed file; on divergence it raises a self-incident: **High** for apply-drift (signed config not in the kernel) and **Critical** for the brick case (gate armed in enforce mode but the live allowlist is empty → every exec would be denied). It verifies the LIVE kernel state, never an internal record (same principle as spec 076 block live-verify), and an unreadable map never cries wolf. `innerwarden doctor` gains an **Execution Gate** section showing signed-vs-live counts + mode. This honesty net is **free/OSS** by design (spec 080 §10) — keeping the paid feature accountable is a safety net, not a paid add-on. The arming/reconcile tooling itself remains the paid layer.
+- **`innerwarden uninstall` — one-command, complete removal (closes #1047).** There was no documented way to remove InnerWarden; users had to reverse-engineer the install footprint by hand. New `innerwarden uninstall` tears it down in the safe order: stops the watchdog/supervisor FIRST (so nothing respawns the agent mid-uninstall), then stops the agent + sensor (a `systemctl stop` kills the whole cgroup, so the PID-namespaced / comm-masked agent goes down with it), then removes the systemd units + drop-ins, binaries, embedded eBPF object, pinned BPF maps, sudoers drop-ins, and the firewall rules InnerWarden added (matched by `innerwarden` tag, deleted high-number-first so the indices don't shift). Config (`/etc/innerwarden`) and data (`/var/lib/innerwarden`) are KEPT by default so a reinstall keeps history + license; `--purge` removes them plus `/var/log/innerwarden` and the `innerwarden` user. `--dry-run` prints the exact plan and needs no root; the real teardown requires sudo and confirms first (`--yes` to skip). The installer mirrors this for broken-binary cases: `curl … | sudo bash -s -- --uninstall [--purge]` prefers `innerwarden uninstall` and falls back to an inline teardown if the binary is unusable. README gains an Uninstall section.
+- **`innerwarden dashboard` — easy + secure dashboard access (no more systemd surgery).** The dashboard binds to localhost by default (secure). Opening it used to mean hand-editing the systemd unit (or the watchdog `--agent-arg`), `daemon-reload`, restart, and a manual firewall rule. Now it is config-driven (`[dashboard] bind` in agent.toml, which takes precedence over the `--dashboard-bind` flag) and managed by one command: `innerwarden dashboard` (status: bind, URL, login, ready-to-paste SSH-tunnel command), `dashboard open` (exposes it **securely** — generates a login if none exists, sets the bind, and **firewall-locks to your current SSH client IP** by default; `--public`/`--allow <ip>` to widen/narrow), `dashboard close` (back to localhost), `dashboard tunnel` (print the exact SSH-forward command). Exposing is always password-protected: the agent refuses to serve a non-loopback bind without credentials (SEC-005), so `open` sets a login first.
+- **Surface-aware agent-guard benchmark (spec 079 P2, deep-MCP inspection) — catch rate to 100% on the corpus.** The MCP guard inspects several surfaces with different rules (a command via `analyze_command`, a poisoned tool *result* via `inspect_response`, a poisoned tool *description*/manifest via `inspect_tool_description`), but the benchmark previously ran every case through the command path, so an indirect-injection-via-tool-result was scored against the wrong rules and missed. Corpus cases now carry a `surface` and the evaluator routes each to the matching inspector. This closed the last two misses — an indirect-injection tool result and a hex-escaped command — taking the corpus to **35/35 caught (100%)** at the same 5.6% false-positive rate. Supporting detection: a more flexible exfil-directive rule (`exfiltrate/POST <sensitive> to <url|email>`, tolerant of words between the verb and the data noun) and `\xNN` hex-escape obfuscation detection.
+
+### Fixed
+- **Agent-Guard false-positive rate cut from 27.8% to 5.6% while raising catch rate to 94.3%** (spec 079 P3, gated by the agent-attack benchmark). Root cause was an engine category error: `rules.rs::parse_field` mapped any unknown condition field — including `tool_name` — to the `UserInput` catch-all, so tool-NAME word lists (`chmod|sudo|bash|rm -rf`) matched raw command substrings (`~/.bashrc` matched `bash`, `sudo apt install` matched `sudo`, `rm -rf ./build` matched `rm -rf`), flagging normal dev commands as CRITICAL. Fixes: (1) a dedicated `AtrField::ToolName` evaluated only against an actual tool name via `check_tool_name`, never against user input/commands; (2) ATR-2026-064 no longer treats `chmod +x` as privesc (only setuid `+s`) and only flags privilege-escalating `sudo` (a root shell), not `sudo apt-get install`; (3) ATR-2026-061 generic `any`-token matching (bare `curl`/`wget`/`rm -rf`/`$VAR`) tightened to malicious-specific shapes. No detection blind spot: the catches those over-broad rules were incidentally making are restored via proper specific signals — `curl … | python3 -` (versioned-interpreter download-exec), `dd` disk-wipe + fork bomb (new destructive signals), and a hidden-exfil-to-URL tool-poisoning condition — so catch rate went UP (91.4% → 94.3%), not down. A `p3_fp_reduction_regression_gate` test locks the result so future changes can't silently regress it.
+
+### Added
+- **Agent-Guard proof benchmark (`cargo run -p innerwarden-agent-guard --example agent_attack_benchmark`).** A curated 53-case corpus (35 agent-native attacks across reverse-shell / download-exec / obfuscation / destructive / persistence / credential-access / privesc / prompt-injection / indirect-injection / tool-poisoning / multi-step + 18 benign controls) plus a reproducible scoring harness that runs each case through the real `check-command` engine and writes an honest `SCOREBOARD.md` (catch rate, hard-deny rate, false-positive rate, per-category breakdown, and the explicit list of misses). Measured baseline of the current engine: **91.4% caught (85.7% hard-denied) on 35 attacks**; the **27.8% benign false-positive rate** and 2 destructive-technique gaps (`dd`-to-block-device, fork bomb) are now measured, not assumed — they are the backlog for the guardrail-hardening work (spec 079 P2/P3).
+
+### Fixed
+- **No more CRITICAL "keylogger persistence" false positive when a toolchain installer writes `~/.profile`.** `rustup-init` (and `pip`/`npm`/`nvm`/`conda`/…) appending a `PATH`/env line to the invoking user's own shell startup file fired the `shell_startup_write` detector as a CRITICAL keylogger alert (T1546.004). The detector now recognizes language/runtime installers and, when they write **within their own user scope**, downgrades to Low (still recorded for provenance) instead of paging. This is a downgrade, never a suppression: a comm-spoofing attacker still leaves a triage-able incident, and any installer-claimed write **outside** its scope (a non-root process touching `/root` or `/etc`) stays CRITICAL — no detection blind spot. Anti-evasion tests included.
+- **`innerwarden doctor` no longer false-warns that the dashboard is down when it serves HTTPS.** doctor probed the dashboard over plain HTTP; on an HTTPS-only deployment that connection is refused, so doctor reported "Dashboard port 8787 is not responding" even while the dashboard returned HTTPS 200. doctor now falls back to a scheme-agnostic TCP connect, so a listening dashboard is reported up regardless of HTTP vs HTTPS.
+- **Integrity collector stops re-warning every minute about an unhashable file.** A single unreadable integrity target (e.g. permission denied) logged `cannot hash file` every poll interval forever — ~10k lines in 7 days on one host. It now warns ONCE per path and clears the latch when the path becomes hashable again, so a real new blind spot still surfaces immediately without the per-minute spam.
+- **Anomaly recalibration no longer spams WARN before the autoencoder has trained.** On a fresh or frequently redeployed host the nightly autoencoder has no model yet, and post-graph recalibration logged `no model loaded: train_nightly first` at WARN every 30s tick (~2.7k lines in 7 days). That expected pre-training condition is now a debug line; genuine recalibration errors still WARN.
+- **Flaky `run_agent` orchestration test de-flaked.** The slow-loop side-effect test used a fixed 8s `timeout(run_agent)` that always burned the full window and failed on slower hardware (2 of 3 isolated runs on a slow box) when the grouping-engine tick had not landed in time. It now polls for the snapshot and finishes the instant it appears (30s ceiling), so it is deterministic on loaded CI and faster on success.
+- **XDP TTL cleanup no longer hammers `sudo bpftool` every tick when the agent lacks privilege.** When the agent runs unprivileged (e.g. `User=innerwarden`) with a non-XDP block backend (`ufw`), the boot-loop XDP TTL sweep's `sudo bpftool map delete` fails with a permission/sudo error every slow-loop tick. The old code treated that as a *transient* drift and retried + logged every 30s forever: one stuck entry produced **44,415 failed sudo-auths + 44,260 WARN lines in 7 days** on a production box. A new classifier (`is_xdp_privilege_failure`) routes permanent privilege failures into exponential backoff (60s → 1h cap) and logs only on the first failure and once at the cap; transient kernel/map drift keeps the retry-next-tick behaviour. Backoff is runtime-only, so a restart (or a newly added sudoers rule) retries immediately. Surfaces the entry for drift visibility instead of flooding.
+- **AI briefing "Ignored" count now matches the dashboard "Filtered out" tile.** The briefing said "Ignored 21" while the Home tile said "Filtered out 11" — the briefing counted `dismissed.incidents + allowlisted.incidents` while the tile is `dismissed.unique_attackers` (one attacker fires many incidents). The briefing's `ignored` is now `dismissed.unique_attackers` and drops the separate allowlisted/operator-trust bucket. The incident-count lines ("operator-relevant incidents today", "observing") stay incident-based so they keep agreeing with the Sensors HUD and Report totals.
+- **Operator suggestions are operator-actionable again.** The dashboard "Suggestions" surfaced trial/rollout/dev-tuning notes ("improve detector payload completeness", "before widening rollout", "proceed to next phase", "signal quality") that a steady-state operator can't act on. Rewrote them to plain operator guidance and dropped the internal detector-payload diagnostic from the operator surface.
+
+### Fixed
+- **Daily briefing/digest now names the host.** The digest body led with no host, so on a shared Telegram chat / Slack channel you couldn't tell which server's briefing it was. It now leads with `🖥 <host>` (the incident host label / sensor `host_id`, same as real alerts), falling back to the system hostname.
+
+### Fixed
+- **Daily digest ("Daily Security Briefing") now reaches Slack + Discord, not just Telegram.** The once-a-day report was sent only through `telegram_client`, so Slack-only hosts (and shared channels) never got it. It now fans out through the spec 078 chat-channel registry: Telegram keeps its uncapped `send_text_message` path (a busy day can't drop it), and Slack/Discord receive it too. One dedup marker still guarantees one send per day.
+
+### Changed
+- **`innerwarden notify test` now names the host.** The test alert (Telegram + Slack) includes the host label (sensor `[agent] host_id`, same as real incidents) so operators sharing one chat/channel across several boxes can tell which server it came from.
+
+### Added
+- **Discord notifications.** A new `[discord]` channel (Incoming Webhook) gets
+  incident alerts, action reports, and burst summaries as colour-coded Discord
+  embeds — full parity with Telegram and Slack. Enable with `[discord] enabled =
+  true` + `webhook_url = "https://discord.com/api/webhooks/…"` (or env
+  `DISCORD_WEBHOOK_URL`); optional `min_severity` / `dashboard_url` /
+  `channel_notifications` mirror Slack. Off by default; an empty webhook
+  disables it at boot with a warning (never panics). Built on the spec 078
+  chat-channel registry — it touched only a new `discord` module, the config,
+  one boot block, and one registry line, with no dispatch-site edits. (Spec 078
+  Phase 3.)
+- **`innerwarden notify discord` setup command** + a **Discord integration card**
+  on the dashboard's Alerts & Notifications panel. The command (and its
+  `innerwarden config discord` alias) prompts for / accepts a webhook URL, saves
+  it, flips `[discord]`, sends a test message, and restarts the agent — same UX
+  as `notify slack`. (Spec 078 Phase 3b.)
+- **`innerwarden setup` wizard now offers Discord** as a notification channel
+  in the `[3/4] Notification channels` multi-select, with detection of an
+  existing `[discord]` config and a guided configurator at apply-time. (Spec 078
+  Phase 3c.)
+
+### Changed
+- **Unified chat-channel registry for notifications (internal).** Telegram and
+  Slack incident alerts now fan out through one `ChatChannel` trait + registry
+  (`notification_channels`) instead of two hand-wired dispatch blocks. Each
+  channel applies the same severity-rank + filter-level gate, and one channel
+  failing never blocks the others. Behaviour is identical for existing
+  channels; the point is that a new operator-facing channel (e.g. Discord) now
+  plugs in by implementing one trait + one registry line, with no edits to any
+  dispatch site. Webhook and Web Push remain non-chat sinks. (Spec 078 Phase 1.)
+- **Action reports and burst summaries reach Slack too.** Post-execution action
+  reports ("🛡️ Threat neutralized — Blocked …") and burst rollups were
+  Telegram-only; they now fan out through the chat-channel registry so Slack
+  (and future Discord) render the same disposition. `SlackClient` gained
+  `send_action_report` (Block Kit) + `send_summary`. The `Dismiss`/`Ignore`
+  suppression stays — only real actions report, on every channel. Action reports
+  now follow the Telegram notification master switch (`[telegram] enabled`)
+  instead of the conversational-bot switch. (Spec 078 Phase 2.)
+
+### Fixed
+- **No more "Threat neutralized — Dismissed" notification spam.** The
+  post-execution action report fired for every decided action, including
+  `Dismiss` and `Ignore` — which are *non-actions* (the agent judged the
+  incident benign). Operators were flooded with "Threat neutralized —
+  Dismissed" messages for false positives that needed no response. Dismissed
+  and ignored incidents now skip the action report entirely; the first-alert
+  and daily digest still record them.
+- **False-positive "data exfiltration" on source/package files.** The exfil
+  detector's sensitive-path list matched generic substrings (`/secret`,
+  `/token`, `/credentials`) anywhere in a path, so an AI agent loading its own
+  `node_modules/.../secret-contract-api.js` or `.../token/const.mjs` and then
+  calling an API was flagged CRITICAL. Source files (`.js/.mjs/.ts/...`) and
+  anything under `node_modules/` are no longer treated as credential reads
+  (`.json` stays sensitive — gcloud's credentials file is genuine).
+
+## [0.15.13] - 2026-06-15
+
+### Added
+- **`innerwarden setup` is now cloud-aware.** It detects the host's cloud
+  platform (offline, via DMI) and adds that platform's fixed infrastructure
+  addresses (e.g. Azure's wireserver, used for DNS/DHCP/health) to the host
+  allowlist automatically, so the responder treats the cloud's own platform
+  traffic as infrastructure rather than a third party. A per-host server-side
+  rule the operator can see/edit in `agent.toml [allowlist]` — not a hardcoded
+  entry in the product's block path. Idempotent.
+- **`innerwarden mesh connect <peer>` — one-command collaborative defense.**
+  Enables mesh, registers the peer, and opens the local host firewall
+  (ufw/firewalld, source-scoped to the peer IP) for the mesh port in a single
+  step, instead of `mesh enable` + `mesh add-peer` + a manual firewall edit.
+  Accepts `host`, `host:port`, or a URL; normalizes to the mesh's HTTP scheme.
+- **`innerwarden harden` — two new check categories.**
+  - **Kernel Hardening**: 15 CIS-aligned sysctls the advisor did not check
+    before (`kptr_restrict`, `dmesg_restrict`, Yama `ptrace_scope`,
+    `unprivileged_bpf_disabled`, `bpf_jit_harden`, `protected_{hardlinks,
+    symlinks,fifos,regular}`, `suid_dumpable`, `rp_filter`, `log_martians`,
+    `icmp_echo_ignore_broadcasts`, `send_redirects`, `kexec_load_disabled`).
+    Deliberately does **not** check `perf_event_paranoid` — raising it would
+    break InnerWarden's own eBPF sensor.
+  - **Access Control**: flags a host with neither AppArmor nor SELinux
+    enforcing (a root compromise would otherwise be unconfined); warns when
+    SELinux is merely permissive.
+
+### Changed
+- **`innerwarden harden` — cloud-aware false-positive reduction.** A clean
+  public-cloud host no longer raises noise that buries real findings:
+  - `cifs-utils`' SUID-root `/usr/sbin/mount.cifs` (and `ecryptfs-utils`) are
+    recognised as packaged mount helpers, not anomalous SUID binaries. The
+    trusted-owner dpkg lookup now also handles **usrmerge path aliasing** —
+    `find` reports the canonical `/usr/sbin/...` while some packages record the
+    pre-merge `/sbin/...` path, so the query retries the alias before flagging.
+  - Stock cloud/virt/AMD/NIC kernel modules (Azure Hyper-V + MANA, RDMA/IB,
+    AMD `ccp`, `irqbypass`, AWS `ena`, GCP `gve`, `dm_multipath`, common NIC
+    drivers, ...) are added to the known-good set, clearing the "unusual kernel
+    module(s)" low finding on Azure/AWS/GCP images.
+
+### Fixed
+- **Mesh could be silently disabled by a corrupt state file.** A zero-byte
+  `mesh-state.json` (left by the previous non-atomic save when the agent was
+  killed mid-write) made `load_state` return an error, which aborted mesh
+  init — no listener, no peering — with only a swallowed warning. Mesh
+  persistence now (a) writes atomically (temp + rename) and (b) fails soft on an
+  empty/corrupt file (warn + start fresh). `innerwarden mesh status` no longer
+  errors on such a file either. (innerwarden-mesh bumped to `12890c08`.)
+- **`innerwarden agent scan` missed interpreter-launched AI agents.** Detection
+  matched `/proc/<pid>/comm` only, so a node/python-launched agent (OpenClaw,
+  aider, goose, cline, ...) whose `comm` is `node`/`python`/`MainThread` was
+  reported as "No known agents detected". Detection now also scans
+  `/proc/<pid>/cmdline` when the executable is a known interpreter, matching a
+  signature name as an exact path component or a `python -m <module>` argument.
+  Stays precise — bare args and `<name>.md` do not match.
+- **`configure ai azure_openai` wrote a config that silently 404'd.** Azure's
+  chat endpoint needs an `api-version` query param the agent reads from
+  `[ai].api_version`; `configure ai` never wrote it. Now a known-good default is
+  written for Azure, `azure` is accepted as an alias for `azure_openai`, and
+  configuring Azure without `--base-url` fails loudly at configure-time.
+- **`innerwarden doctor` reported a false `OPENAI_API_KEY not set` for Azure.**
+  `doctor` now resolves and validates `AZURE_OPENAI_API_KEY` for
+  `azure_openai`/`azure` instead of falling through to the OpenAI check.
+- **`innerwarden enable` could not repair a half-enabled capability.** A
+  capability marked enabled in config but missing its sudoers drop-in (so
+  block-ip silently could not run firewall commands) was a dead end: `enable`
+  replied "already enabled, nothing to do" and never re-applied. `enable` now
+  takes `--force` to re-run apply and repair drift (idempotent), and `doctor`
+  points at `sudo innerwarden enable <cap> --force`.
+- **Integration Advisor no longer flags Telegram + Slack as a problem.** Running
+  both notification channels (Telegram for real-time, Slack for team visibility)
+  is an intentional setup; it is now a neutral "MULTI-CHANNEL ACTIVE" note rather
+  than a red "OVERLAP DETECTED" warning.
+- **Flaky MCP-proxy pipe tests eliminated.** Tests that pipe through a real
+  spawned child occasionally saw a partial/empty read under CI load; they now
+  run on a multi-worker runtime and re-run the exchange until the expected
+  output is present. Test-only; no behavior change.
+
+## [0.15.12] - 2026-06-14
+
+### Fixed
+- **Installer (`install.sh`) failed on a clean `curl | sudo bash`.** Three bugs,
+  all on the product's front-door install path, now fixed + guarded by CI:
+  1. `SUPERVISED: unbound variable` — the var was referenced under `set -u` but
+     never declared. Now defaulted (`SUPERVISED="${SUPERVISED:-false}"`, opt-in)
+     with a `--supervised` flag.
+  2. `[responder]: command not found` — a backtick in a comment **inside an
+     unquoted `<<EOF` heredoc** ran as a command substitution. Backticks removed.
+  3. `/dev/tty: No such device or address` — the headless guard tested the device
+     node's permission bits (`-r`) but the actual open still fails with no
+     controlling terminal (piped/cloud-init/CI), aborting the install. Now probes
+     by actually opening `/dev/tty`, and the interactive wizard is non-fatal.
+  Removed dead `prompt_yes_no` (zero callers).
+- **New `Installer` CI workflow** (`.github/workflows/installer.yml`) so this
+  class never ships again: shellcheck (static, catches the heredoc/quoting class)
+  **plus** a runtime smoke test that runs the installer exactly as users do
+  (piped, no TTY) and asserts `innerwarden-sensor` + `innerwarden-agent` come up
+  active — the only way to catch the `set -u` / heredoc / tty runtime failures
+  shellcheck can't see.
+- **Truthful containment for already-blocked `needs_review` cases.** A
+  High/Critical case decided `needs_review` *before* its IP was blocked stayed in
+  the dashboard's "Needs your attention" forever once the firewall started
+  dropping it — pestering the operator about an already-contained threat (#987
+  only verified at first-decision; the in-memory block record can also diverge
+  from an orphaned ufw rule). A new slow-loop pass
+  (`orphan_recovery::reverify_already_blocked_needs_review`) re-checks every
+  current `needs_review` case against the **live firewall** (ufw + iptables probe,
+  never the internal record — per spec-076) and records a truthful Contained
+  decision for any IP it is actually dropping. Hole-free: it only contains
+  recon-class detectors a firewall block fully mitigates (active-harm —
+  reverse_shell/c2/data_exfil/ransomware/kill_chain — always stays surfaced even
+  when blocked), a failed probe contains nothing, and a returning attacker raises
+  a new incident handled by the live-verified re-block path (no free pass).
+- **De-flake `mcp_proxy::transport::advisory_is_a_transparent_pipe`.** The test
+  awaited the proxy task before reading its output, a duplex race that could
+  observe an empty/partial buffer under CI load. It now drains concurrently
+  (`tokio::join!`).
+
+### Added
+- **Execution Gate operator "Trust Exec" + allow_exec rules (spec 077 P3/P4).**
+  The approve side of the gate, open-core: the OSS agent owns the approval UX, the
+  paid `exec-gate watch` daemon owns enforcement, and they meet at the shared
+  `/etc/innerwarden/rules/exec-gate` rules directory.
+  - New `operator_exec_trust` module writes `allow_exec` rules (the same artifact
+    an advanced user can hand-write) the paid daemon hot-reloads into the kernel
+    allowlist.
+  - Dashboard `POST /api/action/trust-exec` (+ `untrust-exec`, `GET trusted-execs`)
+    authorise/revoke a binary path. Authorising an exec is a **sensitive action**,
+    so it is **2FA-gated** (`verify_dashboard_totp`, when `[security].method = totp`)
+    and recorded in the hash-chained admin-actions audit. Globs are rejected (the
+    kernel enforces an exact path).
+  - `innerwarden rule list` now shows Execution Gate `allow_exec` rules, and
+    `rule disable/enable <id>` toggles them (revoke takes effect within one watch
+    cycle). Without the paid daemon these rules are inert.
+- **Execution Gate observe mode (spec 077 P2).** `LSM_POLICY` key 3 gains mode
+  `2 = observe`: the eBPF gate computes the path-hash and, on an allowlist miss,
+  emits a `lsm.exec_gate_would_block` event (Info) **but allows the exec** —
+  instead of `-EPERM` (mode 1 = enforce). This is the safe-onboarding primitive:
+  a host runs the gate in observe to *learn* its allowlist without bricking, then
+  flips to enforce after a clean window. The would-block carries the real
+  attempted path (marker `EXEC_OBSV`, distinct from the enforce `EXEC_GATE`).
+  Ships inert (mode 0 default); arming/observe is the paid Active Defence step.
+- **Operator "Trust IP" — a monitor-only allowlist managed from the dashboard.**
+  New endpoints `POST /api/action/trust-ip`, `POST /api/action/untrust-ip`, and
+  `GET /api/action/trusted-ips` (all under the existing dashboard auth + CSRF
+  gate) let an operator mark an IP or CIDR as trusted so the agent stops
+  AUTO-blocking it. Trust is deliberately the *safe* half of allowlisting: a
+  trusted IP is **still detected, still logged, and still notified** (Telegram /
+  Slack / webhook) — only the automated response is suppressed. There is no
+  "drop / suppress detection" mode on this surface, so a dashboard-authenticated
+  session cannot self-allowlist into silence. Internal/private ranges are allowed
+  (trusting your own office/VPN/LB range is the point); ranges broader than
+  `/8` (v4) or `/16` (v6) are rejected — this blocks `0.0.0.0/0` and the
+  `0.0.0.0/1` + `128.0.0.0/1` two-halves end-run that would otherwise trust the
+  whole internet from a hijacked session. Entries can be **time-boxed**
+  (`ttl_hours`) and expire on their own within one slow-loop tick — no manual
+  cleanup. Every add/remove is recorded in the hash-chained admin-actions audit
+  trail. **Integrated with the user-facing rule system:** entries are written as
+  ordinary `suppress_response`/`scope: ip` rules into the event_pipeline rules
+  dir (`70-operator-trust.yml`) — the same format a user can hand-write — so they
+  show up in `innerwarden rule list`, can be disabled with
+  `innerwarden rule disable <id>`, appear in `innerwarden trust list` (now reads
+  the dynamic rules too), and are hot-reloaded into `dynamic_trusted_ips` with
+  TTL honoured. The sensor's `suppress_response` schema was relaxed
+  (`SuppressConfig { detector?, scope? }`) so these shared-dir rules parse
+  cleanly instead of warn-and-skipping — a fix that also benefits any
+  hand-written `suppress_response` rule. **Dashboard:** a "✓ Trust IP" button on
+  the case/journey view (next to Block/Unblock) opens a confirm modal and calls
+  `trust-ip`; available on any IP case. Manage/time-box trusted entries via the
+  CLI (`innerwarden trust`).
+
+### Fixed
+- **macOS release signing.** The release workflow's "Sign macOS release
+  binaries" step failed on every run from 0.15.9 through 0.15.11
+  (`pkeyutl: Option unknown option -rawin`, exit 1) because macOS runners
+  expose LibreSSL as the system `openssl`, and LibreSSL's `pkeyutl` cannot
+  raw-sign Ed25519. It now uses Homebrew's `openssl@3` explicitly, keeping the
+  signature scheme byte-for-byte identical to the Linux job. Linux releases were
+  never affected. (Note: macOS binaries ship without eBPF — eBPF is Linux-only;
+  the macOS sensor uses log-based collectors. See README "Platform Support".)
+
+### Changed
+- **Install/upgrade telemetry is now opt-OUT (was opt-in), transparent, and
+  covers upgrades.** The anonymous install ping flips to on-by-default; disable
+  it with `INNERWARDEN_NO_TELEMETRY=1`. The installer and `innerwarden upgrade`
+  each print a one-line notice (what is sent + how to opt out + link to
+  `/privacy`) before sending, so the default-on collection is informed. The ping
+  now also fires on `innerwarden upgrade` (previously only fresh `install.sh`, so
+  upgrades were invisible) and carries an `event=install|upgrade` field. The data
+  is unchanged — anonymous and minimal: release version + OS + CPU arch + event,
+  no IP (the server hashes ip+day into a one-way dedup id and discards the raw
+  IP), no host/agent/config data. See https://www.innerwarden.com/privacy.
+
+## [0.15.11] - 2026-06-12
+
+Headline: the **Execution Gate eBPF primitive** ships — a free, auditable,
+kernel-level allowlist primitive that is **inert by default** and changes
+nothing for existing users. Plus a Zero-Trust input-robustness sweep across the
+enrichment clients and a batch of false-positive + operator-experience fixes.
+Also reactivates the install-ping for the client deployment.
+
+### Fixed
+- **`systemd_persistence` false positives on benign systemctl ops.** Two FP classes
+  reported from a live Telegram alert (2026-06-11): (1) `systemctl is-enabled <unit>`
+  — a read-only query — fired because `contains("enable")` matched the "enable" inside
+  "is-enabled"; (2) a bare `systemctl daemon-reload` (ubiquitous: every package install,
+  deploy, and the agent's own restart dance) fired as High. Now persistence verbs are
+  matched as TOKENS (`enable`/`reenable`/`link`), read-only verbs (`is-enabled`,
+  `is-active`, `status`, …) stay silent, and a bare `daemon-reload` only alerts when the
+  command references a suspicious path. Real persistence (unit-file writes + `enable`) is
+  still caught aggressively. Regression tests added.
+- **MCP proxy: capped the line reader (OOM/DoS).** The agent-guard MCP proxy
+  (`innerwarden agent proxy -- <server>`) sits in front of UNTRUSTED MCP servers
+  (and an untrusted client); its `tokio` `Lines` reader grew a single
+  newline-less line without limit, so a hostile server/client could OOM the
+  proxy with a multi-GB line. A new `CappedLines` reader (4 MB ceiling) fails the
+  session closed instead of buffering unbounded. Regression tests cover normal
+  lines, oversized-without-newline, and oversized-with-newline-past-cap.
+- **Input-robustness hardening across the enrichment clients (same class as the
+  DShield bug).** A Zero-Trust audit found the DShield failure mode lurking in
+  siblings and a few unbounded reads:
+  - **geoip** (`ip-api.com`): `isp`/`asn` were strict `String`s, so a bare-integer
+    `as` or a `null` field failed the whole record and silently killed geo
+    enrichment for every IP — exactly the DShield incident. Now a `lenient_string`
+    deserializer (string/number/null) + a body cap.
+  - **AbuseIPDB**: required scalars (`abuseConfidenceScore`, `totalReports`,
+    `numDistinctUsers`, `isPublic`) get `#[serde(default)]` so a schema flip can't
+    fail the record.
+  - **Body-size caps** on the threat-feed IOC reader (operator-configured, often
+    plain-`http://`, MITM-able), DShield, and the fleet poller — an unbounded
+    `text()`/`json()` could OOM the agent. Mirrors the CrowdSec 8 MB cap.
+  - **Honesty fix**: the orphan-recovery contained-decision text said "verified
+    live" when it only consults the in-memory response lifecycle (no live firewall
+    re-check); the text now states the real source.
+- **DShield enrichment was silently dead.** DShield's per-IP API returns the AS
+  number as a bare integer (`"as":48090`) for many IPs, but the `as_number`
+  field was typed `Option<String>` (tests only covered the quoted-string form).
+  serde failed the whole record — `invalid type: integer, expected a string` —
+  so the ISC reputation signal was dropped for every IP (239 `failed to parse
+  DShield response` warnings in 2 days on prod). A `lenient_string` deserializer
+  now accepts string-or-number-or-null on the AS string fields.
+- **Already-blocked threats no longer show up under "Needs your attention".**
+  When a High/Critical incident became an orphan (no AI decision recorded — a
+  deploy orphan or provider skip) the orphan-recovery sweep routed it to
+  `needs_review` unconditionally, even when its IP was already blocked at the
+  firewall. On prod this surfaced threat-intel IPs that `ufw`/`nft` were already
+  dropping as cases that "need your attention". The sweep now verifies LIVE
+  (`response_lifecycle::is_ip_actively_blocked`, mirroring the fast-loop churn
+  guard: a block-mitigated detector AND a TTL-valid live block) and records a
+  truthful `block_ip`/contained decision instead — so a neutralised threat reads
+  as contained, not as pending operator action. Genuinely-unhandled High/Critical
+  orphans still route to `needs_review` (Spec 062 invariant preserved).
+- **Operator decision overrides now actually drive the case outcome.** The
+  dashboard's override/reopen rows (`operator_override:<action>`,
+  `operator_reopen`) were classified as unknown strings, so a "Dismiss" left the
+  case stuck in "Needs your attention". `threat_contract::classify_decision` now
+  understands the operator-action vocabulary, so Dismiss clears a case, Monitor
+  moves it to Observing, Reopen returns it to attention, and an operator unblock
+  resolves it.
+
+### Added
+- **Execution Gate primitive (eBPF, ships INERT).** A new dedicated minimal LSM
+  program `innerwarden_lsm_exec_gate` on `bprm_check_security`: when armed
+  (`LSM_POLICY` key 3 = 1), an exec whose path-hash (FNV-1a of `bprm->filename`,
+  ≤256 bytes) is absent from the new `EXEC_ALLOWLIST` map is denied with `-EPERM`
+  and an `EXEC_GATE_BLOCKED` event is emitted; allowlisted paths run untouched.
+  Default is key 3 = 0 — the gate is **inert** out of the box and arming is
+  operator-driven tooling, so OSS behaviour is unchanged. It lives in its own
+  program (not `innerwarden_lsm_exec`) because the full hook fails the verifier
+  on kernel ≥ 6.4. The `bprm->filename` byte offset is read from kernel BTF at
+  load time (`BPRM_OFFSETS` map, CO-RE — it is 96 on 6.8, not the 72 older code
+  assumed, which is `cred`), with 96 as fallback. `EXEC_ALLOWLIST` is pinned at
+  `/sys/fs/bpf/innerwarden/exec_allowlist` so userspace tooling can populate it.
+  Path read uses a per-CPU scratch buffer (zero BPF stack cost) and the gate
+  fails OPEN (allow) on any read error. Proven end-to-end on kernel 6.8 x86_64:
+  unknown binary blocked at exec, allowlisted binaries run, clean disarm, no
+  brick. `scripts/verify-lsm-hooks.sh` now also pins the per-program FUNC
+  symbol surface (bpf-linker folds same-hook programs into one ELF section, so
+  the section check alone cannot see a dropped program). The gate's block is
+  surfaced as a dedicated **`lsm.exec_gate_blocked`** event carrying the real
+  attempted path inline (`details.filename` + `blocked_by: exec_gate`) — read
+  straight from `bprm->filename`, since a denied exec leaves `/proc/<pid>`
+  pointing at the old image and the path is unrecoverable afterwards.
+- **More case actions than just "Block IP".** The case detail offered only a
+  Block button (which hid once a case was blocked, leaving zero actions). New
+  operator actions, all behind the same auth + CSRF gate as block-ip and
+  honouring watch/guard mode:
+  - **Unblock IP** (`POST /api/action/unblock-ip`) — the inverse of Block. It
+    QUEUES the revert (writes an `operator_unblock_request`); the agent slow
+    loop drains it and performs the real revert through `response_lifecycle`,
+    clearing the persisted block records only on a confirmed revert. Going
+    through the agent loop is deliberate: a dashboard-side rule removal would be
+    re-applied by the spec-076 block-enforcement reconciler within minutes.
+  - **Dismiss / Monitor / Reopen a case** (`POST /api/action/triage-case`) —
+    writes one operator-action decision per incident in the case; the read
+    path's latest-decision-per-incident selection makes the operator's verb win.
+
+## [0.15.10] - 2026-06-10
+
+### Fixed
+- **Block enforcement now verifies the LIVE firewall rule before skipping a
+  re-block (spec 076) — closes a free-pass hole.** The redundant-re-block guard
+  in `execute_block_ip_decision` skipped re-blocking based on the agent's
+  internal TTL record (`response_lifecycle::is_ip_actively_blocked`), not the
+  actual firewall. When that record diverged from reality (a TTL removal that
+  did not clear the record, an agent restart reloading a stale set, or an
+  externally-flushed rule) it false-positived "already blocked" and skipped, so
+  a still-attacking repeat offender got a free pass. Found in prod on a
+  known-malicious IP whose every block decision logged "already blocked: live
+  firewall rule already active" while it was absent from ufw/nft/iptables/XDP.
+  The guard now confirms the rule against the live backend (`backend_status_cmd`
+  + `rule_present_in` + `is_ip_live_blocked`); if it cannot be confirmed live it
+  re-applies (idempotent, never opens a gap). Can only add blocks, never remove
+  or widen them.
+
+### Added
+- **Explained Alerts (spec 075) — every notification teaches and reassures.** A
+  new `detector_catalog` maps each detector to a plain-language "what + why",
+  fused with the live MITRE mapping from `mitre.rs`. The plain-language Telegram
+  alert (`format_simple_message`) now carries a "Why this matters" line with the
+  attacker goal and MITRE attribution, so an alert reads as "InnerWarden saw
+  this, knows what it is, and is handling it" instead of a raw detector name.
+  Communication-only — no detection or severity change. Also maps three
+  previously-unmapped detectors (`keylogger_bash_trap` -> T1056.004,
+  `auditd_disable` / `selinux_apparmor_disable` -> T1562.001) so their alerts
+  carry MITRE too.
+
+## [0.15.9] - 2026-06-10
+
+### Added
+- **Audit-state monitor (spec 074) — catch an audit disable by ANY method.** A
+  new `audit_state` collector polls the kernel audit `enabled` flag
+  (`auditctl -s`) every 60s and emits `audit.disabled` when it is found off —
+  either already disabled when the sensor starts or transitioning
+  enabled->disabled at runtime. The `auditd_disable` detector turns it into a
+  Critical incident (T1562.001). This closes a real gap found in prod on
+  2026-06-09: a host ran with kernel audit disabled (`enabled 0`) for ~22h with
+  NO alert, because the existing detector only watches for the disabling
+  *command* in execve and that disable left no observed command. A state poll
+  catches it regardless of how audit was disabled (`auditctl -e 0`, a netlink
+  `AUDIT_SET`, etc.). Default-on like the other always-on collectors; fail-open
+  when auditctl is absent. Brings the sensor to 30 collectors.
+
+## [0.15.8] - 2026-06-09
+
+### Added
+- **Warden Context Gate — deterministic guardrail around the on-device decider (spec 071).**
+  A pre/post gate around the Local Warden ONNX classifier: it surfaces under-rated
+  High/Critical threats (escalates when the model's confidence is below the floor)
+  and NEVER dismisses a High/Critical incident on a forgeable signal (`comm` /
+  argv0 / prctl). Red-teamed: an attacker renaming a payload to a trusted process
+  name can no longer talk the gate into a silent dismiss. Closes the false-positive
+  source where the decider acted on a context-starved input, without weakening
+  real detection.
 - **MCP inspecting proxy (`innerwarden agent proxy`).** A stdio
   man-in-the-middle that wraps a real MCP server and inspects the JSON-RPC
   traffic in both directions: `tools/call` arguments (prompt injection,
   credential leaks, dangerous commands, ATR rules), `tools/list` descriptions
-  (tool poisoning), and tool results (injection in responses). Three modes:
+  (tool poisoning), and tool results (injection in responses). Four modes:
   `advisory` (default — a transparent, alerting pipe, no behavior change),
-  `guard` (a disallowed `tools/call` is not forwarded; the client gets an
-  `isError` denial keyed to the request id), and `kill` (block + terminate the
-  server). Usage: `innerwarden agent proxy --mode guard -- npx -y <server>`.
+  `warn` (same forward-and-alert behavior as advisory, never blocks, but
+  tagged for louder operator surfacing), `guard` (a disallowed `tools/call`
+  is not forwarded; the client gets an `isError` denial keyed to the request
+  id), and `kill` (block + terminate the server). Usage: `innerwarden agent
+  proxy --mode guard -- npx -y <server>`.
   The decision logic is pure and unit-tested; the transport is a single-task
   `select!` loop (one client writer, no shared lock). Pass-through preserves
   original bytes; stdout carries only MCP traffic. New `crates/agent-guard/src/
@@ -45,8 +635,33 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   patterns = 24 — the previously marketed "29" was false; dangerous commands = 14;
   API-key patterns = 7; AI agent/tool/runtime signatures = 20, not "25+"), so a
   doc/code drift fails CI.
+- **Orphan-recovery retries the decider for High/Critical orphans before queueing (spec 071 Part C).**
+  A High/Critical incident left without an AI decision (e.g. a provider skip during
+  an agent restart) is now re-run through the decider before being routed to the
+  `needs_review` queue, instead of leaking straight there. Fewer ambiguous incidents
+  reach the human queue; the queue stays the rung of last resort.
+- **The decider gate refuses to dismiss `provenance:illegitimate` incidents (spec 072 Phase 2).**
+  An incident whose evidence carries a non-forgeable illegitimate-provenance tag is
+  never auto-dismissed — it is always surfaced, regardless of the model's verdict.
 
 ### Fixed
+- **False-positive suppression via non-forgeable exe-path provenance (specs 071/072).**
+  Several FP-prone detectors now gate their benign-self / toolchain skips on the
+  non-forgeable `/proc/<pid>/exe` path instead of the forgeable `comm`:
+  `data_exfiltration` excludes the zig / build-script toolchain and only skips a
+  build tool when its exe path is itself trusted (not a renamed binary in `/tmp`);
+  `host_drift`'s comm allowlist is gated on the exe path; `rootkit` timing no longer
+  flags `tcp_stream.{http,ssh,smb}`; `suspicious_archive` suppresses InnerWarden's
+  own self-unpack into `/var/lib/innerwarden`. These clear the operator- and
+  self-traffic false positives that were piling in `needs_review`, without weakening
+  real detection.
+- **`innerwarden get` reads the unified SQLite store, not legacy JSONL (#969).** The
+  CLI under-reported decisions/incidents by reading the old jsonl files instead of
+  `innerwarden.db`; it now reads the unified store (with a jsonl fallback).
+- **De-flaked the `privesc` provenance tests (#976).** The tests read real `/proc`,
+  so a live PID matching a hardcoded test pid made provenance resolve to a real
+  trusted process intermittently in CI; they now use guaranteed-dead pids (above
+  `pid_max`) so provenance resolves deterministically to Unknown.
 - **ATR community rules now actually load in production (agent-guard).** The
   `check-command` snitch path advertised "71 ATR community rules", but the agent
   loaded them from `/etc/innerwarden/rules` while `deploy-prod.sh` only ever

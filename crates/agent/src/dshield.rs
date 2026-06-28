@@ -55,17 +55,19 @@ pub struct DshieldIp {
     /// Most recent date the IP was reported attacking (YYYY-MM-DD).
     #[serde(default)]
     pub maxdate: Option<String>,
-    /// Autonomous System number.
-    #[serde(rename = "as", default)]
+    /// Autonomous System number. DShield returns this as a bare integer
+    /// (`"as":48090`) for many IPs but as a quoted string (`"as":"4134"`) for
+    /// others; parse leniently so a type-flip does not fail the whole record.
+    #[serde(rename = "as", default, deserialize_with = "lenient_string")]
     pub as_number: Option<String>,
     /// AS owner name.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     pub asname: Option<String>,
     /// Two-letter country of the AS.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     pub ascountry: Option<String>,
     /// CIDR the IP belongs to.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     pub network: Option<String>,
     /// Named threat feeds this IP is currently a member of. DShield returns
     /// this as an object keyed by feed name (or null/absent).
@@ -82,6 +84,26 @@ where
     Ok(match v {
         serde_json::Value::Number(n) => n.as_i64(),
         serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
+/// Accept a string, a bare number (stringified), or null for a string field.
+///
+/// Why this exists: DShield flipped `as` from a quoted string (`"as":"4134"`)
+/// to a bare integer (`"as":48090`). With a plain `Option<String>` field, serde
+/// fails the WHOLE record with "invalid type: integer, expected a string", so
+/// DShield enrichment silently died for every IP — 239 `failed to parse DShield
+/// response` warnings in 2 days on prod (2026-06-11). Tolerating either shape on
+/// the AS string fields keeps a single upstream type-flip from killing the feed.
+fn lenient_string<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(de)?;
+    Ok(match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
         _ => None,
     })
 }
@@ -203,7 +225,20 @@ impl DshieldClient {
             return None;
         }
 
-        match resp.json::<DshieldResponse>().await {
+        // Cap the body before parsing (keyless public API; defense-in-depth).
+        const MAX_BODY: usize = 1024 * 1024;
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(ip, error = %e, "DShield body read failed");
+                return None;
+            }
+        };
+        if bytes.len() > MAX_BODY {
+            warn!(ip, body_bytes = bytes.len(), "DShield response too large");
+            return None;
+        }
+        match serde_json::from_slice::<DshieldResponse>(&bytes) {
             Ok(d) => Some(DshieldReputation::from_ip(d.ip)),
             Err(e) => {
                 warn!(ip, error = %e, "failed to parse DShield response");
@@ -270,6 +305,28 @@ mod tests {
         let json = r#"{"ip":{"count":-1,"attacks":-5,"threatfeeds":null}}"#;
         let r: DshieldResponse = serde_json::from_str(json).unwrap();
         let rep = DshieldReputation::from_ip(r.ip);
+        assert_eq!(rep.reports, 0);
+        assert_eq!(rep.targets, 0);
+    }
+
+    #[test]
+    fn parses_as_field_as_bare_integer() {
+        // Regression (prod 2026-06-11): DShield returns `"as":48090` as a BARE
+        // INTEGER for many IPs. The field was typed `Option<String>`, so serde
+        // failed the whole record ("invalid type: integer, expected a string")
+        // and DShield enrichment died for every IP (239 parse failures / 2 days).
+        // This is the real on-wire shape (extra fields like weblogs/number/
+        // maxrisk are present and must be tolerated; `as` is the integer).
+        let json = r#"{"ip":{"number":"45.148.10.121","count":null,"attacks":null,
+            "maxdate":null,"mindate":null,"updated":null,"comment":null,
+            "maxrisk":null,"asabusecontact":"abuse@vegatele.com","as":48090,
+            "asname":"PPTECHNOLOGY","ascountry":"GB","assize":256,
+            "network":"45.148.10.0/24","weblogs":{"count":1},"threatfeeds":null}}"#;
+        let r: DshieldResponse = serde_json::from_str(json).expect("must parse with integer `as`");
+        let rep = DshieldReputation::from_ip(r.ip);
+        assert_eq!(rep.as_number.as_deref(), Some("48090"));
+        assert_eq!(rep.as_name.as_deref(), Some("PPTECHNOLOGY"));
+        assert_eq!(rep.as_country.as_deref(), Some("GB"));
         assert_eq!(rep.reports, 0);
         assert_eq!(rep.targets, 0);
     }

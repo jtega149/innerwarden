@@ -380,6 +380,13 @@ impl Blocklist {
         self.blocked.insert(ip.into());
     }
 
+    /// Remove an IP from the in-memory blocklist. Returns true if it was
+    /// present. Used by the operator-unblock drain so a manually un-blocked
+    /// IP is no longer treated as blocked by the algorithm gate.
+    pub fn remove(&mut self, ip: &str) -> bool {
+        self.blocked.remove(ip)
+    }
+
     /// Cap the blocklist to prevent unbounded memory growth.
     /// Keeps the most recent entries by clearing and reloading if over limit.
     pub fn trim_if_needed(&mut self, max_entries: usize) {

@@ -111,6 +111,55 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/neural_lifecycle.rs::tests::train_nightly_post_recal_skips_when_no_graph_features` — the post-train recalibration block in `train_nightly_with_store` is gated on `Some(graph_features)`; without graph features the recalibration is skipped so test fixtures and pre-graph boots do not get a recalibration that would overwrite anchors with a degraded no-graph distribution. Pinned the operator-observed bug where the 2026-05-04 nightly retrain wiped Wave 7a's boot recalibration and prod returned to 100% saturation by morning.
 
+### rootkit:timing protocol-stream FP skip (spec 071 Part B)
+
+- `crates/sensor/src/detectors/rootkit.rs::tests::timing_skips_tcp_stream_protocol_kinds` — `tcp_stream.http` / `.ssh` / `.smb` are excluded from the timing-anomaly pipeline (alongside the already-skipped `tcp_stream.flow` and `network.*`): their inter-event delta measures traffic idleness, not syscall-hook latency, so they are never tracked or flagged. Pinned the 2026-06-08 test001 FP where an 895-second gap between two HTTP streams (baseline ~4.8s) fired a critical `rootkit:timing` "getdents64 hook" incident that flooded `needs_review`.
+- `crates/sensor/src/detectors/rootkit.rs::tests::timing_still_tracks_file_read_access_after_tcp_stream_skip` — anti-regression: extending the skip list did NOT disable the real latency-tracked kinds; `file.read_access` still trains and remains eligible for timing detection (a getdents64 hook adds µs and is the detector's actual purpose).
+
+### Orphan-recovery retry (spec 071 Part C)
+
+- `crates/agent/src/orphan_recovery.rs::tests::is_passive_resolution_accepts_only_pure_verdicts` — only `dismiss`/`ignore` resolve a retried orphan; `monitor` / `block_ip` (and any active verdict) fall through to `needs_review` so the human still adjudicates a stale action. Pins the invariant that the retry never executes a stale enforcement action.
+- `crates/agent/src/orphan_recovery.rs::tests::retry_decide_resolves_high_crit_orphan_with_dismiss` — a High/Critical orphan whose re-decide returns a pure-verdict close is resolved with a real decision instead of being parked for a human (closes the "AI never ran → needs_review" inflation from transient restarts).
+- `crates/agent/src/orphan_recovery.rs::tests::retry_decide_returns_none_on_unparseable_incident` — a bad incident JSON yields `None` so the sweep safely falls back to `needs_review` (never panics, never loses the orphan).
+
+### suspicious_archive suppresses InnerWarden self-unpack (spec 072 Part D-sensor)
+
+The model/config install (`tar -xzf … -C /var/lib/innerwarden/models`) is an EXTRACTION into our own data dir, not exfil staging. Gated on extraction (not create) so an attacker cannot launder a `tar -c` of sensitive data by appending `/var/lib/innerwarden`.
+
+- `crates/sensor/src/detectors/mitre_hunt.rs::tests::suspicious_archive_suppresses_innerwarden_model_unpack` — extracting our tarball into `/var/lib/innerwarden` does NOT fire.
+- `crates/sensor/src/detectors/mitre_hunt.rs::tests::suspicious_archive_still_fires_on_create_of_sensitive_into_iw_dir` — anti-bypass: a `tar -c` of `/etc/shadow` outputting into our dir STILL fires (create ≠ extraction).
+- `crates/sensor/src/detectors/mitre_hunt.rs::tests::suspicious_archive_still_fires_on_real_exfil` — regression: a genuine `tar -c` of sensitive dirs to `/tmp` still fires.
+- `crates/sensor/src/detectors/mitre_hunt.rs::tests::is_innerwarden_self_unpack_logic` — extraction-vs-create + our-dir-vs-other classifier.
+
+### host_drift comm allowlist gated on the non-forgeable exe path (spec 072 Part D-sensor)
+
+`host_drift` skipped on the forgeable `comm` allowlist BEFORE checking the path, so `/tmp/payload` with `comm=cargo` was a comm-spoof bypass inside the detector. The allowlist is now revoked for binaries in an untrusted staging dir.
+
+- `crates/sensor/src/detectors/host_drift.rs::tests::allowlisted_comm_from_raw_staging_fires` — `comm=cargo` running from a raw `/tmp/payload` MUST fire Critical (the allowlist no longer shields a staging exe).
+- `crates/sensor/src/detectors/host_drift.rs::tests::allowlisted_comm_from_cargo_build_temp_still_skipped` — regression: real cargo build temp (`/tmp/cargo-*`) stays suppressed via the development-path allowlist (the staging gate did not break builds).
+- `crates/sensor/src/detectors/host_drift.rs::tests::allowlisted_comm_from_nonstaging_path_still_skipped` — a non-staging path with an allowlisted comm still skips (the gate only revokes the allowlist for staging dirs).
+- `crates/sensor/src/detectors/host_drift.rs::tests::path_in_untrusted_staging_classifies_dirs` — staging-dir classifier.
+
+### Warden Context Gate — non-forgeable `provenance:illegitimate` overrides the classifier (spec 072 Phase 2)
+
+The mirror of the comm rule: a forgeable comm can never DISMISS a real threat; symmetrically, a detector's non-forgeable `evidence.provenance:illegitimate` (spec-070 exe-path lineage) can never BE dismissed by the text-only classifier — even at high confidence.
+
+- `crates/agent/src/warden_context_gate.rs::tests::illegitimate_provenance_refuses_even_high_confidence_dismiss` — a classifier dismiss at conf 0.97 on a `provenance:illegitimate` incident is refused and surfaced.
+- `crates/agent/src/warden_context_gate.rs::tests::illegitimate_provenance_does_not_touch_enforcement` — the guard only refuses passive closes; a `block_ip` stands.
+- `crates/agent/src/warden_context_gate.rs::tests::non_illegitimate_provenance_unaffected_by_guard` — a trusted/absent tag does not trigger the guard.
+- `crates/agent/src/warden_context_gate.rs::tests::evidence_provenance_is_illegitimate_parses_array_and_object` — evidence parser handles both the array and single-object shapes.
+
+### Warden Context Gate — no forgeable-comm dismiss of a real threat (spec 071 Part A)
+
+These pin the 2026-06-08 adversarial red-team must-fixes. `comm` is attacker-forgeable, so the gate must NEVER auto-dismiss a High/Critical incident on it. A failure here means a real attack can be silenced by a process rename.
+
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_self_spoofed_critical_privesc_is_never_dismissed` — naming the binary `innerwarden-agent` must NOT dismiss a Critical privesc (it surfaces). Undoing this re-opens the spec-070 anti-spoof bypass (B1).
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_build_spoofed_critical_host_drift_tmp_is_never_dismissed` — `comm=rust-lld` on a Critical `/tmp` host_drift is not dismissed (host_drift is off both allowlists; B2).
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_self_spoofed_high_data_exfil_is_never_dismissed` — `comm=innerwarden-ctl` on a High data_exfil_cmd is not dismissed (B3).
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_self_spoof_does_not_launder_block_to_dismiss` — a `block_ip` on a Critical incident with a spoofed trusted comm is never turned into a silent dismiss (B4).
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_overbroad_comm_does_not_impersonate` — exact base-name match: `innerwarden9` / `ccminer` do NOT match the allowlists (B6).
+- `crates/agent/src/warden_context_gate.rs::tests::unlisted_detector_from_self_not_dismissed_even_at_medium` — the Medium/Low provenance dismiss is a tight per-detector allowlist, not a blanket self/build pass.
+
 ### CLI module/capability surface (Wave 7b)
 
 - `crates/ctl/src/scan.rs::tests::module_ids_use_module_install_not_enable` — every `enable_hint` on a `ModuleRec` and every step of `activation_sequence()` that starts with `innerwarden enable <id>` must use a real capability id (`block-ip`, `sudo-protection`, `shell-audit`, `ai`); module ids must use `innerwarden module install <id>`. Pinned the 2026-05-04 operator-hit bug where `innerwarden scan` printed `→ innerwarden enable container-security` and the operator running it got `unknown capability 'container-security'` because container-security is a module, not a capability.
@@ -134,6 +183,21 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/correlation_engine.rs::tests::comm_suppression_does_not_leak_to_other_rules` — only CL-008 opts into package-manager suppression today. Other rules with the same kind patterns must still fire; suppression is keyed by `rule_id`, not global. Anti-regression for accidentally lifting the per-rule gate (would silently disable many chains).
 
 - `crates/agent/src/correlation_engine.rs::tests::cl008_no_comm_field_does_not_panic_and_falls_through` — older sensors (or non-eBPF event sources) emit `file.read_access` without a `comm` field. `event_comm_is_suppressed` returns false in that case (event proceeds to normal kind/entity matching) instead of panicking on the missing JSON key.
+
+### data_exfil_cmd build-tool skip is gated on the non-forgeable exe path (spec 072 Part D-sensor)
+
+`comm` is attacker-forgeable (argv0 / prctl), so the build-tool skip is only honoured when the kernel-captured `exe_path` is NOT in an untrusted staging dir. A failure here means a renamed payload in `/tmp` can launder exfil through the build-tool skip.
+
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_fires_when_build_tool_name_runs_from_staging_dir` — `comm=cargo` but `exe_path=/tmp/cargo` on a real exfil command MUST fire (the skip is bypassed for staging exes).
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_skips_build_tool_from_trusted_exe_path` — same `comm=cargo` with `exe_path=/usr/bin/cargo` is suppressed (a real toolchain binary).
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_falls_back_to_comm_skip_when_no_exe_path` — when `exe_path` is absent (a /proc race), the comm-only skip (#970) still applies (no regression).
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::exe_path_in_untrusted_staging_classifies_dirs` — `/tmp`,`/var/tmp`,`/dev/shm` are staging; `/usr/bin`, `~/.cargo/bin` are not.
+
+### data_exfil_cmd build-toolchain FP suppression (spec 071 Part B)
+
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_skips_zig_compiler` / `command_exec_skips_zigcc_truncated_comm` / `command_exec_skips_cargo_build_script` / `command_exec_skips_rust_lld_linker` — each feeds a real `tar | curl` exfil-shaped command whose only reason to be suppressed is that `comm` is a build tool (`zig`, the truncated `zigcc-x86_64-un`, `build-script-bu`, `rust-lld`). Pins the 2026-06-08 test001 FP cluster where the Rust/Zig build toolchain produced 100+ `data_exfil_cmd` High incidents that flooded `needs_review`. The `build_tools` list previously had `cargo`/`rustc`/`gcc` but not `zig`/`zigcc`/`build-script`.
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_skips_zig_via_first_word_of_command` / `command_exec_skips_zig_build_shell_wrapper` — cover the two non-comm suppression branches (first word of a `bash -c` command is a build tool; the long-shell-wrapper `zig build` guard).
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_still_detects_real_exfil_from_non_build_comm` — anti-regression: a genuine `tar /etc/shadow | curl` from `comm=python3` MUST still raise the incident. The exclusion list is a tight allowlist, not a hole that disables the detector.
 
 ### Allowlist audit trail (Wave 8e)
 

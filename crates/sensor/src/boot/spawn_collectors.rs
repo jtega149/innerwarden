@@ -424,6 +424,29 @@ pub(crate) fn spawn_collectors(
         });
     }
 
+    // audit_state (spec 074): polls the kernel audit `enabled` flag every 60s
+    // and emits `audit.disabled` when it is found off — method-independent,
+    // unlike the command-watching auditd_disable detector routes.
+    if cfg.collectors.audit_state.enabled {
+        let tx_audit_state = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::audit_state::run(tx_audit_state, host_id, 60).await;
+        });
+    }
+
+    // tunnel_iface: behavioural mesh/overlay-VPN persistence detection — watches
+    // for a NEW tun/WireGuard interface appearing at runtime (rename-proof,
+    // complements the c2_web_tunnel exec-name detector). Baselines startup
+    // interfaces; 30s poll.
+    if cfg.collectors.tunnel_iface.enabled {
+        let tx_tunnel = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        tokio::spawn(async move {
+            collectors::tunnel_iface::run(tx_tunnel, host_id, 30).await;
+        });
+    }
+
     // SUID page-cache integrity: detects Copy Fail / Dirty Frag / Fragnesia-style
     // page-cache poisoning by comparing cached reads with direct-I/O disk reads.
     if cfg.detectors.suid_page_cache_integrity.enabled {
@@ -565,6 +588,7 @@ mod tests {
         cfg.collectors.sysctl_drift.enabled = true;
         cfg.collectors.systemd_inventory.enabled = true;
         cfg.collectors.tcp_stream.enabled = true;
+        cfg.collectors.tunnel_iface.enabled = true;
         cfg.detectors.suid_page_cache_integrity.enabled = true;
         cfg.detectors.kernel_devnode_exposed.enabled = true;
 

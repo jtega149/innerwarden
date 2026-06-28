@@ -103,6 +103,117 @@ pub(crate) fn looks_like_anthropic_key(key: &str) -> bool {
     key.starts_with("sk-ant-") && key.len() >= 20
 }
 
+/// Map an Execution Gate state to a single doctor [`Check`] (spec 080 G4 — the
+/// FREE read-only honesty surface). Pure: the divergence verdict comes from
+/// `innerwarden_core::execution_gate`. `fail` on real drift, `warn` when the
+/// signed config is present but the live map couldn't be read (run as root),
+/// `ok` when live matches intent.
+pub(crate) fn gate_doctor_check(gate: &innerwarden_core::execution_gate::GateState) -> Check {
+    use innerwarden_core::execution_gate::{evaluate_divergence, Divergence};
+    let signed = gate
+        .signed_count
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "no file".into());
+    let live = gate
+        .live_count
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unreadable".into());
+    match evaluate_divergence(gate) {
+        Divergence::ActiveButEmpty { mode, .. } => Check::fail(
+            format!(
+                "Execution Gate is {} but the live allowlist is EMPTY (signed {signed}, live {live})",
+                mode.label()
+            ),
+            "Run a FULL `config-sign exec-gate apply`; never leave it armed with an empty map (enforce = host brick).",
+        ),
+        Divergence::ApplyDrift { .. } => Check::fail(
+            format!(
+                "Execution Gate apply drift: signed {signed} (intent {}), live map {live}, live mode {}",
+                gate.intended_mode.map(|m| m.label()).unwrap_or("unknown"),
+                gate.live_mode.label()
+            ),
+            "Signed config not applied to the kernel. Run a FULL `config-sign exec-gate apply`, then re-check that live == signed.",
+        ),
+        Divergence::None => {
+            if gate.live_count.is_none()
+                && (gate.signed_count.is_some() || gate.intended_mode.is_some())
+            {
+                Check::warn(
+                    format!("Execution Gate signed config present (signed {signed}) but live map not readable"),
+                    "Re-run `innerwarden doctor` as root (CAP_BPF / bpftool) to verify the live kernel map matches the signed file.",
+                )
+            } else {
+                Check::ok(format!(
+                    "Execution Gate consistent (signed {signed}, live {live}, mode {})",
+                    gate.live_mode.label()
+                ))
+            }
+        }
+    }
+}
+
+/// True when an Execution Gate is present on this host (a signed file or a
+/// pinned map) — so `doctor` only shows the section where it's relevant.
+fn execution_gate_present() -> bool {
+    use innerwarden_core::execution_gate::{EXEC_ALLOWLIST_PIN, SIGNED_ALLOWLIST_FILE};
+    std::path::Path::new(SIGNED_ALLOWLIST_FILE).exists()
+        || std::path::Path::new(EXEC_ALLOWLIST_PIN).exists()
+}
+
+/// Read + parse the signed allowlist file for `doctor` (plain JSON read).
+fn read_signed_allowlist_for_doctor() -> (
+    Option<usize>,
+    Option<innerwarden_core::execution_gate::GateMode>,
+) {
+    use innerwarden_core::execution_gate::{parse_signed_allowlist, SIGNED_ALLOWLIST_FILE};
+    match std::fs::read_to_string(SIGNED_ALLOWLIST_FILE) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .map(|v| parse_signed_allowlist(&v))
+            .unwrap_or((None, None)),
+        Err(_) => (None, None),
+    }
+}
+
+/// Live `EXEC_ALLOWLIST` entry count via `bpftool` (ctl doesn't link aya).
+/// `None` when bpftool is missing / unprivileged / the pin is absent.
+fn bpftool_allowlist_count() -> Option<usize> {
+    use innerwarden_core::execution_gate::{count_bpftool_dump, EXEC_ALLOWLIST_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args(["map", "dump", "pinned", EXEC_ALLOWLIST_PIN])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(count_bpftool_dump(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Live gate mode via `bpftool map lookup` of LSM_POLICY key 3. `Unknown` when
+/// it can't be read (absent key / no privilege / no bpftool).
+fn bpftool_gate_mode() -> innerwarden_core::execution_gate::GateMode {
+    use innerwarden_core::execution_gate::{parse_bpftool_value_u32, GateMode, LSM_POLICY_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args([
+            "map",
+            "lookup",
+            "pinned",
+            LSM_POLICY_PIN,
+            "key",
+            "3",
+            "0",
+            "0",
+            "0",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            GateMode::from_policy_key(parse_bpftool_value_u32(&String::from_utf8_lossy(&o.stdout)))
+        }
+        _ => GateMode::Unknown,
+    }
+}
+
 /// Heuristic check for Telegram bot tokens: `<digits>:<20+ alphanumeric>`.
 pub(crate) fn looks_like_telegram_token(token: &str) -> bool {
     if !token.contains(':') {
@@ -201,6 +312,21 @@ pub(crate) fn build_ai_provider_check(provider: &str, resolved_key: Option<&str>
             ),
         },
         "ollama" => Check::ok("Ollama provider configured (reachability is checked separately)"),
+        "azure_openai" | "azure" => match resolved_key {
+            None => Check::fail(
+                "AZURE_OPENAI_API_KEY not set (provider = \"azure_openai\")",
+                "Get the key + endpoint from your Azure OpenAI resource, then run:\n\n  innerwarden configure ai azure_openai --key <key> --model <deployment> --base-url https://<resource>.openai.azure.com",
+            ),
+            // Azure keys are 32-char hex or longer base64-ish strings with no
+            // stable prefix, so only emptiness is a meaningful format signal.
+            Some(k) if !k.trim().is_empty() => {
+                Check::ok("AZURE_OPENAI_API_KEY is set (provider = \"azure_openai\")")
+            }
+            Some(_) => Check::fail(
+                "AZURE_OPENAI_API_KEY is set but empty (provider = \"azure_openai\")",
+                "Run:\n  innerwarden configure ai azure_openai --key <key> --base-url https://<resource>.openai.azure.com",
+            ),
+        },
         // Default: openai (also handles unknown providers gracefully)
         _ => match resolved_key {
             None => Check::fail(
@@ -721,6 +847,15 @@ pub(crate) fn build_dashboard_reachability_check(
     }
 }
 
+/// Scheme-agnostic reachability probe: is something accepting TCP connections
+/// on `addr`? Used as a fallback for the dashboard check because the dashboard
+/// is frequently HTTPS-only on prod, so a plain-HTTP probe gets connection
+/// refused and `doctor` would otherwise false-warn that it is down. A
+/// successful TCP connect means a listener is up regardless of HTTP vs HTTPS.
+fn tcp_port_listening(addr: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
+    std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
+}
+
 /// Build the GeoIP reachability check from a pre-computed flag.
 pub(crate) fn build_geoip_reachability_check(reachable: bool) -> Check {
     if reachable {
@@ -851,6 +986,36 @@ pub(crate) fn doctor_resolve_agent_data_dir(agent_doc: Option<&toml_edit::Docume
         .and_then(|d| d.as_str())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/var/lib/innerwarden"))
+}
+
+/// Doctor lines for one enabled capability's sudoers drop-in, plus whether it
+/// is an issue. A capability whose drop-in is missing is non-functional (e.g.
+/// block-ip cannot run the firewall as the `innerwarden` user), so the fix
+/// hint points at `enable <cap> --force` — the command that actually re-applies
+/// the drop-in (plain `enable` no-ops on an already-enabled capability).
+pub(crate) fn capability_sudoers_status_lines(
+    cap_id: &str,
+    drop_in: Option<&str>,
+    present: bool,
+) -> (Vec<String>, bool) {
+    match drop_in {
+        None => (vec![format!("  [ok]   {cap_id} (enabled)")], false),
+        Some(_) if present => (
+            vec![format!(
+                "  [ok]   {cap_id} (enabled): sudoers drop-in present"
+            )],
+            false,
+        ),
+        Some(name) => (
+            vec![
+                format!(
+                    "  [warn] {cap_id} (enabled): sudoers drop-in missing (/etc/sudoers.d/{name})"
+                ),
+                format!("         → sudo innerwarden enable {cap_id} --force"),
+            ],
+            true,
+        ),
+    }
 }
 
 /// Map a Cli's configured paths to the sudoers drop-in for a given capability.
@@ -2035,10 +2200,10 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             )
         });
     } else {
-        let env_var = if provider == "anthropic" {
-            "ANTHROPIC_API_KEY"
-        } else {
-            "OPENAI_API_KEY"
+        let env_var = match provider.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "azure_openai" | "azure" => "AZURE_OPENAI_API_KEY",
+            _ => "OPENAI_API_KEY",
         };
         let key = resolve_key(env_var);
         cfg.push(build_ai_provider_check(&provider, key.as_deref()));
@@ -2100,6 +2265,24 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
     }
 
     run_section(cfg, &mut total_issues);
+
+    // ── Execution Gate (spec 080 G4) ──────────────────────
+    // FREE read-only honesty surface: compare the signed allowlist to the LIVE
+    // kernel maps so a paid gate that staged-but-never-applied (or armed with an
+    // empty map) is visible here. Section is shown only where a gate is present.
+    if execution_gate_present() {
+        println!("\nExecution Gate");
+        let (signed_count, intended_mode) = read_signed_allowlist_for_doctor();
+        let live_count = bpftool_allowlist_count();
+        let live_mode = bpftool_gate_mode();
+        let gate = innerwarden_core::execution_gate::GateState {
+            signed_count,
+            intended_mode,
+            live_count,
+            live_mode,
+        };
+        run_section(vec![gate_doctor_check(&gate)], &mut total_issues);
+    }
 
     // ── Telegram ──────────────────────────────────────────
     // Only check Telegram when enabled = true in agent config.
@@ -2315,13 +2498,24 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
         db.push(build_dashboard_flag_check(dashboard_flag_in_service));
         db.extend(build_dashboard_credentials_checks(has_user, has_hash));
 
-        // Check if the dashboard is actually reachable
+        // Check if the dashboard is actually reachable.
+        //
+        // The dashboard is frequently HTTPS-only (self-signed) on prod, so a
+        // plain-HTTP probe returns connection-refused and doctor used to warn
+        // "Dashboard port 8787 is not responding" even when the dashboard was
+        // serving HTTPS 200 (false negative observed on Azure prod). Fall back
+        // to a scheme-agnostic TCP connect: if something is listening on the
+        // port, the dashboard is up regardless of HTTP vs HTTPS.
         let dashboard_up = ureq::get("http://127.0.0.1:8787/api/status")
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(2)))
             .build()
             .call()
-            .is_ok();
+            .is_ok()
+            || tcp_port_listening(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 8787)),
+                std::time::Duration::from_secs(2),
+            );
         // Bug 3 (2026-05-06): pass agent-alive so the hint adapts
         // when the dashboard is unreachable but the agent itself is
         // running. `service_status::Active` is one signal; the
@@ -2385,20 +2579,16 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
         any_enabled = true;
 
         // Map capability → expected sudoers drop-in name
-        if let Some(name) = capability_sudoers_drop_in(cap.id()) {
-            let path = std::path::Path::new("/etc/sudoers.d").join(name);
-            if path.exists() {
-                println!("  [ok]   {} (enabled): sudoers drop-in present", cap.id());
-            } else {
-                println!(
-                    "  [warn] {} (enabled): sudoers drop-in missing (/etc/sudoers.d/{name})",
-                    cap.id()
-                );
-                println!("         → innerwarden enable {}", cap.id());
-                total_issues += 1;
-            }
-        } else {
-            println!("  [ok]   {} (enabled)", cap.id());
+        let drop_in = capability_sudoers_drop_in(cap.id());
+        let present = drop_in
+            .map(|name| std::path::Path::new("/etc/sudoers.d").join(name).exists())
+            .unwrap_or(false);
+        let (lines, has_issue) = capability_sudoers_status_lines(cap.id(), drop_in, present);
+        for line in lines {
+            println!("{line}");
+        }
+        if has_issue {
+            total_issues += 1;
         }
     }
 
@@ -3175,6 +3365,63 @@ mod tests {
     }
 
     #[test]
+    fn gate_doctor_check_fails_on_apply_drift_the_oracle_case() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(1685),
+            intended_mode: Some(GateMode::Observe),
+            live_count: Some(0),
+            live_mode: GateMode::Inert,
+        };
+        let check = gate_doctor_check(&gate);
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("apply drift"));
+        assert!(check.label.contains("1685"));
+    }
+
+    #[test]
+    fn gate_doctor_check_fails_critical_when_armed_and_empty() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(10),
+            intended_mode: Some(GateMode::Enforce),
+            live_count: Some(0),
+            live_mode: GateMode::Enforce,
+        };
+        let check = gate_doctor_check(&gate);
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("EMPTY"));
+    }
+
+    #[test]
+    fn gate_doctor_check_ok_when_converged() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(1685),
+            intended_mode: Some(GateMode::Observe),
+            live_count: Some(1685),
+            live_mode: GateMode::Observe,
+        };
+        let check = gate_doctor_check(&gate);
+        assert_eq!(check.sev, Sev::Ok);
+        assert!(check.label.contains("consistent"));
+    }
+
+    #[test]
+    fn gate_doctor_check_warns_when_live_unreadable_but_signed_present() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(1685),
+            intended_mode: Some(GateMode::Observe),
+            live_count: None, // bpftool unavailable / unprivileged
+            live_mode: GateMode::Unknown,
+        };
+        let check = gate_doctor_check(&gate);
+        assert_eq!(check.sev, Sev::Warn);
+        assert!(check.label.contains("not readable"));
+    }
+
+    #[test]
     fn looks_like_anthropic_key_accepts_sk_ant_prefix() {
         assert!(looks_like_anthropic_key("sk-ant-abcdefghijklmno"));
         assert!(looks_like_anthropic_key(
@@ -3364,6 +3611,31 @@ mod tests {
     fn build_ai_provider_check_ollama_returns_ok() {
         let c = build_ai_provider_check("ollama", None);
         assert_eq!(c.sev, Sev::Ok);
+    }
+
+    #[test]
+    fn build_ai_provider_check_azure_missing_key_fails_with_azure_var() {
+        // Regression: azure used to fall through to the openai arm and report
+        // "OPENAI_API_KEY not set" — a confusing false fail for azure users.
+        let c = build_ai_provider_check("azure_openai", None);
+        assert_eq!(c.sev, Sev::Fail);
+        assert!(c.label.contains("AZURE_OPENAI_API_KEY"));
+        assert!(!c
+            .label
+            .contains("OPENAI_API_KEY not set (provider = \"openai\")"));
+    }
+
+    #[test]
+    fn build_ai_provider_check_azure_alias_with_key_is_ok() {
+        let c = build_ai_provider_check("azure", Some("8Y59hQabcdef0123456789"));
+        assert_eq!(c.sev, Sev::Ok);
+        assert!(c.label.contains("AZURE_OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn build_ai_provider_check_azure_empty_key_fails() {
+        let c = build_ai_provider_check("azure_openai", Some("   "));
+        assert_eq!(c.sev, Sev::Fail);
     }
 
     #[test]
@@ -4228,6 +4500,29 @@ enabled = true
     }
 
     #[test]
+    fn capability_sudoers_status_lines_covers_present_missing_and_no_dropin() {
+        // Missing drop-in -> warn + the --force fix hint, and it IS an issue.
+        let (lines, issue) =
+            capability_sudoers_status_lines("block-ip", Some("innerwarden-block-ip"), false);
+        assert!(issue);
+        assert!(lines.iter().any(|l| l.contains("drop-in missing")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("innerwarden enable block-ip --force")));
+
+        // Present drop-in -> ok, no issue.
+        let (lines, issue) =
+            capability_sudoers_status_lines("block-ip", Some("innerwarden-block-ip"), true);
+        assert!(!issue);
+        assert!(lines.iter().any(|l| l.contains("drop-in present")));
+
+        // Capability with no drop-in -> plain ok, no issue.
+        let (lines, issue) = capability_sudoers_status_lines("ai", None, false);
+        assert!(!issue);
+        assert_eq!(lines, vec!["  [ok]   ai (enabled)".to_string()]);
+    }
+
+    #[test]
     fn build_service_running_check_running_is_ok() {
         let c = build_service_running_check("innerwarden-agent", true, false);
         assert_eq!(c.sev, Sev::Ok);
@@ -4290,6 +4585,27 @@ enabled = true
         // agent_alive value irrelevant on the reachable path.
         let c = build_dashboard_reachability_check(true, true, false).unwrap();
         assert_eq!(c.sev, Sev::Ok);
+    }
+
+    #[test]
+    fn tcp_port_listening_detects_open_and_closed_ports() {
+        use std::time::Duration;
+        // A bound listener (any scheme, incl. an HTTPS-only dashboard) is
+        // detected as up — this is the false-negative fix: the old HTTP-only
+        // probe missed an HTTPS-only listener.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        assert!(
+            tcp_port_listening(addr, Duration::from_secs(1)),
+            "open port must be detected"
+        );
+
+        // A closed port (drop the listener first) is reported down.
+        drop(listener);
+        assert!(
+            !tcp_port_listening(addr, Duration::from_millis(300)),
+            "closed port must be reported down"
+        );
     }
 
     /// Pre-Bug-3 behavior: agent down, dashboard down → "Start the agent".

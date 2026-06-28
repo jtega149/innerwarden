@@ -12,8 +12,16 @@ see [`docs/integration-recipes.md`](../docs/integration-recipes.md).
 
 ## Available Recipes
 
-There are currently no bundled external security-tool integration recipes in
+There are currently no bundled external security-tool *collector* recipes in
 this directory.
+
+For **integration recipes that drive Inner Warden's Agent Guard API from an
+external automation tool**, see [`docs/integration-recipes/`](../docs/integration-recipes/):
+
+- [n8n](../docs/integration-recipes/n8n-agent-guard.md) — call
+  `GET /api/agent/security-context` and `POST /api/agent/check-command` from an
+  n8n workflow, with an importable example that halts when the threat level is
+  elevated.
 
 ## Adding a Recipe
 

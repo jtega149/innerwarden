@@ -68,6 +68,8 @@ pub struct DashboardActionConfig {
     pub telegram_enabled: bool,
     /// Whether Slack notifications are enabled.
     pub slack_enabled: bool,
+    /// Whether Discord notifications are enabled.
+    pub discord_enabled: bool,
     /// Whether Cloudflare integration is enabled.
     pub cloudflare_enabled: bool,
     /// Whether CrowdSec integration is enabled.
@@ -126,6 +128,7 @@ impl Default for DashboardActionConfig {
             honeypot_port: 2222,
             telegram_enabled: false,
             slack_enabled: false,
+            discord_enabled: false,
             cloudflare_enabled: false,
             crowdsec_enabled: false,
             webhook_format: "default".to_string(),

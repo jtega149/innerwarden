@@ -146,8 +146,19 @@ async fn poll_one_with_bearer(
     if !status.is_success() {
         anyhow::bail!("HTTP {} from {}", status.as_u16(), url);
     }
-    let body: serde_json::Value = resp.json().await?;
+    let body = read_capped_json(resp).await?;
     parse_overview(&body).ok_or_else(|| anyhow::anyhow!("malformed /api/overview body from {url}"))
+}
+
+/// Read a response body with a size cap before JSON-parsing. A compromised or
+/// misbehaving spoke host must not be able to OOM the hub with an unbounded body.
+async fn read_capped_json(resp: reqwest::Response) -> anyhow::Result<serde_json::Value> {
+    const MAX_BODY: usize = 4 * 1024 * 1024;
+    let bytes = resp.bytes().await?;
+    if bytes.len() > MAX_BODY {
+        anyhow::bail!("response body too large ({} bytes)", bytes.len());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// Phase 4: refresh the bearer token by calling
@@ -171,7 +182,7 @@ async fn login_to_spoke(
     if !status.is_success() {
         anyhow::bail!("login HTTP {} from {}", status.as_u16(), url);
     }
-    let body: serde_json::Value = resp.json().await?;
+    let body = read_capped_json(resp).await?;
     body.get("token")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)

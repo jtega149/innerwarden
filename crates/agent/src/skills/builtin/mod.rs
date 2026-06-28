@@ -19,7 +19,9 @@ pub use block_ip_iptables::BlockIpIptables;
 pub use block_ip_nftables::BlockIpNftables;
 pub use block_ip_pf::BlockIpPf;
 pub use block_ip_ufw::BlockIpUfw;
-pub use block_ip_xdp::{xdp_blocklist_pin_for_ip, BlockIpXdp};
+pub use block_ip_xdp::{
+    is_xdp_privilege_failure, xdp_blocklist_pin_for_ip, xdp_cleanup_backoff_secs, BlockIpXdp,
+};
 pub(crate) use honeypot::run_sandbox_worker as run_honeypot_sandbox_worker;
 pub use honeypot::Honeypot;
 pub use kill_chain_response::KillChainResponse;

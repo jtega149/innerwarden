@@ -24,6 +24,11 @@ use innerwarden_core::{entities::EntityRef, event::Event, event::Severity, incid
 /// `is_browser_self_access` and `BACKUP_TOOLS` allowlists keep this
 /// FP-safe — Chrome reading its own Login Data and rclone uploading a
 /// home-dir backup both pass through without alert.
+// SPECIFIC credential paths — distinctive enough that a match is a real
+// credential read REGARDLESS of file extension or location (e.g. even a key
+// named `id_rsa` planted under node_modules still counts). These are NEVER
+// relaxed by the source-file guard below, so an attacker cannot evade by
+// staging a real credential at a .js path.
 const SENSITIVE_PATHS: &[&str] = &[
     "/etc/shadow",
     "/etc/passwd",
@@ -35,10 +40,8 @@ const SENSITIVE_PATHS: &[&str] = &[
     "/id_ed25519",
     "/id_ecdsa",
     "/.env",
-    "/credentials",
-    "/secret",
+    "/.aws/credentials",
     "/.kube/config",
-    "/token",
     // ── Cloud credentials (Credential Access, T1552.001) ──────────────
     // Docker Hub auth tokens: `docker login` writes a base64'd
     // username:password (or registry token) into config.json.
@@ -65,6 +68,14 @@ const SENSITIVE_PATHS: &[&str] = &[
     "/logins.json",
     "/cookies.sqlite",
 ];
+
+/// GENERIC credential keywords — high recall, but they also appear in ordinary
+/// source/package file paths (`dist/secret-contract-api.js` contains `/secret`,
+/// `.../token/const.mjs` contains `/token`). These match ONLY when the file is
+/// not a source/package artifact, so loading a JS module never looks like a
+/// credential read. They never gate the SPECIFIC list above, so a genuine
+/// credential is still caught even if its path also looks code-like.
+const SENSITIVE_GENERIC_TOKENS: &[&str] = &["/secret", "/token", "/credentials"];
 
 /// Browser process names (truncated to 15 chars by Linux's TASK_COMM_LEN
 /// where applicable). Reading browser-data paths from a browser process
@@ -465,9 +476,37 @@ impl DataExfilEbpfDetector {
 
 fn is_sensitive_path(path: &str) -> bool {
     let lower = path.to_lowercase();
-    SENSITIVE_PATHS
-        .iter()
-        .any(|sensitive| lower.contains(sensitive))
+    // SPECIFIC credential paths ALWAYS count — distinctive enough that an
+    // attacker can't evade by giving a real key a code-like name or hiding it
+    // under node_modules. /etc/shadow, id_rsa, .aws/credentials, etc. are
+    // credentials wherever they appear.
+    if SENSITIVE_PATHS.iter().any(|s| lower.contains(s)) {
+        return true;
+    }
+    // GENERIC keyword matches (/secret, /token, /credentials) are relaxed ONLY
+    // for source/package artifacts, because those words routinely appear in
+    // ordinary JS/TS module paths. This was the dominant false positive: an AI
+    // agent loading its own `node_modules/.../dist/secret-contract-api.js` then
+    // calling an API was flagged CRITICAL "data exfiltration". A read of a
+    // non-code file whose path contains a generic keyword is still sensitive.
+    // (`.json` is NOT treated as code — gcloud credentials.json is genuine.)
+    if is_source_or_package_artifact(&lower) {
+        return false;
+    }
+    SENSITIVE_GENERIC_TOKENS.iter().any(|t| lower.contains(t))
+}
+
+/// True for JS/TS source and package artifacts (or anything under
+/// `node_modules/`) — module code, never a real credential.
+fn is_source_or_package_artifact(lower_path: &str) -> bool {
+    lower_path.contains("/node_modules/")
+        || lower_path.ends_with(".js")
+        || lower_path.ends_with(".mjs")
+        || lower_path.ends_with(".cjs")
+        || lower_path.ends_with(".ts")
+        || lower_path.ends_with(".tsx")
+        || lower_path.ends_with(".jsx")
+        || lower_path.ends_with(".map")
 }
 
 /// True when a browser process is reading its own credential store.
@@ -809,6 +848,38 @@ mod tests {
         assert!(is_sensitive_path("/home/user/.kube/config"));
         assert!(!is_sensitive_path("/var/log/syslog"));
         assert!(!is_sensitive_path("/usr/bin/ls"));
+    }
+
+    #[test]
+    fn source_and_node_modules_files_are_not_sensitive() {
+        // Regression: an AI agent loading its own package code was flagged as
+        // credential access because the path contained the generic words
+        // "secret"/"token" (only the GENERIC tokens are relaxed for code).
+        assert!(!is_sensitive_path(
+            "/home/lab/.openclaw/npm/projects/openclaw-slack-x/node_modules/@openclaw/slack/dist/secret-contract-api.js"
+        ));
+        assert!(!is_sensitive_path(
+            "/home/lab/.openclaw/npm/projects/x/node_modules/typebox/build/type/script/token/const.mjs"
+        ));
+        assert!(!is_sensitive_path("/srv/app/src/secret-utils.ts"));
+        // Genuine credentials are still sensitive (incl. the gcloud .json).
+        assert!(is_sensitive_path(
+            "/home/u/.config/gcloud/application_default_credentials.json"
+        ));
+        assert!(is_sensitive_path("/home/u/secrets/api.key.env"));
+    }
+
+    #[test]
+    fn specific_credentials_cannot_be_evaded_by_code_naming() {
+        // Anti-evasion (advanced-attacker thinking): a SPECIFIC credential path
+        // is detected regardless of extension or location — an attacker cannot
+        // hide a real key by naming it `.js` or stashing it under node_modules.
+        assert!(is_sensitive_path("/srv/app/node_modules/evil/id_rsa"));
+        assert!(is_sensitive_path("/tmp/loot/id_rsa.js"));
+        assert!(is_sensitive_path(
+            "/home/u/proj/node_modules/x/.aws/credentials"
+        ));
+        assert!(is_sensitive_path("/etc/shadow"));
     }
 
     // ---------------------------------------------------------------------

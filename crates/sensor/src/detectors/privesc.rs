@@ -164,6 +164,14 @@ fn resolve_ppid_status(pid: u32) -> u32 {
 mod tests {
     use super::*;
 
+    /// A guaranteed-nonexistent pid. Spec-070 provenance (`provenance::resolve`)
+    /// reads the REAL `/proc/<pid>/exe`; using a small pid (e.g. 1234) made these
+    /// tests flaky in CI — when pid 1234 was a live trusted process, `resolve`
+    /// returned `Trusted` and privesc suppressed, failing `assert is_some()`.
+    /// This value is above the kernel `pid_max` ceiling (2^22 = 4_194_304), so
+    /// `/proc/<pid>/exe` never exists and `resolve` is deterministically `Unknown`.
+    const DEAD_PID: u32 = 4_000_000_001;
+
     fn privesc_event(
         comm: &str,
         pid: u32,
@@ -200,7 +208,7 @@ mod tests {
         let mut det = PrivescDetector::new("test", 300);
         let now = Utc::now();
 
-        let inc = det.process(&privesc_event("exploit", 1234, 1000, None, now));
+        let inc = det.process(&privesc_event("exploit", DEAD_PID, 1000, None, now));
         assert!(inc.is_some());
         let inc = inc.unwrap();
         assert_eq!(inc.severity, Severity::Critical);
@@ -213,7 +221,7 @@ mod tests {
         let mut det = PrivescDetector::new("test", 300);
         let now = Utc::now();
 
-        let inc = det.process(&privesc_event("exploit", 1234, 33, Some("abc123"), now));
+        let inc = det.process(&privesc_event("exploit", DEAD_PID, 33, Some("abc123"), now));
         assert!(inc.is_some());
         let inc = inc.unwrap();
         assert_eq!(inc.severity, Severity::Critical);
@@ -226,12 +234,12 @@ mod tests {
         let now = Utc::now();
 
         assert!(det
-            .process(&privesc_event("exploit", 1234, 1000, None, now))
+            .process(&privesc_event("exploit", DEAD_PID, 1000, None, now))
             .is_some());
         assert!(det
             .process(&privesc_event(
                 "exploit",
-                1234,
+                DEAD_PID,
                 1000,
                 None,
                 now + Duration::seconds(5)
@@ -245,10 +253,10 @@ mod tests {
         let now = Utc::now();
 
         assert!(det
-            .process(&privesc_event("exploit", 100, 1000, None, now))
+            .process(&privesc_event("exploit", DEAD_PID, 1000, None, now))
             .is_some());
         assert!(det
-            .process(&privesc_event("exploit", 200, 1000, None, now))
+            .process(&privesc_event("exploit", DEAD_PID + 1, 1000, None, now))
             .is_some());
     }
 
@@ -259,24 +267,30 @@ mod tests {
 
         // Known SUID binaries should NOT trigger
         assert!(det
-            .process(&privesc_event("install", 1234, 6, None, now))
+            .process(&privesc_event("install", DEAD_PID, 6, None, now))
             .is_none());
         assert!(det
-            .process(&privesc_event("find", 1235, 6, None, now))
+            .process(&privesc_event("find", DEAD_PID + 1, 6, None, now))
             .is_none());
         assert!(det
-            .process(&privesc_event("mandb", 1236, 6, None, now))
+            .process(&privesc_event("mandb", DEAD_PID + 2, 6, None, now))
             .is_none());
         assert!(det
-            .process(&privesc_event("fwupdmgr", 1237, 112, None, now))
+            .process(&privesc_event("fwupdmgr", DEAD_PID + 3, 112, None, now))
             .is_none());
         // Parenthesized kernel comm format
         assert!(det
-            .process(&privesc_event("(install)", 1238, 6, None, now))
+            .process(&privesc_event("(install)", DEAD_PID + 4, 6, None, now))
             .is_none());
         // Unknown process SHOULD still trigger
         assert!(det
-            .process(&privesc_event("evil_exploit", 1239, 1000, None, now))
+            .process(&privesc_event(
+                "evil_exploit",
+                DEAD_PID + 5,
+                1000,
+                None,
+                now
+            ))
             .is_some());
     }
 
@@ -293,7 +307,7 @@ mod tests {
             severity: Severity::High,
             summary: "setuid(0)".to_string(),
             details: serde_json::json!({
-                "pid": 5678,
+                "pid": DEAD_PID,
                 "uid": 1000,
                 "target_uid": 0,
                 "comm": "exploit",

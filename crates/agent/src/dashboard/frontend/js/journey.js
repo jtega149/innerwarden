@@ -33,9 +33,22 @@ function renderEnforcementBlock(subjectType, subjectValue, responsesPayload) {
     var remHrs = Math.floor(remMins / 60);
     var remaining = remHrs > 0 ? (remHrs + 'h ' + (remMins % 60) + 'm') : (remMins + 'm');
     var incident = a.incident_id ? ' · <span class="enf-incident">' + esc(a.incident_id) + '</span>' : '';
+    // Spec 076 phase 2: show whether the rule is actually live, not just within
+    // its TTL. `enforcement_verified` comes from the reconciler confirming the
+    // rule against the real firewall — so the panel can't claim "enforced"
+    // while the rule silently dropped.
+    var verifiedBadge;
+    if (a.enforcement_verified) {
+      verifiedBadge = '<span class="enf-verified" title="confirmed live in the firewall by the reconciler">&#10003; live</span>';
+    } else if (a.last_verified_live) {
+      verifiedBadge = '<span class="enf-unverified" title="last confirmed live a while ago — may have lapsed; reconciler will re-check">&#9888; stale</span>';
+    } else {
+      verifiedBadge = '<span class="enf-unverified" title="not yet confirmed against the live firewall">&#9888; unverified</span>';
+    }
     return '<div class="enf-row">'
       + '<span class="enf-backend">' + esc(a.backend || '—') + '</span>'
       + stateBadge
+      + verifiedBadge
       + '<span class="enf-type">' + esc(a.type || 'block_ip') + '</span>'
       + '<span class="enf-ttl">TTL ' + esc(ttlLabel) + '</span>'
       + '<span class="enf-remaining">' + esc(remaining) + ' remaining</span>'
@@ -43,8 +56,12 @@ function renderEnforcementBlock(subjectType, subjectValue, responsesPayload) {
       + '</div>';
   }).join('');
 
+  var allVerified = matches.every(function(a) { return a.enforcement_verified; });
+  var title = allVerified
+    ? 'ENFORCEMENT · enforced right now (verified live)'
+    : 'ENFORCEMENT · enforced (verifying against live firewall)';
   return '<div class="enf-block">'
-    + '<div class="enf-title">ENFORCEMENT · enforced right now</div>'
+    + '<div class="enf-title">' + title + '</div>'
     + rows
     + '</div>';
 }
@@ -856,15 +873,44 @@ async function loadJourney(subjectType, subjectValue, focusIncidentId) {
       ? ' disabled title="Watch mode: actions are dry-run only. Switch to Guard mode to execute."'
       : '';
     const watchStyle = isWatchMode ? 'opacity:0.55;cursor:not-allowed' : '';
+    const blockedNow = j.outcome === 'blocked'
+      || (j.block_state && j.block_state.kind === 'blocked_now');
     if (actionCfg && actionCfg.enabled && subjectType === 'ip') {
-      if (j.outcome !== 'blocked') {
+      if (!blockedNow) {
         actionBtns += `<button type="button" class="journey-btn action-block" style="${watchStyle}"${watchAttrs}
           onclick="showActionModal('block_ip','${esc(subjectValue)}',null)">⊘ Block IP</button>`;
+      } else {
+        // 2026-06-10: the inverse of Block. A contained/blocked case used to
+        // offer ZERO buttons (Block hides once blocked). Unblock queues a
+        // revert the agent loop performs (see /api/action/unblock-ip).
+        actionBtns += `<button type="button" class="journey-btn action-unblock" style="${watchStyle}"${watchAttrs}
+          onclick="showActionModal('unblock_ip','${esc(subjectValue)}',null)">⊘ Unblock IP</button>`;
       }
+      // Trust IP (monitor-only): mark this IP benign so the agent stops
+      // AUTO-blocking it. Still detected/logged/notified — only the automated
+      // response is suppressed (see /api/action/trust-ip). Available whether or
+      // not it's currently blocked.
+      actionBtns += `<button type="button" class="journey-btn action-trust" style="${watchStyle}"${watchAttrs}
+        onclick="showActionModal('trust_ip','${esc(subjectValue)}',null)">✓ Trust IP</button>`;
     }
     if (actionCfg && actionCfg.enabled && subjectType === 'user') {
       actionBtns += `<button type="button" class="journey-btn action-suspend" style="${watchStyle}"${watchAttrs}
         onclick="showActionModal('suspend_user',null,'${esc(subjectValue)}')">⏸ Suspend sudo</button>`;
+    }
+    // 2026-06-10: case-level triage verbs. Operate on every incident in the
+    // case (collected from the journey at click time). A case in "Needs your
+    // attention" (outcome 'open') can be Dismissed or moved to Monitor; an
+    // already-handled case can be Reopened.
+    if (actionCfg && actionCfg.enabled) {
+      if (j.outcome === 'open') {
+        actionBtns += `<button type="button" class="journey-btn action-dismiss" style="${watchStyle}"${watchAttrs}
+          onclick="showCaseTriageModal('dismiss')">✓ Dismiss (reviewed)</button>`;
+        actionBtns += `<button type="button" class="journey-btn action-monitor" style="${watchStyle}"${watchAttrs}
+          onclick="showCaseTriageModal('monitor')">⊙ Monitor</button>`;
+      } else if (['dismissed', 'monitoring', 'blocked', 'honeypot'].indexOf(j.outcome) !== -1) {
+        actionBtns += `<button type="button" class="journey-btn action-reopen" style="${watchStyle}"${watchAttrs}
+          onclick="showCaseTriageModal('reopen')">↺ Reopen</button>`;
+      }
     }
 
     // D5: store journey data globally for scrollToChapter

@@ -53,6 +53,20 @@ pub fn safe_truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Build a display preview of a command for an alert: the command unchanged if
+/// it fits within `max` bytes, otherwise a char-boundary-safe truncation with a
+/// trailing ellipsis. The Telegram and Slack agent-guard alert builders share
+/// this; both previously did a raw `&cmd[..120]` byte slice that panicked on a
+/// multi-byte boundary (a command-supplied DoS of the snitch alert).
+pub fn command_preview(cmd: &str, max: usize) -> String {
+    let head = safe_truncate(cmd, max);
+    if head.len() < cmd.len() {
+        format!("{head}…")
+    } else {
+        cmd.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +159,30 @@ mod tests {
     fn empty_input_with_any_max_returns_empty_string() {
         assert_eq!(safe_truncate("", 0), "");
         assert_eq!(safe_truncate("", 100), "");
+    }
+
+    #[test]
+    fn command_preview_returns_input_unchanged_when_within_limit() {
+        assert_eq!(command_preview("echo ok", 120), "echo ok");
+        assert_eq!(command_preview("", 120), "");
+    }
+
+    #[test]
+    fn command_preview_truncates_long_ascii_with_ellipsis() {
+        let out = command_preview(&"x".repeat(140), 120);
+        assert!(out.ends_with('…'));
+        // 120 ASCII bytes + the 3-byte ellipsis codepoint.
+        assert_eq!(out.len(), 120 + '…'.len_utf8());
+    }
+
+    #[test]
+    fn command_preview_truncates_multibyte_command_without_panic() {
+        // 140 × "✓" (U+2713, 3 bytes) = 420 bytes; a raw &cmd[..120] would
+        // risk splitting a codepoint. Must produce a valid, ellipsised string.
+        let out = command_preview(&"✓".repeat(140), 120);
+        assert!(out.ends_with('…'));
+        let _ = out.chars().count(); // pins valid UTF-8
+        assert!(out.len() <= 120 + '…'.len_utf8());
     }
 
     #[test]

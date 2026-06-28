@@ -50,7 +50,7 @@ Full STRIDE table per asset is in `security-audit/11-product-threat-model/THREAT
 - **Spoofing of operator → dashboard.** Defence: Basic Auth + optional TOTP + session limits + loopback bind default. Gap: rate limit on the auth path (finding 06-ASVS-002).
 - **Tampering with audit trail.** Defence: SHA-256 hash chain (`verify_hash_chain` in `crates/agent/src/dashboard/compliance.rs:654`, confirmed). Operator playbook for chain breaks is in §7 below.
 - **Information disclosure via AI provider.** Defence: Local Warden Model option avoids externality entirely; otherwise outbound HTTPS. Gap: documented redaction policy (finding 09-AI-003).
-- **DoS via panic.** ~5,340 `unwrap()/expect()` across agent/sensor/ctl/agent-guard — confirmed surface; phased audit tracked under finding 07-SSDF-003.
+- **DoS via panic.** ~6,100 `unwrap()/expect()` across agent/sensor/ctl/agent-guard — confirmed surface; phased audit tracked under finding 07-SSDF-003.
 - **Privilege escalation through response skills.** Skill execution runs as the sensor/agent user; no privilege drop today (architectural — assumed).
 
 ## 5. Trust boundaries
@@ -64,7 +64,7 @@ Full STRIDE table per asset is in `security-audit/11-product-threat-model/THREAT
 |              \---- in-process mpsc(1024) ---->                        |
 |              ┌────────────────────────────┐                           |
 |              │  innerwarden-sensor        │                           |
-|              │  (53 collectors → events)  │                           |
+|              │  (29 collectors → events)  │                           |
 |              └─────────────┬──────────────┘                           |
 |                            │  TB-1 (sensor → agent, in-process)      |
 |                            ▼                                          |

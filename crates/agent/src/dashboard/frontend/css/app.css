@@ -1202,6 +1202,27 @@
       background: rgba(255,184,77,0.17);
       border-color: rgba(255,184,77,0.45);
     }
+    /* 2026-06-10: unblock (green = lifting protection) + triage verbs. */
+    .journey-btn.action-unblock,
+    .journey-btn.action-dismiss {
+      color: var(--ok); border-color: rgba(52,211,153,0.33);
+      background: rgba(52,211,153,0.09);
+    }
+    .journey-btn.action-unblock:hover,
+    .journey-btn.action-dismiss:hover {
+      background: rgba(52,211,153,0.17);
+      border-color: rgba(52,211,153,0.45);
+    }
+    .journey-btn.action-monitor,
+    .journey-btn.action-reopen {
+      color: var(--accent); border-color: rgba(96,165,250,0.33);
+      background: rgba(96,165,250,0.09);
+    }
+    .journey-btn.action-monitor:hover,
+    .journey-btn.action-reopen:hover {
+      background: rgba(96,165,250,0.17);
+      border-color: rgba(96,165,250,0.45);
+    }
 
     /* ── D3 - modal overlay ──────────────────────────────────────── */
     .modal-overlay {

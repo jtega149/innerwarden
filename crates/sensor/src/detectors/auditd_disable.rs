@@ -66,8 +66,81 @@ impl AuditdDisableDetector {
         match event.kind.as_str() {
             "shell.command_exec" | "process.exec" => self.process_exec(event),
             "file.write_access" => self.process_write(event),
+            // Spec 074: state-poll route. The `audit_state` collector emits
+            // `audit.disabled` when the kernel audit `enabled` flag is found
+            // off — method-independent, so it catches a disable that never
+            // executed a command we watch (the 2026-06-09 prod gap).
+            "audit.disabled" => self.process_state_disabled(event),
             _ => None,
         }
+    }
+
+    /// Route 4 (spec 074): the audit subsystem was found disabled by the
+    /// `audit_state` collector's state poll. Unlike routes 1-3 this is not tied
+    /// to a specific command/file/process — `auditctl -s` reported `enabled 0`,
+    /// however it got there.
+    fn process_state_disabled(&mut self, event: &Event) -> Option<Incident> {
+        let now = event.ts;
+        let enabled = event
+            .details
+            .get("enabled")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let previous = event.details.get("previous").and_then(|v| v.as_i64());
+        let reason = event
+            .details
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("kernel audit disabled");
+
+        let key = "audit_state_disabled".to_string();
+        if let Some(&last) = self.last_fired.get(&key) {
+            if now - last < self.cooldown {
+                return None;
+            }
+        }
+        self.last_fired.insert(key, now);
+
+        Some(Incident {
+            ts: now,
+            host: self.host.clone(),
+            incident_id: format!(
+                "auditd_disable:state:{}",
+                now.format("%Y-%m-%dT%H:%M:%SZ")
+            ),
+            severity: Severity::Critical,
+            title: format!(
+                "auditd tamper: kernel audit subsystem DISABLED (enabled={enabled}) — detected by state poll"
+            ),
+            summary: format!(
+                "The kernel audit `enabled` flag is {enabled} (previous={previous:?}): {reason}. \
+                 Syscall auditing (execve/connect/...) is no longer recorded. Detected by polling \
+                 `auditctl -s`, so it is caught regardless of HOW audit was disabled (auditctl -e 0, \
+                 a netlink AUDIT_SET, etc.) — unlike the command-pattern routes. Attackers disable \
+                 host audit before the loud part of the kill chain (T1562.001)."
+            ),
+            evidence: serde_json::json!([{
+                "kind": "auditd_disable",
+                "sub_kind": "audit_state_disabled",
+                "enabled": enabled,
+                "previous": previous,
+                "reason": reason,
+                "detection": "state_poll",
+                "mitre": ["T1562.001"],
+            }]),
+            recommended_checks: vec![
+                "Re-enable audit if this is unexpected: `sudo auditctl -e 1`".to_string(),
+                "Confirm state: `auditctl -s` (enabled should be 1) and `systemctl is-active auditd`".to_string(),
+                "Investigate who disabled it: shell history, `ausearch -m CONFIG_CHANGE`, recent root logins".to_string(),
+                "If this is a planned operator action (audit reconfig), allowlist via [detectors.auditd_disable]".to_string(),
+            ],
+            tags: vec![
+                "defense_evasion".to_string(),
+                "auditd".to_string(),
+                "state_poll".to_string(),
+            ],
+            entities: vec![],
+        })
     }
 
     fn process_exec(&mut self, event: &Event) -> Option<Incident> {
@@ -339,6 +412,48 @@ mod tests {
             tags: vec![],
             entities: vec![],
         }
+    }
+
+    fn state_event(enabled: i64, previous: Option<i64>) -> Event {
+        Event {
+            ts: Utc::now(),
+            host: "test".into(),
+            source: "audit_state".into(),
+            kind: "audit.disabled".into(),
+            severity: Severity::High,
+            summary: "kernel audit disabled".into(),
+            details: serde_json::json!({
+                "enabled": enabled,
+                "previous": previous,
+                "reason": "test",
+                "detection": "state_poll",
+            }),
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn fires_on_audit_state_disabled_method_independent() {
+        // Spec 074: a state poll found audit off, with NO disabling command in
+        // sight (the 2026-06-09 prod gap). Must still raise a Critical incident.
+        let mut det = AuditdDisableDetector::new("test");
+        let inc = det
+            .process(&state_event(0, Some(1)))
+            .expect("state disable must fire an incident");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("DISABLED"));
+        let ev = inc.evidence.to_string();
+        assert!(ev.contains("audit_state_disabled"));
+        assert!(ev.contains("T1562.001"));
+    }
+
+    #[test]
+    fn audit_state_disabled_respects_cooldown() {
+        // A 60s state poll must not re-alert every tick while audit stays off.
+        let mut det = AuditdDisableDetector::new("test");
+        assert!(det.process(&state_event(0, Some(1))).is_some());
+        assert!(det.process(&state_event(0, None)).is_none());
     }
 
     #[test]

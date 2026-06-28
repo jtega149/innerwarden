@@ -1,5 +1,6 @@
 mod boot;
 mod btf_offsets;
+mod cloud_platform;
 mod collector_health;
 mod collectors;
 mod config;
@@ -11,6 +12,7 @@ mod event_pipeline;
 mod incident_builders;
 mod kernel_promote;
 mod main_helpers;
+mod path_trust;
 mod seccomp;
 mod sensor;
 mod sinks;
@@ -239,6 +241,12 @@ enabled = false
 enabled = false
 
 [collectors.tcp_stream]
+enabled = false
+
+[collectors.audit_state]
+enabled = false
+
+[collectors.tunnel_iface]
 enabled = false
 
 [detectors.suid_page_cache_integrity]

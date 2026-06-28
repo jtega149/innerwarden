@@ -354,6 +354,11 @@ fn execve_to_event(
         .collect();
 
     let parent_comm = crate::detectors::exec_context::proc_comm(ppid).unwrap_or_default();
+    // Controlling-terminal proof for the exec_context classifier: read the
+    // PARENT's tty (the long-lived shell), not the microsecond-lived recon child
+    // whose /proc entry is often already gone. tty_nr != 0 ⇒ real interactive
+    // session; an implant / reverse shell / daemon-spawned shell has none.
+    let has_tty = crate::detectors::exec_context::proc_has_tty(ppid);
 
     let mut details = serde_json::json!({
         "pid": pid,
@@ -361,6 +366,7 @@ fn execve_to_event(
         "ppid": ppid,
         "comm": comm,
         "parent_comm": parent_comm,
+        "has_tty": has_tty,
         "command": command,
         "argv": argv_json,
         "argc": argc,
@@ -615,6 +621,33 @@ fn bytes_to_string(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..end]).to_string()
 }
 
+/// `ExecveEvent.argv[0]` lives at bytes 352..480 of the `#[repr(C)]` layout
+/// (after kind/pid/tgid/uid/gid/ppid = 24, cgroup_id = 8, comm = 64,
+/// filename = 256). The Execution Gate writes `b"EXEC_GATE"` there so its
+/// kind-6 blocks are distinguishable from the legacy full-hook / kill-chain /
+/// neural blocks — every other kind-6 emitter zeroes argv, so the marker is
+/// unambiguous. `filename` then carries the REAL attempted path (a denied exec
+/// leaves `/proc/<pid>` pointing at the old image, so the path is only
+/// recoverable from the event itself).
+const EXEC_GATE_MARKER: &[u8; 9] = b"EXEC_GATE";
+/// Observe-mode (spec 077 P2): the gate emits this marker instead of EXEC_GATE
+/// when LSM_POLICY key 3 == 2 — a would-block (exec was ALLOWED, logged only).
+const EXEC_OBSERVE_MARKER: &[u8; 9] = b"EXEC_OBSV";
+const EXECVE_ARGV0_OFFSET: usize = 352;
+
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+fn is_exec_gate_block(data: &[u8]) -> bool {
+    let end = EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len();
+    data.len() >= end && data[EXECVE_ARGV0_OFFSET..end] == EXEC_GATE_MARKER[..]
+}
+
+/// True when this kind-6 event is an OBSERVE-mode would-block (gate allowed it).
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+fn is_exec_gate_observe(data: &[u8]) -> bool {
+    let end = EXECVE_ARGV0_OFFSET + EXEC_OBSERVE_MARKER.len();
+    data.len() >= end && data[EXECVE_ARGV0_OFFSET..end] == EXEC_OBSERVE_MARKER[..]
+}
+
 /// Pin path for the XDP blocklist BPF map.
 /// The agent writes to this map via bpftool to add/remove blocked IPs.
 const XDP_PIN_DIR: &str = "/sys/fs/bpf/innerwarden";
@@ -665,6 +698,19 @@ const COMM_CAP_PIN: &str = "/sys/fs/bpf/innerwarden/comm_capabilities";
 /// The agent populates this via `agent::lsm_policy::register_blocked_pid`.
 const BLOCKED_PIDS_PIN: &str = "/sys/fs/bpf/innerwarden/blocked_pids";
 
+/// Pin path for the Execution Gate allowlist (FNV(path) -> 1). Pinned so the paid
+/// Active Defence `config-sign exec-gate` tooling can populate it from userspace.
+/// The map + gate ship free + INERT; only LSM_POLICY key 3 = 1 (license-gated
+/// arming) makes the `bprm_check_security` hook enforce against it.
+const EXEC_ALLOWLIST_PIN: &str = "/sys/fs/bpf/innerwarden/exec_allowlist";
+
+/// Pin path for the Execution Gate SCOPE (cgroup id -> 1). Populated by the paid
+/// `config-sign exec-gate` tooling with the AI agent's cgroup id(s). Consulted by
+/// the gate ONLY when `LSM_POLICY` key 4 = 1 (agent-scoped mode): enforce solely
+/// inside these cgroups, allow the rest of the host. Empty + scoped = the gate
+/// never fires (fail-open), so a wipe is safe, not a brick.
+const EXEC_GATE_SCOPE_PIN: &str = "/sys/fs/bpf/innerwarden/exec_gate_scope";
+
 /// Attach LSM execution policy and pin the policy map.
 /// Requires `lsm=...,bpf` in kernel boot cmdline.
 /// Non-critical - if LSM is not available, the sensor continues without it.
@@ -703,6 +749,36 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
         }
         None => {
             info!("innerwarden_lsm_exec_min program not found in .o (sensor built without Spec 052 Phase 1?)");
+        }
+    }
+
+    // Execution Gate (Active Defence) — dedicated minimal LSM on bprm_check_security.
+    // Attaches alongside _min; inert unless LSM_POLICY key 3 = 1 (license-gated arm).
+    // Lives in its own program because the full innerwarden_lsm_exec fails the
+    // verifier on kernel ≥ 6.4, so a gate buried there never runs.
+    match bpf.program_mut("innerwarden_lsm_exec_gate") {
+        Some(prog) => {
+            let lsm_res: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_res {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("bprm_check_security", b) {
+                            warn!("innerwarden_lsm_exec_gate: failed to load: {:?}", e);
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_exec_gate: failed to attach");
+                        } else {
+                            info!("eBPF: innerwarden_lsm_exec_gate → bprm_check_security (Execution Gate) ✅");
+                        }
+                    } else {
+                        info!("innerwarden_lsm_exec_gate: BTF not available; skipping");
+                    }
+                }
+                Err(e) => info!(error = %e, "innerwarden_lsm_exec_gate: not available as Lsm"),
+            }
+        }
+        None => {
+            info!("innerwarden_lsm_exec_gate program not found in .o");
         }
     }
 
@@ -907,24 +983,88 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
     pin_lsm_policy(bpf);
 }
 
+/// Re-pin a PERSISTENT map across a sensor restart WITHOUT losing its entries.
+///
+/// Spec 080 P0: the old code did `remove_file(pin)` then `map.pin(pin)` for the
+/// persistent maps. The remove-first avoids `EEXIST` (the previous instance's
+/// pin still references a live map), but it makes the fresh empty map the pinned
+/// one and DROPS every entry — fatal for `EXEC_ALLOWLIST` (the Execution Gate
+/// allowlist the active-defence reconciler writes incrementally and never
+/// re-applies) and `LSM_POLICY` (which holds the arm bit). A sensor restart
+/// (e.g. a deploy) silently zeroed the live allowlist on prod.
+///
+/// Here we read the old pinned map's `(key, value)` pairs first, re-pin the
+/// fresh map, then write the saved pairs back, so the allowlist + policy survive
+/// a restart. Fail-open throughout (the sensor must never crash); a fresh box
+/// with no prior pin just restores nothing.
+#[cfg(feature = "ebpf")]
+fn repin_preserving<K, V>(bpf: &mut aya::Ebpf, name: &str, pin: &str)
+where
+    K: aya::Pod,
+    V: aya::Pod,
+{
+    let saved: Vec<(K, V)> = if std::path::Path::new(pin).exists() {
+        aya::maps::MapData::from_pin(pin)
+            .ok()
+            .and_then(|md| {
+                // aya's typed HashMap is built from a `Map`, not a raw
+                // `MapData`; wrap the pinned data in the HashMap variant.
+                let map = aya::maps::Map::HashMap(md);
+                aya::maps::HashMap::<_, K, V>::try_from(&map)
+                    .ok()
+                    .map(|old| old.iter().filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let Some(map) = bpf.map_mut(name) else {
+        return;
+    };
+    let _ = std::fs::remove_file(pin);
+    if let Err(e) = map.pin(pin) {
+        warn!(error = %e, "{name}: failed to pin");
+        return;
+    }
+    info!("eBPF: {name} pinned at {pin}");
+
+    if saved.is_empty() {
+        return;
+    }
+    if let Some(map) = bpf.map_mut(name) {
+        if let Ok(mut hm) = aya::maps::HashMap::<_, K, V>::try_from(map) {
+            let n = saved.len();
+            for (k, v) in &saved {
+                let _ = hm.insert(k, v, 0);
+            }
+            info!("eBPF: {name}: restored {n} entries across sensor restart");
+        }
+    }
+}
+
 #[cfg(feature = "ebpf")]
 fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     // Pin the LSM_POLICY map so the agent can enable/disable enforcement.
-    // Remove stale pin first — on sensor restart, the old pin points to a dead
-    // map from the previous instance, causing map.pin() to fail with EEXIST.
-    if let Some(map) = bpf.map_mut("LSM_POLICY") {
-        let _ = std::fs::remove_file(LSM_POLICY_PIN);
-        if let Err(e) = map.pin(LSM_POLICY_PIN) {
-            warn!(error = %e, "LSM: failed to pin policy map");
-        } else {
-            info!("eBPF: LSM policy map pinned at {LSM_POLICY_PIN}");
-            info!("eBPF: LSM enforcement is OFF by default - enable via: bpftool map update pinned {LSM_POLICY_PIN} key 0 0 0 0 value 1 0 0 0");
-        }
-    }
+    // Spec 080 P0: preserve entries across restart — LSM_POLICY holds the
+    // exec-gate arm bit (key 3); EXEC_ALLOWLIST holds the signed allowlist.
+    repin_preserving::<u32, u32>(bpf, "LSM_POLICY", LSM_POLICY_PIN);
+    info!("eBPF: LSM enforcement is OFF by default - enable via: bpftool map update pinned {LSM_POLICY_PIN} key 0 0 0 0 value 1 0 0 0");
 
-    // Pin capability maps so the agent can grant per-cgroup/per-comm permissions.
-    // Spec 052 Phase 1: pin BLOCKED_PIDS alongside the existing capability maps
-    // so `agent::lsm_policy::register_blocked_pid` can open it via `MapData::from_pin`.
+    // Execution Gate allowlist — MUST survive restart (active-defence writes it
+    // incrementally and does not re-apply; a wipe = empty allowlist = brick on
+    // arm). u64 FNV(path) keys, u8 value.
+    repin_preserving::<u64, u8>(bpf, "EXEC_ALLOWLIST", EXEC_ALLOWLIST_PIN);
+
+    // Execution Gate SCOPE (cgroup id -> 1) — agent-scoped enforcement (spec 083).
+    // Preserve across restart like the allowlist so the agent stays scoped; a
+    // wipe is fail-open (empty scope = gate never fires) so it is not a brick.
+    repin_preserving::<u64, u8>(bpf, "EXEC_GATE_SCOPE", EXEC_GATE_SCOPE_PIN);
+
+    // Capability + blocked-pid maps. These have the same restart-wipe behaviour
+    // (TODO spec 080 P0 follow-up: BLOCKED_PIDS is an LRU map + the capability
+    // maps use different value types; the agent re-registers BLOCKED_PIDS today,
+    // so they are lower-priority than the Execution Gate pair above).
     for (map_name, pin_path) in [
         ("CGROUP_CAPABILITIES", CGROUP_CAP_PIN),
         ("COMM_CAPABILITIES", COMM_CAP_PIN),
@@ -943,6 +1083,95 @@ fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     // Populate INODE_SIZE map for overlayfs drift detection.
     // sizeof(struct inode) varies by kernel config; query BTF at runtime.
     populate_inode_size(bpf);
+
+    // Populate BPRM_OFFSETS (linux_binprm.filename byte offset) from BTF so the
+    // Execution Gate reads the right field across kernels (CO-RE).
+    populate_bprm_offset(bpf);
+
+    // Populate TASK_OFFSETS (task_struct.real_parent + .tgid byte offsets) from
+    // BTF so the execve handler can read the real parent PID in-kernel for
+    // short-lived execs (the /proc fallback misses those).
+    populate_task_offsets(bpf);
+}
+
+/// Query the `linux_binprm.filename` byte offset from kernel BTF and write it to
+/// the BPRM_OFFSETS map (key 0). The Execution Gate eBPF reads it so it works
+/// across kernels (the offset differs: 96 on 6.8). Falls back to the eBPF default
+/// (96) if BTF is unavailable.
+#[cfg(feature = "ebpf")]
+fn populate_bprm_offset(bpf: &mut aya::Ebpf) {
+    use aya::maps::HashMap as BpfHashMap;
+
+    let off = match std::fs::read("/sys/kernel/btf/vmlinux") {
+        Ok(btf) => crate::btf_offsets::member_offset(&btf, "linux_binprm", "filename"),
+        Err(e) => {
+            info!(error = %e, "BPRM_OFFSETS: no kernel BTF — Execution Gate uses default offset 96");
+            None
+        }
+    };
+    let Some(off) = off else {
+        info!("BPRM_OFFSETS: linux_binprm.filename not in BTF — Execution Gate uses default 96");
+        return;
+    };
+    if let Some(map) = bpf.map_mut("BPRM_OFFSETS") {
+        let mut hash: BpfHashMap<_, u32, u32> = match map.try_into() {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "BPRM_OFFSETS: map type mismatch");
+                return;
+            }
+        };
+        if let Err(e) = hash.insert(0u32, off, 0) {
+            warn!(error = %e, "BPRM_OFFSETS: failed to write filename offset");
+        } else {
+            info!("eBPF: BPRM_OFFSETS linux_binprm.filename offset = {off} (from BTF)");
+        }
+    }
+}
+
+/// Query `task_struct.real_parent` + `.tgid` byte offsets from kernel BTF and
+/// write them to the TASK_OFFSETS map (key 0 = real_parent, key 1 = tgid). The
+/// execve eBPF handler reads them to capture the real parent PID in-kernel for
+/// short-lived execs (e.g. systemd's sealed-executor `fexecve`) whose
+/// `/proc/<pid>/status` is gone before the userspace ring reader can read it —
+/// without this their `ppid` stays 0. If BTF is unavailable or the members are
+/// absent, the map stays empty and the handler leaves `ppid = 0` (the userspace
+/// `/proc` fallback applies — unchanged behaviour, never a guessed offset).
+#[cfg(feature = "ebpf")]
+fn populate_task_offsets(bpf: &mut aya::Ebpf) {
+    use aya::maps::HashMap as BpfHashMap;
+
+    let btf = match std::fs::read("/sys/kernel/btf/vmlinux") {
+        Ok(b) => b,
+        Err(e) => {
+            info!(error = %e, "TASK_OFFSETS: no kernel BTF — execve ppid uses /proc fallback");
+            return;
+        }
+    };
+    let real_parent = crate::btf_offsets::member_offset(&btf, "task_struct", "real_parent");
+    let tgid = crate::btf_offsets::member_offset(&btf, "task_struct", "tgid");
+    let (Some(real_parent), Some(tgid)) = (real_parent, tgid) else {
+        info!("TASK_OFFSETS: task_struct.real_parent/tgid not in BTF — execve ppid uses /proc fallback");
+        return;
+    };
+    if let Some(map) = bpf.map_mut("TASK_OFFSETS") {
+        let mut hash: BpfHashMap<_, u32, u32> = match map.try_into() {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "TASK_OFFSETS: map type mismatch");
+                return;
+            }
+        };
+        let ok0 = hash.insert(0u32, real_parent, 0);
+        let ok1 = hash.insert(1u32, tgid, 0);
+        if ok0.is_err() || ok1.is_err() {
+            warn!("TASK_OFFSETS: failed to write task_struct offsets");
+        } else {
+            info!(
+                "eBPF: TASK_OFFSETS task_struct.real_parent={real_parent} tgid={tgid} (from BTF)"
+            );
+        }
+    }
 }
 
 /// Query sizeof(struct inode) from kernel BTF and write it to the INODE_SIZE map.
@@ -2047,6 +2276,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
                     let filename = bytes_to_string(&data[96..352]);
+                    let gate = is_exec_gate_block(data);
+                    // Observe mode (spec 077 P2): the gate WOULD have blocked but
+                    // allowed the exec (learning). Logged only, never an incident.
+                    let observe = is_exec_gate_observe(data);
 
                     let container_id = resolve_container_id(pid);
 
@@ -2056,27 +2289,66 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "comm": comm,
                         "filename": filename,
                         "cgroup_id": cgroup_id,
-                        "action": "blocked",
+                        "action": if observe { "would_block" } else { "blocked" },
                     });
+                    if gate {
+                        details["blocked_by"] = serde_json::Value::String("exec_gate".to_string());
+                    } else if observe {
+                        details["would_block_by"] =
+                            serde_json::Value::String("exec_gate".to_string());
+                    }
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
 
-                    let mut tags =
-                        vec!["ebpf".to_string(), "lsm".to_string(), "blocked".to_string()];
+                    let mut tags = vec!["ebpf".to_string(), "lsm".to_string()];
+                    tags.push(if observe { "would_block" } else { "blocked" }.to_string());
+                    if gate || observe {
+                        tags.push("exec_gate".to_string());
+                    }
+                    if observe {
+                        tags.push("observe".to_string());
+                    }
                     let mut entities = vec![];
                     if let Some(ref cid) = container_id {
                         tags.push("container".to_string());
                         entities.push(EntityRef::container(cid));
                     }
 
+                    let (kind, summary, severity) = if observe {
+                        (
+                            "lsm.exec_gate_would_block".to_string(),
+                            format!(
+                                "Execution Gate (observe) would block: {comm} tried to run {filename} \
+                                 — allowed (learning). Approve to allowlist, or it is denied once armed."
+                            ),
+                            // Learning signal, not a block — keep it out of the
+                            // critical incident stream (onboarding can be noisy).
+                            Severity::Info,
+                        )
+                    } else if gate {
+                        (
+                            "lsm.exec_gate_blocked".to_string(),
+                            format!(
+                                "Execution Gate blocked unknown binary: {comm} tried to run {filename}"
+                            ),
+                            Severity::Critical,
+                        )
+                    } else {
+                        (
+                            "lsm.exec_blocked".to_string(),
+                            format!("LSM blocked execution: {comm} tried to run {filename}"),
+                            Severity::Critical,
+                        )
+                    };
+
                     Some(Event {
                         ts: chrono::Utc::now(),
                         host: host.to_string(),
                         source: "ebpf".to_string(),
-                        kind: "lsm.exec_blocked".to_string(),
-                        severity: Severity::Critical,
-                        summary: format!("LSM blocked execution: {comm} tried to run {filename}"),
+                        kind,
+                        severity,
+                        summary,
                         details,
                         tags,
                         entities,
@@ -2520,6 +2792,11 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         2 => "stderr",
                         _ => "fd",
                     };
+                    // Resolve ppid so reverse_shell can correlate a fork()'d
+                    // reverse shell (connect in the parent, dup2 onto stdio in the
+                    // child — socat/python). Only for stdio redirects (newfd<=2,
+                    // the reverse-shell case); a non-stdio dup skips the /proc read.
+                    let ppid = if newfd <= 2 { resolve_ppid(pid) } else { 0 };
                     Some(Event {
                         ts: chrono::Utc::now(),
                         host: host.to_string(),
@@ -2529,7 +2806,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         summary: format!(
                             "{comm} (PID {pid}) redirected fd {oldfd} → {fd_name}({newfd})"
                         ),
-                        details: serde_json::json!({"pid": pid, "uid": uid, "oldfd": oldfd, "newfd": newfd, "comm": comm}),
+                        details: serde_json::json!({"pid": pid, "uid": uid, "oldfd": oldfd, "newfd": newfd, "comm": comm, "ppid": ppid}),
                         tags: vec!["ebpf".to_string(), "reverse_shell".to_string()],
                         entities: vec![],
                     })
@@ -3188,6 +3465,45 @@ pub async fn run(_tx: crate::event_channels::EbpfTx, _host: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Execution Gate: kind-6 events from the gate carry b"EXEC_GATE" in
+    // argv[0] (bytes 352..361) and the REAL attempted path in filename;
+    // legacy/kill-chain/neural kind-6 emitters zero argv. This anchor pins
+    // the marker offset against ExecveEvent layout drift.
+    #[test]
+    fn exec_gate_marker_detected_only_when_present() {
+        // Full-size ExecveEvent buffer, argv zeroed → NOT a gate block.
+        let mut data = vec![0u8; 1400];
+        assert!(!is_exec_gate_block(&data));
+        // Marker at argv[0] → gate block.
+        data[EXECVE_ARGV0_OFFSET..EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len()]
+            .copy_from_slice(EXEC_GATE_MARKER);
+        assert!(is_exec_gate_block(&data));
+        // Marker must be exact — a prefix is not enough.
+        data[EXECVE_ARGV0_OFFSET + 8] = 0;
+        assert!(!is_exec_gate_block(&data));
+        // Buffer too short for argv (legacy 352-byte minimum) → never a gate block.
+        assert!(!is_exec_gate_block(&vec![0u8; 352]));
+        assert!(!is_exec_gate_block(b""));
+    }
+
+    // Spec 077 P2: observe mode emits EXEC_OBSV (would-block, allowed) — distinct
+    // from EXEC_GATE (real block). The two markers must not cross-detect.
+    #[test]
+    fn exec_observe_marker_distinct_from_block() {
+        let mut data = vec![0u8; 1400];
+        assert!(!is_exec_gate_observe(&data));
+        data[EXECVE_ARGV0_OFFSET..EXECVE_ARGV0_OFFSET + EXEC_OBSERVE_MARKER.len()]
+            .copy_from_slice(EXEC_OBSERVE_MARKER);
+        assert!(is_exec_gate_observe(&data));
+        assert!(!is_exec_gate_block(&data)); // observe is NOT a block
+                                             // and a real block is not an observe
+        let mut blk = vec![0u8; 1400];
+        blk[EXECVE_ARGV0_OFFSET..EXECVE_ARGV0_OFFSET + EXEC_GATE_MARKER.len()]
+            .copy_from_slice(EXEC_GATE_MARKER);
+        assert!(is_exec_gate_block(&blk));
+        assert!(!is_exec_gate_observe(&blk));
+    }
 
     // Spec 069: the syscall handlers attach as kprobes on the architecture
     // syscall ENTRY WRAPPER. The symbol must match the build-host arch.

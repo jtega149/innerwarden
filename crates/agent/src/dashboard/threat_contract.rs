@@ -79,6 +79,38 @@ pub(super) fn classify_decision(decision: Option<&str>, exec_result: Option<&str
         }
         Some("ignore") | Some("dismiss") => OUTCOME_DISMISSED,
         Some("escalate") | Some("request_confirmation") => OUTCOME_OPEN,
+        // Operator-initiated corrections (2026-06-10). The dashboard's
+        // operator-action endpoints write rows the operator's click drives:
+        // an override carries `operator_override:<action>`, so classify it by
+        // the underlying action — that is what makes "Dismiss" actually clear
+        // a case out of "Needs your attention", "Mark monitored" move it to
+        // Observing, etc., instead of being an inert unknown string that stays
+        // stuck in the attention KPI. The SQLite read path selects the LATEST
+        // decision per incident (ROW_NUMBER ... rn=1), so the operator's row —
+        // the newest — wins.
+        Some(s) if s.starts_with("operator_override:") => {
+            let inner = &s["operator_override:".len()..];
+            // One level of indirection: never infinite (the suffix is a base
+            // action, never another `operator_override:` prefix).
+            classify_decision(Some(inner), exec_result)
+        }
+        // Operator un-blocked the IP: they have judged it safe, so the case is
+        // resolved (leaves both "blocked" and "needs attention"). A failed
+        // unblock keeps it open so the operator notices the firewall did not
+        // comply.
+        Some("operator_unblock") => {
+            if exec_ok {
+                OUTCOME_DISMISSED
+            } else {
+                OUTCOME_OPEN
+            }
+        }
+        // Queued unblock request (operator clicked Unblock; the agent loop
+        // executes it within ~30s). Treat as resolved-by-operator-intent so it
+        // leaves "Needs your attention" immediately rather than lingering.
+        Some("operator_unblock_request") => OUTCOME_DISMISSED,
+        // Operator re-opened a previously-handled incident: back to attention.
+        Some("operator_reopen") => OUTCOME_OPEN,
         None => OUTCOME_OPEN,
         // Unknown decision strings are operator-visible but
         // unactionable -- bucket them as `open` so they show up in
@@ -347,6 +379,77 @@ mod tests {
         assert_eq!(classify_decision(None, None), OUTCOME_OPEN);
     }
 
+    // ── Operator-action classification (2026-06-10) ──────────────────
+    // Operator buttons write rows that must DRIVE the case outcome, not
+    // sit inertly in "needs attention". These anchor that contract.
+
+    #[test]
+    fn classify_operator_override_dismiss_resolves_case() {
+        // The headline fix: Dismiss must remove the case from attention.
+        assert_eq!(
+            classify_decision(Some("operator_override:dismiss"), Some("ok")),
+            OUTCOME_DISMISSED
+        );
+        assert_eq!(
+            classify_decision(Some("operator_override:ignore"), None),
+            OUTCOME_DISMISSED
+        );
+    }
+
+    #[test]
+    fn classify_operator_override_monitor_moves_to_observing() {
+        assert_eq!(
+            classify_decision(Some("operator_override:monitor"), Some("ok")),
+            OUTCOME_MONITORING
+        );
+    }
+
+    #[test]
+    fn classify_operator_override_block_ip_is_blocked() {
+        assert_eq!(
+            classify_decision(Some("operator_override:block_ip"), Some("ok")),
+            OUTCOME_BLOCKED
+        );
+    }
+
+    #[test]
+    fn classify_operator_override_request_confirmation_stays_open() {
+        assert_eq!(
+            classify_decision(Some("operator_override:request_confirmation"), None),
+            OUTCOME_OPEN
+        );
+    }
+
+    #[test]
+    fn classify_operator_unblock_resolves_on_success_open_on_failure() {
+        assert_eq!(
+            classify_decision(Some("operator_unblock"), Some("ok")),
+            OUTCOME_DISMISSED
+        );
+        // A failed unblock must NOT silently read as resolved — the operator
+        // needs to see the firewall did not comply.
+        assert_eq!(
+            classify_decision(Some("operator_unblock"), Some("failed: ufw error")),
+            OUTCOME_OPEN
+        );
+    }
+
+    #[test]
+    fn classify_operator_unblock_request_leaves_attention() {
+        assert_eq!(
+            classify_decision(Some("operator_unblock_request"), None),
+            OUTCOME_DISMISSED
+        );
+    }
+
+    #[test]
+    fn classify_operator_reopen_returns_to_attention() {
+        assert_eq!(
+            classify_decision(Some("operator_reopen"), Some("ok")),
+            OUTCOME_OPEN
+        );
+    }
+
     #[test]
     fn aggregate_blocked_wins_over_everything() {
         let outcomes = vec![
@@ -534,6 +637,15 @@ mod tests {
             Some("escalate"),
             Some("request_confirmation"),
             Some("future_unknown_action"),
+            // Operator-action rows must also map to canonical strings only.
+            Some("operator_override:dismiss"),
+            Some("operator_override:monitor"),
+            Some("operator_override:block_ip"),
+            Some("operator_override:request_confirmation"),
+            Some("operator_override:future_unknown"),
+            Some("operator_unblock"),
+            Some("operator_unblock_request"),
+            Some("operator_reopen"),
         ];
         let exec_results = [None, Some("ok"), Some("error: rejected"), Some("executed")];
         for d in decisions {

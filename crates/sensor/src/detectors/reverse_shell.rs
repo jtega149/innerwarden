@@ -142,6 +142,20 @@ impl ReverseShellDetector {
             .unwrap_or("unknown");
         let now = event.ts;
 
+        // Self-exclusion: InnerWarden's OWN agent/ctl legitimately connect out
+        // (Telegram notifications, the dashboard API, threat-feed polling) and
+        // dup2 fds, and that connect + fd_redirect shape self-false-fired
+        // `ebpf_reverse_shell` on the product's own egress — observed 126
+        // Critical self-flags / 30 min to Telegram (149.154.166.x) on test001,
+        // with `innerwarden-age` / `innerwarden` as the source comm. Verified via
+        // `/proc/<pid>/exe` (NOT the forgeable comm): a process that merely sets
+        // comm=innerwarden-* but whose exe is /tmp still fires — no blind spot.
+        // Checked on the reliable connect-time comm; skipping the connect means a
+        // later fd_redirect finds no recorded connect and cannot fire either.
+        if super::is_verified_infra_process(comm, pid, &["innerwarden"]) {
+            return None;
+        }
+
         // Record this event for the PID
         let dst_ip = event
             .details
@@ -156,18 +170,18 @@ impl ReverseShellDetector {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u16;
 
-        let pid_events = self.pid_network_events.entry(pid).or_default();
-
-        // Expire old events (>30s)
-        pid_events.retain(|e| now - e.ts < Duration::seconds(30));
-
-        pid_events.push(PidNetworkEvent {
-            kind: event.kind.clone(),
-            ts: now,
-            dst_ip: dst_ip.clone(),
-            dst_port,
-            comm: comm.to_string(),
-        });
+        {
+            let pid_events = self.pid_network_events.entry(pid).or_default();
+            // Expire old events (>30s)
+            pid_events.retain(|e| now - e.ts < Duration::seconds(30));
+            pid_events.push(PidNetworkEvent {
+                kind: event.kind.clone(),
+                ts: now,
+                dst_ip: dst_ip.clone(),
+                dst_port,
+                comm: comm.to_string(),
+            });
+        }
 
         // Only check on fd_redirect — that's the final step
         if event.kind != "process.fd_redirect" {
@@ -184,18 +198,41 @@ impl ReverseShellDetector {
             return None; // Not redirecting stdio
         }
 
+        // Fork-aware correlation (evasion audit E4): a reverse shell can connect()
+        // in the PARENT then fork() and dup2() the socket onto stdio in the CHILD
+        // (classic socat / `python: fork; in child dup2+exec`). The connect is then
+        // recorded under the parent pid while the fd_redirect arrives under the
+        // child pid, so a strict per-pid match (the old behaviour) never fired. We
+        // correlate over THIS pid's ring UNION its PARENT's ring. ppid is enriched
+        // onto the fd_redirect event by the collector (stdio dups only).
+        let ppid = event
+            .details
+            .get("ppid")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let mut combined: Vec<PidNetworkEvent> = self
+            .pid_network_events
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default();
+        if ppid != 0 && ppid != pid {
+            if let Some(parent) = self.pid_network_events.get(&ppid) {
+                combined.extend(parent.iter().cloned());
+            }
+        }
+
         // Check for reverse shell: connect + fd_redirect
-        let has_connect = pid_events
+        let has_connect = combined
             .iter()
             .any(|e| e.kind == "network.outbound_connect");
 
         // Check for bind shell: bind_listen + listen + fd_redirect
-        let has_bind = pid_events.iter().any(|e| e.kind == "network.bind_listen");
-        let has_listen = pid_events.iter().any(|e| e.kind == "network.listen");
+        let has_bind = combined.iter().any(|e| e.kind == "network.bind_listen");
+        let has_listen = combined.iter().any(|e| e.kind == "network.listen");
 
         let (pattern, target_ip, target_port, source_comm) = if has_connect {
             // Reverse shell detected
-            let conn = pid_events
+            let conn = combined
                 .iter()
                 .find(|e| e.kind == "network.outbound_connect")?;
             (
@@ -206,9 +243,7 @@ impl ReverseShellDetector {
             )
         } else if has_bind && has_listen {
             // Bind shell detected
-            let bind = pid_events
-                .iter()
-                .find(|e| e.kind == "network.bind_listen")?;
+            let bind = combined.iter().find(|e| e.kind == "network.bind_listen")?;
             (
                 "ebpf_bind_shell",
                 bind.dst_ip.clone(),
@@ -726,6 +761,19 @@ mod tests {
             entities: vec![],
         }
     }
+    /// fd_redirect carrying a parent pid (the collector enriches this from
+    /// /proc for stdio dups) — used for the fork()'d reverse-shell case.
+    fn fd_redirect_event_ppid(
+        pid: u32,
+        oldfd: u32,
+        newfd: u32,
+        ppid: u32,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        let mut ev = fd_redirect_event(pid, oldfd, newfd, ts);
+        ev.details["ppid"] = serde_json::json!(ppid);
+        ev
+    }
 
     fn bind_event(pid: u32, port: u16, ts: DateTime<Utc>) -> Event {
         Event {
@@ -975,9 +1023,113 @@ mod tests {
         // Connect from PID 1234
         det.process(&connect_event(1234, "10.0.0.1", 4444, now));
 
-        // fd_redirect from different PID 5678 → should NOT trigger
+        // fd_redirect from an UNRELATED PID 5678 (no ppid link) → must NOT trigger
         let inc = det.process(&fd_redirect_event(5678, 5, 0, now + Duration::seconds(1)));
         assert!(inc.is_none());
+    }
+
+    /// Regression anchor (evasion audit E4, 2026-06-20): a fork()'d reverse shell
+    /// connects in the PARENT then dup2()s the socket onto stdio in the CHILD
+    /// (socat / `python: fork; child dup2+exec`). The connect is recorded under
+    /// the parent pid, the fd_redirect arrives under the child pid — the old
+    /// strict per-pid match never fired. With ppid-aware correlation (parent ring
+    /// unioned in) the child's stdio redirect now correctly fires Critical.
+    #[test]
+    fn ebpf_reverse_shell_fires_across_fork_parent_connect_child_redirect() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+
+        // Parent PID 1234 connects to the attacker.
+        assert!(det
+            .process(&connect_event(1234, "10.0.0.1", 4444, now))
+            .is_none());
+
+        // Child PID 9999 (ppid=1234) dup2's the socket onto stdin → reverse shell.
+        let inc = det
+            .process(&fd_redirect_event_ppid(
+                9999,
+                5,
+                0,
+                1234,
+                now + Duration::seconds(1),
+            ))
+            .expect("a fork()'d reverse shell (connect in parent, dup2 in child) MUST fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("ebpf_reverse_shell"));
+    }
+
+    /// Guard the fix's bound: a child fd_redirect whose parent did NOT connect
+    /// must still NOT fire (no false positive from the parent-ring union alone).
+    #[test]
+    fn ebpf_fork_correlation_does_not_false_fire_without_a_parent_connect() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        // Parent 1234 did something unrelated (no connect); child 9999 redirects.
+        let inc = det.process(&fd_redirect_event_ppid(9999, 5, 0, 1234, now));
+        assert!(inc.is_none());
+    }
+
+    /// A pid above the kernel pid_max ceiling → `/proc/<pid>/exe` never exists →
+    /// `is_verified_infra_process` takes its comm-match + process-exited fallback,
+    /// the same Managed semantics as a live verified InnerWarden process. Avoids
+    /// the flaky-small-live-pid /proc read (RECURRING_BUGS.md).
+    const DEAD_PID: u32 = 4_000_000_001;
+
+    /// Regression anchor (self-FP found 2026-06-21): InnerWarden's own agent/ctl
+    /// connect out (Telegram, API, threat feeds) + dup2 fds, and that shape
+    /// self-false-fired `ebpf_reverse_shell` — 126 Critical self-flags / 30 min on
+    /// test001 (`innerwarden-age` → Telegram 149.154.166.x). The agent must not
+    /// accuse itself of a reverse shell.
+    #[test]
+    fn innerwarden_self_egress_is_not_flagged_as_reverse_shell() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        // Agent connects out, then a fd_redirect at the same pid.
+        assert!(det
+            .process(&connect_event_with_comm(
+                DEAD_PID,
+                "149.154.166.110",
+                443,
+                "innerwarden-agent",
+                now
+            ))
+            .is_none());
+        let inc = det.process(&fd_redirect_event(
+            DEAD_PID,
+            5,
+            0,
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_none(),
+            "InnerWarden's own verified egress must NOT fire ebpf_reverse_shell"
+        );
+    }
+
+    /// No blind spot: a process that merely SETS comm=innerwarden-* but whose
+    /// `/proc/exe` is NOT a system path (here the test binary under target/) is
+    /// still flagged — the exclusion is verified by exe, not the forgeable comm.
+    /// Linux-only: needs a real readable /proc/<pid>/exe (absent on macOS).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forged_innerwarden_comm_from_nonsystem_exe_still_fires() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        let own = std::process::id();
+        assert!(det
+            .process(&connect_event_with_comm(
+                own,
+                "10.0.0.1",
+                4444,
+                "innerwarden-agent",
+                now
+            ))
+            .is_none());
+        let inc = det.process(&fd_redirect_event(own, 5, 0, now + Duration::seconds(1)));
+        assert!(
+            inc.is_some(),
+            "a forged comm=innerwarden-* with a non-system /proc/exe must still fire"
+        );
     }
 
     #[test]

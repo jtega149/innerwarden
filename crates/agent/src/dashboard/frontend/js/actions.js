@@ -94,6 +94,33 @@ function buildActionPreviewHtml(cfg, intent) {
       '<code>' + esc(cmd2) + '</code>' +
       '<div class="preview-meta">' + esc(meta2) + '</div>';
   }
+  if (intent.type === 'unblock_ip') {
+    var cmd3 = 'revert ' + backend + ' block for ' + intent.ip + ' (queued for the agent loop)';
+    var meta3 = live
+      ? 'LIVE — the agent removes the firewall rule on its next slow-loop tick (≤30s).'
+      : 'DRY RUN — preview only, no firewall change. Logged as simulated.';
+    return '<span class="preview-label">Unblock</span>' +
+      '<code>' + esc(cmd3) + '</code>' +
+      '<div class="preview-meta">' + esc(meta3) + '</div>';
+  }
+  if (intent.type === 'triage') {
+    var n = (intent.incidentIds || []).length;
+    var verb = intent.triageAction || 'dismiss';
+    var cmd4 = verb + ' ' + n + ' incident(s) in this case';
+    var meta4 = 'Audit-trail entry written. No firewall change — updates how the case is classified.';
+    return '<span class="preview-label">Case triage</span>' +
+      '<code>' + esc(cmd4) + '</code>' +
+      '<div class="preview-meta">' + esc(meta4) + '</div>';
+  }
+  if (intent.type === 'trust_ip') {
+    var cmd5 = 'trust ' + intent.ip + ' (monitor-only — suppress auto-response, keep detecting)';
+    var meta5 = live
+      ? 'LIVE — the agent stops auto-blocking this IP within ≤30s. Still detected, logged, notified.'
+      : 'DRY RUN — preview only. Logged as simulated.';
+    return '<span class="preview-label">Trust IP</span>' +
+      '<code>' + esc(cmd5) + '</code>' +
+      '<div class="preview-meta">' + esc(meta5) + '</div>';
+  }
   return '';
 }
 
@@ -111,29 +138,98 @@ function refreshActionPreview() {
   previewEl.classList.toggle('danger', !actionCfg.dry_run);
 }
 
+var _mono = function(v) {
+  return '<span style="font-family:\'JetBrains Mono\',monospace">' + esc(v) + '</span>';
+};
+
+// Collect the unique incident ids of the case currently rendered in the
+// journey detail. Triage + unblock operate on the whole case, so the read
+// path's latest-decision-per-incident selection flips every incident at once.
+function _caseIncidentIds() {
+  var j = window._journeyData;
+  if (!j || !Array.isArray(j.entries)) return [];
+  var ids = [];
+  j.entries.forEach(function(e) {
+    if (e && e.kind === 'incident' && e.data && e.data.incident_id
+        && ids.indexOf(e.data.incident_id) === -1) {
+      ids.push(e.data.incident_id);
+    }
+  });
+  return ids;
+}
+
 function showActionModal(type, ip, user) {
   if (!actionCfg || !actionCfg.enabled) return;
   pendingAction = { type, ip, user };
-  const modal = document.getElementById('actionModal');
-  const drLabel = actionCfg.dry_run
+  if (type === 'block_ip') {
+    _openActionModal(
+      'Block IP: ' + _mono(ip),
+      'Executes ' + esc(actionCfg.block_backend) + ' deny rule. Logged to the audit trail.',
+      actionCfg.dry_run ? 'Simulate Block' : 'Block IP',
+      false);
+  } else if (type === 'unblock_ip') {
+    // Carry the case incidents so each leaves the "blocked" bucket once the
+    // agent loop confirms the revert.
+    pendingAction.incidentIds = _caseIncidentIds();
+    _openActionModal(
+      'Unblock IP: ' + _mono(ip),
+      'Queues removal of the ' + esc(actionCfg.block_backend) + ' block. The agent reverts it on '
+        + 'its next slow-loop tick (≤30s). Logged to the audit trail.',
+      actionCfg.dry_run ? 'Simulate Unblock' : 'Unblock IP',
+      false);
+  } else if (type === 'trust_ip') {
+    _openActionModal(
+      'Trust IP: ' + _mono(ip),
+      'Monitor-only allowlist: the agent stops AUTO-blocking ' + esc(ip) + ', but it is still '
+        + 'detected, logged, and you are still notified. Manage / time-box via the CLI '
+        + '(innerwarden trust). Logged to the audit trail.',
+      actionCfg.dry_run ? 'Simulate Trust' : 'Trust IP',
+      false);
+  } else {
+    _openActionModal(
+      'Suspend sudo: ' + _mono(user),
+      'Temporarily revokes sudo access for the specified duration. Logged to the audit trail.',
+      actionCfg.dry_run ? 'Simulate Suspend' : 'Suspend User',
+      true);
+  }
+}
+
+// Case-level triage (dismiss / monitor / reopen) — operates on every incident
+// in the currently-open case.
+function showCaseTriageModal(action) {
+  if (!actionCfg || !actionCfg.enabled) return;
+  var ids = _caseIncidentIds();
+  if (!ids.length) {
+    showToast('No incidents in this case to triage.', 'err');
+    return;
+  }
+  pendingAction = { type: 'triage', triageAction: action, incidentIds: ids };
+  var n = ids.length;
+  var copy = {
+    dismiss: ['Dismiss case',
+      'Marks ' + n + ' incident(s) reviewed and removes the case from "Needs your attention". '
+        + 'No firewall change. Logged to the audit trail.', 'Dismiss'],
+    monitor: ['Monitor case',
+      'Moves ' + n + ' incident(s) to "Observing" — watch without acting. '
+        + 'No firewall change. Logged to the audit trail.', 'Monitor'],
+    reopen: ['Reopen case',
+      'Returns ' + n + ' incident(s) to "Needs your attention" for re-review. '
+        + 'Logged to the audit trail.', 'Reopen'],
+  };
+  var c = copy[action] || copy.dismiss;
+  _openActionModal(c[0], c[1], c[2], false);
+}
+
+// Shared modal opener used by every action flavour above.
+function _openActionModal(titleHtml, subtitle, confirmText, showDuration) {
+  var modal = document.getElementById('actionModal');
+  var drLabel = actionCfg.dry_run
     ? '<span class="dry-run-badge on">DRY RUN</span>'
     : '<span class="dry-run-badge off">LIVE</span>';
-
-  if (type === 'block_ip') {
-    document.getElementById('modalTitle').innerHTML =
-      'Block IP: <span style="font-family:\'JetBrains Mono\',monospace">' + esc(ip) + '</span>' + drLabel;
-    document.getElementById('modalSubtitle').textContent =
-      'Executes ' + esc(actionCfg.block_backend) + ' deny rule. Logged to the audit trail.';
-    document.getElementById('modalDurationField').style.display = 'none';
-    document.getElementById('modalConfirm').textContent = actionCfg.dry_run ? 'Simulate Block' : 'Block IP';
-  } else {
-    document.getElementById('modalTitle').innerHTML =
-      'Suspend sudo: <span style="font-family:\'JetBrains Mono\',monospace">' + esc(user) + '</span>' + drLabel;
-    document.getElementById('modalSubtitle').textContent =
-      'Temporarily revokes sudo access for the specified duration. Logged to the audit trail.';
-    document.getElementById('modalDurationField').style.display = 'block';
-    document.getElementById('modalConfirm').textContent = actionCfg.dry_run ? 'Simulate Suspend' : 'Suspend User';
-  }
+  document.getElementById('modalTitle').innerHTML = titleHtml + drLabel;
+  document.getElementById('modalSubtitle').textContent = subtitle;
+  document.getElementById('modalDurationField').style.display = showDuration ? 'block' : 'none';
+  document.getElementById('modalConfirm').textContent = confirmText;
 
   // Audit 4.7: render the preview before opening, then re-render
   // when the suspend duration field changes.
@@ -147,7 +243,7 @@ function showActionModal(type, ip, user) {
   document.getElementById('modalReason').value = '';
   document.getElementById('modalReason').style.borderColor = '';
   modal.classList.add('open');
-  setTimeout(() => document.getElementById('modalReason').focus(), 60);
+  setTimeout(function() { document.getElementById('modalReason').focus(); }, 60);
 }
 
 function closeActionModal() {
@@ -181,6 +277,23 @@ async function submitAction() {
     if (pendingAction.type === 'block_ip') {
       url = '/api/action/block-ip';
       body = JSON.stringify({ ip: pendingAction.ip, reason });
+    } else if (pendingAction.type === 'unblock_ip') {
+      url = '/api/action/unblock-ip';
+      body = JSON.stringify({
+        ip: pendingAction.ip,
+        reason,
+        incident_ids: pendingAction.incidentIds || [],
+      });
+    } else if (pendingAction.type === 'trust_ip') {
+      url = '/api/action/trust-ip';
+      body = JSON.stringify({ ip: pendingAction.ip, reason });
+    } else if (pendingAction.type === 'triage') {
+      url = '/api/action/triage-case';
+      body = JSON.stringify({
+        incident_ids: pendingAction.incidentIds || [],
+        action: pendingAction.triageAction,
+        reason,
+      });
     } else {
       const duration_secs = parseInt(
         document.getElementById('modalDuration').value || '3600', 10

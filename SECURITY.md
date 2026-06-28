@@ -49,7 +49,7 @@ The short version:
 - Stable releases ship per-binary `.sha256` and `.sig` (Ed25519). The installer (`install.sh`) and the updater (`innerwarden upgrade`) fail-closed when signatures are missing or invalid (Spec 048).
 - The 6 release **binaries** (sensor + agent + ctl × x86_64/aarch64) carry a [GitHub Artifact Attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) (SLSA v1 provenance) verifiable via `gh attestation verify`. The sidecar files (`.sha256`, `.sig`, `SHA256SUMS`, `install.sh`) are not currently attested individually.
 - Stable tags publish an aggregate `SHA256SUMS` + `SHA256SUMS.sig` (GPG) for the manual-verification path. Prerelease/canary tags publish `SHA256SUMS` only; the GPG signature is gated to stable.
-- Active Ed25519 fingerprint: `9cba21f2d6a45e7f58edd9b840e152b5c7d0ee6e511bb6835037088c6a89143f` (also in `crates/ctl/src/upgrade.rs::RELEASE_PUBLIC_KEY_B64` and `install.sh::INNERWARDEN_RELEASE_PEM`).
+- Active Ed25519 key fingerprint (SHA-256 of the release public key): `9cba21f2d6a45e7f58edd9b840e152b5c7d0ee6e511bb6835037088c6a89143f`, pinned in `docs/supply-chain-security.md`. The raw key material is in `crates/ctl/src/upgrade.rs::RELEASE_PUBLIC_KEY_B64` and `install.sh::INNERWARDEN_RELEASE_PEM`.
 
 ## Security Features
 

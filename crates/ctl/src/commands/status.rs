@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use innerwarden_store::Store;
 
 use crate::capability::CapabilityRegistry;
 use crate::module_manifest::{is_module_enabled, scan_modules_dir};
@@ -27,6 +28,76 @@ fn summary_dates_from_filenames(names: &[String]) -> Vec<String> {
                 .map(|d| d.to_string())
         })
         .collect()
+}
+
+/// Format an incident RFC3339 timestamp as the "time ago" string used by the
+/// status header. Mirrors `read_last_incident_summary` exactly so the store
+/// path and the JSONL path produce identical "Last threat" suffixes.
+fn format_incident_time_ago(ts: &str) -> String {
+    if let Ok(incident_time) = chrono::DateTime::parse_from_rfc3339(ts) {
+        let diff = chrono::Utc::now() - incident_time.with_timezone(&chrono::Utc);
+        let mins = diff.num_minutes();
+        if mins < 1 {
+            "just now".to_string()
+        } else if mins < 60 {
+            format!("{mins}m ago")
+        } else if mins < 1440 {
+            format!("{}h ago", mins / 60)
+        } else {
+            format!("{}d ago", mins / 1440)
+        }
+    } else if ts.len() >= 16 {
+        format!("{} UTC", &ts[11..16])
+    } else {
+        ts.to_string()
+    }
+}
+
+/// Resolve today's event count, incident count, and last-incident summary.
+///
+/// Prefers the unified SQLite store (the canonical source the sensor/agent
+/// write to — the JSONL counters lie with "0" on migrated boxes). Falls back
+/// to the legacy per-day JSONL files when the store cannot be opened OR has no
+/// data for today, for backward compat with non-migrated boxes.
+fn today_counts(dir: &Path, today: &str) -> (usize, usize, Option<(String, String)>) {
+    // Window start for "today" incidents: midnight UTC, RFC3339, matched
+    // lexicographically against the store's `ts` column.
+    let start_ts = format!("{today}T00:00:00+00:00");
+
+    if let Ok(store) = Store::open(dir) {
+        let events_today = store.events_count_for_date(today).unwrap_or_else(|e| {
+            eprintln!("  [warn] status: events_count_for_date failed ({e:#})");
+            0
+        });
+        let incidents_today = match store.incidents_since_ts(&start_ts, 100_000) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  [warn] status: incidents_since_ts failed ({e:#})");
+                Vec::new()
+            }
+        };
+
+        // Only trust the store when it actually has today's data; an empty
+        // store on a mid-migration box must fall through to JSONL below.
+        if events_today > 0 || !incidents_today.is_empty() {
+            let incidents_count = incidents_today.len();
+            // incidents_since_ts is ascending by ts -> the last element is the
+            // most recent incident today.
+            let last_incident = incidents_today.last().map(|inc| {
+                (
+                    inc.title.clone(),
+                    format_incident_time_ago(&inc.ts.to_rfc3339()),
+                )
+            });
+            return (events_today as usize, incidents_count, last_incident);
+        }
+    }
+
+    // Legacy JSONL fallback (store absent / unreadable / empty for today).
+    let events_count = count_jsonl_lines(&dir.join(format!("events-{today}.jsonl")));
+    let incidents_count = count_jsonl_lines(&dir.join(format!("incidents-{today}.jsonl")));
+    let last_incident = read_last_incident_summary(&dir.join(format!("incidents-{today}.jsonl")));
+    (events_count, incidents_count, last_incident)
 }
 
 pub(crate) fn cmd_status(cli: &Cli, registry: &CapabilityRegistry, id: &str) -> Result<()> {
@@ -76,10 +147,7 @@ pub(crate) fn cmd_status_global(
 
     if let Some(ref dir) = data_dir {
         let today = today_date_string();
-        let events_count = count_jsonl_lines(&dir.join(format!("events-{today}.jsonl")));
-        let incidents_count = count_jsonl_lines(&dir.join(format!("incidents-{today}.jsonl")));
-        let last_incident =
-            read_last_incident_summary(&dir.join(format!("incidents-{today}.jsonl")));
+        let (events_count, incidents_count, last_incident) = today_counts(dir, &today);
 
         println!("\nToday  ({})", today);
         println!("  Events logged:    {events_count}");
@@ -360,6 +428,88 @@ fn generate_navigator_layer() -> serde_json::Value {
     })
 }
 
+/// Render the Collectors + Detectors sections of `innerwarden get sensor`
+/// from the unified SQLite store when the agent telemetry snapshot is absent.
+///
+/// Collectors come from `events_timeline_for_date` (per-minute buckets summed
+/// per source). Detectors come from today's incidents, keyed by the same
+/// `detector_kind` derivation the agent telemetry uses (the first
+/// colon-delimited segment of `incident_id`). The AI/response section is NOT
+/// reconstructable from the store (those counters live only in the agent
+/// snapshot), so it is intentionally omitted rather than shown as zeros.
+///
+/// Returns `true` when the store yielded any events or incidents for `today`
+/// (sections were printed), `false` otherwise (store absent / unreadable /
+/// empty for today) so the caller can show the legacy "No telemetry" message.
+fn render_sensor_status_from_store(dir: &Path, today: &str) -> bool {
+    let store = match Store::open(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  [warn] sensor status: store open failed ({e:#})");
+            return false;
+        }
+    };
+
+    // Collectors: sum per-minute buckets per source.
+    let mut events_by_source: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    if let Ok(timeline) = store.events_timeline_for_date(today) {
+        for (_bucket, per_source) in timeline {
+            for (source, count) in per_source {
+                *events_by_source.entry(source).or_insert(0) += count;
+            }
+        }
+    }
+
+    // Detectors: today's incidents grouped by detector_kind (first segment of
+    // incident_id), mirroring `agent::correlation::detector_kind`.
+    let start_ts = format!("{today}T00:00:00+00:00");
+    let mut incidents_by_detector: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    if let Ok(incidents) = store.incidents_since_ts(&start_ts, 100_000) {
+        for inc in &incidents {
+            let detector = inc
+                .incident_id
+                .split(':')
+                .next()
+                .unwrap_or("unknown")
+                .to_string();
+            *incidents_by_detector.entry(detector).or_insert(0) += 1;
+        }
+    }
+
+    if events_by_source.is_empty() && incidents_by_detector.is_empty() {
+        return false;
+    }
+
+    println!("Collectors (events today):");
+    if events_by_source.is_empty() {
+        println!("  (no events recorded yet today)");
+    } else {
+        let mut pairs: Vec<(&String, u64)> =
+            events_by_source.iter().map(|(k, v)| (k, *v)).collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        for (source, count) in &pairs {
+            println!("  ● {:<30} {:>6} events", source, count);
+        }
+    }
+
+    println!();
+    println!("Detectors (incidents today):");
+    if incidents_by_detector.is_empty() {
+        println!("  (no incidents today)");
+    } else {
+        let mut pairs: Vec<(&String, u64)> =
+            incidents_by_detector.iter().map(|(k, v)| (k, *v)).collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        for (detector, count) in &pairs {
+            println!("  ⚠  {:<30} {:>6} incidents", detector, count);
+        }
+    }
+
+    true
+}
+
 pub(crate) fn cmd_sensor_status(cli: &Cli, data_dir: &Path) -> Result<()> {
     let effective_dir = resolve_data_dir(cli, data_dir);
     let today = epoch_secs_to_date(
@@ -382,6 +532,16 @@ pub(crate) fn cmd_sensor_status(cli: &Cli, data_dir: &Path) -> Result<()> {
     println!("InnerWarden - sensor status  ({})\n", today);
 
     let Some(snap) = snapshot else {
+        // The agent telemetry snapshot is absent, but the sensor may still be
+        // writing events/incidents to the unified SQLite store. Render the
+        // collector + detector breakdown from the store so the operator is not
+        // told "no data" while the store holds tens of thousands of events.
+        // (AI / response counts live only in the agent snapshot — they are
+        // omitted here, not fabricated.)
+        if render_sensor_status_from_store(&effective_dir, &today) {
+            println!();
+            return Ok(());
+        }
         println!("  No telemetry data for today.");
         println!("  Is the agent running?  innerwarden status");
         return Ok(());
@@ -826,6 +986,293 @@ mod tests {
         let err = cmd_posture(&cli, &data_dir).expect_err("malformed JSON must error");
         assert!(err.to_string().contains("malformed JSON"));
     }
+
+    // ---- SQLite-store routing tests (spec: get readers route to store) ----
+
+    use innerwarden_core::entities::EntityRef;
+    use innerwarden_core::event::{Event, Severity};
+    use innerwarden_core::incident::Incident;
+    use innerwarden_store::Store;
+
+    fn today_ts(hhmmss: &str) -> String {
+        format!("{}T{hhmmss}+00:00", today())
+    }
+
+    fn seed_event(store: &Store, source: &str) {
+        let ev = Event {
+            ts: chrono::DateTime::parse_from_rfc3339(&today_ts("09:00:00"))
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            host: "h".to_string(),
+            source: source.to_string(),
+            kind: "shell.command_exec".to_string(),
+            severity: Severity::Medium,
+            summary: "exec".to_string(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+        store.insert_event(&ev).expect("seed event");
+    }
+
+    fn seed_incident(store: &Store, detector: &str, ip: &str, title: &str) {
+        let inc = Incident {
+            ts: chrono::DateTime::parse_from_rfc3339(&today_ts("10:30:00"))
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            host: "h".to_string(),
+            incident_id: format!("{detector}:{ip}:test"),
+            severity: Severity::High,
+            title: title.to_string(),
+            summary: "s".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip(ip)],
+        };
+        store.insert_incident(&inc).expect("seed incident");
+    }
+
+    #[test]
+    fn today_counts_prefers_store_over_jsonl() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let today = today();
+
+        // JSONL files claim ZERO (file absent) — the bug being fixed. The
+        // store holds the real data.
+        let store = Store::open(&data_dir).expect("open store");
+        for _ in 0..5 {
+            seed_event(&store, "auth_log");
+        }
+        seed_incident(&store, "ssh_bruteforce", "203.0.113.10", "SSH Brute Force");
+        drop(store);
+
+        let (events, incidents, last) = today_counts(&data_dir, &today);
+        assert_eq!(
+            events, 5,
+            "events come from the store, not the missing JSONL"
+        );
+        assert_eq!(incidents, 1, "incident counted from the store");
+        let (title, _when) = last.expect("last incident from store");
+        assert_eq!(title, "SSH Brute Force");
+    }
+
+    #[test]
+    fn today_counts_falls_back_to_jsonl_when_store_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let today = today();
+
+        // Empty store (created but no rows) + legacy JSONL with data -> the
+        // fallback path must surface the JSONL counts.
+        let _store = Store::open(&data_dir).expect("open store");
+        write_file(
+            &data_dir.join(format!("events-{today}.jsonl")),
+            "{}\n{}\n{}\n",
+        );
+        write_file(
+            &data_dir.join(format!("incidents-{today}.jsonl")),
+            &format!(
+                "{{\"title\":\"Legacy threat\",\"ts\":\"{}\"}}\n",
+                today_ts("11:00:00")
+            ),
+        );
+
+        let (events, incidents, last) = today_counts(&data_dir, &today);
+        assert_eq!(events, 3, "events fall back to JSONL line count");
+        assert_eq!(incidents, 1, "incidents fall back to JSONL line count");
+        assert_eq!(last.expect("last from jsonl").0, "Legacy threat");
+    }
+
+    #[test]
+    fn cmd_status_global_renders_store_backed_counts() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("status-data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        write_file(
+            &cli.agent_config,
+            &format!(
+                "[output]\ndata_dir = \"{}\"\n[ai]\nenabled = true\nprovider = \"ollama\"\n[responder]\nenabled = true\ndry_run = false\n",
+                data_dir.display()
+            ),
+        );
+        write_file(
+            &cli.sensor_config,
+            "[collectors.exec_audit]\nenabled = true\n",
+        );
+        let store = Store::open(&data_dir).expect("open store");
+        seed_event(&store, "auth_log");
+        seed_incident(&store, "port_scan", "203.0.113.20", "Port scan");
+        drop(store);
+
+        let modules_dir = temp.path().join("modules");
+        std::fs::create_dir_all(&modules_dir).expect("modules dir");
+        let registry = CapabilityRegistry::default_all();
+        // Default data_dir sentinel so resolve_data_dir reads the agent config
+        // (which points at our seeded store directory).
+        cmd_status_global(&cli, &registry, &modules_dir).expect("store-backed status renders");
+    }
+
+    #[test]
+    fn render_sensor_status_from_store_reports_collectors_and_detectors() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let today = today();
+
+        let store = Store::open(&data_dir).expect("open store");
+        seed_event(&store, "auth_log");
+        seed_event(&store, "auth_log");
+        seed_event(&store, "ebpf_syscall");
+        seed_incident(&store, "ssh_bruteforce", "203.0.113.30", "Brute force");
+        drop(store);
+
+        // Returns true when the store yields data.
+        assert!(render_sensor_status_from_store(&data_dir, &today));
+    }
+
+    #[test]
+    fn render_sensor_status_from_store_returns_false_when_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let _store = Store::open(&data_dir).expect("open store");
+        assert!(!render_sensor_status_from_store(&data_dir, &today()));
+    }
+
+    #[test]
+    fn cmd_sensor_status_renders_store_when_no_telemetry_snapshot() {
+        // No telemetry-*.jsonl present, but the store holds today's events —
+        // the command must render from the store instead of "No telemetry".
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("sensor-data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let store = Store::open(&data_dir).expect("open store");
+        seed_event(&store, "dns_capture");
+        seed_incident(&store, "dns_tunneling", "203.0.113.40", "DNS tunnel");
+        drop(store);
+
+        cmd_sensor_status(&cli, &data_dir).expect("store-backed sensor status renders");
+    }
+
+    #[test]
+    fn metrics_breakdowns_from_store_returns_maps_when_seeded() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let today = today();
+        let store = Store::open(&data_dir).expect("open store");
+        seed_event(&store, "auth_log");
+        seed_event(&store, "nginx_access");
+        seed_incident(&store, "ssh_bruteforce", "203.0.113.50", "Brute");
+        drop(store);
+
+        let (events, incidents) = metrics_breakdowns_from_store(&data_dir, &today);
+        let events = events.expect("event map present");
+        assert_eq!(events.get("auth_log").copied(), Some(1));
+        assert_eq!(events.get("nginx_access").copied(), Some(1));
+        let incidents = incidents.expect("incident map present");
+        assert_eq!(incidents.get("ssh_bruteforce").copied(), Some(1));
+    }
+
+    #[test]
+    fn metrics_breakdowns_from_store_returns_none_when_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let _store = Store::open(&data_dir).expect("open store");
+        let (events, incidents) = metrics_breakdowns_from_store(&data_dir, &today());
+        assert!(events.is_none());
+        assert!(incidents.is_none());
+    }
+
+    #[test]
+    fn cmd_metrics_prefers_store_breakdowns_over_snapshot() {
+        // Telemetry snapshot exists (so the "cannot read" gate passes) but its
+        // event counter reads 0 / stale; the store holds the real per-source
+        // counts. The command must render without panicking and prefer store.
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("metrics-data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let today = today();
+        write_file(
+            &data_dir.join(format!("telemetry-{today}.jsonl")),
+            "{\"events_by_collector\":{},\"incidents_by_detector\":{},\"decisions_by_action\":{\"block_ip\":1},\"ai_sent_count\":2,\"ai_decision_count\":1,\"gate_pass_count\":3,\"avg_decision_latency_ms\":10.0,\"real_execution_count\":1,\"dry_run_execution_count\":0}\n",
+        );
+        let store = Store::open(&data_dir).expect("open store");
+        seed_event(&store, "auth_log");
+        seed_incident(&store, "ssh_bruteforce", "203.0.113.60", "Brute");
+        drop(store);
+
+        cmd_metrics(&cli, &data_dir).expect("store-backed metrics render");
+    }
+
+    #[test]
+    fn format_incident_time_ago_matches_buckets() {
+        // Bad timestamp -> raw passthrough (short string branch).
+        assert_eq!(format_incident_time_ago("bad"), "bad");
+        // A recent timestamp -> "just now" or "Nm ago" (never panics).
+        let recent = chrono::Utc::now().to_rfc3339();
+        let out = format_incident_time_ago(&recent);
+        assert!(out == "just now" || out.ends_with("m ago"));
+    }
+}
+
+/// Build the per-source event counts and per-detector incident counts for
+/// `today` from the unified SQLite store, for `cmd_metrics`.
+///
+/// Each return slot is `Some(map)` only when the store actually yielded data
+/// for that dimension, so the caller falls back to the agent telemetry
+/// snapshot maps when the store is absent / unreadable / empty. Event sources
+/// are summed from `events_timeline_for_date`; detector keys are the first
+/// colon-delimited segment of each incident's `incident_id` (matching the
+/// agent telemetry's `detector_kind`).
+#[allow(clippy::type_complexity)]
+fn metrics_breakdowns_from_store(
+    dir: &Path,
+    today: &str,
+) -> (Option<HashMap<String, u64>>, Option<HashMap<String, u64>>) {
+    let store = match Store::open(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  [warn] metrics: store open failed ({e:#})");
+            return (None, None);
+        }
+    };
+
+    let mut events_by_source: HashMap<String, u64> = HashMap::new();
+    if let Ok(timeline) = store.events_timeline_for_date(today) {
+        for (_bucket, per_source) in timeline {
+            for (source, count) in per_source {
+                *events_by_source.entry(source).or_insert(0) += count;
+            }
+        }
+    }
+
+    let start_ts = format!("{today}T00:00:00+00:00");
+    let mut incidents_by_detector: HashMap<String, u64> = HashMap::new();
+    if let Ok(incidents) = store.incidents_since_ts(&start_ts, 100_000) {
+        for inc in &incidents {
+            let detector = inc
+                .incident_id
+                .split(':')
+                .next()
+                .unwrap_or("unknown")
+                .to_string();
+            *incidents_by_detector.entry(detector).or_insert(0) += 1;
+        }
+    }
+
+    (
+        (!events_by_source.is_empty()).then_some(events_by_source),
+        (!incidents_by_detector.is_empty()).then_some(incidents_by_detector),
+    )
 }
 
 pub(crate) fn cmd_metrics(cli: &Cli, data_dir: &Path) -> Result<()> {
@@ -859,49 +1306,68 @@ pub(crate) fn cmd_metrics(cli: &Cli, data_dir: &Path) -> Result<()> {
 
     println!("InnerWarden - metrics  ({})\n", today);
 
+    // Prefer the unified SQLite store for the event/incident breakdowns so the
+    // totals match `get status` (the agent telemetry snapshot's
+    // events_by_collector counter can lag or read 0 on migrated boxes). The
+    // decisions / AI-pipeline / uptime sections below stay snapshot-sourced —
+    // those counters live only in the agent snapshot, not the store.
+    let (store_events, store_incidents) = metrics_breakdowns_from_store(&effective_dir, &today);
+
     println!("Events processed today:");
-    let by_collector = snap["events_by_collector"].as_object();
+    let snap_collector: HashMap<String, u64> = snap["events_by_collector"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let events_map = store_events.as_ref().unwrap_or(&snap_collector);
     let mut total_events: u64 = 0;
-    match by_collector {
-        Some(map) if !map.is_empty() => {
-            let mut pairs: Vec<(&String, u64)> = map
-                .iter()
-                .map(|(k, v)| {
-                    let c = v.as_u64().unwrap_or(0);
-                    total_events += c;
-                    (k, c)
-                })
-                .collect();
-            pairs.sort_by(|a, b| b.1.cmp(&a.1));
-            for (source, count) in &pairs {
-                println!("  {:<30} {:>6}", source, count);
-            }
-            println!("  {:<30} {:>6}", "TOTAL", total_events);
+    if events_map.is_empty() {
+        println!("  (no events recorded yet today)");
+    } else {
+        let mut pairs: Vec<(&String, u64)> = events_map
+            .iter()
+            .map(|(k, v)| {
+                total_events += *v;
+                (k, *v)
+            })
+            .collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        for (source, count) in &pairs {
+            println!("  {:<30} {:>6}", source, count);
         }
-        _ => println!("  (no events recorded yet today)"),
+        println!("  {:<30} {:>6}", "TOTAL", total_events);
     }
 
     println!();
     println!("Incidents detected today:");
-    let by_detector = snap["incidents_by_detector"].as_object();
+    let snap_detector: HashMap<String, u64> = snap["incidents_by_detector"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let incidents_map = store_incidents.as_ref().unwrap_or(&snap_detector);
     let mut total_incidents: u64 = 0;
-    match by_detector {
-        Some(map) if !map.is_empty() => {
-            let mut pairs: Vec<(&String, u64)> = map
-                .iter()
-                .map(|(k, v)| {
-                    let c = v.as_u64().unwrap_or(0);
-                    total_incidents += c;
-                    (k, c)
-                })
-                .collect();
-            pairs.sort_by(|a, b| b.1.cmp(&a.1));
-            for (detector, count) in &pairs {
-                println!("  {:<30} {:>6}", detector, count);
-            }
-            println!("  {:<30} {:>6}", "TOTAL", total_incidents);
+    if incidents_map.is_empty() {
+        println!("  (no incidents today)");
+    } else {
+        let mut pairs: Vec<(&String, u64)> = incidents_map
+            .iter()
+            .map(|(k, v)| {
+                total_incidents += *v;
+                (k, *v)
+            })
+            .collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        for (detector, count) in &pairs {
+            println!("  {:<30} {:>6}", detector, count);
         }
-        _ => println!("  (no incidents today)"),
+        println!("  {:<30} {:>6}", "TOTAL", total_incidents);
     }
 
     println!();

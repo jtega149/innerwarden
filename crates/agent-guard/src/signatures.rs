@@ -240,6 +240,43 @@ impl SignatureIndex {
         self.identify(process_name).is_some()
     }
 
+    /// Identify an agent from its full `argv` when `comm` did not match — the
+    /// common case for interpreter-launched agents. OpenClaw runs as
+    /// `node .../node_modules/openclaw/dist/index.js`, where `comm` is
+    /// `node`/`MainThread` (node renames its main thread), so the identity
+    /// lives only in the script path. Same for aider/goose/cline (python/node).
+    ///
+    /// Kept precise: this fires only when `argv[0]` is a known interpreter, and
+    /// only matches a signature `process_name` that appears as an exact,
+    /// `/`-delimited PATH COMPONENT of a later argv token. So `grep openclaw`
+    /// (bare arg, no `/`) and `vim openclaw.md` (component is `openclaw.md`, not
+    /// `openclaw`) do not false-positive.
+    pub fn identify_cmdline(&self, argv: &[&str]) -> Option<&'static Signature> {
+        let exe = basename(argv.first().copied().unwrap_or("")).to_lowercase();
+        if !is_interpreter(&exe) {
+            return None;
+        }
+        let mut prev = "";
+        for token in argv.iter().skip(1) {
+            // `python -m aider`: a bare module name right after `-m`.
+            if prev == "-m" {
+                if let Some(&idx) = self.by_process.get(&token.to_lowercase()) {
+                    return Some(&KNOWN[idx]);
+                }
+            }
+            // `node .../node_modules/openclaw/dist/index.js`: exact path component.
+            if token.contains('/') {
+                for component in token.split('/') {
+                    if let Some(&idx) = self.by_process.get(&component.to_lowercase()) {
+                        return Some(&KNOWN[idx]);
+                    }
+                }
+            }
+            prev = token;
+        }
+        None
+    }
+
     /// Agents that can be installed via `innerwarden agent add`.
     pub fn installable_agents() -> Vec<&'static Signature> {
         KNOWN
@@ -255,6 +292,21 @@ impl Default for SignatureIndex {
     }
 }
 
+/// Last `/`-delimited component of a path (the executable name).
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Script interpreters that launch agents as a child script, hiding the agent
+/// identity from `comm`. Covers node/python/deno/bun/ruby/php/perl and
+/// version-suffixed pythons (`python3.12`).
+fn is_interpreter(exe: &str) -> bool {
+    matches!(
+        exe,
+        "node" | "nodejs" | "deno" | "bun" | "ruby" | "php" | "perl" | "uv"
+    ) || exe.starts_with("python")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +318,57 @@ mod tests {
         assert_eq!(oc.kind, Kind::Agent);
         let zc = idx.identify("zeroclaw").unwrap();
         assert_eq!(zc.kind, Kind::Agent);
+    }
+
+    #[test]
+    fn identify_cmdline_detects_openclaw_launched_via_node() {
+        // The exact live cmdline on the Azure VM (comm was "MainThread").
+        let idx = SignatureIndex::new();
+        let argv = [
+            "/usr/bin/node",
+            "/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js",
+            "gateway",
+            "--port",
+            "18789",
+        ];
+        let sig = idx.identify_cmdline(&argv).expect("openclaw via node");
+        assert_eq!(sig.name, "OpenClaw");
+    }
+
+    #[test]
+    fn identify_cmdline_detects_python_agent() {
+        let idx = SignatureIndex::new();
+        let argv = [
+            "/usr/bin/python3",
+            "/usr/local/lib/python3.12/site-packages/aider/main.py",
+        ];
+        assert_eq!(idx.identify_cmdline(&argv).unwrap().name, "Aider");
+    }
+
+    #[test]
+    fn identify_cmdline_detects_python_dash_m_module() {
+        let idx = SignatureIndex::new();
+        let argv = ["python3", "-m", "aider", "--model", "gpt-4o"];
+        assert_eq!(idx.identify_cmdline(&argv).unwrap().name, "Aider");
+        // A bare `aider` NOT preceded by -m must not match (could be any arg).
+        assert!(idx.identify_cmdline(&["python3", "aider"]).is_none());
+    }
+
+    #[test]
+    fn identify_cmdline_ignores_non_interpreter_and_bare_args() {
+        let idx = SignatureIndex::new();
+        // grep with a bare arg "openclaw" (no '/') → not an interpreter anyway.
+        assert!(idx.identify_cmdline(&["grep", "openclaw"]).is_none());
+        // node editing a doc whose component is "openclaw.md", not "openclaw".
+        assert!(idx
+            .identify_cmdline(&["/usr/bin/node", "/home/u/openclaw.md"])
+            .is_none());
+        // a plain node app with no agent in its path.
+        assert!(idx
+            .identify_cmdline(&["node", "/srv/app/server.js"])
+            .is_none());
+        // empty argv must not panic.
+        assert!(idx.identify_cmdline(&[]).is_none());
     }
 
     #[test]

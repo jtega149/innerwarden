@@ -1156,7 +1156,16 @@ impl RootkitDetector {
             | "process.exit"
             | "process.clone"
             | "shell.command_exec"
-            | "tcp_stream.flow" => {
+            // tcp_stream.* are infrequent protocol-stream events: the
+            // inter-event delta measures traffic idleness, not syscall-hook
+            // latency. `tcp_stream.flow` was already skipped; `.http`/`.ssh`/
+            // `.smb` were missed and produced critical `rootkit:timing` FPs
+            // (e.g. an 895-second gap between two HTTP streams flagged as a
+            // "getdents64 hook"). Same idleness class as the network.* kinds.
+            | "tcp_stream.flow"
+            | "tcp_stream.http"
+            | "tcp_stream.ssh"
+            | "tcp_stream.smb" => {
                 return None;
             }
             _ => {}
@@ -2108,6 +2117,53 @@ mod tests {
             triggered,
             "Should trigger after 5 consecutive anomalous timings"
         );
+    }
+
+    #[test]
+    fn timing_skips_tcp_stream_protocol_kinds() {
+        // Spec 071 Part B: tcp_stream.{http,ssh,smb} are infrequent
+        // protocol-stream events; their inter-event delta is traffic idleness,
+        // not syscall-hook latency. Before this skip, an 895-second gap between
+        // two HTTP streams fired a critical `rootkit:timing` FP (baseline was
+        // ~4.8s, so a 900s gap is z>>4). Mirrors the tcp_stream.flow / network.*
+        // exclusions. These kinds must never be tracked or flagged.
+        for kind in ["tcp_stream.http", "tcp_stream.ssh", "tcp_stream.smb"] {
+            let mut det = timing_detector(3, 4.0, 3);
+            let mut ts = Utc::now();
+            // Tight "baseline" then repeated massive idle gaps — would trip the
+            // z-score if these kinds were tracked like a hot syscall.
+            for _ in 0..20 {
+                assert!(det.process(&timing_event(kind, ts)).is_none());
+                ts += Duration::milliseconds(1);
+            }
+            for _ in 0..10 {
+                ts += Duration::seconds(900);
+                assert!(
+                    det.process(&timing_event(kind, ts)).is_none(),
+                    "{kind} must never raise a timing anomaly (idleness, not latency)"
+                );
+            }
+            assert!(
+                !det.syscall_timing.contains_key(kind),
+                "{kind} should be skipped before any timing tracking"
+            );
+        }
+    }
+
+    #[test]
+    fn timing_still_tracks_file_read_access_after_tcp_stream_skip() {
+        // Regression: extending the skip list did not disable the real
+        // latency-tracked kinds. file.read_access still trains + fires.
+        let mut det = timing_detector(10, 4.0, 5);
+        let base = Utc::now();
+        for i in 0..15 {
+            det.process(&timing_event(
+                "file.read_access",
+                base + Duration::milliseconds(i),
+            ));
+        }
+        assert!(det.syscall_timing.contains_key("file.read_access"));
+        assert!(det.syscall_timing["file.read_access"].trained);
     }
 
     // --- Timing Test 5: Different syscall kinds tracked independently ---

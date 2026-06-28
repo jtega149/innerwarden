@@ -613,6 +613,7 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
             "honeypot_mode": action_cfg.honeypot_mode,
             "telegram": action_cfg.telegram_enabled,
             "slack": action_cfg.slack_enabled,
+            "discord": action_cfg.discord_enabled,
             "cloudflare": action_cfg.cloudflare_enabled,
             "crowdsec": action_cfg.crowdsec_enabled,
             "mesh": action_cfg.mesh_enabled,

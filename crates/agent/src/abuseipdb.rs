@@ -29,13 +29,21 @@ pub struct AbuseIpDbResponse {
     pub data: AbuseIpDbData,
 }
 
+// Required scalar fields carry `#[serde(default)]` so a single upstream
+// schema flip (a missing field, or a `null`) cannot fail the WHOLE record and
+// silently kill AbuseIPDB enrichment for every IP — the DShield/geoip failure
+// class. Defaults are the safe "no signal" values (score 0, 0 reports).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AbuseIpDbData {
     #[allow(dead_code)]
+    #[serde(default)]
     pub ip_address: String,
+    #[serde(default)]
     pub abuse_confidence_score: u8, // 0–100
+    #[serde(default)]
     pub total_reports: u32,
+    #[serde(default)]
     pub num_distinct_users: u32,
     pub country_code: Option<String>,
     pub isp: Option<String>,
@@ -43,6 +51,7 @@ pub struct AbuseIpDbData {
     pub domain: Option<String>,
     pub is_tor: Option<bool>,
     #[allow(dead_code)]
+    #[serde(default)]
     pub is_public: bool,
 }
 
@@ -292,6 +301,23 @@ mod tests {
         assert_eq!(resp.data.country_code.as_deref(), Some("CN"));
         assert_eq!(resp.data.isp.as_deref(), Some("SomeHosting Inc."));
         assert_eq!(resp.data.is_tor, Some(false));
+    }
+
+    #[test]
+    fn deserializes_with_missing_required_scalars() {
+        // Robustness (DShield/geoip class): if AbuseIPDB ever omits a required
+        // scalar (schema flip / partial response), `#[serde(default)]` must keep
+        // the record parsing with safe zero values instead of failing the whole
+        // record and silently killing enrichment for every IP.
+        let json = r#"{ "data": { "countryCode": "US", "isp": "Acme" } }"#;
+        let resp: AbuseIpDbResponse =
+            serde_json::from_str(json).expect("must parse with missing required scalars");
+        assert_eq!(resp.data.abuse_confidence_score, 0);
+        assert_eq!(resp.data.total_reports, 0);
+        assert_eq!(resp.data.num_distinct_users, 0);
+        assert!(!resp.data.is_public);
+        assert_eq!(resp.data.ip_address, "");
+        assert_eq!(resp.data.country_code.as_deref(), Some("US"));
     }
 
     #[test]

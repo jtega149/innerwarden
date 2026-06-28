@@ -159,7 +159,15 @@ impl ThreatFeedClient {
         if !resp.status().is_success() {
             anyhow::bail!("HTTP {}", resp.status());
         }
-        let body = resp.text().await?;
+        // Cap the body — IOC feed URLs are operator-configured and may be plain
+        // http:// (MITM-able). An unbounded `text()` lets a hostile/MITM'd feed
+        // OOM the agent. Mirrors the CrowdSec stream cap.
+        const MAX_BODY: usize = 8 * 1024 * 1024;
+        let bytes = resp.bytes().await?;
+        if bytes.len() > MAX_BODY {
+            anyhow::bail!("IOC feed body too large ({} bytes), skipping", bytes.len());
+        }
+        let body = String::from_utf8_lossy(&bytes);
 
         let mut added = 0usize;
         for line in body.lines() {

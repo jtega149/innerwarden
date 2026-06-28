@@ -87,6 +87,147 @@ pub(crate) fn xdp_failure_to_warn(
     }
 }
 
+/// Extract the source-process identity `(pid, comm, read_path)` from an
+/// incident's `evidence`, tolerating both the array-of-one shape the eBPF
+/// detectors + killchain tracker emit (`evidence: [{...}]`) and a bare object.
+///
+/// For `data_exfil_ebpf` the evidence keys are `comm`, `pid`, `sensitive_file`
+/// (per `crates/sensor/src/detectors/data_exfil_ebpf.rs`); for the killchain
+/// tracker they are `comm`, `pid`, `pattern` (no read path). Returns `None`
+/// when there is no pid to attribute (then there is no source to verify and the
+/// block proceeds).
+fn incident_source_identity(
+    incident: &innerwarden_core::incident::Incident,
+) -> Option<(u32, String, Option<String>)> {
+    let ev = match &incident.evidence {
+        serde_json::Value::Array(arr) => arr.first()?,
+        obj @ serde_json::Value::Object(_) => obj,
+        _ => return None,
+    };
+    let pid = ev.get("pid").and_then(|p| p.as_u64())? as u32;
+    let comm = ev
+        .get("comm")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    let read_path = ev
+        .get("sensitive_file")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string());
+    Some((pid, comm, read_path))
+}
+
+/// Spec 081 — consult the managed-agent verifier for the incident's source
+/// process. Returns `Some((agent_id, name))` ONLY when the source is a
+/// positively-verified, IW-managed agent acting on its own services (the caller
+/// then downgrades to monitor); `None` in every other case (no attributable
+/// source, registry miss, forged identity, recycled pid, …) so the block
+/// proceeds normally. Fail-closed by construction.
+///
+/// Clones the shared registry + signature-index `Arc`s up front so the registry
+/// lock does not conflict with the `&mut state` borrow of other fields.
+///
+/// This thin wrapper performs the AgentState-dependent steps (non-blocking
+/// `try_lock` of the shared registry, clone of the signature index, the
+/// destination-reputation lookup) and then delegates the verdict to the pure-of
+/// -AgentState [`evaluate_managed_agent_downgrade`] with the production
+/// [`crate::managed_agent_guard::SystemProc`] resolver. Behaviour is IDENTICAL
+/// to the pre-refactor inline body; the split only lets the wiring be tested
+/// without a live `/proc` or a full `AgentState`.
+fn managed_agent_downgrade(
+    incident: &innerwarden_core::incident::Incident,
+    state: &AgentState,
+) -> Option<(String, String)> {
+    let registry = state.agent_registry.clone();
+    let sigindex = state.signature_index.clone();
+    // Non-blocking try_lock: the registry mutex is only contended for the brief
+    // window of an `agent connect`. If it is momentarily held, fail closed
+    // (block proceeds) rather than await inside the block-decision hot path.
+    let reg = registry.try_lock().ok()?;
+    let resolver = crate::managed_agent_guard::SystemProc;
+    evaluate_managed_agent_downgrade(
+        incident,
+        &reg,
+        &sigindex,
+        &resolver,
+        // Destination-reputation refinement: when the destination IP is
+        // independently known-malicious, force the block regardless of source.
+        // This is a BLOCK override only — never a destination EXEMPTION.
+        destination_is_known_bad(incident, state),
+    )
+}
+
+/// Pure-of-`AgentState` core of the managed-agent downgrade decision (spec 081).
+/// Given the incident, an already-locked registry, the signature index, a
+/// `/proc` resolver, and the precomputed destination-known-bad flag, returns
+/// `Some((agent_id, name))` when the incident's source is a positively-verified
+/// IW-managed agent on its own services (downgrade to monitor) and `None`
+/// otherwise (block proceeds).
+///
+/// `incident_source_identity` is the first step: with no attributable pid there
+/// is no source to verify, so the block proceeds (`None`). Identical behaviour
+/// to the former inline body of [`managed_agent_downgrade`]; extracting it lets
+/// the wiring be exercised with a stub resolver + a hand-built registry without
+/// constructing a full `AgentState`.
+fn evaluate_managed_agent_downgrade(
+    incident: &innerwarden_core::incident::Incident,
+    registry: &innerwarden_agent_guard::registry::Registry,
+    sigindex: &innerwarden_agent_guard::signatures::SignatureIndex,
+    resolver: &dyn crate::managed_agent_guard::ProcResolver,
+    destination_known_bad: bool,
+) -> Option<(String, String)> {
+    let (pid, comm, read_path) = incident_source_identity(incident)?;
+    let verdict = crate::managed_agent_guard::verify_managed_agent_self_activity(
+        pid,
+        &comm,
+        read_path.as_deref(),
+        registry,
+        sigindex,
+        resolver,
+        destination_known_bad,
+    );
+    match verdict {
+        crate::managed_agent_guard::ManagedAgentVerdict::Managed { agent_id, name } => {
+            Some((agent_id, name))
+        }
+        crate::managed_agent_guard::ManagedAgentVerdict::NotManaged => None,
+    }
+}
+
+/// Destination-reputation hook (spec 081). Returns true when the incident's
+/// destination IP is independently known-malicious, which forces the block even
+/// for an otherwise-managed agent. Today this consults the in-memory local IP
+/// reputation (a destination the agent itself previously confirmed bad). It is
+/// deliberately conservative: a miss returns false (no block override), so the
+/// managed-agent downgrade still applies for unknown destinations. NEVER turns
+/// a known-bad destination into an exemption.
+fn destination_is_known_bad(
+    incident: &innerwarden_core::incident::Incident,
+    state: &AgentState,
+) -> bool {
+    dst_known_bad_from(&incident.entities, &state.ip_reputations)
+}
+
+/// Pure core of [`destination_is_known_bad`]: true when any IP entity of the
+/// incident has a local reputation with `total_blocks > 0` (a destination the
+/// agent itself previously confirmed bad). Split from the `AgentState`-bound
+/// wrapper so the lookup is unit-testable with a hand-built entity slice +
+/// reputation map. Identical behaviour to the former inline body.
+fn dst_known_bad_from(
+    entities: &[innerwarden_core::entities::EntityRef],
+    reputations: &std::collections::HashMap<String, crate::ip_reputation::LocalIpReputation>,
+) -> bool {
+    use innerwarden_core::entities::EntityType;
+    entities
+        .iter()
+        .filter(|e| e.r#type == EntityType::Ip)
+        .any(|e| {
+            reputations
+                .get(&e.value)
+                .is_some_and(|r| r.total_blocks > 0)
+        })
+}
+
 /// Execute the layered `BlockIp` decision path (XDP + firewall + Cloudflare + AbuseIPDB report).
 pub(crate) async fn execute_block_ip_decision(
     ip: &str,
@@ -109,6 +250,37 @@ pub(crate) async fn execute_block_ip_decision(
     state
         .store
         .prune_recent_blocks_before((now_utc - chrono::Duration::seconds(60)).timestamp_millis());
+
+    // Spec 081 — managed-agent coexistence. BEFORE we block the destination IP,
+    // check whether the incident's SOURCE process is a positively-verified,
+    // IW-managed AI agent acting on its OWN config / services (the OpenClaw
+    // class: reads its own .env, connects to its own Slack/Azure endpoint, which
+    // matches the generic sensitive-read → outbound-connect exfil/C2 signature).
+    // If so, DOWNGRADE to monitor/notify — do NOT block the destination IP (a
+    // shared service IP that other users depend on, and which the agent needs to
+    // keep working when it rotates). The relaxation is SOURCE-based (the agent
+    // identity), never destination-based, and AGENT-agnostic (any agent-guard
+    // signature). The verifier fails closed, and a known-bad destination still
+    // forces the block. Detection is untouched: the incident already fired and
+    // was notified; this only withholds the automatic IP-block.
+    if let Some((agent_id, name)) = managed_agent_downgrade(incident, state) {
+        warn!(
+            ip,
+            incident_id = %incident.incident_id,
+            agent_id = %agent_id,
+            agent = %name,
+            "withheld_ip_block: managed-agent-self-activity — destination {ip} block WITHHELD; \
+             source is verified managed agent {agent_id} ({name}) on its own services. \
+             Downgraded to monitor (incident + notification still fired). Detection unchanged."
+        );
+        return (
+            format!(
+                "downgraded to monitor: source is managed agent {agent_id} ({name}) on its \
+                 own services — destination IP {ip} not blocked (spec 081)"
+            ),
+            false,
+        );
+    }
 
     // Circuit breaker: hard ceiling on auto-blocks per UTC hour. Catches
     // the CL-008 *class* of regression — any future correlation rule that
@@ -176,15 +348,29 @@ pub(crate) async fn execute_block_ip_decision(
     // decision rather than a "skipped" no-op that would re-orphan. This runs
     // AFTER the safety gates (allowlist/safelist/circuit-breaker) so it can
     // never widen what gets blocked — it only suppresses a duplicate.
+    // …but only skip when the firewall rule is VERIFIABLY live. The lifecycle
+    // record can diverge from the actual firewall: a TTL removal that did not
+    // clear the record, an agent restart that reloaded a stale set, or an
+    // externally-flushed rule. Skipping on a stale record gives a repeat
+    // attacker a free pass — prod 2026-06-10: hundreds of known-bad IPs were
+    // "actively blocked" per the record yet absent from ufw, so every new hit
+    // was skipped and never re-blocked. Verify against the live backend first.
     if state.response_lifecycle.is_ip_actively_blocked(ip, now_utc) {
-        info!(
+        if is_ip_live_blocked(ip, skill_id).await {
+            info!(
+                ip,
+                "already actively blocked (verified live) — skipping redundant re-block"
+            );
+            return (
+                "already blocked: live firewall rule verified active for this IP".to_string(),
+                true,
+            );
+        }
+        warn!(
             ip,
-            "already actively blocked (live firewall rule) — skipping redundant re-block"
+            "lifecycle marks this IP actively blocked but no live firewall rule found — re-applying (stale record / dropped rule)"
         );
-        return (
-            "already blocked: live firewall rule already active for this IP".to_string(),
-            true,
-        );
+        // fall through: re-apply so a still-attacking IP never gets a free pass.
     }
 
     state.recent_blocks.push_back(now_utc);
@@ -579,11 +765,323 @@ where
     Ok(())
 }
 
+/// The status command for the firewall backend behind a block skill. `None`
+/// for backends we cannot cheaply introspect (xdp/pf/unknown) — the caller then
+/// re-applies (idempotent) rather than risk a free pass.
+fn backend_status_cmd(skill_id: &str) -> Option<(&'static str, &'static [&'static str])> {
+    if skill_id.contains("ufw") {
+        Some(("ufw", &["status"]))
+    } else if skill_id.contains("nft") {
+        Some(("nft", &["list", "ruleset"]))
+    } else if skill_id.contains("iptables") {
+        Some(("iptables", &["-S"]))
+    } else if skill_id.contains("firewalld") {
+        Some(("firewall-cmd", &["--list-all"]))
+    } else {
+        None
+    }
+}
+
+/// True when `ip` appears as a whole token in firewall status output. Splits on
+/// any char that cannot be part of an IP/CIDR so `1.2.3.4` never matches inside
+/// `11.2.3.4` or `1.2.3.40`.
+fn rule_present_in(status_output: &str, ip: &str) -> bool {
+    status_output
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == ':' || c == '/'))
+        .any(|tok| tok == ip)
+}
+
+/// Best-effort check of whether `ip` is in the LIVE firewall ruleset for the
+/// backend behind `skill_id`. Returns `false` when the backend is not
+/// introspectable or the query fails — callers treat `false` as "re-apply",
+/// which is idempotent and never opens a gap. Uses the same `sudo` path the
+/// block skills use to apply rules.
+async fn is_ip_live_blocked(ip: &str, skill_id: &str) -> bool {
+    let (prog, args) = match backend_status_cmd(skill_id) {
+        Some(c) => c,
+        None => return false,
+    };
+    match tokio::process::Command::new("sudo")
+        .arg(prog)
+        .args(args)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => rule_present_in(&String::from_utf8_lossy(&o.stdout), ip),
+        _ => false,
+    }
+}
+
+/// Status dump + (optional) apply command for the reconciler, keyed on the
+/// record's backend. `apply` is `None` for backends whose rules are table/chain
+/// specific (nft/firewalld) or kernel-map based (xdp/pf) — those are verify-only
+/// here; their standalone paths own re-application. Prod uses ufw.
+#[allow(clippy::type_complexity)]
+fn reconcile_cmds(
+    backend: &ResponseBackend,
+    ip: &str,
+) -> Option<(
+    (&'static str, Vec<String>),
+    Option<(&'static str, Vec<String>)>,
+)> {
+    match backend {
+        ResponseBackend::Ufw => Some((
+            ("ufw", vec!["status".to_string()]),
+            Some((
+                "ufw",
+                vec![
+                    "deny".into(),
+                    "from".into(),
+                    ip.to_string(),
+                    "to".into(),
+                    "any".into(),
+                ],
+            )),
+        )),
+        ResponseBackend::Iptables => Some((
+            ("iptables", vec!["-S".to_string()]),
+            Some((
+                "iptables",
+                vec![
+                    "-I".into(),
+                    "INPUT".into(),
+                    "-s".into(),
+                    ip.to_string(),
+                    "-j".into(),
+                    "DROP".into(),
+                ],
+            )),
+        )),
+        ResponseBackend::Nftables => Some((("nft", vec!["list".into(), "ruleset".into()]), None)),
+        _ => None,
+    }
+}
+
+async fn run_sudo_stdout(prog: &str, args: &[String]) -> Option<String> {
+    match tokio::process::Command::new("sudo")
+        .arg(prog)
+        .args(args)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        _ => None,
+    }
+}
+
+async fn run_sudo_ok(prog: &str, args: &[String]) -> bool {
+    matches!(
+        tokio::process::Command::new("sudo").arg(prog).args(args).output().await,
+        Ok(o) if o.status.success()
+    )
+}
+
+/// What the reconciler should do for one active block, given the live dump for
+/// its backend. The pure, testable core of the reconcile loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    /// Rule is live in the dump — just stamp it verified.
+    Present,
+    /// Rule is gone and the backend has an apply command — re-apply it.
+    Reapply,
+    /// Rule is gone but the backend has no hand-built apply (verify-only).
+    MissingNoReapply,
+    /// Backend we do not introspect (xdp/pf/firewalld) — its own path owns it.
+    Unsupported,
+    /// No dump available for this backend this tick — skip, retry next tick.
+    NoDump,
+}
+
+fn classify_for_reconcile(
+    backend: &ResponseBackend,
+    ip: &str,
+    dump: Option<&str>,
+) -> ReconcileAction {
+    let apply_available = match reconcile_cmds(backend, ip) {
+        Some((_, apply)) => apply.is_some(),
+        None => return ReconcileAction::Unsupported,
+    };
+    let dump = match dump {
+        Some(d) => d,
+        None => return ReconcileAction::NoDump,
+    };
+    if rule_present_in(dump, ip) {
+        ReconcileAction::Present
+    } else if apply_available {
+        ReconcileAction::Reapply
+    } else {
+        ReconcileAction::MissingNoReapply
+    }
+}
+
+/// Slow-loop block-enforcement reconciler (spec 076 phase 2). Makes the live
+/// firewall match intent: for every active, TTL-valid block whose rule is
+/// missing from the live ruleset, re-apply it; for every block confirmed present
+/// (or just re-applied), stamp `last_verified_live` so the dashboard reflects
+/// reality instead of the TTL alone. This is the proactive counterpart to the
+/// decision-time guard in `execute_block_ip_decision` — it closes the idle
+/// window between a rule silently dropping and the IP's next attack. Returns
+/// `(verified, reapplied)`.
+pub(crate) async fn reconcile_block_enforcement(state: &mut AgentState) -> (usize, usize) {
+    let now = chrono::Utc::now();
+    let targets = state.response_lifecycle.active_block_ip_targets(now);
+    if targets.is_empty() {
+        return (0, 0);
+    }
+
+    // Dump each distinct backend status program ONCE, not per IP.
+    let mut dumps: std::collections::HashMap<&'static str, String> =
+        std::collections::HashMap::new();
+    for (_ip, backend) in &targets {
+        if let Some(((sprog, sargs), _)) = reconcile_cmds(backend, "0.0.0.0") {
+            if !dumps.contains_key(sprog) {
+                if let Some(out) = run_sudo_stdout(sprog, &sargs).await {
+                    dumps.insert(sprog, out);
+                }
+            }
+        }
+    }
+
+    let mut verified = 0usize;
+    let mut reapplied = 0usize;
+    for (ip, backend) in &targets {
+        let dump = reconcile_cmds(backend, ip)
+            .and_then(|((sprog, _), _)| dumps.get(sprog).map(String::as_str));
+        match classify_for_reconcile(backend, ip, dump) {
+            ReconcileAction::Present => {
+                state.response_lifecycle.mark_verified_live(ip, now);
+                verified += 1;
+            }
+            ReconcileAction::Reapply => {
+                if let Some((_, Some((aprog, aargs)))) = reconcile_cmds(backend, ip) {
+                    if run_sudo_ok(aprog, &aargs).await {
+                        warn!(
+                            ip = %ip,
+                            backend = ?backend,
+                            "reconciler restored a dropped firewall block (was missing from the live ruleset)"
+                        );
+                        state.response_lifecycle.mark_verified_live(ip, now);
+                        reapplied += 1;
+                    } else {
+                        warn!(ip = %ip, "reconciler failed to re-apply a dropped block");
+                    }
+                }
+            }
+            ReconcileAction::MissingNoReapply => {
+                warn!(
+                    ip = %ip,
+                    backend = ?backend,
+                    "reconciler: block missing from live ruleset and backend has no auto-reapply (verify-only)"
+                );
+            }
+            ReconcileAction::Unsupported | ReconcileAction::NoDump => {}
+        }
+    }
+    if verified + reapplied > 0 {
+        info!(verified, reapplied, "block-enforcement reconcile complete");
+    }
+    (verified, reapplied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::time::Instant;
+
+    #[test]
+    fn backend_status_cmd_maps_known_backends() {
+        assert_eq!(
+            backend_status_cmd("block-ip-ufw"),
+            Some(("ufw", &["status"][..]))
+        );
+        assert_eq!(
+            backend_status_cmd("block-ip-nftables"),
+            Some(("nft", &["list", "ruleset"][..]))
+        );
+        assert_eq!(
+            backend_status_cmd("block-ip-iptables"),
+            Some(("iptables", &["-S"][..]))
+        );
+        assert_eq!(
+            backend_status_cmd("block-ip-firewalld"),
+            Some(("firewall-cmd", &["--list-all"][..]))
+        );
+        // Backends we cannot cheaply introspect -> None -> caller re-applies.
+        assert_eq!(backend_status_cmd("block-ip-xdp"), None);
+        assert_eq!(backend_status_cmd("block-ip-pf"), None);
+        assert_eq!(backend_status_cmd("monitor-ip"), None);
+    }
+
+    #[test]
+    fn reconcile_cmds_maps_backends() {
+        use crate::response_lifecycle::ResponseBackend;
+        // ufw + iptables: status dump + an apply command carrying the IP.
+        let (s, a) = reconcile_cmds(&ResponseBackend::Ufw, "1.2.3.4").unwrap();
+        assert_eq!(s.0, "ufw");
+        assert!(a.unwrap().1.contains(&"1.2.3.4".to_string()));
+        let (s, a) = reconcile_cmds(&ResponseBackend::Iptables, "1.2.3.4").unwrap();
+        assert_eq!(s.0, "iptables");
+        assert!(a.unwrap().1.contains(&"1.2.3.4".to_string()));
+        // nftables: verify-only (status, no hand-built apply).
+        let (s, a) = reconcile_cmds(&ResponseBackend::Nftables, "1.2.3.4").unwrap();
+        assert_eq!(s.0, "nft");
+        assert!(a.is_none());
+        // xdp: standalone path owns it -> reconciler skips.
+        assert!(reconcile_cmds(&ResponseBackend::Xdp, "1.2.3.4").is_none());
+    }
+
+    #[test]
+    fn classify_for_reconcile_decides_actions() {
+        use crate::response_lifecycle::ResponseBackend;
+        let ufw = "Status: active\n[1] Anywhere   DENY IN   1.2.3.4\n";
+        // present -> verify; missing + has apply -> reapply
+        assert_eq!(
+            classify_for_reconcile(&ResponseBackend::Ufw, "1.2.3.4", Some(ufw)),
+            ReconcileAction::Present
+        );
+        assert_eq!(
+            classify_for_reconcile(&ResponseBackend::Ufw, "9.9.9.9", Some(ufw)),
+            ReconcileAction::Reapply
+        );
+        // nft missing -> verify-only (no hand-built apply command)
+        assert_eq!(
+            classify_for_reconcile(
+                &ResponseBackend::Nftables,
+                "9.9.9.9",
+                Some("table inet f {}")
+            ),
+            ReconcileAction::MissingNoReapply
+        );
+        // xdp -> unsupported (own path); no dump -> skip this tick
+        assert_eq!(
+            classify_for_reconcile(&ResponseBackend::Xdp, "1.2.3.4", Some("x")),
+            ReconcileAction::Unsupported
+        );
+        assert_eq!(
+            classify_for_reconcile(&ResponseBackend::Ufw, "1.2.3.4", None),
+            ReconcileAction::NoDump
+        );
+    }
+
+    #[test]
+    fn rule_present_in_matches_whole_ip_token_only() {
+        let ufw = "Status: active\n[2419] Anywhere   DENY IN   45.148.10.121\n";
+        assert!(rule_present_in(ufw, "45.148.10.121"));
+        // No false positive on a substring / neighbouring IP.
+        assert!(!rule_present_in(ufw, "45.148.10.12"));
+        assert!(!rule_present_in(ufw, "145.148.10.121"));
+        assert!(!rule_present_in(ufw, "45.148.10.1"));
+        // Absent IP.
+        assert!(!rule_present_in(ufw, "8.8.8.8"));
+        // CIDR token preserved.
+        assert!(rule_present_in(
+            "-A INPUT -s 10.0.0.0/8 -j DROP",
+            "10.0.0.0/8"
+        ));
+        // Empty output.
+        assert!(!rule_present_in("", "1.2.3.4"));
+    }
 
     fn mem_store() -> innerwarden_store::Store {
         innerwarden_store::Store::open_memory().expect("memory store")
@@ -999,5 +1497,287 @@ mod tests {
         let (context, details) = result.expect("shield-only failure must warn");
         assert_eq!(context, "shield xdp_manager");
         assert_eq!(details, "shield: ENOENT");
+    }
+
+    // ── Spec 081 — managed-agent downgrade wiring (decision_block_ip side) ──
+    //
+    // These cover the extracted, AgentState-free helpers:
+    //   - `incident_source_identity` (evidence-shape parsing)
+    //   - `dst_known_bad_from` (destination-reputation lookup)
+    //   - `evaluate_managed_agent_downgrade` (the userspace IP-block downgrade
+    //     decision, against a stub `/proc` resolver + hand-built registry)
+    // plus the CROSS test that proves the SAME incident is spared on BOTH the
+    // userspace IP-block path AND the kernel-block path.
+
+    use innerwarden_agent_guard::registry::Registry;
+    use innerwarden_agent_guard::signatures::SignatureIndex;
+    use innerwarden_core::entities::EntityRef;
+    use innerwarden_core::event::Severity;
+    use innerwarden_core::incident::Incident;
+
+    /// Prod-realistic OpenClaw interpreter (`/proc/<pid>/exe`) + identity script
+    /// (argv[1]) + the `interpreter|script` fingerprint the hardened `connect()`
+    /// records. Mirrors the fixtures in `managed_agent_guard::tests`.
+    const OC_INTERP: &str = "/usr/bin/node";
+    const OC_SCRIPT: &str = "/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js";
+
+    fn oc_fingerprint() -> String {
+        format!("{OC_INTERP}|{OC_SCRIPT}")
+    }
+
+    fn oc_resolved(uid: u32) -> crate::managed_agent_guard::ResolvedProcess {
+        crate::managed_agent_guard::ResolvedProcess {
+            argv: vec![
+                OC_INTERP.to_string(),
+                OC_SCRIPT.to_string(),
+                "gateway".to_string(),
+            ],
+            exe_path: Some(OC_INTERP.to_string()),
+            uid: Some(uid),
+        }
+    }
+
+    /// Registry that vouches for OpenClaw at `pid` with the hardened facts
+    /// captured exactly as production `connect()` would.
+    fn registry_with_openclaw(pid: u32) -> Registry {
+        let mut reg = Registry::new();
+        reg.connect_with_facts(
+            "OpenClaw",
+            pid,
+            Some("ag-x"),
+            Some(OC_INTERP.to_string()),
+            Some(1000),
+            Some(oc_fingerprint()),
+        )
+        .expect("connect");
+        reg
+    }
+
+    /// Build a realistic exfil/C2 incident: evidence carries `pid`/`comm`/
+    /// `sensitive_file`/`pattern` (the `data_exfil_ebpf` shape) AND an Ip
+    /// entity for the outbound destination.
+    fn openclaw_exfil_incident(pid: u32, dst_ip: &str) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "azure-dogfood".to_string(),
+            incident_id: format!("data_exfil:detected:{pid}:2026-06-18T00:00Z"),
+            severity: Severity::Critical,
+            title: "Data exfiltration".to_string(),
+            summary: "sensitive read → outbound connect".to_string(),
+            evidence: serde_json::json!([{
+                "pid": pid,
+                "comm": "MainThread",
+                "sensitive_file": "/home/lab/.env",
+                "pattern": "data_exfil",
+            }]),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip(dst_ip)],
+        }
+    }
+
+    #[test]
+    fn incident_source_identity_parses_array_evidence() {
+        let inc = openclaw_exfil_incident(4242, "1.2.3.4");
+        let (pid, comm, read_path) =
+            incident_source_identity(&inc).expect("array evidence must parse");
+        assert_eq!(pid, 4242);
+        assert_eq!(comm, "MainThread");
+        assert_eq!(read_path.as_deref(), Some("/home/lab/.env"));
+    }
+
+    #[test]
+    fn incident_source_identity_parses_object_evidence() {
+        let mut inc = openclaw_exfil_incident(7, "1.2.3.4");
+        // Collapse the array-of-one into a bare object — the killchain forward
+        // -compat shape.
+        inc.evidence = serde_json::json!({
+            "pid": 7,
+            "comm": "node",
+            "sensitive_file": "/home/lab/.env",
+        });
+        let (pid, comm, read_path) =
+            incident_source_identity(&inc).expect("object evidence must parse");
+        assert_eq!(pid, 7);
+        assert_eq!(comm, "node");
+        assert_eq!(read_path.as_deref(), Some("/home/lab/.env"));
+    }
+
+    #[test]
+    fn incident_source_identity_returns_none_without_pid() {
+        let mut inc = openclaw_exfil_incident(1, "1.2.3.4");
+        // Evidence present but no pid → no attributable source → None.
+        inc.evidence = serde_json::json!([{ "comm": "node" }]);
+        assert!(incident_source_identity(&inc).is_none());
+        // A non-array/object evidence shape → None too.
+        inc.evidence = serde_json::json!("not-an-object");
+        assert!(incident_source_identity(&inc).is_none());
+    }
+
+    #[test]
+    fn dst_known_bad_from_true_when_ip_entity_has_blocks() {
+        let mut reps = HashMap::new();
+        let mut rep = crate::ip_reputation::LocalIpReputation::new();
+        rep.total_blocks = 3;
+        reps.insert("1.2.3.4".to_string(), rep);
+        let entities = vec![EntityRef::ip("1.2.3.4")];
+        assert!(dst_known_bad_from(&entities, &reps));
+    }
+
+    #[test]
+    fn dst_known_bad_from_false_when_unknown_or_no_blocks() {
+        let mut reps = HashMap::new();
+        // Present but zero blocks → not known-bad.
+        reps.insert(
+            "1.2.3.4".to_string(),
+            crate::ip_reputation::LocalIpReputation::new(),
+        );
+        let entities = vec![EntityRef::ip("1.2.3.4")];
+        assert!(!dst_known_bad_from(&entities, &reps));
+        // Unknown IP → not known-bad.
+        let other = vec![EntityRef::ip("9.9.9.9")];
+        assert!(!dst_known_bad_from(&other, &reps));
+        // A non-IP entity (user) is ignored.
+        let user = vec![EntityRef::user("lab")];
+        assert!(!dst_known_bad_from(&user, &reps));
+    }
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_managed_for_real_openclaw() {
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        let out = evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false);
+        let (agent_id, name) = out.expect("real OpenClaw self-activity must downgrade");
+        assert_eq!(name, "OpenClaw");
+        assert!(agent_id.starts_with("ag-"));
+    }
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_none_when_unregistered() {
+        let pid = 4242;
+        let reg = Registry::new(); // nobody registered
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false).is_none(),
+            "an unregistered source must NOT downgrade — block proceeds"
+        );
+    }
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_none_when_no_pid_in_evidence() {
+        let reg = registry_with_openclaw(4242);
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default();
+        let mut inc = openclaw_exfil_incident(4242, "1.2.3.4");
+        inc.evidence = serde_json::json!([{ "comm": "MainThread" }]); // no pid
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false).is_none(),
+            "no attributable pid → None (block proceeds)"
+        );
+    }
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_none_when_destination_known_bad() {
+        // Even a perfect managed agent is blocked when the destination is
+        // independently known-malicious (reputation override).
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, true).is_none(),
+            "destination_known_bad=true forces the block even for a managed agent"
+        );
+    }
+
+    // ── CROSS / INTEGRATION TEST (incident → response, BOTH paths) ─────────
+    //
+    // The SAME realistic OpenClaw incident must be spared on BOTH response
+    // paths: the userspace IP-block (`evaluate_managed_agent_downgrade`) AND
+    // the kernel PID-block (`killchain_inline::evaluate_kernel_block_withhold`).
+    // The negative variant (unregistered pid) must block on BOTH. This proves
+    // the end-to-end incident→response wiring, not just the unit `decide()`.
+
+    #[test]
+    fn cross_managed_openclaw_spared_on_both_response_paths() {
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        // Prod-realistic OpenClaw: exe=/usr/bin/node, argv carries the script,
+        // uid 1000, owner of /home/lab/.env = 1000.
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+
+        // (1) Userspace IP-block path — downgrade (Some).
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        let userspace = evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false);
+        assert!(
+            userspace.is_some(),
+            "userspace IP-block must be downgraded for the managed OpenClaw"
+        );
+
+        // (2) Kernel-block path — withhold (Some). Build the killchain evidence
+        // object shape the kernel path reads (pid + pattern=data_exfil + comm +
+        // the `sensitive_file` the tracker now emits). The read is the agent's
+        // OWN /home/lab/.env (owner uid 1000), so the own-config gate passes on
+        // the kernel path exactly like the userspace path.
+        let kc_ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+            "sensitive_file": "/home/lab/.env",
+        });
+        let kernel =
+            crate::killchain_inline::evaluate_kernel_block_withhold(&kc_ev, &reg, &sigindex, &stub);
+        assert!(
+            kernel.is_some(),
+            "kernel PID-block must be WITHHELD for the managed OpenClaw"
+        );
+
+        // Same agent identity surfaced on both paths.
+        assert_eq!(userspace.unwrap().1, "OpenClaw");
+        assert_eq!(kernel.unwrap().1, "OpenClaw");
+    }
+
+    #[test]
+    fn cross_unregistered_pid_blocks_on_both_response_paths() {
+        let pid = 4242;
+        let reg = Registry::new(); // EMPTY registry — nobody vouched
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000))
+            .with_owner("/home/lab/.env", 1000);
+
+        // (1) Userspace IP-block path — proceeds (None).
+        let inc = openclaw_exfil_incident(pid, "1.2.3.4");
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false).is_none(),
+            "unregistered source → userspace block proceeds"
+        );
+
+        // (2) Kernel-block path — proceeds (None).
+        let kc_ev = serde_json::json!({
+            "pid": pid,
+            "pattern": "data_exfil",
+            "comm": "MainThread",
+        });
+        assert!(
+            crate::killchain_inline::evaluate_kernel_block_withhold(&kc_ev, &reg, &sigindex, &stub)
+                .is_none(),
+            "unregistered source → kernel block proceeds"
+        );
     }
 }

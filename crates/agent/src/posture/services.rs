@@ -208,3 +208,173 @@ fn extract_comm(s: &str) -> Option<String> {
     let close = rest.find('"')?;
     Some(rest[..close].to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr_port(addr: &str, port: u16) -> Option<(String, u16)> {
+        Some((addr.to_string(), port))
+    }
+
+    #[test]
+    fn parse_ss_dump_parses_known_good_tcp_snippet() {
+        let dump = "\
+LISTEN 0      128        127.0.0.1:22        0.0.0.0:*    users:((\"sshd\",pid=1234,fd=3))
+LISTEN 0      4096         0.0.0.0:8787      0.0.0.0:*    users:((\"innerwarden-age\",pid=4321,fd=45))
+";
+
+        let listeners = parse_ss_dump(dump, Proto::Tcp);
+
+        assert_eq!(
+            listeners,
+            vec![
+                Listener {
+                    proto: Proto::Tcp,
+                    port: 22,
+                    addr: "127.0.0.1".to_string(),
+                    comm: "sshd".to_string(),
+                },
+                Listener {
+                    proto: Proto::Tcp,
+                    port: 8787,
+                    addr: "0.0.0.0".to_string(),
+                    comm: "innerwarden-age".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ss_dump_empty_input_returns_empty_vec() {
+        assert!(parse_ss_dump("", Proto::Tcp).is_empty());
+        assert!(parse_ss_dump("   \n\t\n", Proto::Udp).is_empty());
+    }
+
+    #[test]
+    fn parse_ss_dump_skips_header_line() {
+        let dump = "\
+State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+LISTEN 0      128        127.0.0.1:22    0.0.0.0:*         users:((\"sshd\",pid=1234,fd=3))
+";
+
+        let listeners = parse_ss_dump(dump, Proto::Tcp);
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].addr, "127.0.0.1");
+        assert_eq!(listeners[0].port, 22);
+    }
+
+    #[test]
+    fn parse_ss_dump_handles_ipv6_bind_address() {
+        let dump = "\
+LISTEN 0      128             [::]:443          [::]:*    users:((\"nginx\",pid=99,fd=8))
+";
+
+        let listeners = parse_ss_dump(dump, Proto::Tcp);
+
+        assert_eq!(
+            listeners,
+            vec![Listener {
+                proto: Proto::Tcp,
+                port: 443,
+                addr: "[::]".to_string(),
+                comm: "nginx".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_ss_dump_accepts_udp_unconn_zone_id() {
+        let dump = "\
+UNCONN 0      0          127.0.0.53%lo:53     0.0.0.0:*    users:((\"systemd-resolve\",pid=999,fd=14))
+";
+
+        let listeners = parse_ss_dump(dump, Proto::Udp);
+
+        assert_eq!(
+            listeners,
+            vec![Listener {
+                proto: Proto::Udp,
+                port: 53,
+                addr: "127.0.0.53%lo".to_string(),
+                comm: "systemd-resolve".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_ss_dump_defaults_missing_process_column_to_question_mark() {
+        let dump = "\
+LISTEN 0      128          0.0.0.0:22        0.0.0.0:*
+";
+
+        let listeners = parse_ss_dump(dump, Proto::Tcp);
+
+        assert_eq!(
+            listeners,
+            vec![Listener {
+                proto: Proto::Tcp,
+                port: 22,
+                addr: "0.0.0.0".to_string(),
+                comm: "?".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_ss_dump_skips_unparseable_local_address() {
+        let dump = "\
+LISTEN 0      128          not-an-addr        0.0.0.0:*    users:((\"bad\",pid=1,fd=1))
+LISTEN 0      128          0.0.0.0:22         0.0.0.0:*    users:((\"sshd\",pid=1234,fd=3))
+";
+
+        let listeners = parse_ss_dump(dump, Proto::Tcp);
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].comm, "sshd");
+    }
+
+    #[test]
+    fn split_addr_port_parses_ipv4_address() {
+        assert_eq!(split_addr_port("127.0.0.1:22"), addr_port("127.0.0.1", 22));
+    }
+
+    #[test]
+    fn split_addr_port_parses_ipv6_address_without_losing_brackets() {
+        assert_eq!(split_addr_port("[::1]:80"), addr_port("[::1]", 80));
+    }
+
+    #[test]
+    fn split_addr_port_parses_wildcard_listener() {
+        assert_eq!(split_addr_port("*:53"), addr_port("*", 53));
+    }
+
+    #[test]
+    fn split_addr_port_returns_none_without_port_separator() {
+        assert_eq!(split_addr_port("not-an-addr"), None);
+    }
+
+    #[test]
+    fn split_addr_port_returns_none_for_non_numeric_port() {
+        assert_eq!(split_addr_port("127.0.0.1:not-a-port"), None);
+    }
+
+    #[test]
+    fn extract_comm_parses_ss_users_field() {
+        assert_eq!(
+            extract_comm("users:((\"sshd\",pid=1234,fd=3))"),
+            Some("sshd".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_comm_returns_none_without_users_field() {
+        assert_eq!(extract_comm("timer:(\"sshd\",pid=1234,fd=3)"), None);
+    }
+
+    #[test]
+    fn extract_comm_returns_none_for_malformed_quotes() {
+        assert_eq!(extract_comm("users:((\"sshd,pid=1234,fd=3))"), None);
+    }
+}
