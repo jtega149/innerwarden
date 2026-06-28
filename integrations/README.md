@@ -22,6 +22,11 @@ external automation tool**, see [`docs/integration-recipes/`](../docs/integratio
   `GET /api/agent/security-context` and `POST /api/agent/check-command` from an
   n8n workflow, with an importable example that halts when the threat level is
   elevated.
+- [Claude Code](../docs/integration-recipes/claude-code-agent-guard.md) — wire a
+  fail-closed PreToolUse hook so every shell command Claude Code proposes is
+  screened by `POST /api/agent/check-command` before it runs, paired with the
+  [`claude-code-protection`](../modules/claude-code-protection/docs/README.md)
+  module for kernel-level execution monitoring.
 
 ## Adding a Recipe
 

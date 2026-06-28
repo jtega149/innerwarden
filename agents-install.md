@@ -237,8 +237,22 @@ still work but the grouped forms below are canonical.
 | `system` | Health / security / data | `system doctor`, `system scan`, `system harden`, `system tune`, `system calibrate`, `system test`, `system export`, `system backup`, `system reconcile-blocks`, `system gdpr` |
 | `rule` | Detection rules | `rule list [--type ...]`, `rule enable <id>`, `rule disable <id>` |
 | `module` | Security modules | `module list`, `module search`, `module install <src>`, `module enable <path>`, `module disable <id>` |
-| `agent` | AI-agent protection | `agent list`, `agent scan`, `agent connect [pid]`, `agent disconnect <id>`, `agent proxy --mode {advisory\|warn\|guard\|kill} -- <server-cmd>`, `agent mcp-serve` |
+| `agent` | AI-agent protection | `agent list`, `agent scan`, `agent connect [pid]`, `agent disconnect <id>`, `agent install-hook [--block-review]`, `agent proxy --mode {advisory\|warn\|guard\|kill} -- <server-cmd>`, `agent mcp-serve` |
 | top-level | Lifecycle | `setup`, `upgrade [--check]`, `uninstall [--purge]`, `dashboard {open\|close\|tunnel}`, `install-warden`, `enable <cap>`, `disable <cap>`, `list`, `completions <shell>` |
+
+**`agent install-hook` guards the agent's RAW shell tool (the enforcing in-path front door for a
+coding agent like Claude Code):** `mcp-serve` and `check-command` are *advisory* — a coding agent
+running its own shell tool never asks. `install-hook` writes a fail-closed `PreToolUse` hook into
+the agent's settings so EVERY shell command it proposes is POSTed to the loopback `check-command`
+brain and blocked *before* it runs when dangerous (and blocked if the brain is unreachable —
+fail-closed). Currently supports Claude Code (`~/.claude/settings.json`; `--settings`/`--url`
+override, `--block-review` also blocks `review` verdicts). Run it as the user that runs the agent.
+The matching built-in module is `claude-code-protection` (`enable claude-code-protection` for the
+observe-layer kernel detection). Example:
+
+```bash
+innerwarden agent install-hook            # claude-code, deny-only, fail-closed
+```
 
 **`agent proxy` is the MCP enforcement front door:** wrap an MCP server so InnerWarden sits *in
 the path* of the AI agent's tool calls and inspects / blocks / kills them. Example:

@@ -253,6 +253,15 @@ impl SignatureIndex {
     /// `openclaw`) do not false-positive.
     pub fn identify_cmdline(&self, argv: &[&str]) -> Option<&'static Signature> {
         let exe = basename(argv.first().copied().unwrap_or("")).to_lowercase();
+        // Standalone-binary launch: argv[0] IS the agent's own native binary
+        // (e.g. Claude Code, distributed as `~/.local/bin/claude` -> a native
+        // executable, NOT an interpreter). Match the basename directly against a
+        // known signature `process_name`. This is the tool-CLI counterpart of the
+        // interpreter+script path below; it must run BEFORE the `is_interpreter`
+        // gate, which would otherwise reject a non-interpreter argv[0] outright.
+        if let Some(&idx) = self.by_process.get(&exe) {
+            return Some(&KNOWN[idx]);
+        }
         if !is_interpreter(&exe) {
             return None;
         }
@@ -275,6 +284,16 @@ impl SignatureIndex {
             prev = token;
         }
         None
+    }
+
+    /// True when `argv[0]`'s basename is itself a known agent `process_name` — a
+    /// STANDALONE-BINARY launch (e.g. Claude Code's `~/.local/bin/claude`), as
+    /// opposed to an interpreter+script launch (`node X.js`). The spec-081
+    /// managed-agent verifier uses this to bind own-config to the agent user's
+    /// HOME (derived from the binary path) rather than to a script install dir.
+    pub fn is_standalone_binary_launch(&self, argv: &[&str]) -> bool {
+        let exe = basename(argv.first().copied().unwrap_or("")).to_lowercase();
+        self.by_process.contains_key(&exe)
     }
 
     /// Agents that can be installed via `innerwarden agent add`.
@@ -369,6 +388,39 @@ mod tests {
             .is_none());
         // empty argv must not panic.
         assert!(idx.identify_cmdline(&[]).is_none());
+    }
+
+    #[test]
+    fn identify_cmdline_detects_standalone_claude_code_binary() {
+        // Claude Code 2.x ships as a native binary, launched directly (argv[0]
+        // is the tool itself, NOT an interpreter). The real cmdline observed on a
+        // host: `/home/lab/.local/bin/claude -p "..."`.
+        let idx = SignatureIndex::new();
+        let argv = ["/home/lab/.local/bin/claude", "-p", "say hi"];
+        let sig = idx.identify_cmdline(&argv).expect("standalone claude");
+        assert_eq!(sig.name, "Claude Code");
+        // Bare command name (PATH-resolved) also matches.
+        assert_eq!(
+            idx.identify_cmdline(&["claude", "--version"]).unwrap().name,
+            "Claude Code"
+        );
+        // The resolved native binary basename matches too.
+        assert!(idx.is_standalone_binary_launch(&argv));
+        assert!(idx.is_standalone_binary_launch(&["claude"]));
+    }
+
+    #[test]
+    fn is_standalone_binary_launch_is_false_for_interpreter_and_unknown() {
+        let idx = SignatureIndex::new();
+        // node-launched OpenClaw: argv[0] is the interpreter, NOT a standalone
+        // tool binary -> false (own-config binds to the script, not the home).
+        assert!(!idx.is_standalone_binary_launch(&[
+            "/usr/bin/node",
+            "/home/lab/.npm-global/lib/node_modules/openclaw/dist/index.js",
+        ]));
+        // a random binary is not a known agent.
+        assert!(!idx.is_standalone_binary_launch(&["/usr/bin/grep", "x"]));
+        assert!(!idx.is_standalone_binary_launch(&[]));
     }
 
     #[test]

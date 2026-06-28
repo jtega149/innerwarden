@@ -3418,6 +3418,7 @@ bind_addr = "127.0.0.1:8787"
     #[test]
     fn known_module_id_recognises_registry_modules() {
         assert!(known_module_id("openclaw-protection"));
+        assert!(known_module_id("claude-code-protection"));
         assert!(known_module_id("cloudflare-integration"));
         assert!(known_module_id("ssh-protection"));
         assert!(known_module_id("container-security"));

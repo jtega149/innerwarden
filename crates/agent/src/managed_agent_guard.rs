@@ -341,6 +341,33 @@ fn interpreter_root_trusted(exe: &str) -> bool {
     TRUSTED_INTERPRETER_ROOTS.iter().any(|r| exe.starts_with(r))
 }
 
+/// True when a STANDALONE agent binary (`argv[0]`/`/proc/<pid>/exe` is the tool
+/// itself, e.g. Claude Code's `~/.local/bin/claude` or
+/// `~/.local/share/claude/versions/X`) sits in a trustworthy root. Unlike an
+/// interpreter (which MUST be a system binary), a standalone CLI tool is
+/// commonly user-installed under the home dir (`~/.local/...`, `~/.npm-global/...`,
+/// `~/.bun/...`); that is trusted because the binary path is the
+/// fingerprint-pinned identity (gate 2b in [`decide`]). Transient /
+/// attacker-writable roots (`/tmp`, `/dev/shm`, `/var/tmp`, `~/Downloads`,
+/// `~/Desktop`, `~/tmp`) are ALWAYS rejected — the same denylist the
+/// interpreter/script checks use.
+fn standalone_binary_root_trusted(exe: &str) -> bool {
+    if UNTRUSTED_EXE_ROOTS.iter().any(|r| exe.starts_with(r)) {
+        return false;
+    }
+    if is_untrusted_home_subdir(exe) {
+        return false;
+    }
+    // System / package roots are always trusted.
+    if TRUSTED_EXE_ROOTS.iter().any(|r| exe.starts_with(r)) {
+        return true;
+    }
+    // A standalone tool installed under the user's home (the common case for a
+    // per-user CLI). The untrusted-home-subdir reject above already excludes
+    // Downloads/Desktop/tmp; the binary path itself is the pinned identity.
+    exe.starts_with("/home/") || exe.starts_with("/root/")
+}
+
 /// All the inputs the pure [`decide`] core needs, already resolved. Keeping this
 /// a plain struct (no `/proc`, no registry) makes every branch of the no-hole
 /// logic unit-testable.
@@ -373,6 +400,13 @@ pub(crate) struct DecideInputs<'a> {
     /// NotManaged so the block still lands. NEVER a destination EXEMPTION — only
     /// a destination-based BLOCK override. Default false.
     pub destination_known_bad: bool,
+    /// True when the live process is a STANDALONE-BINARY agent launch — argv[0]
+    /// is itself a known tool binary (e.g. Claude Code's `~/.local/bin/claude`),
+    /// not an interpreter+script. Computed via
+    /// `SignatureIndex::is_standalone_binary_launch`. When set, the no-script
+    /// branch of [`decide`] binds own-config to the agent user's HOME (from the
+    /// binary path) instead of failing closed for lack of a script.
+    pub live_is_standalone_binary: bool,
 }
 
 /// Registry-captured identity facts for a pid.
@@ -450,16 +484,9 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
         return ManagedAgentVerdict::NotManaged;
     }
 
-    // Identity SCRIPT PATH (Defect 1): the argv token `identify_cmdline` matched
-    // — for `node X.js` it is argv[1] (the first later `/`-token). This, NOT
-    // `/proc/<pid>/exe` (the interpreter), is the basis for the untrusted-root
-    // rejection + home/install derivation + own-config check. A `python -m foo`
-    // agent has no script token → None → fail closed when a read_path is present.
-    let script_path = script_path_from_argv(&live.argv);
-
-    // Interpreter path for the trusted-root checks (3b / no-script branch).
-    // Prefer the kernel-truth `/proc/<pid>/exe`, but FALL BACK to argv[0] when it
-    // is unreadable. A NON-ROOT InnerWarden agent cannot `readlink` the
+    // Interpreter / binary path for the trusted-root checks. Prefer the
+    // kernel-truth `/proc/<pid>/exe`, but FALL BACK to argv[0] when it is
+    // unreadable. A NON-ROOT InnerWarden agent cannot `readlink` the
     // `/proc/<pid>/exe` of a managed agent running as a DIFFERENT user (EACCES),
     // so `exe_path` is None there — and without this fallback spec-081 silently
     // failed closed and blocked the agent's own activity (observed live on Azure:
@@ -467,12 +494,57 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
     // OpenClaw's own Azure-OpenAI endpoint got auto-blocked). The fallback is safe
     // ONLY because gate (2b) above already proved the live cmdline fingerprint
     // (argv[0]|argv[1]) EQUALS the operator-registered fingerprint, so argv[0] is
-    // the vouched interpreter, not an attacker's free-form claim. (Grant the agent
+    // the vouched path, not an attacker's free-form claim. (Grant the agent
     // CAP_SYS_PTRACE to restore strict /proc/exe verification — see the unit file.)
     let interp_path: Option<&str> = live
         .exe_path
         .as_deref()
         .or_else(|| live.argv.first().map(String::as_str));
+
+    // (S) Standalone-binary tool launch (e.g. Claude Code): argv[0] IS the
+    // agent's own native binary, pinned by the (2b) fingerprint equality. There
+    // is no interpreter+script, so own-config binds to the agent user's HOME
+    // derived from the binary path. Handled BEFORE script extraction because a
+    // flag/prompt token (`-p "edit /etc/hosts"`) may incidentally contain a `/`
+    // and would otherwise be mis-read as a script path. The binary must sit in a
+    // trusted root (system, or a user-install dir under the home), never a
+    // transient/attacker-writable root. This is the only path that may stay
+    // Managed WITH a read_path present yet without an interpreter script.
+    if inputs.live_is_standalone_binary {
+        let Some(exe) = interp_path else {
+            return ManagedAgentVerdict::NotManaged;
+        };
+        if !standalone_binary_root_trusted(exe) {
+            return ManagedAgentVerdict::NotManaged;
+        }
+        if let Some(read_path) = inputs.read_path {
+            // Own-config bound to the agent user's HOME (from the binary path).
+            // The credential-subpath denylist inside `read_path_is_own` still
+            // blocks `~/.ssh`, `~/.aws`, … even within the agent's own home.
+            let home_dir = home_dir_from_exe(exe);
+            if !read_path_is_own(read_path, home_dir.as_deref(), None) {
+                return ManagedAgentVerdict::NotManaged;
+            }
+            // The file must be owned by the SAME uid as the process.
+            let (Some(proc_uid), Some(file_uid)) = (live.uid, inputs.read_path_owner_uid) else {
+                return ManagedAgentVerdict::NotManaged;
+            };
+            if proc_uid != file_uid {
+                return ManagedAgentVerdict::NotManaged;
+            }
+        }
+        return ManagedAgentVerdict::Managed {
+            agent_id: reg.agent_id.clone(),
+            name: live_name.to_string(),
+        };
+    }
+
+    // Identity SCRIPT PATH (Defect 1): the argv token `identify_cmdline` matched
+    // — for `node X.js` it is argv[1] (the first later `/`-token). This, NOT
+    // `/proc/<pid>/exe` (the interpreter), is the basis for the untrusted-root
+    // rejection + home/install derivation + own-config check. A `python -m foo`
+    // agent has no script token → None → fail closed when a read_path is present.
+    let script_path = script_path_from_argv(&live.argv);
 
     // (3) Untrusted-root rejection on the SCRIPT (Defect 1): a script under
     // /tmp, /dev/shm, ~/Downloads → block even when the fingerprint+cmdline match
@@ -480,11 +552,9 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
     // so a home npm-global install is still trusted.
     let Some(script) = script_path.as_deref() else {
         // No script path (e.g. `python -m module`): identity is the module, but
-        // there is no on-disk script to root-check or to bind own-config to.
-        // The interpreter-root check below still runs; the own-config gate fails
-        // closed if a read_path is present (handled at (4)).
-        // We can still be Managed for a NO-read-path C2-connect case as long as
-        // the interpreter is trusted.
+        // there is no on-disk script to root-check or to bind own-config to. The
+        // interpreter must be a trusted system root, and a read_path cannot bind
+        // to a script → fail closed when one is present.
         let Some(exe) = interp_path else {
             return ManagedAgentVerdict::NotManaged;
         };
@@ -492,7 +562,6 @@ pub(crate) fn decide(inputs: &DecideInputs) -> ManagedAgentVerdict {
             return ManagedAgentVerdict::NotManaged;
         }
         if inputs.read_path.is_some() {
-            // own-config cannot be bound to a script → fail closed.
             return ManagedAgentVerdict::NotManaged;
         }
         return ManagedAgentVerdict::Managed {
@@ -609,6 +678,15 @@ pub(crate) fn verify_managed_agent_self_activity(
     // (4) Own-config owner uid (stat) when a read_path is present.
     let read_path_owner_uid = read_path.and_then(|p| resolver.file_owner_uid(p));
 
+    // Standalone-binary launch (argv[0] is the tool itself, e.g. Claude Code).
+    let live_is_standalone_binary = live
+        .as_ref()
+        .map(|p| {
+            let argv_refs: Vec<&str> = p.argv.iter().map(String::as_str).collect();
+            sigindex.is_standalone_binary_launch(&argv_refs)
+        })
+        .unwrap_or(false);
+
     let inputs = DecideInputs {
         registered,
         live,
@@ -617,6 +695,7 @@ pub(crate) fn verify_managed_agent_self_activity(
         read_path,
         read_path_owner_uid,
         destination_known_bad,
+        live_is_standalone_binary,
     };
 
     decide(&inputs)
@@ -1390,6 +1469,238 @@ mod tests {
             verify(pid, None, &reg, &proc),
             ManagedAgentVerdict::NotManaged
         );
+    }
+
+    // ── Standalone-binary agent (Claude Code) — spec 081 coexistence ─────────
+    // Claude Code 2.x ships as a NATIVE binary launched directly. The real
+    // cmdline observed on a host: `/home/lab/.local/bin/claude -p "..."`, with
+    // `/proc/<pid>/exe` -> `/home/lab/.local/share/claude/versions/X`. There is
+    // no interpreter+script, so identity binds to the binary path + the home.
+    const CLAUDE_BIN: &str = "/home/lab/.local/bin/claude";
+    const CLAUDE_EXE: &str = "/home/lab/.local/share/claude/versions/2.1.195";
+
+    /// first-2-argv joined by `|`, exactly as `capture_proc_facts` records.
+    fn claude_fingerprint() -> String {
+        format!("{CLAUDE_BIN}|-p")
+    }
+
+    /// `exe_readable=false` models the common cross-uid case: IW (uid
+    /// `innerwarden`) cannot readlink a `lab`-owned `/proc/<pid>/exe`, so
+    /// `exe_path` is None and the verifier falls back to argv[0].
+    fn claude_proc(uid: u32, exe_readable: bool) -> ResolvedProcess {
+        ResolvedProcess {
+            argv: vec![CLAUDE_BIN.into(), "-p".into(), "do a task".into()],
+            exe_path: exe_readable.then(|| CLAUDE_EXE.to_string()),
+            uid: Some(uid),
+        }
+    }
+
+    fn registry_with_claude(pid: u32) -> Registry {
+        let mut reg = Registry::new();
+        reg.connect_with_facts(
+            "Claude Code",
+            pid,
+            Some("ag-cc"),
+            Some(CLAUDE_BIN.to_string()),
+            Some(1000),
+            Some(claude_fingerprint()),
+        )
+        .expect("connect claude");
+        reg
+    }
+
+    /// THE FP THIS PR KILLS: Claude Code reads its OWN config then calls its LLM
+    /// endpoint; IW sees sensitive_read -> outbound_connect and would auto-block.
+    /// The verifier must return Managed (withhold the block, keep the incident).
+    /// Cross-uid case: `/proc/<pid>/exe` unreadable -> argv[0] fallback.
+    #[test]
+    fn standalone_claude_reading_own_config_is_managed() {
+        let pid = 7001;
+        let reg = registry_with_claude(pid);
+        let proc = StubProc::default()
+            .with_proc(pid, claude_proc(1000, false))
+            .with_owner("/home/lab/.claude/settings.json", 1000);
+        // agent_id is an auto-generated, test-order-volatile `ag-xxxx`; assert the
+        // verdict + the resolved signature name, not the id.
+        assert!(matches!(
+            verify(pid, Some("/home/lab/.claude/settings.json"), &reg, &proc),
+            ManagedAgentVerdict::Managed { ref name, .. } if name == "Claude Code"
+        ));
+    }
+
+    /// Same, with a readable exe under `~/.local/share/claude/versions/...`.
+    #[test]
+    fn standalone_claude_readable_exe_own_config_is_managed() {
+        let pid = 7002;
+        let reg = registry_with_claude(pid);
+        let proc = StubProc::default()
+            .with_proc(pid, claude_proc(1000, true))
+            .with_owner("/home/lab/.config/innerwarden/agent.env", 1000);
+        assert!(matches!(
+            verify(
+                pid,
+                Some("/home/lab/.config/innerwarden/agent.env"),
+                &reg,
+                &proc
+            ),
+            ManagedAgentVerdict::Managed { .. }
+        ));
+    }
+
+    /// Pure C2-connect (no read_path) from a trusted standalone binary -> Managed.
+    #[test]
+    fn standalone_claude_no_read_path_is_managed() {
+        let pid = 7003;
+        let reg = registry_with_claude(pid);
+        let proc = StubProc::default().with_proc(pid, claude_proc(1000, false));
+        assert!(matches!(
+            verify(pid, None, &reg, &proc),
+            ManagedAgentVerdict::Managed { .. }
+        ));
+    }
+
+    // ── Anti-evasion: a standalone binary must NEVER buy these exemptions ────
+
+    /// Reading the user's SSH key (credential subpath) stays BLOCKED even though
+    /// it is under the agent's own home + same uid.
+    #[test]
+    fn standalone_claude_reading_ssh_key_blocks() {
+        let pid = 7004;
+        let reg = registry_with_claude(pid);
+        let proc = StubProc::default()
+            .with_proc(pid, claude_proc(1000, false))
+            .with_owner("/home/lab/.ssh/id_rsa", 1000);
+        assert_eq!(
+            verify(pid, Some("/home/lab/.ssh/id_rsa"), &reg, &proc),
+            ManagedAgentVerdict::NotManaged,
+        );
+    }
+
+    /// A `claude`-named binary dropped in /tmp (transient root) is NEVER trusted.
+    #[test]
+    fn standalone_claude_binary_in_tmp_blocks() {
+        let pid = 7005;
+        let mut reg = Registry::new();
+        reg.connect_with_facts(
+            "Claude Code",
+            pid,
+            Some("ag-cc"),
+            Some("/tmp/claude".to_string()),
+            Some(1000),
+            Some("/tmp/claude|-p".to_string()),
+        )
+        .expect("connect");
+        let proc = StubProc::default().with_proc(
+            pid,
+            ResolvedProcess {
+                argv: vec!["/tmp/claude".into(), "-p".into(), "x".into()],
+                exe_path: None,
+                uid: Some(1000),
+            },
+        );
+        assert_eq!(
+            verify(pid, None, &reg, &proc),
+            ManagedAgentVerdict::NotManaged
+        );
+    }
+
+    /// Reading ANOTHER user's home fails the own-home gate.
+    #[test]
+    fn standalone_claude_reading_other_home_blocks() {
+        let pid = 7006;
+        let reg = registry_with_claude(pid);
+        let proc = StubProc::default()
+            .with_proc(pid, claude_proc(1000, false))
+            .with_owner("/home/victim/.config/x", 1000);
+        assert_eq!(
+            verify(pid, Some("/home/victim/.config/x"), &reg, &proc),
+            ManagedAgentVerdict::NotManaged,
+        );
+    }
+
+    /// Own-home read but the file is owned by a DIFFERENT uid -> BLOCK (a planted
+    /// file / symlink-owner mismatch).
+    #[test]
+    fn standalone_claude_own_config_wrong_owner_blocks() {
+        let pid = 7007;
+        let reg = registry_with_claude(pid);
+        let proc = StubProc::default()
+            .with_proc(pid, claude_proc(1000, false))
+            .with_owner("/home/lab/.claude/settings.json", 0); // root-owned
+        assert_eq!(
+            verify(pid, Some("/home/lab/.claude/settings.json"), &reg, &proc),
+            ManagedAgentVerdict::NotManaged,
+        );
+    }
+
+    /// A fingerprint mismatch (pid-reuse / a different launch on the same pid)
+    /// -> BLOCK, even for a standalone binary.
+    #[test]
+    fn standalone_claude_fingerprint_mismatch_blocks() {
+        let pid = 7008;
+        let reg = registry_with_claude(pid); // registered fp = ".../claude|-p"
+                                             // Live argv differs (argv[1] is `mcp`, not `-p`) so live fp != registered.
+        let proc = StubProc::default().with_proc(
+            pid,
+            ResolvedProcess {
+                argv: vec![CLAUDE_BIN.into(), "mcp".into(), "serve".into()],
+                exe_path: None,
+                uid: Some(1000),
+            },
+        );
+        assert_eq!(
+            verify(pid, None, &reg, &proc),
+            ManagedAgentVerdict::NotManaged
+        );
+    }
+
+    /// destination_known_bad forces the block even for a perfect standalone agent.
+    #[test]
+    fn standalone_claude_known_bad_destination_blocks() {
+        let pid = 7009;
+        let reg = registry_with_claude(pid);
+        let proc = StubProc::default().with_proc(pid, claude_proc(1000, false));
+        let sigindex = SignatureIndex::new();
+        assert_eq!(
+            verify_managed_agent_self_activity(pid, "claude", None, &reg, &sigindex, &proc, true),
+            ManagedAgentVerdict::NotManaged,
+        );
+    }
+
+    /// pid gone (live None) -> fail closed.
+    #[test]
+    fn standalone_claude_pid_gone_blocks() {
+        let pid = 7010;
+        let reg = registry_with_claude(pid);
+        let proc = StubProc::default(); // no proc registered for pid
+        assert_eq!(
+            verify(pid, None, &reg, &proc),
+            ManagedAgentVerdict::NotManaged
+        );
+    }
+
+    /// Registry MISS (claude not auto-registered) -> BLOCK (membership gate).
+    #[test]
+    fn standalone_claude_not_registered_blocks() {
+        let pid = 7011;
+        let reg = Registry::new(); // empty
+        let proc = StubProc::default().with_proc(pid, claude_proc(1000, false));
+        assert_eq!(
+            verify(pid, None, &reg, &proc),
+            ManagedAgentVerdict::NotManaged
+        );
+    }
+
+    #[test]
+    fn standalone_binary_root_trusted_policy() {
+        assert!(standalone_binary_root_trusted(CLAUDE_BIN));
+        assert!(standalone_binary_root_trusted(CLAUDE_EXE));
+        assert!(standalone_binary_root_trusted("/usr/local/bin/claude"));
+        assert!(!standalone_binary_root_trusted("/tmp/claude"));
+        assert!(!standalone_binary_root_trusted("/dev/shm/claude"));
+        assert!(!standalone_binary_root_trusted(
+            "/home/lab/Downloads/claude"
+        ));
     }
 
     /// Live exe under a home dir that does NOT match the registered install dir
