@@ -1,4 +1,5 @@
 pub(crate) mod agent;
+pub(crate) mod agent_install_hook;
 pub(crate) mod agent_mcp_serve;
 pub(crate) mod agent_proxy;
 pub(crate) mod ai;

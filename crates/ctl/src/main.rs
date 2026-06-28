@@ -686,6 +686,34 @@ enum AgentCommand {
         #[arg(long)]
         label: Option<String>,
     },
+
+    /// Install InnerWarden's in-path command guard into an AI coding agent.
+    ///
+    /// Writes a small guard script and a PreToolUse hook so every shell command
+    /// the agent proposes is POSTed to the loopback `check-command` brain and
+    /// BLOCKED before it runs when dangerous, failing closed if the agent is not
+    /// reachable. Unlike `mcp-serve`/`check-command` (advisory), this enforces
+    /// even when the agent uses its raw shell tool. Currently supports Claude
+    /// Code. Example:
+    ///   innerwarden agent install-hook    # claude-code, ~/.claude/settings.json
+    #[command(name = "install-hook")]
+    InstallHook {
+        /// AI agent to wire up (currently only "claude-code").
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+
+        /// Path to the agent's settings.json (default ~/.claude/settings.json).
+        #[arg(long)]
+        settings: Option<String>,
+
+        /// InnerWarden dashboard base URL (default https://127.0.0.1:8787).
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Also block "review" verdicts, not just "deny".
+        #[arg(long)]
+        block_review: bool,
+    },
 }
 
 #[derive(Subcommand)]
