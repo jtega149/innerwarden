@@ -21,7 +21,7 @@
 > InnerWarden** on this machine. This file is the authoritative playbook. It ships with the
 > installed binary, so the commands here match the version you have.
 >
-> **Guide matches InnerWarden `0.15.29`.** If `innerwarden --version` prints something else,
+> **Guide matches InnerWarden `0.15.30`.** If `innerwarden --version` prints something else,
 > trust `innerwarden --help` and `innerwarden <group> --help` over this file for exact flags.
 
 ---
