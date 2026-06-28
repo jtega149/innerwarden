@@ -29,7 +29,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 ![Correlation Rules](https://img.shields.io/badge/correlation%20rules-69-purple)
 ![Tests](https://img.shields.io/badge/tests-7900%2B-brightgreen)
 ![MITRE Coverage](https://img.shields.io/badge/MITRE%20ATT%26CK-90%2B%20mappings-red)
-![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-208-blueviolet)
+![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-209-blueviolet)
 ![Memory](https://img.shields.io/badge/memory-~250MB%20(full%20stack)-green)
 ![AI Optional](https://img.shields.io/badge/AI-optional-lightgrey)
 ![Storage](https://img.shields.io/badge/storage-SQLite%20WAL-blue)
@@ -125,7 +125,7 @@ Apache-2.0. If this project helps make agent automation safer to try, [give it a
 │       └───────────┴───────────────┴─────────────┘                 │
 │                          │                                        │
 │                    ┌─────▼──────┐                                 │
-│                    │82 detectors│ + 8 YARA + 208 Sigma (+9 built-in)│
+│                    │82 detectors│ + 8 YARA + 209 Sigma (+9 built-in)│
 │                    │ stateful   │                                 │
 │                    └─────┬──────┘                                 │
 │                          │                                        │
@@ -218,7 +218,7 @@ Apache-2.0. If this project helps make agent automation safer to try, [give it a
 
 1. **Guards agent actions**: agents and tool runners can call the local command-check API before acting, or route MCP tool calls through the inspecting proxy. Commands are scored against embedded Agent Threat Rules (ATR), risky actions can be denied or sent for review, and the host layer still verifies what actually ran.
 2. **Watches**: 31 collectors across every layer — eBPF syscall tracing (45 kernel programs), firmware integrity, memory forensics (/proc/maps RWX), native DNS/HTTP/TLS (JA3/JA4) capture, tunnel-interface monitoring (a new tun/WireGuard interface = a mesh-VPN brought up), real-time filesystem, cgroup, kernel integrity, plus auth.log, journald, Docker, nginx, CloudTrail. (Full collector list under [How it works](#how-it-works).)
-3. **Detects**: 82 stateful detectors + 8 YARA malware rules + 9 built-in Sigma rules + 208 community Sigma rules cover the full attack lifecycle — brute-force/credential stuffing, C2 (incl. ngrok/cloudflared/bore + mesh-VPN tunnels + DNS/ICMP/SSH-forward), privilege escalation, container escape, reverse shells (eBPF sequence, impossible to evade), ransomware, rootkits, exfiltration, persistence, defense evasion, data destruction, and more. **90+ MITRE ATT&CK techniques covered** across 12 ATT&CK tactics. (The per-detector table with MITRE IDs is in [What it detects](#what-it-detects).)
+3. **Detects**: 82 stateful detectors + 8 YARA malware rules + 9 built-in Sigma rules + 209 community Sigma rules cover the full attack lifecycle — brute-force/credential stuffing, C2 (incl. ngrok/cloudflared/bore + mesh-VPN tunnels + DNS/ICMP/SSH-forward), privilege escalation, container escape, reverse shells (eBPF sequence, impossible to evade), ransomware, rootkits, exfiltration, persistence, defense evasion, data destruction, and more. **90+ MITRE ATT&CK techniques covered** across 12 ATT&CK tactics. (The per-detector table with MITRE IDs is in [What it detects](#what-it-detects).)
 4. **Correlates**: 69 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP, Discovery → Privesc → Lateral Movement chains, full kill chain Initial Access → Foothold → Persistence → Defense Evasion → Impact. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
 5. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
 6. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
@@ -295,7 +295,7 @@ The real Autonomy Gap: an incident the Local Warden is not confident about, that
 
 ## What it detects
 
-82 stateful detectors + 8 YARA rules + 9 built-in Sigma rules + 208 community Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across 12 ATT&CK tactics.** Highlights:
+82 stateful detectors + 8 YARA rules + 9 built-in Sigma rules + 209 community Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across 12 ATT&CK tactics.** Highlights:
 
 | Detector | Threat | MITRE |
 |----------|--------|-------|
@@ -337,7 +337,7 @@ The real Autonomy Gap: an incident the Local Warden is not confident about, that
 | **`symlink_hijack`** | Symlink/hardlink naming /etc/shadow, /etc/sudoers, /etc/pam.d/*, ~/.ssh/authorized_keys | T1555 / T1574.005 |
 | **`system_user_interactive`** | Service accounts (www-data, nobody, postgres, …) running interactive shells with tty or sshd parent | T1059 / T1078.003 |
 
-Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection`, `user_creation`, `crontab_persistence`, `systemd_persistence`, `process_injection`, `outbound_anomaly`, `data_exfil_ebpf` (sensitive file read → outbound connect by PID), `keylogger_bash_trap` (shell startup file tampering + trap-DEBUG patterns), `yara_scan` (8 built-in rules: XMRig, webshells, Cobalt Strike, Metasploit, rootkits), `sigma_rule` (8 built-in rules: cron modification, /tmp execution, shadow access, docker.sock; plus 208 community rules auto-loaded from `rules/sigma/`), `cgroup_abuse` (CPU/memory resource abuse), `io_uring_anomaly`, `container_drift`, `host_drift`, `sensitive_write`.
+Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection`, `user_creation`, `crontab_persistence`, `systemd_persistence`, `process_injection`, `outbound_anomaly`, `data_exfil_ebpf` (sensitive file read → outbound connect by PID), `keylogger_bash_trap` (shell startup file tampering + trap-DEBUG patterns), `yara_scan` (8 built-in rules: XMRig, webshells, Cobalt Strike, Metasploit, rootkits), `sigma_rule` (8 built-in rules: cron modification, /tmp execution, shadow access, docker.sock; plus 209 community rules auto-loaded from `rules/sigma/`), `cgroup_abuse` (CPU/memory resource abuse), `io_uring_anomaly`, `container_drift`, `host_drift`, `sensitive_write`.
 
 `execution_guard` parses commands structurally using tree-sitter-bash. It catches `curl | sh` pipelines, `/tmp` execution, reverse shell patterns, and staged download-chmod-execute sequences.
 
